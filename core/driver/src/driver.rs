@@ -872,11 +872,10 @@ impl Driver {
             let mut store = Store::open(&path).map_err(store_error(&path))?;
             let stored = store
                 .transaction(|tx| {
-                    let waiting = (tx.questions()?.into_iter()).find(|stored| {
-                        stored.question_id == question_id && stored.answer.is_some()
-                    });
-                    match waiting {
-                        Some(stored) => Ok(Some(stored)),
+                    let current = (tx.questions()?.into_iter())
+                        .find(|stored| stored.question_id == question_id);
+                    match current {
+                        Some(stored) => Ok(stored.answer.is_some().then_some(stored)),
                         None => tx.taken_question(question_id),
                     }
                 })
@@ -1715,6 +1714,33 @@ mod tests {
             Err(DriverError::QuestionNotFound(_))
         ));
         assert_eq!(driver.questions().unwrap(), [mass_delete("q3")]);
+    }
+
+    #[test]
+    fn a_question_asked_again_after_the_engine_took_its_answer_reads_as_unanswered() {
+        let (_dir, paths, _root) = profile(&[mass_delete("q1")]);
+        let driver = Driver::open(paths.clone()).unwrap();
+        let store = || Store::open(paths.store(SPACE).unwrap()).unwrap();
+        assert_eq!(driver.answer("q1", Answer::Delete).unwrap(), Answered::Now);
+        assert!(store().transaction(|tx| tx.take_answer("q1")).unwrap());
+        assert_eq!(
+            driver.answered_question("q1").unwrap(),
+            Some(mass_delete("q1"))
+        );
+
+        store()
+            .transaction(|tx| {
+                tx.put_question(&StoredQuestion {
+                    question_id: "q1".into(),
+                    asked_at_ms: 30,
+                    body: serde_json::to_vec(&mass_delete("q1")).unwrap(),
+                    answer: None,
+                })
+            })
+            .unwrap();
+        assert_eq!(driver.answered_question("q1").unwrap(), None);
+        assert_eq!(driver.questions().unwrap(), [mass_delete("q1")]);
+        assert_eq!(driver.answer("q1", Answer::Restore).unwrap(), Answered::Now);
     }
 
     #[tokio::test]
