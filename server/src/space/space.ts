@@ -285,7 +285,10 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
     snapshotPageNodes = 1000;
     private exporting: Promise<void> | undefined;
     private alarmStale = false;
-    private readonly leases = new Map<string, { check: SessionCheck; untilMs: number }>();
+    private readonly leases = new Map<string, { check: SessionCheck; askedAtMs: number; untilMs: number }>();
+    private leaseGeneration = 0;
+    private readonly renewalsDue = new Set<string>();
+    private renewing: { atMs: number; forMs: number } | undefined;
 
     async init(args: { spaceId: string; name: string; ownerUserId: string; spaceKey: Uint8Array }): Promise<void> {
       const existing = getMeta(this.sql, "space_id");
@@ -398,8 +401,53 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
     private knownCheck(deviceId: string): SessionCheck | undefined {
       if (this.revoked(deviceId)) return { active: false, revoked: true, closed: false, kind: "", scope: null, leaseMs: 0 };
       const lease = this.leases.get(deviceId);
-      if (lease && this.clock() < lease.untilMs) return lease.check;
-      return undefined;
+      if (!lease) return undefined;
+      const leftMs = lease.untilMs - this.clock();
+      if (leftMs <= 0) return undefined;
+      if (leftMs < lease.check.leaseMs / 2) {
+        this.renewalsDue.add(deviceId);
+        this.renewLeases();
+      }
+      return lease.check;
+    }
+
+    private dropLeases(): void {
+      this.leases.clear();
+      this.leaseGeneration++;
+    }
+
+    private storeLease(deviceId: string, check: SessionCheck, askedAtMs: number): void {
+      if ((this.leases.get(deviceId)?.askedAtMs ?? -Infinity) > askedAtMs) return;
+      this.leases.set(deviceId, { check, askedAtMs, untilMs: askedAtMs + check.leaseMs });
+    }
+
+    private renewLeases(): void {
+      const askedAtMs = this.clock();
+      if (this.renewing && askedAtMs - this.renewing.atMs < this.renewing.forMs) return;
+      const due = [...this.renewalsDue].flatMap((deviceId) => {
+        const lease = this.leases.get(deviceId);
+        const leftMs = lease ? lease.untilMs - askedAtMs : 0;
+        return lease && leftMs > 0 && leftMs < lease.check.leaseMs / 2 ? [{ deviceId, leaseMs: lease.check.leaseMs }] : [];
+      });
+      this.renewalsDue.clear();
+      if (due.length === 0) return;
+      const deviceIds = due.map(({ deviceId }) => deviceId);
+      const generation = this.leaseGeneration;
+      const renewal = { atMs: askedAtMs, forMs: Math.max(...due.map(({ leaseMs }) => leaseMs)) };
+      this.renewing = renewal;
+      this.account()
+        .checkSessions(deviceIds, String(getMeta(this.sql, "space_id")))
+        .then((answers) => {
+          if (generation !== this.leaseGeneration) return;
+          for (const [deviceId, check] of Object.entries(answers)) {
+            if (check.revoked) this.recordRevoked(deviceId);
+            this.storeLease(deviceId, check, askedAtMs);
+          }
+        })
+        .catch((error) => console.error("account lease renewal failed", error))
+        .finally(() => {
+          if (this.renewing === renewal) this.renewing = undefined;
+        });
     }
 
     /**
@@ -415,7 +463,7 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
         const askedAtMs = this.clock();
         try {
           const answer = await account.checkSession(deviceId, spaceId);
-          this.leases.set(deviceId, { check: answer, untilMs: askedAtMs + answer.leaseMs });
+          this.storeLease(deviceId, answer, askedAtMs);
           return answer;
         } catch (error) {
           console.error("account device check failed", error);
@@ -440,7 +488,7 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
         const askedAtMs = this.clock();
         try {
           const answers = await account.checkSessions(unknown, spaceId);
-          for (const [deviceId, check] of Object.entries(answers)) this.leases.set(deviceId, { check, untilMs: askedAtMs + check.leaseMs });
+          for (const [deviceId, check] of Object.entries(answers)) this.storeLease(deviceId, check, askedAtMs);
           return answers;
         } catch (error) {
           console.error("account device check failed", error);
@@ -1174,7 +1222,7 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
     }
 
     async rewindInfo(restorePointMs: number): Promise<{ historyId: string; headSeq: number; descriptorDurable: boolean; bookmark: string }> {
-      this.leases.clear();
+      this.dropLeases();
       const bookmark = await this.pitr.bookmarkForTime(restorePointMs);
       return { historyId: String(getMeta(this.sql, "history_id")), headSeq: this.headSeq, descriptorDurable: descriptorDurable(this.sql), bookmark };
     }

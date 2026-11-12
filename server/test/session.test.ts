@@ -999,6 +999,296 @@ describe("RFC 0014 session leases", () => {
     return socket.next();
   }
 
+  function ageLeases(spaceId: string, byMs: number) {
+    return runInDurableObject(env.SPACE.get(env.SPACE.idFromName(spaceId)), (instance: SpaceDO) => {
+      const atMs = instance.clock() + byMs;
+      instance.clock = () => atMs;
+    });
+  }
+
+  async function holdAccount(method: "checkSession" | "checkSessions") {
+    const prototype = await runInDurableObject(account(), (instance: AccountDO) => Object.getPrototypeOf(instance) as AccountDO);
+    const original = prototype[method] as (this: AccountDO, ...args: unknown[]) => Promise<unknown>;
+    const asked: unknown[] = [];
+    const { promise: held, resolve: release } = Promise.withResolvers<void>();
+    (prototype as unknown as Record<string, unknown>)[method] = async function (this: AccountDO, ...args: unknown[]) {
+      asked.push(args[0]);
+      const answer = await original.apply(this, args);
+      await held;
+      return answer;
+    };
+    return {
+      asked,
+      release,
+      restore: () => {
+        release();
+        (prototype as unknown as Record<string, unknown>)[method] = original;
+      },
+    };
+  }
+
+  function renewalSettled(spaceId: string) {
+    return vi.waitFor(() =>
+      runInDurableObject(env.SPACE.get(env.SPACE.idFromName(spaceId)), (instance: SpaceDO) => {
+        expect((instance as unknown as { renewing?: unknown }).renewing).toBeUndefined();
+      }),
+    );
+  }
+
+  async function connected(name: string) {
+    const owner = await getOwner();
+    const device = await pairDevice(owner, name);
+    const spaceId = await createSpace(owner);
+    await ageLeases(spaceId, 0);
+    const socket = await Socket.connect(spaceId, device);
+    await socket.start();
+    return { owner, device, spaceId, socket };
+  }
+
+  it("renews a lease past half its life in the background, so a commit does not wait for the Account DO", async () => {
+    const { device, spaceId, socket } = await connected("Renewing writer");
+    await ageLeases(spaceId, SESSION_LEASE_MS * 0.6);
+    const renewal = await holdAccount("checkSessions");
+    try {
+      socket.send({ case: "rpc", value: { reqId: 1n, call: { case: "commit", value: { commitId: uuidv7(), ...socket.slot(), baseSeq: 0n, ops: [op.mkdir(uuidv7(), spaceId, "While renewing")] } } } });
+      expect(await socket.next()).toMatchObject({ case: "rpc", value: { result: { case: "commit" } } });
+      socket.acceptedSeq += 1n;
+      await vi.waitFor(() => expect(renewal.asked).toEqual([[device.deviceId]]));
+    } finally {
+      renewal.restore();
+    }
+    await renewalSettled(spaceId);
+    await ageLeases(spaceId, SESSION_LEASE_MS * 0.6);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const prototype = await runInDurableObject(account(), (instance: AccountDO) => Object.getPrototypeOf(instance) as AccountDO);
+    const original = prototype.checkSession;
+    prototype.checkSession = async () => {
+      throw new Error("injected Account DO outage");
+    };
+    try {
+      expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+    } finally {
+      prototype.checkSession = original;
+    }
+  });
+
+  it("renews only leases that an event used past half their life, so an idle device takes the cold path again", async () => {
+    const { owner, device: writer, spaceId, socket } = await connected("Busy writer");
+    const idle = await pairDevice(owner, "Idle reader");
+    const idleSocket = await Socket.connect(spaceId, idle);
+    await idleSocket.start();
+    await ageLeases(spaceId, SESSION_LEASE_MS * 0.6);
+    const renewal = await holdAccount("checkSessions");
+    try {
+      expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      await vi.waitFor(() => expect(renewal.asked).toEqual([[writer.deviceId]]));
+    } finally {
+      renewal.restore();
+    }
+    await revokeRowOnly(idle.deviceId);
+    await ageLeases(spaceId, SESSION_LEASE_MS * 0.5);
+    expect(await listTree(idleSocket)).toMatchObject({ case: "goodbye", value: { code: Close.DEVICE_REVOKED } });
+  });
+
+  it("keeps one renewal in flight, and starts the next once it has answered", async () => {
+    const { spaceId, socket } = await connected("One in flight");
+    await ageLeases(spaceId, SESSION_LEASE_MS * 0.6);
+    const renewal = await holdAccount("checkSessions");
+    try {
+      expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      await vi.waitFor(() => expect(renewal.asked).toHaveLength(1));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(renewal.asked).toHaveLength(1);
+      renewal.release();
+      await renewalSettled(spaceId);
+      await ageLeases(spaceId, SESSION_LEASE_MS * 0.6);
+      expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      await vi.waitFor(() => expect(renewal.asked).toHaveLength(2));
+    } finally {
+      renewal.restore();
+    }
+  });
+
+  it("renews in one check every lease that was used past half while a renewal was in flight", async () => {
+    const { owner, spaceId, socket } = await connected("Batch A");
+    const b = await pairDevice(owner, "Batch B");
+    const c = await pairDevice(owner, "Batch C");
+    const sb = await Socket.connect(spaceId, b);
+    await sb.start();
+    const sc = await Socket.connect(spaceId, c);
+    await sc.start();
+    await ageLeases(spaceId, SESSION_LEASE_MS * 0.6);
+    const renewal = await holdAccount("checkSessions");
+    try {
+      expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      await vi.waitFor(() => expect(renewal.asked).toHaveLength(1));
+      expect(await listTree(sb)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      expect(await listTree(sc)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      renewal.release();
+      await renewalSettled(spaceId);
+      expect(await listTree(sb)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      await vi.waitFor(() => expect(renewal.asked).toHaveLength(2));
+      expect([...(renewal.asked[1] as string[])].sort()).toEqual([b.deviceId, c.deviceId].sort());
+    } finally {
+      renewal.restore();
+    }
+  });
+
+  it("does not renew a lease that was used past half but ended before the next renewal", async () => {
+    const { owner, spaceId, socket } = await connected("Renewed writer");
+    const x = await pairDevice(owner, "Ended before renewal");
+    const sx = await Socket.connect(spaceId, x);
+    await sx.start();
+    await ageLeases(spaceId, SESSION_LEASE_MS * 0.6);
+    const renewal = await holdAccount("checkSessions");
+    try {
+      expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      await vi.waitFor(() => expect(renewal.asked).toHaveLength(1));
+      expect(await listTree(sx)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      renewal.release();
+      await renewalSettled(spaceId);
+      await ageLeases(spaceId, SESSION_LEASE_MS * 0.6);
+      expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      await vi.waitFor(() => expect(renewal.asked).toHaveLength(2));
+      expect(renewal.asked[1]).not.toContain(x.deviceId);
+    } finally {
+      renewal.restore();
+    }
+  });
+
+  it("records a revocation that a renewal reports, so it outlasts the lease", async () => {
+    const { device, spaceId, socket } = await connected("Revoked in renewal");
+    await revokeRowOnly(device.deviceId);
+    await ageLeases(spaceId, SESSION_LEASE_MS * 0.6);
+    expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+    const revoked = () =>
+      runInDurableObject(env.SPACE.get(env.SPACE.idFromName(spaceId)), (_instance, state) => state.storage.sql.exec("SELECT 1 FROM revoked_devices WHERE device_id = ?", device.deviceId).toArray().length);
+    await vi.waitFor(async () => expect(await revoked()).toBe(1));
+  });
+
+  it("stores nothing from a failed renewal, so the lease runs out as before", async () => {
+    const { device, spaceId, socket } = await connected("Failed renewal");
+    await ageLeases(spaceId, SESSION_LEASE_MS * 0.6);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const prototype = await runInDurableObject(account(), (instance: AccountDO) => Object.getPrototypeOf(instance) as AccountDO);
+    const original = prototype.checkSessions;
+    let calls = 0;
+    prototype.checkSessions = async () => {
+      calls++;
+      throw new Error("injected renewal failure");
+    };
+    try {
+      expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      await vi.waitFor(() => expect(calls).toBe(1));
+    } finally {
+      prototype.checkSessions = original;
+    }
+    await revokeRowOnly(device.deviceId);
+    expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+    await ageLeases(spaceId, SESSION_LEASE_MS * 0.5);
+    expect(await listTree(socket)).toMatchObject({ case: "goodbye", value: { code: Close.DEVICE_REVOKED } });
+  });
+
+  it("sends a new renewal once a renewal that never answers has been out for a lease", async () => {
+    const { spaceId, socket } = await connected("Hung renewal");
+    await ageLeases(spaceId, SESSION_LEASE_MS * 0.6);
+    const renewal = await holdAccount("checkSessions");
+    try {
+      expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      await vi.waitFor(() => expect(renewal.asked).toHaveLength(1));
+      await ageLeases(spaceId, SESSION_LEASE_MS * 0.5);
+      expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      await ageLeases(spaceId, SESSION_LEASE_MS * 0.6);
+      expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      await vi.waitFor(() => expect(renewal.asked).toHaveLength(2));
+    } finally {
+      renewal.restore();
+    }
+  });
+
+  it("still waits for the Account DO once a lease has run out", async () => {
+    const { spaceId, socket } = await connected("Expired lease");
+    await passLeases(spaceId);
+    const check = await holdAccount("checkSession");
+    try {
+      const reply = listTree(socket);
+      const early = await Promise.race([reply.then(() => "answered"), new Promise((resolve) => setTimeout(() => resolve("waiting"), 300))]);
+      expect(early).toBe("waiting");
+      expect(check.asked).toHaveLength(1);
+      check.release();
+      expect(await reply).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+    } finally {
+      check.restore();
+    }
+  });
+
+  it("refuses a device whose revocation notice arrived while a renewal of its lease was in flight", async () => {
+    const { owner, device, spaceId, socket } = await connected("Revoked while renewing");
+    await ageLeases(spaceId, SESSION_LEASE_MS * 0.6);
+    const renewal = await holdAccount("checkSessions");
+    const identity = { userId: device.userId, deviceId: device.deviceId, deviceName: "Revoked while renewing", expiresAtMs: Date.now() + 900_000, kind: "device", scope: null };
+    const ask = async () =>
+      fromBinary(RpcResponseSchema, await env.SPACE.get(env.SPACE.idFromName(spaceId)).httpRpc({ identity, origin: BASE }, body(RpcRequestSchema, { reqId: 1n, call: { case: "listTree", value: {} } }))).result;
+    try {
+      expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      await vi.waitFor(() => expect(renewal.asked).toHaveLength(1));
+      expect((await send("/v1/devices/" + device.deviceId, { method: "DELETE", token: owner.access!.token })).status).toBe(204);
+      expect((await socket.waitClosed()).code).toBe(Close.DEVICE_REVOKED);
+      renewal.release();
+      await renewalSettled(spaceId);
+      expect(await ask()).toMatchObject({ case: "error", value: { code: Error_Code.UNAUTHENTICATED } });
+    } finally {
+      renewal.restore();
+    }
+  });
+
+  it("keeps the answer to the check sent last when a renewal from before a cold check arrives after it", async () => {
+    const { device, spaceId, socket } = await connected("Renewal overtaken");
+    await ageLeases(spaceId, SESSION_LEASE_MS * 0.6);
+    const renewal = await holdAccount("checkSessions");
+    const identity = { userId: device.userId, deviceId: device.deviceId, deviceName: "Renewal overtaken", expiresAtMs: Date.now() + 900_000, kind: "device", scope: null };
+    const ask = async () =>
+      fromBinary(RpcResponseSchema, await env.SPACE.get(env.SPACE.idFromName(spaceId)).httpRpc({ identity, origin: BASE }, body(RpcRequestSchema, { reqId: 1n, call: { case: "listTree", value: {} } }))).result;
+    try {
+      expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+      await vi.waitFor(() => expect(renewal.asked).toHaveLength(1));
+      await runInDurableObject(account(), (_instance, state) => {
+        state.storage.sql.exec("UPDATE devices SET expires_at_ms = ? WHERE device_id = ?", Date.now() - 1000, device.deviceId);
+      });
+      await ageLeases(spaceId, SESSION_LEASE_MS * 0.5);
+      expect(await listTree(socket)).toMatchObject({ case: "goodbye", value: { code: Close.DEVICE_REVOKED } });
+      renewal.release();
+      await renewalSettled(spaceId);
+      expect(await ask()).toMatchObject({ case: "error", value: { code: Error_Code.UNAUTHENTICATED } });
+    } finally {
+      renewal.restore();
+    }
+  });
+
+  it("ends a lease renewed from an answer that predates a revocation by the 204, when the space did not take the notice", async () => {
+    await withLease(1000, async () => {
+      const { owner, device, spaceId, socket } = await connected("Renewed before revocation");
+      await ageLeases(spaceId, 600);
+      const renewal = await holdAccount("checkSessions");
+      const restore = await loseNotices(spaceId);
+      try {
+        expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+        await vi.waitFor(() => expect(renewal.asked).toHaveLength(1));
+        const sentAtMs = Date.now();
+        expect((await send("/v1/devices/" + device.deviceId, { method: "DELETE", token: owner.access!.token })).status).toBe(204);
+        await ageLeases(spaceId, Date.now() - sentAtMs);
+        renewal.release();
+        await renewalSettled(spaceId);
+        expect(socket.closed).toBeUndefined();
+        expect(await listTree(socket)).toMatchObject({ case: "goodbye", value: { code: Close.DEVICE_REVOKED } });
+      } finally {
+        restore();
+        renewal.restore();
+      }
+    });
+  }, 30_000);
+
   it("lets no commit through that a device sends after the 204 of its revocation, during a burst of its commits", async () => {
     await withLease(1000, async () => {
       for (const notice of ["delivered", "lost"]) {
