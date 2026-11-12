@@ -1239,7 +1239,7 @@ fn on_disk(root: &Path) -> Vec<FileId> {
             });
             FileId {
                 dev: meta.dev(),
-                ino: meta.ino(),
+                ino: u128::from(meta.ino()),
                 birth_ns: born,
             }
         })
@@ -1251,8 +1251,8 @@ struct Changer {
     random: Random,
     fresh: usize,
     vacated: Vec<PathBuf>,
-    out: BTreeSet<(u64, u64)>,
-    bounced: BTreeSet<(u64, u64)>,
+    out: BTreeSet<(u64, u128)>,
+    bounced: BTreeSet<(u64, u128)>,
 }
 
 impl Changer {
@@ -1277,14 +1277,14 @@ impl Changer {
                 fs::rename(root.join(from), root.join(to)).ok();
             }
         };
-        let ids = |path: &Path| -> Vec<(u64, u64)> {
+        let ids = |path: &Path| -> Vec<(u64, u128)> {
             let mut all = vec![(path.to_path_buf(), root.join(path).is_dir())];
             if all[0].1 {
                 listed(root, path, &mut all);
             }
             (all.iter())
                 .filter_map(|(path, _)| fs::symlink_metadata(root.join(path)).ok())
-                .map(|meta| (meta.dev(), meta.ino()))
+                .map(|meta| (meta.dev(), u128::from(meta.ino())))
                 .collect()
         };
         let free = (self.vacated.iter())
@@ -1378,7 +1378,7 @@ struct Synced {
     step: usize,
     nodes: BTreeMap<PathBuf, Node>,
     gone: Vec<Gone>,
-    racy: BTreeSet<(u64, u64)>,
+    racy: BTreeSet<(u64, u128)>,
 }
 
 impl Synced {
@@ -1404,7 +1404,7 @@ impl Synced {
             if let Change::Ignored { to, id, .. } = change {
                 let meta = fs::symlink_metadata(root.join(to)).unwrap();
                 assert_eq!(
-                    (meta.dev(), meta.ino()),
+                    (meta.dev(), u128::from(meta.ino())),
                     (id.dev, id.ino),
                     "{run}: {change:?}"
                 );
@@ -1472,7 +1472,7 @@ impl Synced {
             .collect();
         assert_eq!(synced, scanned, "{run}: {changes:?} held {held:?}");
         let ids: Vec<FileId> = snapshot.entries.values().map(|entry| entry.id).collect();
-        let unique: BTreeSet<(u64, u64)> = ids.iter().map(|id| (id.dev, id.ino)).collect();
+        let unique: BTreeSet<(u64, u128)> = ids.iter().map(|id| (id.dev, id.ino)).collect();
         assert_eq!(
             unique.len(),
             ids.len(),

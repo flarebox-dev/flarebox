@@ -2344,7 +2344,7 @@ mod tests {
                     let mut snapshot = Snapshot::default();
                     let (_dir, mut engine) = mapper();
                     observe_rescan(&mut engine, &mut snapshot, &root, &mut rules);
-                    let names: BTreeMap<u64, PathBuf> = (snapshot.entries.iter())
+                    let names: BTreeMap<u128, PathBuf> = (snapshot.entries.iter())
                         .map(|(path, entry)| (entry.id.ino, path.clone()))
                         .collect();
                     let local: Vec<_> = (engine.trees.local().iter())
