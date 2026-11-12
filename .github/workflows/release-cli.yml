@@ -73,32 +73,30 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   release-ref:
-    name: CLI release tag on main
-    if: github.event_name == 'push'
+    name: CLI release commit on main
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      prerelease: ${{ steps.tag.outputs.prerelease }}
+      prerelease: ${{ steps.ref.outputs.prerelease }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: Refuse a release tag outside main
-        id: tag
+      - name: Refuse a release outside main
+        id: ref
         env:
+          EVENT: ${{ github.event_name }}
           TAG: ${{ github.ref_name }}
         run: |
-          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|rc)\.[0-9]+)?$ ]] || { echo '::error::Expected a vMAJOR.MINOR.PATCH tag, optionally with an -alpha.N or -rc.N suffix'; exit 1; }
+          if [ "$EVENT" = push ]; then
+            [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|rc)\.[0-9]+)?$ ]] || { echo '::error::Expected a vMAJOR.MINOR.PATCH tag, optionally with an -alpha.N or -rc.N suffix'; exit 1; }
+            if [[ "$TAG" == *-* ]]; then prerelease=true; else prerelease=false; fi
+            echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          fi
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           git merge-base --is-ancestor HEAD origin/main || { echo '::error::Release tags must point to a commit on main'; exit 1; }
-          if [[ "$TAG" == *-* ]]; then
-            echo "$TAG is a prerelease tag: the macOS CLI ships unsigned."
-            echo "prerelease=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "$TAG is a release tag: the macOS CLI must be signed with the Developer ID."
-            echo "prerelease=false" >> "$GITHUB_OUTPUT"
-          fi
 
   build:
     name: CLI (${{ matrix.target }})
@@ -140,7 +138,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y shellcheck qemu-user-static
+          sudo apt-get install -y shellcheck qemu-user
           python3 -m venv "$RUNNER_TEMP/zigbuild"
           "$RUNNER_TEMP/zigbuild/bin/pip" install cargo-zigbuild==0.24.1 ziglang==0.15.2
           echo "$RUNNER_TEMP/zigbuild/bin" >> "$GITHUB_PATH"
@@ -180,7 +178,7 @@ jobs:
           fi
           binary="target/$TARGET/release/koi"
           if [ "$TARGET" = aarch64-unknown-linux-musl ]; then
-            actual=$(qemu-aarch64-static "$binary" --version)
+            actual=$(qemu-aarch64 "$binary" --version)
           else
             actual=$("$binary" --version)
           fi
@@ -209,54 +207,86 @@ jobs:
           if-no-files-found: error
 
   sign-macos:
-    name: Sign the macOS CLI
-    if: github.event_name == 'push' && needs.release-ref.outputs.prerelease == 'false'
+    name: Sign and notarize the macOS CLI
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     needs: [build, release-ref]
     runs-on: macos-15
-    timeout-minutes: 15
+    timeout-minutes: 150
     environment: macos-release
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: cli-*-apple-darwin
           merge-multiple: true
           path: dist
-      - name: Sign with the existing Developer ID identity
+      - name: Sign and notarize with the Developer ID
         env:
           P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 }}
           P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
+          KEY_P8_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          NOTARY_DEADLINE_SECONDS: 3600
+          DEVELOPER_ID_G2_SHA256: f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a
         run: |
-          if [ -z "$P12_BASE64" ] || [ -z "$P12_PASSWORD" ]; then
-            echo '::error::A release tag needs MACOS_DEVELOPER_ID_P12_BASE64 and MACOS_DEVELOPER_ID_P12_PASSWORD in the macos-release environment. Only -alpha.N and -rc.N tags ship the macOS CLI unsigned.'
+          missing=
+          [ -n "$P12_BASE64" ] || missing="$missing MACOS_DEVELOPER_ID_P12_BASE64"
+          [ -n "$P12_PASSWORD" ] || missing="$missing MACOS_DEVELOPER_ID_P12_PASSWORD"
+          [ -n "$KEY_P8_BASE64" ] || missing="$missing APP_STORE_CONNECT_API_KEY_P8_BASE64"
+          [ -n "$NOTARY_KEY_ID" ] || missing="$missing APP_STORE_CONNECT_API_KEY_ID"
+          [ -n "$NOTARY_ISSUER_ID" ] || missing="$missing APP_STORE_CONNECT_API_ISSUER_ID"
+          if [ -n "$missing" ]; then
+            echo "::error::Signing and notarizing the macOS CLI needs these secrets in the macos-release environment:$missing"
             exit 1
           fi
           umask 077
-          keychain="$RUNNER_TEMP/cli-signing.keychain-db"
+          secrets_dir="$RUNNER_TEMP/cli-signing"
+          keychain="$secrets_dir/signing.keychain-db"
+          mkdir -p "$secrets_dir"
           password=$(openssl rand -hex 32)
           echo "::add-mask::$password"
           security create-keychain -p "$password" "$keychain"
-          security set-keychain-settings -lut 1800 "$keychain"
+          security set-keychain-settings -lut 9000 "$keychain"
           security unlock-keychain -p "$password" "$keychain"
-          printf '%s' "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cli-signing.p12"
-          security import "$RUNNER_TEMP/cli-signing.p12" -k "$keychain" -f pkcs12 -P "$P12_PASSWORD" -T /usr/bin/codesign >/dev/null
-          rm -f "$RUNNER_TEMP/cli-signing.p12"
+          curl -fsSL --retry 3 -o "$secrets_dir/DeveloperIDG2CA.cer" https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+          echo "$DEVELOPER_ID_G2_SHA256  $secrets_dir/DeveloperIDG2CA.cer" | shasum -a 256 -c - || { echo "::error::Apple's Developer ID G2 intermediate certificate does not have the pinned SHA-256."; exit 1; }
+          security import "$secrets_dir/DeveloperIDG2CA.cer" -k "$keychain" >/dev/null
+          printf '%s' "$P12_BASE64" | base64 --decode > "$secrets_dir/developer-id.p12"
+          printf '%s' "$KEY_P8_BASE64" | base64 --decode > "$secrets_dir/notary-key.p8"
+          security import "$secrets_dir/developer-id.p12" -k "$keychain" -f pkcs12 -P "$P12_PASSWORD" -T /usr/bin/codesign >/dev/null
+          rm -f "$secrets_dir/developer-id.p12"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
-          identities=$(security find-identity -v -p codesigning "$keychain" | grep '"Developer ID Application: ')
-          test "$(printf '%s\n' "$identities" | wc -l | tr -d ' ')" = 1 || { echo '::error::Expected exactly one Developer ID Application identity'; exit 1; }
+          search_list=()
+          while IFS= read -r entry; do
+            entry="${entry#"${entry%%[![:space:]]*}"}"
+            search_list+=("${entry//\"/}")
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$keychain" "${search_list[@]}"
+          identities=$(security find-identity -v -p codesigning "$keychain" | grep '"Developer ID Application: ' || true)
+          count=$(grep -c . <<< "$identities" || true)
+          [ "$count" = 1 ] || { echo "::error::Expected one valid Developer ID Application identity, found $count."; exit 1; }
+          echo "Signing identity: $(sed -E 's/^ *[0-9]+\) [0-9A-F]+ //' <<< "$identities")"
           identity=$(awk '{print $2}' <<< "$identities")
           for archive in dist/*.tar.gz; do
-            mkdir package
-            tar -xzf "$archive" -C package
-            codesign --force --keychain "$keychain" --sign "$identity" --options runtime --timestamp package/koi
-            codesign --verify --strict --verbose=2 package/koi
-            tar -czf "$archive" -C package koi koidrive.service
-            rm -rf package
+            name=$(basename "$archive" .tar.gz)
+            package="$RUNNER_TEMP/$name"
+            mkdir "$package"
+            tar -xzf "$archive" -C "$package"
+            codesign --force --keychain "$keychain" --sign "$identity" --options runtime --timestamp "$package/koi"
+            codesign --verify --strict --verbose=2 "$package/koi"
+            ditto -c -k "$package/koi" "$package.zip"
+            NOTARY_KEY_PATH="$secrets_dir/notary-key.p8" apps/macos/scripts/notarize.sh "$package.zip"
+            tar -czf "$archive" -C "$package" koi koidrive.service
+            echo "Signed and notarized koi in $archive."
           done
       - name: Remove signing material
         if: always()
         run: |
-          security delete-keychain "$RUNNER_TEMP/cli-signing.keychain-db" || true
-          rm -f "$RUNNER_TEMP/cli-signing.p12"
+          security delete-keychain "$RUNNER_TEMP/cli-signing/signing.keychain-db" || true
+          rm -rf "$RUNNER_TEMP/cli-signing"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cli-macos-release
@@ -265,8 +295,8 @@ jobs:
 
   checksums:
     name: CLI checksums
-    needs: [changes, release-ref, build, sign-macos]
-    if: always() && needs.build.result == 'success' && (needs.sign-macos.result == 'success' || (needs.sign-macos.result == 'skipped' && (github.event_name != 'push' || needs.release-ref.outputs.prerelease == 'true')))
+    needs: [changes, build, sign-macos]
+    if: always() && needs.build.result == 'success' && (needs.sign-macos.result == 'success' || (github.event_name != 'push' && needs.sign-macos.result == 'skipped'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
