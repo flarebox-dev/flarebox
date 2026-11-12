@@ -679,10 +679,7 @@ impl Commits {
         self.published.retain(|id| trees.local().get(id).is_some());
         self.aliases
             .retain(|id, _| trees.local().get(id).is_some() && trees.reverted().contains(id));
-        self.pending.retain(|id, pending| {
-            (trees.remote().get(id))
-                .is_some_and(|remote| nfc(&remote.shape.name) == nfc(&pending.sent))
-        });
+        self.retire_pending(trees);
         let (planned, deletes, reverts, pending) = plan(
             trees,
             &skip,
@@ -969,7 +966,34 @@ impl Commits {
     ///
     /// S stays a valid tree. When the updates together would break it, because S still lags R
     /// elsewhere, each is made as soon as it fits and the rest wait (see [`Trees::waiting`]).
+    /// Drops each pending name whose node R no longer holds at that name, live or in the trash,
+    /// unless the commit in flight creates or moves the node, whose acknowledgement decides. R
+    /// takes the records of one commit at a time, and [`Commits::acknowledge`] runs after each,
+    /// so a node another device renames away ends the owed rename even when it is named back
+    /// before this device builds again.
+    fn retire_pending(&mut self, trees: &Trees) {
+        let flight = self.in_flight.as_ref();
+        self.pending.retain(|id, pending| {
+            let sending = flight.is_some_and(|flight| {
+                flight.commit.ops.iter().any(|op| match &op.op {
+                    Some(op::Op::CreateDir(create)) => create.node_id == *id,
+                    Some(op::Op::Move(moved)) => moved.node_id == *id,
+                    _ => false,
+                })
+            });
+            sending
+                || (trees.remote().get(id))
+                    .is_some_and(|remote| nfc(&remote.shape.name) == nfc(&pending.sent))
+        });
+    }
+
     pub fn acknowledge(&mut self, trees: &mut Trees, last_seq: u64) -> bool {
+        let acknowledged = self.acknowledge_flight(trees, last_seq);
+        self.retire_pending(trees);
+        acknowledged
+    }
+
+    fn acknowledge_flight(&mut self, trees: &mut Trees, last_seq: u64) -> bool {
         let Some(flight) = self
             .in_flight
             .take_if(|flight| flight.result.as_ref().is_some_and(|r| r.seq <= last_seq))
@@ -1111,7 +1135,7 @@ impl Commits {
                     }
                     if applied
                         && (self.pending.get(id))
-                            .is_some_and(|pending| nfc(&moved.new_name) == nfc(&pending.name))
+                            .is_some_and(|pending| nfc(&moved.new_name) != nfc(&pending.sent))
                     {
                         self.pending.remove(id);
                     }

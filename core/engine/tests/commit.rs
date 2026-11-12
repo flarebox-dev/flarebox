@@ -6212,3 +6212,46 @@ fn an_owed_rename_that_lands_is_not_sent_again_once_another_device_names_the_nod
         next.as_ref().map(ops)
     );
 }
+
+#[test]
+fn a_rename_this_device_makes_off_a_pending_name_ends_the_owed_rename() {
+    let (mut commits, mut trees, mut ids) =
+        owing_its_name(&[synced("a", dir(ROOT, "a (pending)"))]);
+    trees.set_local("a".into(), local(dir(ROOT, "c"), 1));
+    let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&sent), [mv("a", ROOT, "c")]);
+    trees.set_remote("a".into(), remote_at(dir(ROOT, "c"), 1));
+    trees.set_remote("a".into(), remote_at(dir(ROOT, "a (pending)"), 2));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    trees.set_local("a".into(), local(dir(ROOT, "a (pending)"), 1));
+    trees.settle();
+    let next = build(&mut commits, &mut trees, &mut ids);
+    assert!(
+        next.as_ref()
+            .is_none_or(|commit| !ops(commit).contains(&mv("a", ROOT, "a"))),
+        "{:?}",
+        next.as_ref().map(ops)
+    );
+}
+
+#[test]
+fn a_rename_another_device_makes_off_a_pending_name_ends_the_owed_rename_before_any_build() {
+    let (mut commits, mut trees, mut ids) =
+        owing_its_name(&[synced("a", dir(ROOT, "a (pending)"))]);
+    trees.set_remote("a".into(), remote_at(dir(ROOT, "c"), 1));
+    assert!(!commits.acknowledge(&mut trees, 1));
+    trees.set_remote("a".into(), remote_at(dir(ROOT, "a (pending)"), 2));
+    assert!(!commits.acknowledge(&mut trees, 2));
+    trees.settle();
+    let next = build(&mut commits, &mut trees, &mut ids);
+    assert!(
+        next.as_ref()
+            .is_none_or(|commit| !ops(commit).contains(&mv("a", ROOT, "a"))),
+        "{:?}",
+        next.as_ref().map(ops)
+    );
+}
