@@ -421,10 +421,10 @@ pub struct World {
     copied: BTreeSet<i64>,
     /// The last copy of the server's storage.
     backup: Option<Backup>,
-    /// The writes that a restore took from the server while no disk held them. The server lost
-    /// them, and no engine can send them again.
+    /// The writes that a restore took from the server while no disk held them. The server may
+    /// stay without them, or hold them again in a file for each device that placed one from R.
     retired: BTreeSet<i64>,
-    /// The writes that a restore took from the server while a disk still held them, each with
+    /// The writes that a restore took from the server while a device still held them, each with
     /// the files the server may hold it in.
     exposed: BTreeMap<i64, Exposure>,
     /// For each device, the names that L and the server held for the nodes whose shape a restore
@@ -759,7 +759,7 @@ impl World {
 
     /// Restores the server from the last copy. A write is lost with the restore when the server
     /// held it only after the copy, or when a file of the server held it before the restore and
-    /// no longer holds it after: it is retired when no disk holds it, and exposed otherwise.
+    /// no longer holds it after: it is exposed, and retired as well when no disk holds it.
     fn restore(&mut self) {
         let Some(backup) = &self.backup else {
             return;
@@ -824,9 +824,10 @@ impl World {
             if !taken && (!stored(&self.held, *write) || stored(&backup.held, *write)) {
                 continue;
             }
-            if !self.devices.iter().any(|device| device.disk.holds(*write)) {
+            if self.devices.iter().any(|device| device.disk.holds(*write)) {
+                self.retired.remove(write);
+            } else {
                 self.retired.insert(*write);
-                continue;
             }
             let holds =
                 |content: &Option<Content>| content.as_ref().is_some_and(|c| c.mtime_ns == *write);
@@ -1829,7 +1830,9 @@ impl World {
             )));
         }
         let gone = (self.exposed.keys()).find(|write| {
-            !server.contains(write) && !self.removed.iter().any(|removed| removed.contains(write))
+            !server.contains(write)
+                && !self.retired.contains(write)
+                && !self.removed.iter().any(|removed| removed.contains(write))
         });
         match gone {
             Some(write) => Err(Failure::Broken(format!(
