@@ -79,6 +79,23 @@ commit added-cfg >/dev/null
 expect "a cfg added to a portable file" "core/engine/src/lib.rs "
 
 base="$(git rev-parse HEAD)"
+write core/chunk/src/simd.rs '#[cfg(target_arch = "aarch64")]
+fn neon() {}'
+commit arch >/dev/null
+expect "a file gated on target_arch" "core/chunk/src/simd.rs "
+
+base="$(git rev-parse HEAD)"
+{
+  echo '#[cfg(target_os = "macos")]'
+  seq 200000 | sed 's/.*/fn filler() {}/'
+} > core/engine/src/big.rs
+commit big-base >/dev/null
+base="$(git rev-parse HEAD)"
+echo 'fn tail() {}' >> core/engine/src/big.rs
+commit big >/dev/null
+expect "a file larger than a pipe buffer with the cfg near the top" "core/engine/src/big.rs "
+
+base="$(git rev-parse HEAD)"
 commit empty >/dev/null
 expect "no changes" ""
 

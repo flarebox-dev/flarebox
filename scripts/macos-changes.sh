@@ -9,12 +9,12 @@ if [ "$#" -ne 2 ]; then
 fi
 base=$1
 head=$2
-platform_rust='target_os|target_vendor|std::os::(macos|darwin)'
+platform_rust='target_os|target_vendor|target_arch|std::os::(macos|darwin)'
 
 has() {
   local path=$1 pattern=$2 rev
   for rev in "$base" "$head"; do
-    if git cat-file -e "$rev:$path" 2>/dev/null && git show "$rev:$path" | grep -Eq "$pattern"; then
+    if git cat-file -e "$rev:$path" 2>/dev/null && git show "$rev:$path" | grep -E "$pattern" >/dev/null; then
       return 0
     fi
   done
