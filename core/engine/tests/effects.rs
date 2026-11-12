@@ -1098,6 +1098,427 @@ fn a_parked_edit_brings_back_its_deleted_folder_after_a_remote_move_into_an_igno
     assert_eq!(f.shape, file("d", "f", 2));
 }
 
+#[test]
+fn a_reverted_folder_whose_r_folder_sits_inside_it_waits_in_place() {
+    for rules in [&b""[..], b"b/\n"] {
+        let (mut trees, mut disk) = space(&[
+            ("y", Some(dir(ROOT, "b")), Some(dir(ROOT, "b"))),
+            ("x", Some(dir("y", "c")), Some(dir("y", "c"))),
+        ]);
+        trees.set_rules(
+            &[] as &[&str],
+            Some(koidrive_engine::ignore::RuleFile::parse(rules)),
+        );
+        let mut x = trees.local().get("x").unwrap().clone();
+        x.shape = dir(ROOT, "x");
+        trees.set_local("x".into(), x);
+        let mut y = trees.local().get("y").unwrap().clone();
+        y.shape = dir("x", "a");
+        trees.set_local("y".into(), y);
+        trees.revert("x".into());
+        disk.entries.insert(
+            2,
+            Entry {
+                area: Area::Root,
+                name: "x".into(),
+                kind: Kind::Dir,
+                content: None,
+            },
+        );
+        disk.entries.insert(
+            1,
+            Entry {
+                area: Area::Dir(2),
+                name: "a".into(),
+                kind: Kind::Dir,
+                content: None,
+            },
+        );
+        trees.check().unwrap();
+        disk.matches(&trees).unwrap();
+        let done = converge(&mut trees, &mut disk, 10).unwrap();
+        assert!(done.is_empty(), "{done:?}");
+        assert!(!trees.local().get("x").unwrap().parked);
+    }
+}
+
+#[test]
+fn a_reverted_folder_whose_inner_folder_an_excluded_node_holds_out_waits_in_place() {
+    let (mut trees, mut disk) = space(&[
+        ("e", Some(dir(ROOT, "e")), Some(dir(ROOT, "e"))),
+        ("y", Some(dir(ROOT, "b")), Some(dir(ROOT, "b"))),
+        ("x", Some(dir("y", "c")), Some(dir("y", "c"))),
+    ]);
+    trees.set_rules(
+        &[] as &[&str],
+        Some(koidrive_engine::ignore::RuleFile::parse(b"b/\n")),
+    );
+    for (id, shape, ino, area, name) in [
+        ("e", dir(ROOT, "b"), 1, Area::Root, "b"),
+        ("x", dir(ROOT, "x"), 3, Area::Root, "x"),
+        ("y", dir("x", "a"), 2, Area::Dir(3), "a"),
+    ] {
+        let mut local = trees.local().get(id).unwrap().clone();
+        local.shape = shape;
+        trees.set_local(id.into(), local);
+        let entry = disk.entries.get_mut(&ino).unwrap();
+        entry.area = area;
+        entry.name = name.into();
+    }
+    trees.revert("x".into());
+    trees.revert("y".into());
+    trees.check().unwrap();
+    disk.matches(&trees).unwrap();
+    assert!(trees.excluded("e") && !trees.excluded("x") && !trees.excluded("y"));
+    let done = converge(&mut trees, &mut disk, 10).unwrap();
+    assert!(done.is_empty(), "{done:?}");
+    assert!(!trees.local().get("x").unwrap().parked);
+}
+
+#[test]
+fn a_name_holder_whose_s_position_the_rules_leave_out_reaches_its_r_position() {
+    let (mut trees, mut disk) = space(&[
+        ("y", Some(dir(ROOT, "b")), Some(dir(ROOT, "x"))),
+        ("x", Some(dir("y", "c")), Some(dir("y", "c"))),
+        ("z", Some(file("x", "z", 1)), Some(file("x", "z", 1))),
+        ("e", Some(dir(ROOT, "x")), Some(dir(ROOT, "h"))),
+    ]);
+    trees.set_rules(
+        &[] as &[&str],
+        Some(koidrive_engine::ignore::RuleFile::parse(b"b/\n")),
+    );
+    for (id, shape, ino, area, name) in [
+        ("x", dir(ROOT, "x"), 2, Area::Root, "x"),
+        ("y", dir("x", "a"), 1, Area::Dir(2), "a"),
+        ("z", file(ROOT, "z", 1), 3, Area::Root, "z"),
+        ("e", dir(ROOT, "g"), 4, Area::Root, "g"),
+    ] {
+        let mut local = trees.local().get(id).unwrap().clone();
+        local.shape = shape;
+        trees.set_local(id.into(), local);
+        let entry = disk.entries.get_mut(&ino).unwrap();
+        entry.area = area;
+        entry.name = name.into();
+    }
+    trees.revert("x".into());
+    trees.revert("y".into());
+    trees.check().unwrap();
+    disk.matches(&trees).unwrap();
+    converge(&mut trees, &mut disk, 10).unwrap();
+    assert!(trees.local().iter().all(|(_, node)| !node.parked));
+    assert_eq!(trees.local().get("x").unwrap().shape, dir("y", "c"));
+    assert_eq!(trees.local().get("y").unwrap().shape, dir(ROOT, "x"));
+}
+
+#[test]
+fn a_reverted_parked_file_whose_r_name_an_excluded_node_holds_goes_back_to_its_local_position() {
+    let (mut trees, mut disk) = space(&[
+        ("e", Some(file(ROOT, "z", 9)), Some(file(ROOT, "z", 9))),
+        ("x", Some(file(ROOT, "x", 1)), Some(file(ROOT, "A", 1))),
+    ]);
+    trees.set_rules(
+        &[] as &[&str],
+        Some(koidrive_engine::ignore::RuleFile::parse(b"a\n")),
+    );
+    let mut moved = trees.local().get("e").unwrap().clone();
+    moved.shape = file(ROOT, "a", 9);
+    trees.set_local("e".into(), moved);
+    disk.entries.get_mut(&1).unwrap().name = "a".into();
+    let mut local = trees.local().get("x").unwrap().clone();
+    local.parked = true;
+    local.shape = file(ROOT, "y", 1);
+    trees.set_local("x".into(), local);
+    trees.revert("x".into());
+    let entry = disk.entries.get_mut(&2).unwrap();
+    entry.area = Area::Parked;
+    entry.name = "x".into();
+    trees.check().unwrap();
+    disk.matches(&trees).unwrap();
+    assert!(trees.excluded("e"));
+    converge(&mut trees, &mut disk, 10).unwrap();
+    let x = trees.local().get("x").unwrap();
+    assert!(!x.parked);
+    assert_eq!(x.shape, file(ROOT, "y", 1));
+}
+
+#[test]
+fn a_reverted_name_cycle_out_of_an_excluded_folder_reaches_its_r_positions() {
+    let (mut trees, mut disk) = space(&[
+        ("y", Some(dir(ROOT, "b")), Some(dir(ROOT, "x"))),
+        ("x", Some(dir("y", "c")), Some(dir("y", "c"))),
+    ]);
+    trees.set_rules(
+        &[] as &[&str],
+        Some(koidrive_engine::ignore::RuleFile::parse(b"b/\n")),
+    );
+    for (id, shape, ino, area, name) in [
+        ("x", dir(ROOT, "x"), 2, Area::Root, "x"),
+        ("y", dir("x", "a"), 1, Area::Dir(2), "a"),
+    ] {
+        let mut local = trees.local().get(id).unwrap().clone();
+        local.shape = shape;
+        trees.set_local(id.into(), local);
+        let entry = disk.entries.get_mut(&ino).unwrap();
+        entry.area = area;
+        entry.name = name.into();
+    }
+    trees.revert("x".into());
+    trees.revert("y".into());
+    trees.check().unwrap();
+    disk.matches(&trees).unwrap();
+    converge(&mut trees, &mut disk, 10).unwrap();
+    assert!(trees.local().iter().all(|(_, node)| !node.parked));
+    assert_eq!(trees.local().get("x").unwrap().shape, dir("y", "c"));
+    assert_eq!(trees.local().get("y").unwrap().shape, dir(ROOT, "x"));
+}
+
+#[test]
+fn a_reverted_case_only_rename_out_of_an_excluded_folder_reaches_its_r_name() {
+    let (mut trees, mut disk) = space(&[
+        ("x", Some(dir(ROOT, "b")), Some(dir(ROOT, "a"))),
+        ("z", Some(file("x", "z", 1)), Some(file("x", "z", 1))),
+        ("e", Some(dir(ROOT, "a")), Some(dir(ROOT, "h"))),
+    ]);
+    trees.set_rules(
+        &[] as &[&str],
+        Some(koidrive_engine::ignore::RuleFile::parse(b"b/\n")),
+    );
+    for (id, shape, ino, name) in [
+        ("x", dir(ROOT, "A"), 1, "A"),
+        ("z", file(ROOT, "z", 1), 2, "z"),
+        ("e", dir(ROOT, "g"), 3, "g"),
+    ] {
+        let mut local = trees.local().get(id).unwrap().clone();
+        local.shape = shape;
+        trees.set_local(id.into(), local);
+        let entry = disk.entries.get_mut(&ino).unwrap();
+        entry.area = Area::Root;
+        entry.name = name.into();
+    }
+    trees.revert("x".into());
+    trees.check().unwrap();
+    disk.matches(&trees).unwrap();
+    converge(&mut trees, &mut disk, 10).unwrap();
+    assert!(trees.local().iter().all(|(_, node)| !node.parked));
+    assert_eq!(trees.local().get("x").unwrap().shape, dir(ROOT, "a"));
+}
+
+#[test]
+fn two_reverted_files_moved_out_of_an_excluded_folder_swap_names_into_their_r_positions() {
+    let (mut trees, mut disk) = space(&[
+        ("logs", Some(dir(ROOT, "logs")), Some(dir(ROOT, "logs"))),
+        ("a", Some(file("logs", "a", 1)), Some(file(ROOT, "q", 1))),
+        ("b", Some(file("logs", "b", 2)), Some(file(ROOT, "p", 2))),
+    ]);
+    trees.set_rules(
+        &[] as &[&str],
+        Some(koidrive_engine::ignore::RuleFile::parse(b"logs/\n")),
+    );
+    for (id, name, ino) in [("a", "p", 2), ("b", "q", 3)] {
+        let mut local = trees.local().get(id).unwrap().clone();
+        local.shape = file(ROOT, name, if id == "a" { 1 } else { 2 });
+        trees.set_local(id.into(), local);
+        let entry = disk.entries.get_mut(&ino).unwrap();
+        entry.area = Area::Root;
+        entry.name = name.into();
+    }
+    trees.revert("a".into());
+    trees.revert("b".into());
+    trees.check().unwrap();
+    disk.matches(&trees).unwrap();
+    assert!(!trees.excluded("a") && !trees.excluded("b"));
+    converge(&mut trees, &mut disk, 20).unwrap();
+    assert!(trees.local().iter().all(|(_, node)| !node.parked));
+    assert_eq!(trees.local().get("a").unwrap().shape, file(ROOT, "q", 1));
+    assert_eq!(trees.local().get("b").unwrap().shape, file(ROOT, "p", 2));
+}
+
+#[test]
+fn a_reverted_parked_file_whose_r_name_an_excluded_node_holds_brings_back_its_deleted_folder() {
+    let (mut trees, mut disk) = space(&[
+        ("logs", Some(dir(ROOT, "logs")), Some(dir(ROOT, "logs"))),
+        ("e", Some(file(ROOT, "z", 9)), Some(file("logs", "z", 9))),
+        ("d", Some(dir(ROOT, "d")), Some(dir(ROOT, "d"))),
+        ("x", Some(file(ROOT, "x", 1)), Some(file(ROOT, "z", 1))),
+    ]);
+    trees.set_rules(
+        &[] as &[&str],
+        Some(koidrive_engine::ignore::RuleFile::parse(b"logs/\n")),
+    );
+    let mut local = trees.local().get("x").unwrap().clone();
+    local.parked = true;
+    local.shape = file("d", "y", 1);
+    trees.set_local("x".into(), local);
+    trees.revert("x".into());
+    trees.remove_local("d");
+    trees.revert("d".into());
+    disk.entries.remove(&3);
+    let entry = disk.entries.get_mut(&4).unwrap();
+    entry.area = Area::Parked;
+    entry.name = "x".into();
+    trees.check().unwrap();
+    disk.matches(&trees).unwrap();
+    assert!(trees.excluded("e") && !trees.ignored("x"));
+    converge(&mut trees, &mut disk, 10).unwrap();
+    let x = trees.local().get("x").unwrap();
+    assert!(!x.parked);
+    assert_eq!(x.shape, file("d", "y", 1));
+}
+
+#[test]
+fn a_reverted_parked_edit_whose_r_folder_the_rules_exclude_stays_at_its_local_position() {
+    let (mut trees, mut disk) = space(&[
+        ("logs", Some(dir(ROOT, "logs")), Some(dir(ROOT, "logs"))),
+        ("f", Some(file(ROOT, "b", 1)), Some(file("logs", "f", 1))),
+    ]);
+    trees.set_rules(
+        &[] as &[&str],
+        Some(koidrive_engine::ignore::RuleFile::parse(b"logs/\n")),
+    );
+    let mut f = trees.local().get("f").unwrap().clone();
+    f.shape = file(ROOT, "a", 2);
+    f.parked = true;
+    trees.set_local("f".into(), f);
+    trees.revert("f".into());
+    let entry = disk.entries.get_mut(&2).unwrap();
+    entry.area = Area::Parked;
+    entry.name = "f".into();
+    entry.content = Some(content(2));
+    trees.check().unwrap();
+    disk.matches(&trees).unwrap();
+    assert!(!trees.ignored("f") && trees.edited("f"));
+    converge(&mut trees, &mut disk, 10).unwrap();
+    let f = trees.local().get("f").unwrap();
+    assert!(!f.parked);
+    assert_eq!(f.shape, file(ROOT, "a", 2));
+    let (mut commits, mut ids) = (koidrive_engine::commit::Commits::default(), IdGen::new(1));
+    let commit = commits
+        .build(&mut trees, &mut ids, NOW, "history", 7)
+        .unwrap();
+    assert!(commit.ops.iter().any(|op| match &op.op {
+        Some(koidrive_proto::v1::op::Op::UpdateContent(op)) => op.content == Some(content(2)),
+        Some(koidrive_proto::v1::op::Op::CreateFile(op)) => op.content == Some(content(2)),
+        _ => false,
+    }));
+}
+
+#[test]
+fn an_edit_whose_r_folder_the_rules_exclude_is_not_parked_to_free_its_name() {
+    let (mut trees, mut disk) = space(&[
+        ("logs", Some(dir(ROOT, "logs")), Some(dir(ROOT, "logs"))),
+        ("f", Some(file(ROOT, "b", 1)), Some(file("logs", "f", 1))),
+        ("g", Some(file(ROOT, "x", 3)), Some(file(ROOT, "a", 3))),
+    ]);
+    trees.set_rules(
+        &[] as &[&str],
+        Some(koidrive_engine::ignore::RuleFile::parse(b"logs/\n")),
+    );
+    let mut f = trees.local().get("f").unwrap().clone();
+    f.shape = file(ROOT, "a", 2);
+    trees.set_local("f".into(), f);
+    trees.revert("f".into());
+    let entry = disk.entries.get_mut(&2).unwrap();
+    entry.name = "a".into();
+    entry.content = Some(content(2));
+    trees.check().unwrap();
+    disk.matches(&trees).unwrap();
+    let done = converge(&mut trees, &mut disk, 10).unwrap();
+    assert!(done.is_empty(), "{done:?}");
+    assert_eq!(trees.local().get("f").unwrap().shape, file(ROOT, "a", 2));
+    let (mut commits, mut ids) = (koidrive_engine::commit::Commits::default(), IdGen::new(1));
+    let commit = commits
+        .build(&mut trees, &mut ids, NOW, "history", 7)
+        .unwrap();
+    assert!(commit.ops.iter().any(|op| match &op.op {
+        Some(koidrive_proto::v1::op::Op::UpdateContent(op)) => op.content == Some(content(2)),
+        Some(koidrive_proto::v1::op::Op::CreateFile(op)) => op.content == Some(content(2)),
+        _ => false,
+    }));
+}
+
+#[test]
+fn a_file_parked_for_a_name_swap_is_not_reported_while_the_swap_goes_on() {
+    let (mut trees, mut disk) = space(&[
+        ("a", Some(file(ROOT, "x", 1)), Some(file(ROOT, "y", 1))),
+        ("b", Some(file(ROOT, "y", 2)), Some(file(ROOT, "x", 2))),
+    ]);
+    trees.settle();
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let park = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    assert!(matches!(
+        park.effect,
+        Effect::Move {
+            to: Location::Parked(_),
+            ..
+        }
+    ));
+    disk.apply(&park.effect).unwrap();
+    effects.done(&mut trees, &park.effect_id, None).unwrap();
+    trees.settle();
+    assert_eq!(
+        koidrive_engine::effects::stuck(&trees, &effects),
+        BTreeMap::new()
+    );
+}
+
+#[test]
+fn an_ignored_parked_file_whose_local_name_an_excluded_folder_holds_goes_into_it_as_r_has_it() {
+    let (mut trees, mut disk) = space(&[
+        ("e", Some(dir(ROOT, "A")), Some(dir(ROOT, "A"))),
+        ("p", Some(file("e", "A", 1)), Some(file("e", "A", 1))),
+    ]);
+    trees.set_rules(
+        &[] as &[&str],
+        Some(koidrive_engine::ignore::RuleFile::parse(b"A\n")),
+    );
+    let mut local = trees.local().get("p").unwrap().clone();
+    local.parked = true;
+    local.shape = file(ROOT, "A", 1);
+    trees.set_local("p".into(), local);
+    trees.revert("p".into());
+    let entry = disk.entries.get_mut(&2).unwrap();
+    entry.area = Area::Parked;
+    entry.name = "p".into();
+    trees.check().unwrap();
+    disk.matches(&trees).unwrap();
+    assert!(trees.excluded("e") && trees.ignored("p"));
+    converge(&mut trees, &mut disk, 10).unwrap();
+    let p = trees.local().get("p").unwrap();
+    assert!(!p.parked);
+    assert_eq!(p.shape, file("e", "A", 1));
+}
+
+#[test]
+fn a_parked_node_that_can_go_nowhere_is_reported_beside_a_failed_effect() {
+    let (mut trees, mut disk) = space(&[
+        ("h", Some(file(ROOT, "a", 1)), Some(file(ROOT, "a", 1))),
+        ("far", None, Some(dir(ROOT, "archive"))),
+        ("f", Some(file(ROOT, "f", 1)), Some(file("far", "f", 1))),
+        ("g", None, Some(file(ROOT, "g", 1))),
+    ]);
+    trees.set_rules(
+        &[] as &[&str],
+        Some(koidrive_engine::ignore::RuleFile::parse(b"archive/\n")),
+    );
+    let mut f = trees.local().get("f").unwrap().clone();
+    f.shape = file(ROOT, "a", 1);
+    f.parked = true;
+    trees.set_local("f".into(), f);
+    let entry = disk.entries.get_mut(&3).unwrap();
+    entry.area = Area::Parked;
+    entry.name = "f".into();
+    trees.check().unwrap();
+    disk.matches(&trees).unwrap();
+    trees.settle();
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let record = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    assert_eq!(record.node, "g");
+    effects.failed(&record.effect_id).unwrap();
+    assert!(effects.plan(&trees, &mut ids, NOW).is_none());
+    let reported = koidrive_engine::effects::stuck(&trees, &effects);
+    assert!(reported.contains_key("f"), "{reported:?}");
+}
+
 /// A valid tree over `n0`, `n1`, ... from one [`Draw`] per node, as in tests/trees.rs, where each
 /// node has the kind and file content of `kinds`. S and R are drawn with their own ranks, so their
 /// moves can swap, rotate and nest into each other.

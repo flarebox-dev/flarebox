@@ -4,11 +4,11 @@
 //! `.koiignore` files, the built-in exclusions and the device-local list decide which nodes this
 //! device leaves alone, and becoming excluded never plans a delete or a removal.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use koidrive_engine::classify::{Origin, Trees, Waiting};
 use koidrive_engine::commit::Commits;
-use koidrive_engine::effects::{Base, Effect, Effects, Location};
+use koidrive_engine::effects::{self, Base, Effect, Effects, Location, Stuck};
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::ignore::{LocalRules, RuleFile};
 use koidrive_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
@@ -578,7 +578,7 @@ fn a_node_whose_place_an_excluded_node_holds_is_not_parked_to_make_room() {
 }
 
 #[test]
-fn a_parked_node_the_rules_now_exclude_frees_its_name_in_s_for_the_node_that_took_it() {
+fn a_parked_node_whose_old_name_another_node_took_follows_r_into_the_folder_the_rules_exclude() {
     let mut trees = trees(&[
         (
             "old",
@@ -599,11 +599,25 @@ fn a_parked_node_the_rules_now_exclude_frees_its_name_in_s_for_the_node_that_too
     };
     trees.set_local("old".into(), parked.clone());
     trees.set_rules(&AT_ROOT, rules("/archive/\n"));
-    assert_eq!(effects(&mut trees), [], "its old name is taken");
+    let to = Location::At {
+        base: Base::Root,
+        dirs: vec![],
+        name: "archive".into(),
+    };
+    let moved = Effect::Move {
+        from: Location::Parked("old".into()),
+        identity: parked.identity,
+        to,
+    };
+    assert_eq!(effects(&mut trees), [("old".into(), moved)]);
     assert_eq!(ops(&mut trees), []);
     assert_eq!(trees.synced().live("new"), Some(&dir(ROOT, "docs")));
     assert_eq!(trees.synced().live("old"), Some(&dir(ROOT, "archive")));
-    assert_eq!(trees.local().get("old"), Some(&parked));
+    assert_eq!(
+        trees.local().get("old").unwrap().shape,
+        dir(ROOT, "archive")
+    );
+    assert!(trees.excluded("old"));
 }
 
 /// A parked folder whose old name "docs" another node took, and whose R position the rules now exclude, with an
@@ -644,6 +658,10 @@ fn a_parked_folder_the_rules_now_exclude_frees_its_name_in_s_with_what_it_holds(
     assert_eq!(trees.synced().live("child"), None);
     assert_eq!(trees.local().get("old"), Some(&parked));
     assert_eq!(trees.check(), Ok(()));
+    assert_eq!(
+        effects::stuck(&trees, &Effects::default()),
+        BTreeMap::from([("old".into(), Stuck::Parked)])
+    );
 }
 
 /// The child sorts before its folder, so settling classifies it before it drops the folder from S with the child: in

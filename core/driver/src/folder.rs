@@ -798,7 +798,7 @@ impl Folder {
             self.engine.effects.in_flight(),
             self.engine.commits.in_flight(),
         ) {
-            (None, None) => effects::stuck(trees),
+            (None, None) => effects::stuck(trees, &self.engine.effects),
             _ => BTreeMap::new(),
         };
         let state = match &self.stream {
@@ -825,22 +825,35 @@ impl Folder {
                 (self.refused_nodes.get(id)).map_or("the server did not take it", String::as_str);
             reasons.entry(id).or_default().push(why.to_owned());
         }
+        let kept_in = |id: &str| {
+            (trees.local().get(id))
+                .is_some_and(|node| node.parked)
+                .then(|| {
+                    let parked = Path::new(koidrive_fs::PRIVATE_DIR)
+                        .join(koidrive_fs::PARKED_DIR)
+                        .join(trees.parked_name(id));
+                    format!("it is kept in {}", koidrive_fs::quoted(&parked))
+                })
+        };
         for (id, stuck) in &held {
+            let kept = kept_in(id);
             let why = match stuck {
                 Stuck::HeldBy(by) => {
                     let why = format!(
                         "its name here is taken by {}, which this device's rules exclude",
                         quoted_item(by)
                     );
-                    if !trees.local().get(id).is_some_and(|node| node.parked) {
-                        why
-                    } else {
-                        let parked = Path::new(koidrive_fs::PRIVATE_DIR)
-                            .join(koidrive_fs::PARKED_DIR)
-                            .join(trees.parked_name(id));
-                        format!("{why}; it is kept in {}", koidrive_fs::quoted(&parked))
+                    match kept {
+                        Some(kept) => format!("{why}; {kept}"),
+                        None => why,
                     }
                 }
+                Stuck::Parked => format!("it has no free place here; {}", kept.unwrap_or_default()),
+                Stuck::Behind(node) if held.get(node) == Some(&Stuck::Parked) => format!(
+                    "waits for {}, which has no free place here; {}",
+                    quoted_item(node),
+                    kept_in(node).unwrap_or_default()
+                ),
                 Stuck::Behind(node) => format!(
                     "waits for {}, whose name here is taken by an entry this device's rules exclude",
                     quoted_item(node)
