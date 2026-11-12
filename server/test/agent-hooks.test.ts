@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The Space DO side of RFC 0006: the authorization point of section 3, stored results that belong to their device and
-// request (section 8) and the delete count of section 10.
-
 import { create, fromBinary } from "@bufbuild/protobuf";
 import { runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";

@@ -1,10 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Packs the server the way `koi setup` uploads it (docs/design/cli-setup.md section 4.2): the Worker module from
-// a dry-run deploy, the static assets, and manifest.json with what an API upload needs from wrangler.jsonc. The CLI
-// embeds the result, so its deploy needs neither Node nor Wrangler. Needs no account or credentials.
-// Usage: node scripts/pack-bundle.mjs <output directory>
-
 import { execFileSync } from "node:child_process";
 import {
   constants,
@@ -38,14 +33,12 @@ function fail(message) {
   process.exit(1);
 }
 
-/** Copies a file or a directory tree to a path that must not exist yet, so that nothing is ever replaced. */
 function copyNew(from, to) {
   if (!statSync(from).isDirectory()) return copyFileSync(from, to, constants.COPYFILE_EXCL);
   mkdirSync(to);
   for (const entry of readdirSync(from)) copyNew(join(from, entry), join(to, entry));
 }
 
-/** The path with every symlink in its existing part resolved; the rest need not exist. */
 function realPath(path) {
   try {
     return realpathSync(path);
@@ -59,7 +52,6 @@ function defined(object) {
   return Object.fromEntries(Object.entries(object).filter(([, value]) => value !== undefined));
 }
 
-// The script never deletes anything at the output, so it writes only into a new or empty directory.
 if (existsSync(output) && (!statSync(output).isDirectory() || readdirSync(output).length > 0)) {
   fail(output + " exists and is not an empty directory; name a new or empty one");
 }
@@ -104,7 +96,6 @@ try {
     observability: config.observability,
     code_update_strategy: config.durable_objects.code_update_strategy,
   });
-  // Every write creates its path exclusively, so a file that appeared in the output during the build stops the packer.
   try {
     mkdirSync(output, { recursive: true });
     mkdirSync(join(output, "worker"));

@@ -1,19 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// What one deploy-test run knows, kept in a file on the runner between its steps. It holds the test owner's refresh
-// credential, so it is never printed and lives only in the runner's temporary directory.
-
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-/** Test Workers and buckets carry this prefix, and teardown refuses any other name. */
 export const NAME_PREFIX = "koidrive-test-";
 
 export interface Deployment {
   ref: string;
   sha: string;
-  /** The copy of server/ that was deployed. */
   dir: string;
   versionId: string;
   atMs: number;
@@ -31,7 +26,6 @@ export interface Stats {
   bytesDown: number;
 }
 
-/** What the upgrade's write phase stored, for the verify phase to find again. */
 export interface Written {
   spaceId: string;
   files: { nodeId: string; name: string; sha256: string; size: number }[];
@@ -40,18 +34,8 @@ export interface Written {
   second: Credentials;
 }
 
-/**
- * The resources this run created, recorded as soon as it knows their identity. Teardown deletes a resource only when
- * the one now carrying the run's name has the identity recorded here.
- */
 export interface Owned {
-  /** The creation date of the bucket this run created after checking that no bucket had the name. */
   bucketCreationDate?: string;
-  /**
-   * The random tag this run passes to `wrangler deploy --tag`, recorded after checking that no Worker had the name and
-   * before the first deploy runs. Wrangler sends it with the upload that creates the Worker, so the Worker carries it
-   * even when the deploy fails afterwards.
-   */
   workerTag?: string;
 }
 
@@ -69,7 +53,6 @@ export function statePath(): string {
   return process.env.KOIDRIVE_DEPLOY_TEST_STATE || join(process.env.RUNNER_TEMP || tmpdir(), "koidrive-deploy-test.json");
 }
 
-/** The Worker and bucket name of this run: KOIDRIVE_TEST_NAME, which must carry the test prefix. */
 export function testName(): string {
   const name = process.env.KOIDRIVE_TEST_NAME ?? "";
   if (!name.startsWith(NAME_PREFIX) || !/^[a-z0-9-]{3,63}$/.test(name)) {
@@ -88,7 +71,6 @@ export function writeState(state: State): void {
   writeFileSync(statePath(), JSON.stringify(state, null, 2), { mode: 0o600 });
 }
 
-/** Adds one phase's request counts to the stored totals. */
 export function addStats(stats: Stats): void {
   const state = readState();
   state.stats.requests += stats.requests;

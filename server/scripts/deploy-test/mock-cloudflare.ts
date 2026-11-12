@@ -1,18 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// An in-memory stand-in for the parts of the Cloudflare API that run.ts and Wrangler's tail use, plus the two Worker
-// routes the claim calls, for run.unit.ts. Point CLOUDFLARE_API_BASE_URL at url + "/client/v4" and the state's server
-// URL at url. The tail is a minimal WebSocket server that pushes one request event for each request to /v1/server, and
-// one whose log line carries the claim code for each request to /setup. POST /mock/workers/<name> with an optional {"tag"} uploads a Worker version from
-// another process, creating the Worker if needed, as a concurrent creator or `wrangler deploy --tag` would.
-
 import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
 
 export interface MockWorker {
   id: string;
-  /** Newest first, with the `workers/tag` annotation of the upload that created each. */
   versions: { id: string; tag?: string }[];
 }
 
@@ -25,12 +18,9 @@ export class MockCloudflare {
   readonly workers = new Map<string, MockWorker>();
   readonly buckets = new Map<string, MockBucket>();
   readonly namespaces: { id: string; class: string; script: string }[] = [];
-  /** Every API request as "METHOD /path", without the query string. */
   readonly requests: string[] = [];
-  /** The status of a bucket creation; 409 also creates the bucket, as a concurrent creator would. */
   createBucketStatus = 200;
   claimStatus = 200;
-  /** The status of listing a Worker's versions. */
   versionsStatus = 200;
   bucketJobStatuses: string[] = ["COMPLETED"];
   bucketJobCreateStatus = 200;
@@ -38,9 +28,7 @@ export class MockCloudflare {
   bucketJobLeftovers: string[] = [];
   readonly bucketJobBodies: unknown[] = [];
   readonly claimCode = "ZQ7K-M2XR-9WPD";
-  /** Events the tail drops before it delivers any, as a tail that is connected but not yet receiving does. */
   tailDropsFirst = 0;
-  /** Requests to /setup, each of which issues a code. */
   setupRequests = 0;
   url = "";
   private server: Server | undefined;
@@ -61,7 +49,6 @@ export class MockCloudflare {
     await new Promise<void>((resolve) => this.server?.close(() => resolve()) ?? resolve());
   }
 
-  /** A Worker with one version and its two Durable Object namespaces, as a deploy with this tag would leave it. */
   addWorker(name: string, id: string = crypto.randomUUID(), tag?: string): MockWorker {
     const worker = { id, versions: [{ id: crypto.randomUUID(), tag }] };
     this.workers.set(name, worker);

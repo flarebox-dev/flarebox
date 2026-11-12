@@ -1,10 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Runs spec/testdata/scenarios/space-conformance-v1.json against the Space DO, as core/sim/tests/conformance.rs runs
-// it against the reference, so both meet the same hand-written expectations. The file's conventions describe every
-// field read here; a field that is unknown or has the wrong type fails its scenario instead of being ignored.
-// Scenarios and steps marked reference_only are skipped, as the conventions allow.
-
 import { create, fromBinary, type MessageInitShape, toBinary } from "@bufbuild/protobuf";
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
@@ -51,7 +46,6 @@ function object(value: Json | undefined, what: string): Obj {
   return value;
 }
 
-/** Fails on any key outside allowed, so that a misspelled assertion cannot vanish. */
 function keys(value: Json | undefined, what: string, allowed: string[]): Obj {
   const found = object(value, what);
   for (const key of Object.keys(found)) if (!allowed.includes(key)) fail(`unknown field ${key} in ${what}`);
@@ -86,7 +80,6 @@ function sameSet(a: Set<string>, b: Set<string>): boolean {
   return a.size === b.size && [...a].every((x) => b.has(x));
 }
 
-/** A call step's expectations: with error only the error branch's fields apply, without it only the success branch's. */
 function expectation(step: Obj, onError: string[], onSuccess: string[]): Obj {
   if (!("expect" in step)) fail("a call step needs expect, even if empty");
   const expect = object(step.expect, "expect");
@@ -150,9 +143,7 @@ class Run {
   private readonly symbols = new Map<string, string>();
   private readonly values = new Map<string, string>();
   private readonly cursors = new Map<string, string>();
-  /** Per device and space, the device_seq of the device's last applied commit there; per space, the highest seq returned. */
   private readonly slots = new Map<string, bigint>();
-  /** Per device, space and commit_id, the device_seq the commit was first sent with: a retry keeps it (RFC 0002 section 2). */
   private readonly sentSlots = new Map<string, bigint>();
   private readonly topSeq = new Map<string, bigint>();
   private reqId = 0n;
@@ -238,13 +229,11 @@ class Run {
     this.values.set(value, symbol);
   }
 
-  /** What root or a = literal stands for, which never binds. */
   private fixed(space: string, symbol: string): string | undefined {
     if (symbol === "root") return this.space(space).spaceId;
     return symbol.startsWith("=") ? symbol.slice(1) : undefined;
   }
 
-  /** The ID a symbol stands for in a request, minting one for a symbol not seen before. */
   private id(space: string, symbol: string): string {
     const value = this.fixed(space, symbol) ?? this.symbols.get(symbol);
     if (value !== undefined) return value;
@@ -253,12 +242,10 @@ class Run {
     return minted;
   }
 
-  /** The ID a symbol in an expected set stands for; such a symbol must already be bound. */
   private known(space: string, symbol: string): string {
     return this.fixed(space, symbol) ?? this.symbols.get(symbol) ?? fail(`unbound symbol ${symbol}`);
   }
 
-  /** Checks a returned ID: root and literals compare exactly, a bound symbol must match, and an unbound one binds. */
   private expectId(space: string, symbol: string, value: string): void {
     const fixed = this.fixed(space, symbol);
     if (fixed === undefined) return this.bind(symbol, value);
@@ -294,7 +281,6 @@ class Run {
     return this.devices.get(device) ?? fail(`unknown device ${device}`);
   }
 
-  /** Sends one RPC with the server clock pinned to atMs. */
   private async rpc(
     space: string,
     session: Session,
@@ -350,7 +336,6 @@ class Run {
     return this.checkState(space, step);
   }
 
-  /** PrepareUpload in batches of 1,000 distinct chunks, then the object and a receipt signed for atMs for each chunk to upload. */
   private async upload(space: string, session: Session, atMs: number, chunks: Chunk[]): Promise<UploadReceipt[]> {
     const distinct = [...new Map(chunks.map((chunk) => [`${toHex(chunk.ref.hash)}/${chunk.ref.size}`, chunk])).values()];
     const { spaceId, key } = this.space(space);
@@ -644,7 +629,6 @@ class Run {
     this.cursors.set(name, list.nextCursor);
   }
 
-  /** Reads the space's head, one node's state, or every live node, straight from the Space DO's storage. */
   private read<T>(space: string, read: (sql: SqlStorage) => T): Promise<T> {
     return runInDurableObject(this.stub(space), (_instance, state) => read(state.storage.sql));
   }
@@ -741,7 +725,6 @@ class Run {
   }
 }
 
-/** Runs one scenario and returns its failure, or undefined when it passes. */
 async function run(scenario: Json): Promise<string | undefined> {
   try {
     const found = object(scenario, "a scenario");
@@ -774,7 +757,6 @@ describe("space conformance (spec/testdata/scenarios/space-conformance-v1.json)"
   }
 });
 
-/** Mutations of a scenario that the runner must reject, each with the failure it must report, as the reference runner checks. */
 describe("conformance runner self-tests", () => {
   const base = scenarios[0]!;
   const long = scenarios.find((s) => object(s, "a scenario").name === "a-long-missing-chunk-list-is-capped-and-the-resent-commit-applies")!;

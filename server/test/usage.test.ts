@@ -27,7 +27,6 @@ async function setup() {
   return { ...space, a, root };
 }
 
-/** Commits a new file whose chunks are the parts, one chunk each, and returns its node ID. */
 async function createFile(a: TestClient, parentId: string, name: string, ...parts: string[]): Promise<string> {
   const nodeId = uuidv7();
   const file = await content(...parts);
@@ -48,10 +47,6 @@ const TRASH = "chunk only a trashed file holds";
 const TRASH_AND_OLD = "chunk of a trashed file and an old version";
 const PENDING = "uploaded and never committed";
 
-/**
- * Two live files, one of them edited once, and one trashed file. LIVE appears twice in one file and in two files;
- * SHARED is in a live file and a trashed one; TRASH_AND_OLD is in the trashed file and the old version.
- */
 async function populated() {
   const space = await setup();
   const { a, root } = space;

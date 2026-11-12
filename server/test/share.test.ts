@@ -84,7 +84,6 @@ async function getOwner(): Promise<DeviceCredentials> {
   return owner;
 }
 
-/** A space with this tree: Docs/{a.txt, Sub/{b.txt}}, Other/{c.txt}, top.txt. */
 async function newSpace() {
   const creds = await getOwner();
   const created = await owned("/v1/spaces", { token: creds.access!.token, body: body(CreateSpaceRequestSchema, { name: `Home ${crypto.randomUUID()}` }) }, SpaceInfoSchema);
@@ -123,7 +122,6 @@ async function newSpace() {
   return { spaceId, creds, device, ids };
 }
 
-/** Adds a file to a space and returns its node_id. */
 async function addFile(device: TestClient, parentId: string, name: string, ...parts: string[]): Promise<string> {
   const nodeId = uuidv7();
   const made = await content(...parts);
@@ -143,7 +141,6 @@ async function link(spaceId: string, init: MessageInitShape<typeof CreateShareLi
 }
 
 let nextIp = 1;
-/** A client address of its own, so the per-client limits of one test do not reach another. */
 function newIp(): string {
   const n = nextIp++;
   return `198.51.${Math.floor(n / 250)}.${(n % 250) + 1}`;
@@ -557,7 +554,6 @@ describe("share links: what a link reaches (RFC 0005 section 6)", () => {
   });
 });
 
-/** The R2 key of the chunk that holds these bytes in a space. */
 async function keyOf(spaceId: string, bytes: string): Promise<string> {
   const hash = (await content(bytes)).content.chunks[0]!.hash;
   const incarnation = await runInDurableObject(space(spaceId), (_instance, state) =>
@@ -566,7 +562,6 @@ async function keyOf(spaceId: string, bytes: string): Promise<string> {
   return chunkKey(spaceId, toHex(hash), incarnation);
 }
 
-/** Sends a request to the Worker with an R2 binding that fails on any read. */
 function withoutR2(path: string): Promise<Response> {
   const BUCKET = { get: () => Promise.reject(new Error("this request must not read R2")) };
   return worker.fetch(
@@ -664,7 +659,6 @@ describe("share links: downloads (RFC 0005 section 7)", () => {
   });
 });
 
-/** Admits a rewind record that holds the space closed, as RFC 0003 section 3 does, and returns a way to end it. */
 async function holdClosed(spaceId: string): Promise<() => Promise<void>> {
   const rewindId = uuidv7();
   await runInDurableObject(account(), (_instance, state) => {
@@ -682,7 +676,6 @@ async function holdClosed(spaceId: string): Promise<() => Promise<void>> {
     });
 }
 
-/** Opens a download and reads its first chunk. */
 async function startDownload(path: string) {
   const response = await exports.default.fetch(BASE + path, { headers: { "CF-Connecting-IP": newIp() } });
   expect(response.status).toBe(200);

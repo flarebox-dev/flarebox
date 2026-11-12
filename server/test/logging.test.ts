@@ -29,7 +29,6 @@ async function post<S extends DescMessage>(path: string, body: Uint8Array, schem
   return fromBinary(schema, new Uint8Array(await response.arrayBuffer()));
 }
 
-/** Everything the server writes with console, as text, while recording is on. */
 function recordLogs(): string[] {
   const lines: string[] = [];
   for (const method of ["log", "info", "warn", "error", "debug"] as const) {

@@ -1,30 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The parts of the load test (load.ts, docs/load-test.md) that need no server: its configuration, the statistics of one
-// step, when to stop, and the commit budget that keeps a run's rows written under a limit. load.unit.ts tests them.
-
 export type ScenarioName = "s1" | "s4";
 
 export interface Config {
   scenario: ScenarioName;
-  /** S1: the writers in the one space at each step. S4: the spaces at each step, each with S4_WRITERS_PER_SPACE writers. */
   steps: number[];
   warmupMs: number;
   measureMs: number;
-  /** The run stops committing before its commits would write more rows than this, by the calibrated rows per commit. */
   maxRowsWritten: number;
-  /** Live connections per space that receive every commit, so a commit pays for one push as well as for itself. */
   subscribersPerSpace: number;
 }
 
 export const S4_WRITERS_PER_SPACE = 25;
-/** One runner holds every connection, so a run may not ask for more. */
 export const MAX_WRITERS = 400;
-/** Warmup and measuring time of all steps together. The run step's 240 minutes also hold up to an hour of setup, calibration and analytics. */
 export const MAX_STEPS_MS = 180 * 60_000;
-/** Used when the Analytics API cannot measure the rows a commit writes. Above every estimate in the plan (20 to 40). */
 export const FALLBACK_ROWS_PER_COMMIT = 60;
-/** Headroom on the calibrated rows per commit, for commits that write more than the calibration's did. */
 const BUDGET_MARGIN = 1.25;
 
 const DEFAULT_STEPS: Record<ScenarioName, number[]> = { s1: [1, 5, 10, 25, 50, 100, 200], s4: [1, 4, 16] };
@@ -39,7 +29,6 @@ function whole(env: Record<string, string | undefined>, name: string, fallback: 
   return value;
 }
 
-/** Reads the LOAD_* variables the workflow sets from its inputs. */
 export function readConfig(env: Record<string, string | undefined>): Config {
   const scenario = env.LOAD_SCENARIO ?? "";
   if (scenario !== "s1" && scenario !== "s4") throw new Error("LOAD_SCENARIO must be s1 or s4, not " + JSON.stringify(scenario));
@@ -69,31 +58,24 @@ export function readConfig(env: Record<string, string | undefined>): Config {
   return config;
 }
 
-/** The spaces and the writers in each space at one step. */
 export function layout(config: Pick<Config, "scenario">, step: number): { spaces: number; writersPerSpace: number } {
   return config.scenario === "s1" ? { spaces: 1, writersPerSpace: step } : { spaces: step, writersPerSpace: S4_WRITERS_PER_SPACE };
 }
 
-/** Nearest-rank percentile of ascending values; undefined when there are none. */
 export function percentile(sorted: number[], p: number): number | undefined {
   if (sorted.length === 0) return undefined;
   return sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1))];
 }
 
-/** What a step records while it measures. */
 export interface StepCounts {
   step: number;
   spaces: number;
   writers: number;
-  /** How long the step measured; shorter than configured when the commit budget ran out. */
   measuredMs: number;
   latenciesMs: number[];
   accepted: number;
-  /** Refused commits by error code, and accepted commits whose op was not applied as "op <result>". */
   refused: Record<string, number>;
-  /** Commits without an answer within the timeout. */
   timeouts: number;
-  /** WebSocket closes by code, and failed connection attempts as "connect". */
   closes: Record<string, number>;
   pushLagMs: number[];
   probeMs: number[];
@@ -115,14 +97,12 @@ export interface StepSummary {
   commitsPerSecond: number;
   commitMs: { p50?: number; p95?: number; p99?: number };
   failed: number;
-  /** Failed commits as a share of every commit that got an answer or timed out. */
   failedShare: number;
   refused: Record<string, number>;
   timeouts: number;
   closes: Record<string, number>;
   pushLagMs: { p50?: number; p95?: number; samples: number };
   probeMs: { p50?: number; p95?: number; samples: number; errors: number };
-  /** The load generator's CPU time over the step's time: near 1 means its one thread was busy all the time. */
   generatorCpuShare: number;
   eventLoopDelayP99Ms: number;
 }
@@ -154,7 +134,6 @@ export function summarize(counts: StepCounts): StepSummary {
   };
 }
 
-/** Why the steps after this one would only measure an overloaded server, or undefined to go on. */
 export function saturated(summary: StepSummary): string | undefined {
   if (summary.accepted === 0) return "no commit was accepted";
   if (summary.failedShare > 0.1) return (summary.failedShare * 100).toFixed(1) + "% of commits failed";
@@ -162,12 +141,10 @@ export function saturated(summary: StepSummary): string | undefined {
   return undefined;
 }
 
-/** The commits a run may make so that they write at most maxRowsWritten rows. */
 export function commitBudget(maxRowsWritten: number, rowsPerCommit: number): number {
   return Math.floor(maxRowsWritten / (Math.max(rowsPerCommit, 1) * BUDGET_MARGIN));
 }
 
-/** Commits made by a given time, interpolated from a rising [time, commits] timeline. */
 export function commitsAt(timeline: [number, number][], atMs: number): number {
   if (timeline.length === 0) return 0;
   if (atMs <= timeline[0]![0]) return timeline[0]![1];
@@ -184,7 +161,6 @@ export function commitsAt(timeline: [number, number][], atMs: number): number {
 /** Subscription states that no longer pay for the plan (Cloudflare's List Subscriptions reference). */
 const ENDED_SUBSCRIPTION = /^(cancelled|failed|expired)$/i;
 
-/** What the account's subscriptions say about its Workers plan, from the API or, failing that, the dispatcher. */
 export function workersPlan(listed: { name: string; price: number; state: string }[] | undefined, unreadable: string, confirmed: boolean): { ok: boolean; message: string } {
   const paid = (listed ?? []).filter((subscription) => /workers/i.test(subscription.name) && subscription.price > 0 && !ENDED_SUBSCRIPTION.test(subscription.state));
   if (paid.length > 0) return { ok: true, message: "The account subscribes to " + paid.map((subscription) => subscription.name).join(", ") + ", so it is on Workers Paid." };

@@ -1,14 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Deploys server/ to a real Cloudflare account under a throwaway name, claims it, and tears it down again
-// (docs/deploy-test.md). The smoke and upgrade checks themselves are Vitest suites in this directory. Usage, from
-// server/, with CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID and KOIDRIVE_TEST_NAME set:
-//   node scripts/deploy-test/run.ts upgrade-from [<ref>]   resolve and check the upgrade's starting commit
-//   node scripts/deploy-test/run.ts deploy <ref>           deploy server/ at <ref>, creating the bucket on first use
-//   node scripts/deploy-test/run.ts claim                  claim the deployment with the code from its own log
-//   node scripts/deploy-test/run.ts teardown               delete the Worker, its Durable Objects and the bucket
-// Nothing this prints contains a credential, a claim code or a chunk ticket.
-
 import { execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { appendFileSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -75,7 +66,6 @@ function withoutSecrets(): NodeJS.ProcessEnv {
   return env;
 }
 
-/** Runs a command with a time limit, echoing and returning its output. */
 function run(command: string, args: string[], cwd: string, timeoutMs: number, env: NodeJS.ProcessEnv): Promise<string> {
   console.log("$ " + [command, ...args].join(" "));
   return new Promise((resolve, reject) => {
@@ -109,7 +99,6 @@ function output(name: string, value: string): void {
   if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, name + "=" + value + "\n");
 }
 
-/** Resolves the commit an upgrade starts from: the given ref, or the newest tag before HEAD. */
 function upgradeFrom(input: string): void {
   const head = git(["rev-parse", "HEAD"]);
   let ref = input.trim();
@@ -137,7 +126,6 @@ function upgradeFrom(input: string): void {
   output("sha", sha);
 }
 
-/** Gives the copy of server/ this run's Worker and bucket name, as an owner renames them on the deploy button's page. */
 function rename(dir: string, name: string): void {
   const path = join(dir, "wrangler.jsonc");
   let config: { name?: string; r2_buckets?: { binding: string; bucket_name?: string }[] };
@@ -170,12 +158,8 @@ async function serving(url: string): Promise<{ serverVersion: string; claimed: b
 }
 
 /**
- * Deploys server/ at ref. The first deploy checks that neither the Worker nor the bucket name is taken, creates the
- * bucket and records its creation date. Once dependencies are installed it checks again that no Worker has the name, then
- * records a random tag and passes it to every wrangler deploy of this run. Wrangler sends the tag with the upload that
- * creates the Worker, so the Worker carries it even if the deploy fails afterwards, while a Worker that someone else
- * created under the name, during dependency installation for example, does not. Teardown deletes the Worker only when
- * one of its versions carries the tag.
+ * Wrangler sends the tag with the upload that creates the Worker, so the Worker carries it even if the deploy fails
+ * afterwards.
  */
 async function deploy(account: Account, ref: string): Promise<void> {
   const state = readState();
@@ -231,7 +215,6 @@ async function deploy(account: Account, ref: string): Promise<void> {
   console.log(url + " serves Koidrive " + info.serverVersion + (info.claimed ? ", claimed" : ", not claimed yet"));
 }
 
-/** Waits until check returns a value, or fails naming what it waited for. */
 async function until<T>(check: () => T | undefined, what: string, timeoutMs: number): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -242,7 +225,6 @@ async function until<T>(check: () => T | undefined, what: string, timeoutMs: num
   }
 }
 
-/** Files under roots (node_modules aside) whose contents include the claim code's log line. */
 function filesWithClaimCode(roots: string[]): string[] {
   const found: string[] = [];
   const visit = (path: string) => {
@@ -262,20 +244,12 @@ function filesWithClaimCode(roots: string[]): string[] {
   return found;
 }
 
-/** Where Wrangler keeps its configuration and, unless told otherwise, its diagnostic logs. */
 function wranglerDirs(): string[] {
   const home = homedir();
   return [join(home, ".wrangler"), join(process.env.XDG_CONFIG_HOME || join(home, ".config"), ".wrangler"), join(home, "Library", "Preferences", ".wrangler")];
 }
 
-/**
- * Claims the deployment as an owner would, with no human: opens /setup, reads the one-time code from the Worker's own
- * log through wrangler tail, and redeems it. /setup opens only once the tail shows a request to /v1/server, because the
- * Worker logs a code once and issues no other until it expires an hour later, and a tail can connect before it receives
- * the Worker's events. The code stays in this process's memory: Wrangler's diagnostic log file is
- * turned off and pointed at a directory that is deleted afterwards, the tail output is never printed unredacted, and
- * the run fails if any file in Wrangler's directories or the deployed copy still holds the code's log line.
- */
+/** A tail can connect before it receives the Worker's events. */
 async function claim(): Promise<void> {
   const state = readState();
   const deployment = state.deployments.at(-1) ?? fail("nothing is deployed yet");
@@ -347,7 +321,6 @@ interface Storage {
   exportBytes: number;
 }
 
-/** Deletes every object and then the bucket, retrying while listings lag behind deletes. Returns what it held. */
 async function emptyAndDeleteBucket(account: Account, name: string): Promise<Storage | undefined> {
   const first = await listObjects(account, name);
   if (!first) return undefined;
@@ -443,12 +416,6 @@ async function analytics(account: Account, state: State | undefined, namespaces:
   return rows;
 }
 
-/**
- * Deletes what this run created and prints what it used. A Worker is deleted, with force, which also deletes the
- * Durable Object namespaces it implements, only when the Worker now named like the run has the ID the run recorded;
- * the bucket is emptied and deleted only when it has the recorded creation date. Anything else carrying the name is
- * left alone and reported. Runs whatever happened before, and refuses names without the test prefix.
- */
 async function teardown(account: Account): Promise<void> {
   const name = testName();
   const state = readState();

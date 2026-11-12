@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Writes src/space/casefold-data.ts from the Unicode CaseFolding.txt file.
-// Usage: node scripts/gen-casefold.mjs path/to/CaseFolding.txt
-
 import { readFileSync, writeFileSync } from "node:fs";
 
 const [source] = process.argv.slice(2);

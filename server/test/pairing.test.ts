@@ -54,7 +54,6 @@ function completePairing(code: string, address: string) {
   return call("/v1/pair/complete", { body, address }, DeviceCredentialsSchema);
 }
 
-/** Sends wrong codes from one address up to the limit, then one more, and checks each answer. */
 async function throttle(address: string): Promise<void> {
   for (let i = 0; i < PAIRING_FAILURES_PER_WINDOW; i++) {
     expect(await completePairing(`WRNG-${String(i).padStart(4, "0")}`, address)).toMatchObject({ status: 403, error: "invalid or expired pairing code" });
@@ -62,7 +61,6 @@ async function throttle(address: string): Promise<void> {
   expect((await completePairing("WRNG-LAST", address)).status).toBe(429);
 }
 
-/** Storage is shared by the tests in this file, and they run in order. */
 describe("pairing failures per client address", () => {
   it("redeems the correct code from another address and from the throttled one", async () => {
     const first = await startPairing();

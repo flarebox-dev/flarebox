@@ -15,7 +15,6 @@ function account() {
   return env.ACCOUNT.get(env.ACCOUNT.idFromName("account"));
 }
 
-/** A recovery-key claim with a fresh key, as the CLI makes after setting a new one-time secret. */
 async function claim(setupAttempt: string, deviceName = "Laptop"): Promise<DeviceCredentials> {
   const key = crypto.randomUUID() + crypto.randomUUID();
   const outcome = await account().claim({ code: key, userName: "Owner", deviceName, platform: "macos", setupAttempt }, ADDRESS, key);
@@ -39,7 +38,6 @@ function activeDevices(): Promise<string[]> {
   );
 }
 
-/** Storage is shared by the tests in this file, and they run in order on one deployment. */
 describe("recovery-key claims of one setup attempt", () => {
   let owner: DeviceCredentials;
   let lost: DeviceCredentials[] = [];

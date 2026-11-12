@@ -38,7 +38,6 @@ function table(space: Space, query: string) {
   return runInDurableObject(space.stub, (_instance, state) => state.storage.sql.exec(query).toArray());
 }
 
-/** Every chunk's refcount equals the number of retained versions that list it, counted from the versions table. */
 async function expectRefcountsMatchVersions(space: Space) {
   const { stored, counted } = await runInDurableObject(space.stub, (_instance, state) => {
     const sql = state.storage.sql;
@@ -55,7 +54,6 @@ async function expectRefcountsMatchVersions(space: Space) {
   for (const hex of counted.keys()) expect(stored.has(hex)).toBe(true);
 }
 
-/** Every chunk of every retained version is live and its bytes are in R2. */
 async function expectRetainedBytes(space: Space) {
   const hashes = await runInDurableObject(space.stub, (_instance, state) => {
     const sql = state.storage.sql;
@@ -83,7 +81,6 @@ async function newContent(c: TestClient, ...text: string[]) {
   return { content: parts.content, receipts: await c.uploadParts(parts) };
 }
 
-/** Replaces the Space DO's R2 binding with one whose delete() runs the given function. */
 function interceptDeletes(space: Space, onDelete: (keys: string[], real: (keys: string[]) => Promise<void>) => Promise<void>) {
   return runInDurableObject(space.stub, (instance: SpaceDO) => {
     const real = (keys: string[]) => env.BUCKET.delete(keys);

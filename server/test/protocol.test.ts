@@ -32,7 +32,6 @@ async function post<S extends DescMessage>(path: string, body: Uint8Array, schem
 
 let setup: Promise<{ owner: DeviceCredentials; spaceId: string }> | undefined;
 
-/** Storage is shared by the tests in this file, so the deployment is claimed and its space created once. */
 function deployment() {
   setup ??= (async () => {
     const log = vi.spyOn(console, "log");
@@ -47,7 +46,6 @@ function deployment() {
   return setup;
 }
 
-/** Opens a socket, sends Hello with the given range and returns the first server message and, after a Goodbye, the close. */
 async function hello(protoMin: number, protoMax: number): Promise<{ msg: ServerMessage["msg"]; close?: { code: number; reason: string } }> {
   const { owner, spaceId } = await deployment();
   const response = await exports.default.fetch(BASE + "/v1/spaces/" + spaceId + "/ws", {

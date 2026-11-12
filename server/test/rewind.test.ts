@@ -76,7 +76,6 @@ function body<S extends DescMessage>(schema: S, init: MessageInitShape<S>): Uint
 
 let owner: DeviceCredentials | undefined;
 
-/** Durable Object storage is shared by the tests in this file, so the deployment is claimed once. */
 async function getOwner(): Promise<DeviceCredentials> {
   if (owner) return owner;
   const log = vi.spyOn(console, "log");
@@ -101,7 +100,6 @@ async function pairDevice(inviter: DeviceCredentials, deviceName: string): Promi
   return paired.message!;
 }
 
-/** A space created through the Account DO, with a client of the owner's device and the time it was created. */
 async function newSpace() {
   const creds = await getOwner();
   const createdAtMs = Date.now();
@@ -161,7 +159,6 @@ async function rpc(token: string, spaceId: string, init: MessageInitShape<typeof
   return { status: response.status, result: response.ok ? fromBinary(RpcResponseSchema, bytes).result : undefined };
 }
 
-/** Opens a socket, sends Hello, and collects what the server sends. */
 async function socket(spaceId: string, token: string) {
   const response = await exports.default.fetch(`${BASE}/v1/spaces/${spaceId}/ws`, {
     headers: { Upgrade: "websocket", Authorization: "Bearer " + token },

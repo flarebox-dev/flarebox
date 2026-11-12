@@ -1,10 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The server's side of the e2e rewind scenario, which e2e.ts runs with Vitest because the generated protobuf code needs
-// it. REWIND_CHECK=before keeps the log of history HISTORY_ID of space SPACE_ID in E2E_TEMP. REWIND_CHECK=after reads the
-// new history HISTORY_ID, fails unless the space is the kept log's state at RESTORE_SEQ, and writes the server's files to
-// E2E_TEMP/rewound-server-listing.txt as "<sha256>  <path>" lines.
-
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fromJson, toJson } from "@bufbuild/protobuf";

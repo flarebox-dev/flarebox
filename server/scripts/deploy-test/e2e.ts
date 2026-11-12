@@ -1,15 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The macOS and Linux end-to-end test of a deployed server (docs/deploy-test.md, mode e2e). Two jobs of one run sync a
-// space with the koi command: the deploy job on Linux, which holds the owner's credential from run.ts claim, and a job
-// on macOS, which holds no secret. Each job runs one phase of this file per workflow step. A job learns what the other
-// did only from the files that sync, the steps the other job has finished and the run's artifacts. The macOS job's
-// pairing code reaches it in an artifact, sealed to a key that the macOS job made and never uploads. Usage, from
-// server/:
-//   node scripts/deploy-test/e2e.ts <phase> [<step of the other job to wait for>]
-// with KOI set to the koi binary, GH_TOKEN to the run's token and E2E_PEER_JOB to the other job's name. Nothing this
-// prints contains a credential or a pairing code.
-
 import { execFileSync, spawn } from "node:child_process";
 import { constants, createHash, generateKeyPairSync, privateDecrypt, publicEncrypt } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -24,9 +14,7 @@ const SYNC_MS = 5 * 60_000;
 const PEER_MS = 45 * 60_000;
 const HALT_MS = 10 * 60_000;
 const REWIND_MS = 5 * 60_000;
-/** RFC 0003 section 2 admits a restore point at least one minute before the request. */
 const RESTORE_POINT_AGE_MS = 70_000;
-/** Time between the last commit before the restore point, the point itself and the first commit after it. */
 const RESTORE_POINT_GAP_MS = 10_000;
 const API_POLL_MS = 10_000;
 const PEER_CHECK_MS = 30_000;
@@ -53,7 +41,6 @@ function temp(...path: string[]): string {
   return join(process.env.RUNNER_TEMP || tmpdir(), "koidrive-e2e", ...path);
 }
 
-/** Bytes both jobs derive from a label, so that each job knows the hash of every file the other one writes. */
 function generated(label: string, size: number): Buffer {
   const out = Buffer.alloc(size);
   for (let block = 0, filled = 0; filled < size; block++) filled += createHash("sha256").update(label + ":" + block).digest().copy(out, filled);
@@ -76,7 +63,6 @@ export const contents = {
 export type Content = keyof typeof contents;
 const hashes = Object.fromEntries(Object.entries(contents).map(([name, bytes]) => [name, sha256(bytes)])) as Record<Content, string>;
 
-/** A file a tree holds: its path, or a pattern for a name sync picks, such as a conflict copy's, and its content. */
 export type Entry = [path: string | RegExp, content: Content];
 
 const SHARED = /^shared[^/]*\.txt$/;
@@ -87,7 +73,6 @@ const kept: Entry[] = [
 ];
 const conflicted: Entry[] = [...kept, [SHARED, "sharedMac"], [SHARED, "sharedLinux"]];
 
-/** The tree each scenario ends with. */
 export const trees = {
   created: [
     ["from-mac.txt", "fromMac"],
@@ -110,7 +95,6 @@ export const trees = {
 } satisfies Record<string, Entry[]>;
 export type Tree = keyof typeof trees;
 
-/** Every regular file under root but the .koidrive folder at its top: path with / separators to SHA-256 hex. */
 export function listing(root: string): Map<string, string> {
   const files: [string, string][] = [];
   const walk = (dir: string) => {
@@ -125,7 +109,6 @@ export function listing(root: string): Map<string, string> {
   return new Map(files.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
 }
 
-/** Whether the files are exactly the entries: one file per entry, at a path the entry allows, with its content. */
 export function matches(files: Map<string, string>, entries: Entry[]): boolean {
   if (files.size !== entries.length) return false;
   const left = [...entries];
@@ -137,7 +120,6 @@ export function matches(files: Map<string, string>, entries: Entry[]): boolean {
   return true;
 }
 
-/** One line per file, "<sha256>  <path>", as sha256sum prints them. The tree hash is the SHA-256 of this text. */
 export function format(files: Map<string, string>): string {
   return [...files].map(([path, hash]) => hash + "  " + path + "\n").join("");
 }
@@ -182,7 +164,6 @@ async function peer(): Promise<Job | undefined> {
 
 let peerCheckedAt = 0;
 
-/** Fails once the other job has ended without success, since nothing this job waits for from it can happen after that. */
 async function checkPeer(): Promise<void> {
   if (!process.env.GITHUB_RUN_ID || Date.now() - peerCheckedAt < PEER_CHECK_MS) return;
   peerCheckedAt = Date.now();
@@ -219,7 +200,6 @@ async function afterPeerStep(step: string): Promise<void> {
   console.log("The job " + name + " finished its step \"" + step + "\"");
 }
 
-/** Unzips this run attempt's artifact with the name into dir, waiting until the other job has uploaded it. */
 async function download(name: string, dir: string): Promise<void> {
   const artifact = name + "-" + env("GITHUB_RUN_ATTEMPT");
   const id = await until(
@@ -244,7 +224,6 @@ async function download(name: string, dir: string): Promise<void> {
 
 let ownerRequests = 0;
 
-/** A request with the access token of the owner's device that run.ts claim stored. */
 async function asOwner(method: string, path: string, body?: unknown): Promise<Response> {
   const { url, owner } = readState();
   if (!url || !owner) fail("run.ts deploy and run.ts claim must run first: the state file has no server or owner");
@@ -259,7 +238,6 @@ async function asOwner(method: string, path: string, body?: unknown): Promise<Re
   return send(path, { method, headers: { ...json, Authorization: "Bearer " + (token ?? fail("POST /v1/token returned no token")) }, body: body === undefined ? undefined : JSON.stringify(body) });
 }
 
-/** A pairing code from the owner's device, with the server's host, as koi join takes it. */
 async function invitation(): Promise<string> {
   const response = await asOwner("POST", "/v1/pair/start");
   if (!response.ok) fail("POST /v1/pair/start returned HTTP " + response.status);
@@ -277,7 +255,6 @@ interface Folder {
   problem: string | null;
 }
 
-/** One koi device: its own configuration, state and socket directories, and one folder linked to the space. */
 interface Device {
   name: string;
   dir: string;
@@ -292,7 +269,6 @@ function device(name: string): Device {
   return { name, dir, folder: join(dir, "folder"), env: { ...process.env, ...xdg } };
 }
 
-/** Runs koi on the device. It prints the command as shown, and its output, unless shown is null. */
 function koi(on: Device, args: string[], shown: string[] | null = args): string {
   if (shown) console.log("\n$ koi " + shown.join(" ") + "   # " + on.name);
   try {
@@ -364,7 +340,6 @@ function remove(on: Device, path: string): void {
   rmSync(join(on.folder, path));
 }
 
-/** Prints what a person needs to see why the device did not get where it should. */
 function explain(on: Device, files: Map<string, string>): void {
   console.log("\nThe last listing on " + on.name + ":\n" + format(files));
   for (const args of [["status"], ["resolve", "--json"]]) {
@@ -379,7 +354,6 @@ function explain(on: Device, files: Map<string, string>): void {
   } catch {}
 }
 
-/** Waits until the device's folder holds one of the trees, and its store holds the server's head. */
 async function reach(on: Device, ...wanted: Tree[]): Promise<[Tree, Map<string, string>]> {
   let files = new Map<string, string>();
   try {
@@ -410,7 +384,6 @@ function passed(scenario: string, on: Device, files: Map<string, string>): void 
   if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, "| " + scenario + " | " + on.name + " | " + files.size + " | " + hash + " |\n");
 }
 
-/** The device with the folder it links after the rewind in place of its first one. */
 function rewound(name: string): Device {
   const on = device(name);
   return { ...on, folder: join(on.dir, "rewound") };
@@ -418,11 +391,6 @@ function rewound(name: string): Device {
 
 const rewoundListingFile = (on: Device) => temp(on.name + "-rewound-listing");
 
-/**
- * Waits until the rewind halts the folder, which this build cannot recover, then does what docs/guide/status.md tells an
- * owner to do: unlinks it and links a new, empty folder. The new folder must get the space the rewind restored, which is
- * the listing expected when given; macOS's is compared with Linux's at the end.
- */
 async function recover(on: Device, expected?: string): Promise<void> {
   const halted = await until("the rewind to halt the folder on " + on.name, HALT_MS, () => {
     const status = folder(on);
@@ -450,7 +418,6 @@ async function recover(on: Device, expected?: string): Promise<void> {
   passed("7. Rewind", fresh, files);
 }
 
-/** Waits until the device's new folder is up to date, and fails unless it still holds what it got from the rewind. */
 async function stillRewound(on: Device): Promise<Map<string, string>> {
   await until("the new folder on " + on.name + " to be up to date", SYNC_MS, () => (folder(on).state === "up_to_date" ? true : undefined));
   const files = listing(on.folder);
@@ -461,8 +428,7 @@ async function stillRewound(on: Device): Promise<Map<string, string>> {
 
 /**
  * Runs rewind-check.ts, which reads the server through the generated protobuf code and so runs under Vitest, not plain
- * Node: before the rewind it keeps the space's log, after it checks the space against that log and writes the server's
- * files as a listing.
+ * Node.
  */
 function checkRewind(vars: Record<string, string>): void {
   const server = join(dirname(fileURLToPath(import.meta.url)), "..", "..");

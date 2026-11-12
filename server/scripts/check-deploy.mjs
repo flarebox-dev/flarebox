@@ -1,11 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Checks that server/ deploys on its own, the way the deploy button sees it (docs/design/deploy-and-upgrade.md
-// section 1): copies the tracked files of server/ into an empty directory, installs from the lockfile, checks the
-// Wrangler configuration, bundles the Worker with a dry-run deploy, then serves the bundle locally and claims it.
-// Needs no account or credentials, and cannot show that an account has R2 activated. Every step has a time limit,
-// and the copy and the local server are removed whatever happens. Usage: node scripts/check-deploy.mjs
-
 import { execFileSync, spawn } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -13,7 +7,6 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-/** Durable Object migration tags a deployment may already have applied. Append only (spec v0 section 9.4). */
 const MIGRATION_TAGS = ["v1"];
 const DURABLE_OBJECTS = { ACCOUNT: "AccountDO", SPACE: "SpaceDO" };
 const INSTALL_MS = 5 * 60_000;
@@ -34,7 +27,6 @@ function fail(message) {
   throw new CheckFailed(message);
 }
 
-/** Wrangler's output without claim codes or anything token-shaped, for diagnostics. */
 function sanitized(text) {
   return text.replace(/\b[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}\b/g, "<claim code>").replace(/[A-Za-z0-9_\-.]{40,}/g, "<redacted>");
 }

@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// An R2-only restore that follows RFC 0004 section 5, so the tests can check what the export wrote against the Space
-// DO's own state.
-
 import { create, fromBinary } from "@bufbuild/protobuf";
 import { BinaryReader } from "@bufbuild/protobuf/wire";
 import { runInDurableObject } from "cloudflare:test";
@@ -52,7 +49,6 @@ async function gunzip(bytes: Uint8Array): Promise<Uint8Array> {
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
-/** The size-delimited messages of an export file, after checking its ExportHeader (RFC 0004 section 3). */
 async function frames(bytes: Uint8Array, format: string, spaceId: string, historyId: string): Promise<Uint8Array[]> {
   const reader = new BinaryReader(await gunzip(bytes));
   const out: Uint8Array[] = [];
@@ -80,7 +76,6 @@ async function keys(prefix: string): Promise<string[]> {
   return out;
 }
 
-/** Applies one commit's records to the restored nodes with the replay rules of RFC 0004 section 5. */
 function replay(nodes: Map<string, RestoredNode>, record: CommitRecord): void {
   for (const { change } of record.changes) {
     if (change.case === "purged") {
@@ -109,7 +104,6 @@ function replay(nodes: Map<string, RestoredNode>, record: CommitRecord): void {
   }
 }
 
-/** Restores a space from R2 alone: the newest history, its newest snapshot, then its log (RFC 0004 section 5). */
 export async function restoreFromR2(spaceId: string): Promise<Restored> {
   const meta = `spaces/${spaceId}/meta/`;
   const descriptors: Record<string, unknown>[] = [];
@@ -190,7 +184,6 @@ export async function restoreFromR2(spaceId: string): Promise<Restored> {
   }
 }
 
-/** The Space DO's own nodes, versions and trash state, in the shape a restore produces. */
 export function serverState(stub: DurableObjectStub): Promise<{ headSeq: number; nodes: Map<string, RestoredNode> }> {
   return runInDurableObject(stub, (_instance, state) => {
     const sql = state.storage.sql;
