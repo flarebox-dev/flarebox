@@ -65,7 +65,7 @@ describe("RFC 0006 section 8: digest v1", () => {
       runId: "run",
     });
     expect(toHex(await commitDigest(commit))).toBe(expected);
-    const withUnknown = [0x10, 0x01, 0x1a, 0x07, 0x2a, 0x05, 0x0a, 0x01, 0x6e, 0x10, 0x05, 0x30, 0x02, 0x78, 0x01];
+    const withUnknown = [0x10, 0x01, 0x1a, 0x07, 0x2a, 0x05, 0x0a, 0x01, 0x6e, 0x70, 0x05, 0x30, 0x02, 0x78, 0x01];
     expect(toHex(await commitDigest(fromBinary(CommitSchema, new Uint8Array(withUnknown))))).toBe(expected);
 
     const empty = create(CommitSchema, { ops: [create(OpSchema, { op: { case: "delete", value: {} } })], requireHead: true });

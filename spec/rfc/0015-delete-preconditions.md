@@ -27,7 +27,7 @@ A conflict answer that removes one file of the pair sends its `Delete` with `req
 
 A `SUPERSEDED` result clears the answer, as for R7 (design §2.7). After the next pull, the engine ends the question if the original was renamed, moved or deleted, and asks it again under a new ID if either file took new content.
 
-A resend of the same commit (RFC 0002 §2) keeps the precondition, and its stored result answers it.
+A resend of the same commit (RFC 0002 §2) keeps the precondition, and its stored result answers it. The request digest of RFC 0006 §8 hashes the ops' encoding, so it covers `requires`, and a commit sent again with another precondition is refused as a different request.
 
 ## 4. Mixed versions
 
