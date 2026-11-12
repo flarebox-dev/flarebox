@@ -97,15 +97,25 @@ fn plain_integers(text: &str) -> Outcome {
                 }
                 i += 1;
             }
-            b'-' | b'0'..=b'9' => {
+            b'-' | b'+' | b'0'..=b'9' => {
                 let start = i;
                 while i < bytes.len() && b"+-.eE0123456789".contains(&bytes[i]) {
                     i += 1;
                 }
                 let token = &text[start..i];
-                if token.contains(['.', 'e', 'E']) {
+                let digits = token.strip_prefix('-').unwrap_or(token);
+                let plain = !digits.is_empty()
+                    && digits.bytes().all(|b| b.is_ascii_digit())
+                    && (digits == "0" || !digits.starts_with('0'))
+                    && token != "-0";
+                if !plain {
                     return Err(format!(
                         "numbers must be written as plain integers, got {token}"
+                    ));
+                }
+                if digits.parse::<u64>().map_or(true, |n| n > MAX_SAFE_INTEGER) {
+                    return Err(format!(
+                        "numbers must be integers from -{MAX_SAFE_INTEGER} to {MAX_SAFE_INTEGER}, got {token}"
                     ));
                 }
             }

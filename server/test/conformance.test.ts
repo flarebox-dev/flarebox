@@ -53,11 +53,15 @@ function plainIntegers(text: string): void {
       i++;
       while (i < text.length && text[i] !== '"') i += text[i] === "\\" ? 2 : 1;
       i++;
-    } else if (/[-0-9]/.test(text[i]!)) {
+    } else if (/[-+0-9]/.test(text[i]!)) {
       const start = i;
       while (i < text.length && /[-+.eE0-9]/.test(text[i]!)) i++;
       const token = text.slice(start, i);
-      if (/[.eE]/.test(token)) fail(`numbers must be written as plain integers, got ${token}`);
+      const digits = token.startsWith("-") ? token.slice(1) : token;
+      if (!/^(0|[1-9][0-9]*)$/.test(digits) || token === "-0") fail(`numbers must be written as plain integers, got ${token}`);
+      if (BigInt(digits) > BigInt(Number.MAX_SAFE_INTEGER)) {
+        fail(`numbers must be integers from -${Number.MAX_SAFE_INTEGER} to ${Number.MAX_SAFE_INTEGER}, got ${token}`);
+      }
     } else i++;
   }
 }
