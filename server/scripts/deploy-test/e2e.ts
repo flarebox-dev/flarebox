@@ -16,9 +16,7 @@ import { appendFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileS
 import { tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { type CommitRecord, NodeKind, type NodeState, NodeStatus } from "../../src/gen/koidrive/v1/model_pb.ts";
 import { uuidv7 } from "../../src/ids.ts";
-import { Device as OwnerDevice, Server, SpaceClient, stats } from "./client.ts";
 import { addStats, readState } from "./state.ts";
 
 const SPACE = "e2e";
@@ -461,52 +459,14 @@ async function stillRewound(on: Device): Promise<Map<string, string>> {
   return files;
 }
 
-/** The space's nodes as the server's log has them at seq: each node as the last record up to seq wrote it, without purged nodes. */
-export function replay(log: CommitRecord[], seq: bigint): Map<string, NodeState> {
-  const nodes = new Map<string, NodeState>();
-  for (const commit of log) {
-    if (commit.seq > seq) break;
-    for (const { change } of commit.changes) {
-      if (change.case === "node") nodes.set(change.value.nodeId, change.value);
-      else if (change.case === "purged") nodes.delete(change.value.nodeId);
-    }
-  }
-  return nodes;
-}
-
-/** One line per live node but the root, which no commit writes: id, parent, name, kind and current version. */
-function liveNodes(nodes: Map<string, NodeState>): string {
-  return [...nodes.values()]
-    .filter((node) => node.status === NodeStatus.LIVE && node.parentId !== "")
-    .map((node) => [node.nodeId, node.parentId, node.name, node.kind, node.current?.versionId ?? ""].join(" ") + "\n")
-    .sort()
-    .join("");
-}
-
 /**
- * Why the space after a rewind to restoreSeq is not the state its old history held at that seq, or undefined when it is:
- * the new history's log must be the old log up to restoreSeq, and the server's live tree that log's tree at that seq.
+ * Runs rewind-check.ts, which reads the server through the generated protobuf code and so runs under Vitest, not plain
+ * Node: before the rewind it keeps the space's log, after it checks the space against that log and writes the server's
+ * files as a listing.
  */
-export function rewindMismatch(before: CommitRecord[], after: CommitRecord[], tree: Map<string, NodeState>, restoreSeq: bigint): string | undefined {
-  const commits = (log: CommitRecord[]) => log.map((commit) => commit.seq + " " + commit.commitId).join(", ");
-  const kept = commits(before.filter((commit) => commit.seq <= restoreSeq));
-  if (commits(after) !== kept) return "the log after the rewind is [" + commits(after) + "], but the log before it up to seq " + restoreSeq + " is [" + kept + "]";
-  const want = liveNodes(replay(before, restoreSeq));
-  const got = liveNodes(tree);
-  if (got !== want) return "the server's tree after the rewind is not the tree the log before it holds at seq " + restoreSeq + ".\nLog:\n" + want + "Server:\n" + got;
-  return undefined;
-}
-
-/** The live files of the tree by path, with / separators, in byte order. */
-function filePaths(tree: Map<string, NodeState>): [string, NodeState][] {
-  const path = (node: NodeState): string => {
-    const parent = tree.get(node.parentId);
-    return parent && parent.parentId !== "" ? path(parent) + "/" + node.name : node.name;
-  };
-  return [...tree.values()]
-    .filter((node) => node.status === NodeStatus.LIVE && node.kind === NodeKind.FILE)
-    .map((node) => [path(node), node] as [string, NodeState])
-    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+function checkRewind(vars: Record<string, string>): void {
+  const server = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+  execFileSync("pnpm", ["exec", "vitest", "run", "--config", "scripts/deploy-test/vitest.config.ts", "rewind-check"], { cwd: server, env: { ...process.env, ...vars, E2E_TEMP: temp() }, stdio: "inherit" });
 }
 
 const restorePointFile = () => temp("restore-point");
@@ -666,9 +626,7 @@ const phases: Record<string, (step: string) => Promise<void>> = {
     passed("7. Writes after the restore point", linux, (await reach(linux, "afterPoint"))[1]);
     await sleep(Math.max(0, point + RESTORE_POINT_AGE_MS - Date.now()));
     const { space_id, history_id } = folder(linux);
-    const { url, owner } = readState();
-    const server = new SpaceClient(new OwnerDevice(new Server(url ?? fail("the state file has no server")), owner ?? fail("the state file has no owner")), space_id);
-    const before = await server.log(history_id ?? fail("the folder on linux has no history"));
+    checkRewind({ REWIND_CHECK: "before", SPACE_ID: space_id, HISTORY_ID: history_id ?? fail("the folder on linux has no history") });
     const request = { rewindId: uuidv7(), restorePointMs: String(point), expectedHistoryId: history_id };
     const result = await until(
       "the rewind to complete",
@@ -682,13 +640,8 @@ const phases: Record<string, (step: string) => Promise<void>> = {
       API_POLL_MS,
     );
     console.log("Rewound the space to " + new Date(point).toISOString() + ": " + JSON.stringify(result));
-    const restoreSeq = BigInt(String(result.restoreSeq));
-    const tree = await server.tree();
-    const mismatch = rewindMismatch(before, await server.log(String(result.historyId)), tree, restoreSeq);
-    if (mismatch) fail(mismatch);
-    let expected = "";
-    for (const [path, node] of filePaths(tree)) expected += (await server.download(node.current?.content ?? fail(path + " has no content on the server"))) + "  " + path + "\n";
-    console.log("The server restored seq " + restoreSeq + " of " + before.length + ", the state its log held there:\n" + expected);
+    checkRewind({ REWIND_CHECK: "after", SPACE_ID: space_id, HISTORY_ID: String(result.historyId), RESTORE_SEQ: String(result.restoreSeq) });
+    const expected = readFileSync(temp("rewound-server-listing.txt"), "utf8");
     await recover(linux, expected);
   },
 
@@ -721,6 +674,6 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     console.error("::error::e2e " + phase + ": " + (error instanceof Error ? error.message : String(error)));
     process.exitCode = 1;
   } finally {
-    if (ownerRequests + stats.requests > 0) addStats({ requests: ownerRequests + stats.requests, bytesUp: stats.bytesUp, bytesDown: stats.bytesDown });
+    if (ownerRequests > 0) addStats({ requests: ownerRequests, bytesUp: 0, bytesDown: 0 });
   }
 }

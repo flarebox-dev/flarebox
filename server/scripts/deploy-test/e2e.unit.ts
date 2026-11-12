@@ -8,8 +8,9 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { afterEach, describe, expect, it } from "vitest";
-import { CommitRecordSchema, NodeKind, type NodeState, NodeStateSchema, NodeStatus } from "../../src/gen/koidrive/v1/model_pb.ts";
-import { type Content, contents, format, keypair, listing, matches, replay, rewindMismatch, seal, trees, unseal } from "./e2e.ts";
+import { CommitRecordSchema, NodeKind, type NodeState, NodeStateSchema, NodeStatus } from "../../src/gen/koidrive/v1/model_pb";
+import { type Content, contents, format, keypair, listing, matches, seal, trees, unseal } from "./e2e.ts";
+import { replay, rewindMismatch } from "./rewind.ts";
 
 const roots: string[] = [];
 
@@ -68,16 +69,22 @@ describe("the space after a rewind against the log before it", () => {
     create(NodeStateSchema, { nodeId, parentId, name, kind, status: NodeStatus.LIVE, current: versionId ? { versionId } : undefined });
   const commit = (seq: bigint, ...nodes: NodeState[]) =>
     create(CommitRecordSchema, { seq, commitId: "c" + seq, changes: nodes.map((value) => ({ change: { case: "node" as const, value } })) });
+  const purge = (seq: bigint, nodeId: string) =>
+    create(CommitRecordSchema, { seq, commitId: "c" + seq, changes: [{ change: { case: "purged", value: { nodeId } } }] });
   const root = node("root", "", "", NodeKind.DIR);
   const log = [
     commit(1n, node("d", "root", "docs", NodeKind.DIR), node("a", "d", "a.txt", NodeKind.FILE, "a1")),
     commit(2n, node("a", "d", "a.txt", NodeKind.FILE, "a2")),
     commit(3n, node("b", "root", "b.txt", NodeKind.FILE, "b1")),
+    commit(4n, { ...node("b", "root", "b.txt", NodeKind.FILE, "b1"), status: NodeStatus.TRASHED }),
+    purge(5n, "b"),
   ];
   const restored = (seq: bigint) => new Map([["root", root], ...replay(log, seq)]);
 
   it("is the state of the log at the restored seq, at any seq", () => {
-    for (const seq of [1n, 2n, 3n]) expect(rewindMismatch(log, log.slice(0, Number(seq)), restored(seq), seq)).toBeUndefined();
+    for (const seq of [1n, 2n, 3n, 4n, 5n]) expect(rewindMismatch(log, log.slice(0, Number(seq)), restored(seq), seq)).toBeUndefined();
+    expect(replay(log, 4n).get("b")?.status).toBe(NodeStatus.TRASHED);
+    expect(replay(log, 5n).has("b")).toBe(false);
   });
 
   it("is not when an edited file comes back with its earlier version or goes missing", () => {
@@ -89,9 +96,18 @@ describe("the space after a rewind against the log before it", () => {
   });
 
   it("is not when the server holds the state one seq away from the seq it reports", () => {
-    expect(rewindMismatch(log, log.slice(0, 2), restored(2n), 3n)).toMatch(/log after the rewind is \[1 c1, 2 c2\], but the log before it up to seq 3/);
+    expect(rewindMismatch(log, log.slice(0, 2), restored(2n), 3n)).toMatch(/restore_seq 3, but the log after it ends at seq 2/);
+    const other = [log[0]!, { ...log[1]!, commitId: "lost" }];
+    expect(rewindMismatch(log, other, restored(2n), 2n)).toMatch(/log after the rewind is \[1 c1, 2 lost\], but the log before it up to seq 2 is \[1 c1, 2 c2\]/);
     expect(rewindMismatch(log, log.slice(0, 3), restored(2n), 3n)).toMatch(/not the tree the log before it holds at seq 3/);
     expect(rewindMismatch(log, log.slice(0, 2), restored(3n), 2n)).toMatch(/not the tree the log before it holds at seq 2/);
+    expect(rewindMismatch(log.slice(0, 2), log.slice(0, 2), restored(2n), 3n)).toMatch(/restore_seq 3, but the log before it ends at seq 2/);
+    expect(rewindMismatch(log, [], restored(0n), 1n)).toMatch(/restore_seq 1, but the log after it ends at seq 0/);
+  });
+
+  it("is not when a file the log trashed is still live on the server", () => {
+    const live = restored(4n).set("b", node("b", "root", "b.txt", NodeKind.FILE, "b1"));
+    expect(rewindMismatch(log, log.slice(0, 4), live, 4n)).toMatch(/not the tree the log before it holds at seq 4/);
   });
 });
 
