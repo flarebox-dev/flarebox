@@ -224,13 +224,14 @@ impl Effects {
     ///
     /// An excluded node ([`Trees::excluded`]) gets no effect and is never parked, and neither is a
     /// node whose own place an excluded node holds. A parked node that the rules now leave out is
-    /// only moved back to the position L keeps for it, and nothing is planned while the rules are
-    /// unknown ([`Trees::rules_known`]), or for a node below a folder whose rules are unknown
-    /// ([`Trees::held`]). A `.koiignore` file that R
-    /// holds and the disk does not yet is written before any other effect below its folder
-    /// (section 5.10). The driver reads the rules of a rules file it wrote and passes them to
-    /// [`Trees::set_rules`] before it asks for the next effect, so the rules are in force before
-    /// the nodes they cover arrive.
+    /// only moved back to the position L keeps for it, unless the server refused that position
+    /// ([`Trees::reverted`]) or its S update waits, and it holds no unuploaded edit: such a node
+    /// goes to its R position. Nothing is planned while the rules are unknown
+    /// ([`Trees::rules_known`]), or for a node below a folder whose rules are unknown
+    /// ([`Trees::held`]). A `.koiignore` file that R holds and the disk does not yet is written
+    /// before any other effect below its folder (section 5.10). The driver reads the rules of a
+    /// rules file it wrote and passes them to [`Trees::set_rules`] before it asks for the next
+    /// effect, so the rules are in force before the nodes they cover arrive.
     pub fn plan(&mut self, trees: &Trees, ids: &mut IdGen, now_ms: u64) -> Option<&EffectRecord> {
         if self.in_flight.is_some() || !trees.rules_known() {
             return None;
@@ -577,7 +578,7 @@ fn holds_below(trees: &Trees, id: &str) -> bool {
     let parent = |node: &str| {
         let home = local
             .get(node)
-            .filter(|held| held.parked && trees.ignored(node))
+            .filter(|held| held.parked && trees.ignored(node) && keeps_local_position(trees, node))
             .map(|held| &held.shape);
         (home
             .or_else(|| remote.live(node))
@@ -595,6 +596,10 @@ fn holds_below(trees: &Trees, id: &str) -> bool {
         }
         false
     })
+}
+
+fn keeps_local_position(trees: &Trees, id: &str) -> bool {
+    !(trees.reverted().contains(id) || trees.waiting().contains_key(id)) || trees.edited(id)
 }
 
 /// Whether the node's only change is remote. While its S update waits, the waiting shape stands
@@ -641,18 +646,13 @@ impl<'a> View<'a> {
     fn step(&self, id: &str) -> Step {
         let local = self.trees.local().get(id);
         let remote = self.trees.remote().live(id);
-        if let Some(local) = local.filter(|local| local.parked && self.trees.ignored(id)) {
+        let home = keeps_local_position(self.trees, id);
+        if let Some(local) = local.filter(|local| local.parked && self.trees.ignored(id) && home) {
             return self.unpark(id, local, &local.shape);
         }
         let (local, remote) = match (local, remote) {
             (None, None) => return Step::Skip,
-            (Some(local), None)
-                if local.parked
-                    && !remote_only(self.trees, id)
-                    && (!(self.trees.reverted().contains(id)
-                        || self.trees.waiting().contains_key(id))
-                        || self.trees.edited(id)) =>
-            {
+            (Some(local), None) if local.parked && !remote_only(self.trees, id) && home => {
                 return self.unpark(id, local, &local.shape);
             }
             (Some(local), None) => return self.remove(id, local),

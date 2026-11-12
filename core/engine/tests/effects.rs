@@ -1058,6 +1058,57 @@ fn a_parked_edit_brings_back_its_deleted_folder_after_a_remote_move_into_an_igno
     assert_eq!(f.shape, file("d", "f", 2));
 }
 
+#[test]
+fn a_reverted_folder_whose_r_folder_sits_inside_it_is_parked_once() {
+    let (mut trees, mut disk) = space(&[
+        ("y", Some(dir(ROOT, "b")), Some(dir(ROOT, "b"))),
+        ("x", Some(dir("y", "c")), Some(dir("y", "c"))),
+    ]);
+    trees.set_rules(
+        &[] as &[&str],
+        Some(koidrive_engine::ignore::RuleFile::parse(b"b/\n")),
+    );
+    let mut x = trees.local().get("x").unwrap().clone();
+    x.shape = dir(ROOT, "x");
+    trees.set_local("x".into(), x);
+    let mut y = trees.local().get("y").unwrap().clone();
+    y.shape = dir("x", "a");
+    trees.set_local("y".into(), y);
+    trees.revert("x".into());
+    disk.entries.insert(
+        2,
+        Entry {
+            area: Area::Root,
+            name: "x".into(),
+            kind: Kind::Dir,
+            content: None,
+        },
+    );
+    disk.entries.insert(
+        1,
+        Entry {
+            area: Area::Dir(2),
+            name: "a".into(),
+            kind: Kind::Dir,
+            content: None,
+        },
+    );
+    trees.check().unwrap();
+    disk.matches(&trees).unwrap();
+    let done = converge(&mut trees, &mut disk, 10).unwrap();
+    assert!(
+        matches!(
+            done.as_slice(),
+            [Effect::Move {
+                to: Location::Parked(_),
+                ..
+            }]
+        ),
+        "{done:?}"
+    );
+    assert!(trees.local().get("x").unwrap().parked);
+}
+
 /// A valid tree over `n0`, `n1`, ... from one [`Draw`] per node, as in tests/trees.rs, where each
 /// node has the kind and file content of `kinds`. S and R are drawn with their own ranks, so their
 /// moves can swap, rotate and nest into each other.
