@@ -1019,7 +1019,7 @@ impl Commits {
                         let shape = created(trees, &synced, &create.node_id, shape);
                         agreed.extend(agree(trees, &create.node_id, result.seq));
                         synced.set(&create.node_id, Some(shape));
-                        trees.sent_edit(&create.node_id);
+                        trees.sent_edit(&create.node_id, create.content.as_ref());
                     }
                     let exists = taken && trees.remote().live(&create.node_id).is_some();
                     (&create.node_id, applied || exists)
@@ -1050,7 +1050,7 @@ impl Commits {
                         trees.record_edited(id, result.seq);
                     }
                     if applied || code == Code::ConflictCopy {
-                        trees.sent_edit(id);
+                        trees.sent_edit(id, update.content.as_ref());
                     }
                     if code == Code::ConflictCopy {
                         conflicts.push((index, id.clone(), outcome.node_id.clone()));

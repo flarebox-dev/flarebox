@@ -10,8 +10,8 @@ use crate::ignore::{LocalRules, Matcher, RuleFile, is_rules_file};
 use crate::names::name_key;
 use crate::state::{Agreed, StateError, TreesState};
 use crate::tree::{
-    FileIdentity, Kind, LocalNode, Names, Node, NodeId, RemoteNode, Shape, Tree, TreeError, same,
-    same_content,
+    Content, FileIdentity, Kind, LocalNode, Names, Node, NodeId, RemoteNode, Shape, Tree,
+    TreeError, same, same_content,
 };
 
 /// The most mutually dependent [`Class::Same`] updates [`Trees::settle`] searches as one group.
@@ -408,6 +408,7 @@ impl Trees {
         self.count_held_trash(&id, true);
         self.count_trashed(&id, true);
         self.note_position(&id);
+        self.record_edit_in_trash(&id);
     }
 
     pub fn remove_remote(&mut self, id: &str) {
@@ -458,6 +459,7 @@ impl Trees {
         self.l.insert(id.clone(), node);
         self.count_held_trash(&id, true);
         self.note_position(&id);
+        self.record_edit_in_trash(&id);
     }
 
     pub fn remove_local(&mut self, id: &str) {
@@ -873,7 +875,8 @@ impl Trees {
             .filter(|(id, _)| {
                 let content = |shape: Option<&Shape>| shape.and_then(|shape| shape.content.clone());
                 let remote = content(self.r.live(id));
-                remote.is_some() && remote == content(self.s.live(id))
+                let synced = content(self.s.live(id));
+                matches!((remote, synced), (Some(remote), Some(synced)) if same_content(&remote, &synced))
             })
             .map(|(id, seq)| (id.clone(), *seq))
             .collect()
@@ -1112,19 +1115,37 @@ impl Trees {
 
     /// The files whose content in L is an edit of this device that the server does not hold,
     /// although S and R may hold the same bytes. A server loss leaves one ([`Trees::forget_lost`]),
-    /// and it stays until the server acknowledges an edit or a create of the file
-    /// ([`Trees::sent_edit`]) or L no longer holds the file. A later edit in L does not end it,
+    /// and so does an edit L holds of a file R holds in the trash. It stays until the server
+    /// acknowledges an edit or a create of the file with L's content ([`Trees::sent_edit`]) or
+    /// L no longer holds the file. A later edit in L does not end it,
     /// since the server holds none of them until one is acknowledged, and neither does R dropping
     /// the file: the edit beats the removal and the file is created again, as for any edit L holds.
     pub fn unsent_edits(&self) -> &BTreeSet<NodeId> {
         &self.unsent_edits
     }
 
-    /// Records that the server acknowledged an edit of `id`, so L's content is no longer an edit it
-    /// lacks ([`Trees::unsent_edits`]).
-    pub fn sent_edit(&mut self, id: &str) {
+    /// Records that the server acknowledged an edit of `id` to `sent`, so L's content is no longer
+    /// an edit it lacks ([`Trees::unsent_edits`]), unless L has since taken other content.
+    pub fn sent_edit(&mut self, id: &str, sent: Option<&Content>) {
+        let local = self.l.live(id).and_then(|shape| shape.content.as_ref());
+        if matches!((local, sent), (Some(local), Some(sent)) if !same_content(local, sent)) {
+            return;
+        }
         if self.unsent_edits.remove(id) {
             self.mark(id);
+        }
+    }
+
+    fn record_edit_in_trash(&mut self, id: &str) {
+        let local = self.l.live(id).and_then(|shape| shape.content.as_ref());
+        let synced = self.s.live(id).and_then(|shape| shape.content.as_ref());
+        let edited = match (local, synced) {
+            (Some(local), Some(synced)) => !same_content(local, synced),
+            (local, _) => local.is_some(),
+        };
+        let trashed = self.r.get(id).is_some_and(|remote| remote.trashed);
+        if edited && trashed && !self.waiting.contains_key(id) {
+            self.unsent_edits.insert(id.to_owned());
         }
     }
 

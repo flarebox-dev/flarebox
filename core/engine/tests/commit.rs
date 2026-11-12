@@ -5753,3 +5753,80 @@ fn a_parked_edit_forked_for_a_concurrent_edit_keeps_its_parked_entry() {
     assert!(node.parked);
     assert_eq!(trees.parked_name(fork), "h");
 }
+
+#[test]
+fn an_edit_made_while_an_unsent_edit_is_out_stays_unsent_when_that_edit_is_acknowledged() {
+    let (mut trees, mut commits, mut ids) = an_edit_to_the_content_a_lost_commit_replaced();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 2)]);
+    trees.set_local("n".into(), local(file(ROOT, "n", 5), 1));
+    let other = RemoteNode {
+        content_rev: 4,
+        ..remote(file(ROOT, "n", 5))
+    };
+    trees.set_remote("n".into(), other);
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    assert_eq!(trees.unsent_edits().iter().collect::<Vec<_>>(), ["n"]);
+    let resent = RemoteNode {
+        content_rev: 5,
+        ..remote(file(ROOT, "n", 6))
+    };
+    trees.set_remote("n".into(), resent);
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Concurrent);
+}
+
+#[test]
+fn an_edit_of_a_file_whose_chunk_list_r_leaves_out_counts_for_loss_recovery() {
+    let chunk = proto::ChunkRef {
+        hash: vec![7; 32],
+        size: 3,
+        encoding: 0,
+    };
+    let listed = Shape {
+        content: Some(Content {
+            chunks: vec![chunk],
+            chunk_count: 1,
+            ..content(2)
+        }),
+        ..file(ROOT, "n", 2)
+    };
+    let unlisted = RemoteNode {
+        content_rev: 4,
+        ..remote(file(ROOT, "n", 2))
+    };
+    let mut trees = trees(&[("n", Some(listed.clone()), Some(listed), Some(unlisted))]);
+    trees.record_edited("n", 4);
+    assert_eq!(trees.edited_here(), [("n".to_owned(), 4)]);
+}
+
+#[test]
+fn an_edit_of_a_file_in_the_trash_after_a_loss_is_kept_from_a_resend_after_a_restore_of_its_bytes()
+{
+    let mut trees = trees(&[synced("n", file(ROOT, "n", 3))]);
+    let commits = Commits::default();
+    let (trashed_here, edited) = (trees.trashed_here(), trees.edited_here());
+    trees.set_remote("n".into(), trashed(file(ROOT, "n", 2)));
+    trees.forget_lost(
+        trashed_here,
+        edited,
+        commits.held_through(),
+        commits.accepted(),
+    );
+    trees.settle();
+    assert!(trees.unsent_edits().is_empty());
+    trees.set_local("n".into(), local(file(ROOT, "n", 2), 1));
+    trees.set_remote("n".into(), remote_at(file(ROOT, "n", 2), 3));
+    trees.settle();
+    let resent = RemoteNode {
+        content_rev: 4,
+        ..remote_at(file(ROOT, "n", 3), 3)
+    };
+    trees.set_remote("n".into(), resent);
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::Concurrent);
+}
