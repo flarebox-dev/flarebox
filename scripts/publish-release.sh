@@ -35,13 +35,14 @@ if [ "$PRERELEASE" = true ] && [ "$PRERELEASE_TAGS_PUBLISH_AS" = prerelease ]; t
 else
     prerelease=false
     latest=true
+    releases=$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name')
     while IFS= read -r other; do
         key=$(version_key "$other") || continue
         if [[ $key > $own ]]; then
             echo "$other is a published release with a higher version, so $tag does not become Latest."
             latest=false
         fi
-    done < <(gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name')
+    done <<< "$releases"
 fi
 
 if ! gh release view "$tag" >/dev/null 2>&1; then
