@@ -933,7 +933,9 @@ impl Engine {
 
     /// Puts `node`, or a new node when it is `None`, at `path` with `identity`. A file keeps the content L had for it
     /// when `content` is `None`. Changes nothing when the parent folder is not in L, or the path is not a name L can
-    /// hold.
+    /// hold. A recorded node placed again ([`Trees::ignore_local`]) takes with it the recorded folders above it that
+    /// hold nothing in L any more: the disk lost them and L kept them only for what was recorded below ([`Self::remove`]),
+    /// so they leave L and their deletion is planned.
     #[allow(clippy::too_many_arguments)]
     fn place(
         &mut self,
@@ -1027,6 +1029,14 @@ impl Engine {
                 self.remove(&holder, moving, false, touched, gone);
             }
         }
+        let left = (self.trees.ignored_local().contains(&id))
+            .then(|| {
+                self.trees
+                    .local()
+                    .get(&id)
+                    .map(|node| node.shape.parent.clone())
+            })
+            .flatten();
         self.trees.set_local(
             id.clone(),
             LocalNode {
@@ -1036,6 +1046,14 @@ impl Engine {
             },
         );
         touched.insert(id);
+        let mut above = left;
+        while let Some(folder) = above.filter(|folder| {
+            self.trees.ignored_local().contains(folder)
+                && self.trees.local_children(folder).next().is_none()
+        }) {
+            above = (self.trees.local().get(&folder)).map(|node| node.shape.parent.clone());
+            self.remove(&folder, moving, true, touched, gone);
+        }
     }
 
     /// Removes `id` and every node placed under it from L, except the nodes in `moving`, which the batch moves
