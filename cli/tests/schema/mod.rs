@@ -5,9 +5,11 @@ use std::path::Path;
 use serde_json::Value;
 
 pub fn check(envelope: &Value) {
-    let command = envelope["command"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no command: {envelope:#}"));
+    let command = match (envelope["command"].as_str(), envelope.get("event")) {
+        (Some(command), _) => command,
+        (None, Some(_)) => "_daemon",
+        (None, None) => panic!("no command: {envelope:#}"),
+    };
     let name = match command {
         "" => "koi.json".to_owned(),
         command if command == "help" || command.starts_with("help ") => "koi-help.json".to_owned(),
@@ -32,16 +34,24 @@ pub fn check(envelope: &Value) {
 }
 
 fn closed(schema: &mut Value) {
+    close(schema, true);
+}
+
+fn close(schema: &mut Value, own: bool) {
     match schema {
         Value::Object(object) => {
-            if object.contains_key("properties") {
+            let shared = object.contains_key("properties");
+            if own && shared && object.get("type") == Some(&Value::from("object")) {
                 object
-                    .entry("additionalProperties")
+                    .entry("unevaluatedProperties")
                     .or_insert(Value::Bool(false));
             }
-            object.values_mut().for_each(closed);
+            for (key, value) in object.iter_mut() {
+                let branches = matches!(key.as_str(), "oneOf" | "anyOf" | "allOf");
+                close(value, !(branches && shared));
+            }
         }
-        Value::Array(items) => items.iter_mut().for_each(closed),
+        Value::Array(items) => items.iter_mut().for_each(|item| close(item, own)),
         _ => {}
     }
 }

@@ -483,6 +483,23 @@ fn ctrl_c_during_setup_under_json_prints_the_interrupted_envelope() {
 }
 
 #[test]
+fn a_help_or_version_flag_before_a_subcommand_reports_the_command_it_belongs_to() {
+    let profile = Profile::new();
+    for (args, command, field) in [
+        (&["--version", "space", "list"][..], "", "version"),
+        (&["-V", "folder", "link"], "", "version"),
+        (&["-h", "space", "list"], "", "help"),
+        (&["space", "--help", "list"], "space", "help"),
+    ] {
+        let (code, envelope) = profile.json(&[&["--json"], args].concat());
+        assert_eq!(code, 0, "{args:?} {envelope:#}");
+        assert_eq!(envelope["command"], command, "{args:?} {envelope:#}");
+        assert!(envelope["data"][field].is_string(), "{args:?} {envelope:#}");
+        schema::check(&envelope);
+    }
+}
+
+#[test]
 fn every_command_prints_its_help_as_an_envelope_its_schema_takes() {
     let profile = Profile::new();
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/json-schema/v1");

@@ -178,9 +178,9 @@ impl Service {
     }
 
     /// Where the service's log is.
-    fn log(&self, manager: &str) -> String {
+    fn log(&self, manager: ServiceManager) -> String {
         match manager {
-            "launchd" => self.log_file().display().to_string(),
+            ServiceManager::Launchd => self.log_file().display().to_string(),
             _ => format!("journalctl --user -u {}", self.unit_name()),
         }
     }
@@ -219,7 +219,7 @@ pub enum State {
 
 /// A service manager. [`Manager::state`] reports `Running`, `Stopped` or `NotInstalled`, or why it cannot be used.
 pub trait Manager {
-    fn kind(&self) -> &'static str;
+    fn kind(&self) -> ServiceManager;
     fn name(&self, service: &Service) -> String;
     fn state(&self, service: &Service) -> Result<State, String>;
     /// Installs the service unless the installed one is the same, and starts it, or restarts it when it changed.
@@ -263,10 +263,17 @@ pub struct Blocked {
     pub waiting: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceManager {
+    Systemd,
+    Launchd,
+}
+
 /// The service as a command left it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Report {
-    pub manager: &'static str,
+    pub manager: ServiceManager,
     pub name: String,
     pub state: State,
     /// Why the service cannot run, or did not change as it should.
@@ -312,7 +319,7 @@ impl Report {
     /// What a command prints about the service: a change, a problem, or nothing when it runs as before.
     pub fn text(&self) -> String {
         let mut text = String::new();
-        let launchd = self.manager == "launchd";
+        let launchd = self.manager == ServiceManager::Launchd;
         let problem = (self.problem.as_deref()).map(crate::printable);
         match self.state {
             State::Off if self.folders > 0 => text.push_str(
@@ -648,8 +655,8 @@ fn systemctl(args: &[&str]) -> Result<String, String> {
 }
 
 impl Manager for Systemd {
-    fn kind(&self) -> &'static str {
-        "systemd"
+    fn kind(&self) -> ServiceManager {
+        ServiceManager::Systemd
     }
 
     fn name(&self, service: &Service) -> String {
@@ -734,8 +741,8 @@ impl Launchd {
 }
 
 impl Manager for Launchd {
-    fn kind(&self) -> &'static str {
-        "launchd"
+    fn kind(&self) -> ServiceManager {
+        ServiceManager::Launchd
     }
 
     fn name(&self, service: &Service) -> String {
@@ -1016,8 +1023,8 @@ mod tests {
     }
 
     impl Manager for Fake {
-        fn kind(&self) -> &'static str {
-            "fake"
+        fn kind(&self) -> ServiceManager {
+            ServiceManager::Systemd
         }
 
         fn name(&self, service: &Service) -> String {

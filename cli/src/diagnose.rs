@@ -834,7 +834,7 @@ thread 'tokio-runtime-worker' panicked at /Users/ada/Secret Plans/ledger.rs:1:1:
         let decision = Decision {
             id: "q1".to_owned(),
             space_id: "s1".to_owned(),
-            kind: "conflict",
+            kind: crate::report::DecisionKind::Conflict,
             group: None,
             asked_at_ms: 1,
             requires_choice: true,

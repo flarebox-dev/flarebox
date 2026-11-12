@@ -69,6 +69,7 @@ fn the_daemon_under_json_prints_its_lifecycle_as_json_lines() {
     assert_eq!(started["schema_version"], 1, "{started}");
     assert_eq!(started["event"], "started", "{started}");
     assert_eq!(started["folders"], 0, "{started}");
+    schema::check(&started);
 
     let help = daemon(true).arg("--help").output().unwrap();
     assert_eq!(help.status.code(), Some(0), "{help:?}");
@@ -105,6 +106,7 @@ fn the_daemon_under_json_prints_its_lifecycle_as_json_lines() {
     assert_eq!(events[0]["signal"], "SIGTERM");
     assert_eq!(events[1]["event"], "stopped");
     assert!(events.iter().all(|event| event["schema_version"] == 1));
+    events.iter().for_each(schema::check);
 
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(!stderr.contains('\u{1b}'), "{stderr:?}");

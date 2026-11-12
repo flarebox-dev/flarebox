@@ -693,6 +693,9 @@ fn command_path(args: &[OsString]) -> String {
     let mut command = Cli::command();
     let mut path = Vec::new();
     for arg in args.iter().skip(1).filter_map(|arg| arg.to_str()) {
+        if matches!(arg, "-h" | "--help" | "-V" | "--version" | "--") {
+            break;
+        }
         if arg.starts_with('-') {
             continue;
         }
@@ -782,11 +785,11 @@ async fn daemon(paths: Paths, json: bool) -> Result<Done, CliError> {
         folders: folders.len(),
     });
     let states = json.then(|| tokio::spawn(folder_states(driver.clone(), watch, folders)));
-    let signal = tokio::select! {
-        _ = terminate.recv() => "SIGTERM",
-        _ = interrupt.recv() => "SIGINT",
+    let (signal, name) = tokio::select! {
+        _ = terminate.recv() => (report::Signal::Term, "SIGTERM"),
+        _ = interrupt.recv() => (report::Signal::Int, "SIGINT"),
     };
-    tracing::info!(signal, "stopping the daemon");
+    tracing::info!(signal = name, "stopping the daemon");
     if let Some(states) = states {
         states.abort();
         let _ = states.await;
@@ -2345,6 +2348,12 @@ mod tests {
         assert_eq!(command_path(&args(&["koi", "history"])), "history");
         assert_eq!(command_path(&args(&["koi", "nonsense", "x"])), "");
         assert_eq!(command_path(&args(&["koi"])), "");
+        assert_eq!(command_path(&args(&["koi", "-V", "space", "list"])), "");
+        assert_eq!(
+            command_path(&args(&["koi", "space", "--help", "list"])),
+            "space"
+        );
+        assert_eq!(command_path(&args(&["koi", "--", "status"])), "");
         assert!(json_requested(&args(&["koi", "linky", "--json"])));
         assert!(json_requested(&args(&["koi", "status", "--json=2"])));
         assert!(!json_requested(&args(&["koi", "status"])));

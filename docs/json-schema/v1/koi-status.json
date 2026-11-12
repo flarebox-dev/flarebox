@@ -214,7 +214,7 @@
               "type": "string"
             },
             "kind": {
-              "type": "string"
+              "$ref": "#/$defs/WaitReason"
             },
             "until_ms": {
               "format": "int64",
@@ -245,7 +245,7 @@
         },
         "exceeded": {
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/LimitKind"
           },
           "type": "array"
         },
@@ -287,9 +287,13 @@
           ]
         },
         "group": {
-          "type": [
-            "string",
-            "null"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecisionGroup"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "id": {
@@ -302,7 +306,7 @@
           "type": "array"
         },
         "kind": {
-          "type": "string"
+          "$ref": "#/$defs/DecisionKind"
         },
         "requires_choice": {
           "description": "False for a notice that only takes `dismiss`: it holds nothing and blocks nothing.",
@@ -322,6 +326,26 @@
         "answers"
       ],
       "type": "object"
+    },
+    "DecisionGroup": {
+      "enum": [
+        "created_after_restore_point",
+        "changed_on_this_device",
+        "created_on_this_device",
+        "deleted_on_this_device",
+        "requested_before_reset"
+      ],
+      "type": "string"
+    },
+    "DecisionKind": {
+      "enum": [
+        "mass_delete",
+        "remote_mass_delete",
+        "ambiguous_disappearance",
+        "conflict",
+        "recovery"
+      ],
+      "type": "string"
     },
     "ErrorBody": {
       "properties": {
@@ -400,7 +424,7 @@
           "type": "string"
         },
         "state": {
-          "type": "string"
+          "$ref": "#/$defs/SyncState"
         },
         "wait": {
           "anyOf": [
@@ -461,6 +485,13 @@
       ],
       "type": "object"
     },
+    "LimitKind": {
+      "enum": [
+        "deletions",
+        "share"
+      ],
+      "type": "string"
+    },
     "Next": {
       "description": "A command to run next, as the arguments to pass.",
       "properties": {
@@ -517,7 +548,7 @@
           ]
         },
         "manager": {
-          "type": "string"
+          "$ref": "#/$defs/ServiceManager"
         },
         "name": {
           "type": "string"
@@ -539,6 +570,13 @@
         "state"
       ],
       "type": "object"
+    },
+    "ServiceManager": {
+      "enum": [
+        "systemd",
+        "launchd"
+      ],
+      "type": "string"
     },
     "State": {
       "description": "What the service manager reports for a service, or what keeps koi from using it.",
@@ -613,11 +651,23 @@
       ],
       "type": "object"
     },
+    "SyncState": {
+      "enum": [
+        "stopped",
+        "connecting",
+        "bootstrapping",
+        "catching_up",
+        "up_to_date",
+        "offline",
+        "halted"
+      ],
+      "type": "string"
+    },
     "WaitData": {
       "description": "A call the folder puts off: `quota` when the server refused it for a used-up limit or full storage, `retry` when\nit kept failing for another reason. It is sent again at `until_ms`, in Unix milliseconds.",
       "properties": {
         "kind": {
-          "type": "string"
+          "$ref": "#/$defs/WaitReason"
         },
         "until_ms": {
           "format": "int64",
@@ -629,9 +679,30 @@
         "until_ms"
       ],
       "type": "object"
+    },
+    "WaitReason": {
+      "enum": [
+        "quota",
+        "retry"
+      ],
+      "type": "string"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "else": {
+    "properties": {
+      "error": {
+        "type": "null"
+      }
+    }
+  },
+  "if": {
+    "properties": {
+      "outcome": {
+        "const": "error"
+      }
+    }
+  },
   "properties": {
     "command": {
       "const": "status"
@@ -687,6 +758,13 @@
     "decisions",
     "next_commands"
   ],
+  "then": {
+    "properties": {
+      "error": {
+        "type": "object"
+      }
+    }
+  },
   "title": "koi status --json",
   "type": "object"
 }

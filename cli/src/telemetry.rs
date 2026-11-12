@@ -456,13 +456,29 @@ mod tests {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum TelemetryMode {
+    On,
+    Off,
+    Debug,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum TelemetrySource {
+    DoNotTrack,
+    Variable,
+    Choice,
+    Unset,
+}
+
 /// `koi telemetry ...`'s result as JSON data.
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct TelemetryStatusData {
-    /// `on`, `off` or `debug`.
-    mode: &'static str,
-    /// What decided the mode: `do_not_track`, `variable`, `choice` or `unset`.
-    source: &'static str,
+    mode: TelemetryMode,
+    /// What decided the mode.
+    source: TelemetrySource,
     #[schemars(with = "Option<String>")]
     install_id: Option<InstallId>,
     waiting_days: usize,
@@ -503,15 +519,18 @@ pub fn command(paths: &Paths, action: TelemetryAction) -> Result<Done, CliError>
             let status = store.status(var).map_err(failed)?;
             let on = status.mode != Mode::Off;
             let (source, why) = match status.source {
-                Source::DoNotTrack => ("do_not_track", "DO_NOT_TRACK is set"),
-                Source::Variable => ("variable", "KOIDRIVE_TELEMETRY is set"),
-                Source::Stored => ("choice", "your choice"),
-                Source::Unset => ("unset", "not asked yet"),
+                Source::DoNotTrack => (TelemetrySource::DoNotTrack, "DO_NOT_TRACK is set"),
+                Source::Variable => (TelemetrySource::Variable, "KOIDRIVE_TELEMETRY is set"),
+                Source::Stored => (TelemetrySource::Choice, "your choice"),
+                Source::Unset => (TelemetrySource::Unset, "not asked yet"),
             };
             let (mode, shown) = match status.mode {
-                Mode::Off => ("off", "off"),
-                Mode::On => ("on", "on"),
-                Mode::Debug => ("debug", "debug (printed to stderr, never sent)"),
+                Mode::Off => (TelemetryMode::Off, "off"),
+                Mode::On => (TelemetryMode::On, "on"),
+                Mode::Debug => (
+                    TelemetryMode::Debug,
+                    "debug (printed to stderr, never sent)",
+                ),
             };
             let queued = store.peek().map_err(failed)?;
             let sends = Uploader::from_env(var).ok().flatten().is_some();

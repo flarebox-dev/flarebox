@@ -5,8 +5,8 @@ use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde_json::{Map, Value, json};
 
 use crate::report::{
-    AccountData, AnsweredData, ChoicesData, DevicesData, DiagnosticsData, Empty, Envelope,
-    FolderData, HelpData, InvitationData, RequestsData, RestoreAskedData, RevokedData,
+    AccountData, AnsweredData, ChoicesData, DaemonLine, DevicesData, DiagnosticsData, Empty,
+    Envelope, FolderData, HelpData, InvitationData, RequestsData, RestoreAskedData, RevokedData,
     SCHEMA_VERSION, SpaceData, SpacesData, StatusData, TrashData, UnlinkedData, UsagesData,
     VersionInfoData, VersionsData, WithService,
 };
@@ -72,13 +72,31 @@ pub fn envelope(command: &str) -> Option<Value> {
         command => json!({ "const": command }),
     };
     properties["data"] = json!({ "anyOf": kinds });
+    root["if"] = json!({ "properties": { "outcome": { "const": "error" } } });
+    root["then"] = json!({ "properties": { "error": { "type": "object" } } });
+    root["else"] = json!({ "properties": { "error": { "type": "null" } } });
+    let line = (command == "_daemon").then(|| of::<DaemonLine>(&mut generator).to_value());
     let mut defs = match root.get_mut("$defs").map(Value::take) {
         Some(Value::Object(defs)) => defs,
         _ => Map::new(),
     };
     defs.extend(generator.take_definitions(true));
-    root["$defs"] = Value::Object(defs);
-    Some(root)
+    let Some(line) = line else {
+        root["$defs"] = Value::Object(defs);
+        return Some(root);
+    };
+    let mut envelope = root.as_object().cloned().unwrap_or_default();
+    let header = ["$schema", "title"].map(|key| (key, envelope.remove(key)));
+    envelope.remove("$defs");
+    let mut root = Map::new();
+    root.extend(
+        header
+            .into_iter()
+            .filter_map(|(key, value)| Some((key.to_owned(), value?))),
+    );
+    root.insert("anyOf".to_owned(), json!([envelope, line]));
+    root.insert("$defs".to_owned(), Value::Object(defs));
+    Some(Value::Object(root))
 }
 
 pub fn file_name(command: &str) -> String {
@@ -165,8 +183,23 @@ mod tests {
         let mut other = printed.clone();
         other["command"] = json!("device list");
         assert!(!validator.is_valid(&other));
-        other = printed;
+        other = printed.clone();
         other["data"] = json!({ "device_id": 1 });
         assert!(!validator.is_valid(&other));
+        other = printed;
+        other["error"] = json!({ "code": "failed", "message": "m", "retryable": false });
+        assert!(!validator.is_valid(&other));
+        other["outcome"] = json!("error");
+        other["error"] = Value::Null;
+        assert!(!validator.is_valid(&other));
+        let lines = jsonschema::validator_for(&envelope("_daemon").unwrap()).unwrap();
+        let line =
+            |event| serde_json::from_str::<Value>(&crate::report::Lifecycle::line(&event)).unwrap();
+        let mut stopping = line(crate::report::Lifecycle::Stopping {
+            signal: crate::report::Signal::Term,
+        });
+        assert!(lines.is_valid(&stopping), "{stopping:#}");
+        stopping["signal"] = json!("SIGHUP");
+        assert!(!lines.is_valid(&stopping));
     }
 }

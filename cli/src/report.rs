@@ -162,14 +162,100 @@ impl Envelope {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionKind {
+    MassDelete,
+    RemoteMassDelete,
+    AmbiguousDisappearance,
+    Conflict,
+    Recovery,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionGroup {
+    CreatedAfterRestorePoint,
+    ChangedOnThisDevice,
+    CreatedOnThisDevice,
+    DeletedOnThisDevice,
+    RequestedBeforeReset,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitKind {
+    Deletions,
+    Share,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncState {
+    Stopped,
+    Connecting,
+    Bootstrapping,
+    CatchingUp,
+    UpToDate,
+    Offline,
+    Halted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitReason {
+    Quota,
+    Retry,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+pub enum Signal {
+    #[serde(rename = "SIGTERM")]
+    Term,
+    #[serde(rename = "SIGINT")]
+    Int,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceKind {
+    Device,
+    Agent,
+    Unspecified,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeType {
+    File,
+    Folder,
+    Symlink,
+}
+
+impl std::fmt::Display for NodeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            NodeType::File => "file",
+            NodeType::Folder => "folder",
+            NodeType::Symlink => "symlink",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingOn {
+    NodeProblem,
+}
+
 /// A decision sync waits on, with every item it holds and the command for each answer.
 #[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct Decision {
     pub id: String,
     pub space_id: String,
-    pub kind: &'static str,
+    pub kind: DecisionKind,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub group: Option<&'static str>,
+    pub group: Option<DecisionGroup>,
     pub asked_at_ms: i64,
     /// False for a notice that only takes `dismiss`: it holds nothing and blocks nothing.
     pub requires_choice: bool,
@@ -184,7 +270,7 @@ pub struct Counts {
     pub deletions: u64,
     pub affected_files: u64,
     pub space_files: u64,
-    pub exceeded: Vec<&'static str>,
+    pub exceeded: Vec<LimitKind>,
 }
 
 #[derive(Debug, PartialEq, Serialize, JsonSchema)]
@@ -211,8 +297,8 @@ impl Decision {
                 exceeded: exceeded
                     .iter()
                     .map(|limit| match limit {
-                        Limit::Deletions => "deletions",
-                        Limit::Share => "share",
+                        Limit::Deletions => LimitKind::Deletions,
+                        Limit::Share => LimitKind::Share,
                     })
                     .collect(),
             })
@@ -224,7 +310,7 @@ impl Decision {
                 space_files,
                 exceeded,
             } => (
-                "mass_delete",
+                DecisionKind::MassDelete,
                 None,
                 counts(deletions, affected_files, space_files, exceeded),
             ),
@@ -234,20 +320,24 @@ impl Decision {
                 space_files,
                 exceeded,
             } => (
-                "remote_mass_delete",
+                DecisionKind::RemoteMassDelete,
                 None,
                 counts(deletions, affected_files, space_files, exceeded),
             ),
-            QuestionKind::AmbiguousDisappearance => ("ambiguous_disappearance", None, None),
-            QuestionKind::Conflict { .. } => ("conflict", None, None),
+            QuestionKind::AmbiguousDisappearance => {
+                (DecisionKind::AmbiguousDisappearance, None, None)
+            }
+            QuestionKind::Conflict { .. } => (DecisionKind::Conflict, None, None),
             QuestionKind::Recovery { group } => (
-                "recovery",
+                DecisionKind::Recovery,
                 Some(match group {
-                    RecoveryGroup::CreatedAfterRestorePoint => "created_after_restore_point",
-                    RecoveryGroup::ChangedOnThisDevice => "changed_on_this_device",
-                    RecoveryGroup::CreatedOnThisDevice => "created_on_this_device",
-                    RecoveryGroup::DeletedOnThisDevice => "deleted_on_this_device",
-                    RecoveryGroup::RequestedBeforeReset => "requested_before_reset",
+                    RecoveryGroup::CreatedAfterRestorePoint => {
+                        DecisionGroup::CreatedAfterRestorePoint
+                    }
+                    RecoveryGroup::ChangedOnThisDevice => DecisionGroup::ChangedOnThisDevice,
+                    RecoveryGroup::CreatedOnThisDevice => DecisionGroup::CreatedOnThisDevice,
+                    RecoveryGroup::DeletedOnThisDevice => DecisionGroup::DeletedOnThisDevice,
+                    RecoveryGroup::RequestedBeforeReset => DecisionGroup::RequestedBeforeReset,
                 }),
                 None,
             ),
@@ -310,7 +400,7 @@ pub struct FolderData {
     pub path: String,
     pub space_id: String,
     pub space_name: String,
-    pub state: &'static str,
+    pub state: SyncState,
     pub history_id: Option<String>,
     pub last_seq: Option<u64>,
     pub head_seq: Option<u64>,
@@ -325,7 +415,7 @@ pub struct FolderData {
 /// it kept failing for another reason. It is sent again at `until_ms`, in Unix milliseconds.
 #[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct WaitData {
-    pub kind: &'static str,
+    pub kind: WaitReason,
     pub until_ms: i64,
 }
 
@@ -333,8 +423,8 @@ impl WaitData {
     fn of(wait: Wait) -> Self {
         WaitData {
             kind: match wait.kind {
-                WaitKind::Quota => "quota",
-                WaitKind::Retry => "retry",
+                WaitKind::Quota => WaitReason::Quota,
+                WaitKind::Retry => WaitReason::Retry,
             },
             until_ms: wait.until_ms,
         }
@@ -348,13 +438,13 @@ impl FolderData {
             space_id: folder.space_id.clone(),
             space_name: folder.space_name.clone(),
             state: match folder.state {
-                FolderState::Stopped => "stopped",
-                FolderState::Connecting => "connecting",
-                FolderState::Bootstrapping => "bootstrapping",
-                FolderState::CatchingUp => "catching_up",
-                FolderState::UpToDate => "up_to_date",
-                FolderState::Offline => "offline",
-                FolderState::Halted => "halted",
+                FolderState::Stopped => SyncState::Stopped,
+                FolderState::Connecting => SyncState::Connecting,
+                FolderState::Bootstrapping => SyncState::Bootstrapping,
+                FolderState::CatchingUp => SyncState::CatchingUp,
+                FolderState::UpToDate => SyncState::UpToDate,
+                FolderState::Offline => SyncState::Offline,
+                FolderState::Halted => SyncState::Halted,
             },
             history_id: folder.history_id.clone(),
             last_seq: folder.last_seq,
@@ -472,6 +562,13 @@ pub fn check_exit(conditions: &[Condition]) -> u8 {
         .unwrap_or(0)
 }
 
+#[derive(Serialize, JsonSchema)]
+pub struct DaemonLine<'a> {
+    schema_version: u32,
+    #[serde(flatten)]
+    event: &'a Lifecycle,
+}
+
 /// One line of `koi _daemon --json`, printed as it happens.
 #[derive(Debug, PartialEq, Serialize, JsonSchema)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -485,10 +582,10 @@ pub enum Lifecycle {
     FolderState {
         folder: String,
         space_id: String,
-        state: &'static str,
+        state: SyncState,
     },
     Stopping {
-        signal: &'static str,
+        signal: Signal,
     },
     Stopped,
 }
@@ -496,13 +593,7 @@ pub enum Lifecycle {
 impl Lifecycle {
     /// The event as one line of JSON, with the schema version.
     pub fn line(&self) -> String {
-        #[derive(Serialize, JsonSchema)]
-        struct Line<'a> {
-            schema_version: u32,
-            #[serde(flatten)]
-            event: &'a Lifecycle,
-        }
-        let line = Line {
+        let line = DaemonLine {
             schema_version: SCHEMA_VERSION,
             event: self,
         };
@@ -529,7 +620,7 @@ pub struct DeviceData {
     pub device_id: String,
     pub name: String,
     pub platform: String,
-    pub kind: &'static str,
+    pub kind: DeviceKind,
     pub created_at_ms: i64,
     pub last_seen_ms: i64,
     pub revoked_at_ms: i64,
@@ -545,9 +636,9 @@ impl DeviceData {
             name: device.name.clone(),
             platform: device.platform.clone(),
             kind: match device.kind() {
-                Kind::Device => "device",
-                Kind::Agent => "agent",
-                Kind::Unspecified => "unspecified",
+                Kind::Device => DeviceKind::Device,
+                Kind::Agent => DeviceKind::Agent,
+                Kind::Unspecified => DeviceKind::Unspecified,
             },
             created_at_ms: device.created_at_ms,
             last_seen_ms: device.last_seen_ms,
@@ -647,7 +738,7 @@ pub struct RefusedSpace {
 pub struct TrashEntry {
     pub node_id: String,
     pub path: String,
-    pub kind: &'static str,
+    pub kind: NodeType,
     pub trash_group: String,
     pub files: u64,
     pub bytes: u64,
@@ -713,7 +804,7 @@ pub enum RequestedData {
 #[derive(Debug, PartialEq, Serialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RequestState {
-    Pending { waits_for: Option<&'static str> },
+    Pending { waits_for: Option<PendingOn> },
     Restored,
     Renamed { name: String },
     Copied { node_id: String, name: String },
@@ -746,7 +837,7 @@ impl RequestData {
             state: match &restore.state {
                 RestoreState::Pending { waits_for } => RequestState::Pending {
                     waits_for: waits_for.map(|wait| match wait {
-                        RestoreWait::NodeProblem => "node_problem",
+                        RestoreWait::NodeProblem => PendingOn::NodeProblem,
                     }),
                 },
                 RestoreState::Restored => RequestState::Restored,
@@ -800,6 +891,7 @@ pub struct Empty {}
 
 /// The data of a command that brings the background service in line with the profile, with the service's report.
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(rename = "WithService_{T}")]
 pub struct WithService<T> {
     #[serde(flatten)]
     pub data: T,
@@ -1000,7 +1092,11 @@ mod tests {
         ));
         assert_eq!(
             (recovery.kind, recovery.group, recovery.counts),
-            ("recovery", Some("requested_before_reset"), None)
+            (
+                DecisionKind::Recovery,
+                Some(DecisionGroup::RequestedBeforeReset),
+                None
+            )
         );
         assert!(!Decision::of(&question("q3", notice())).requires_choice);
     }
@@ -1024,7 +1120,7 @@ mod tests {
         let decision = Decision::of(&question("q1", conflict));
         assert_eq!(
             (decision.kind, decision.group, decision.counts),
-            ("conflict", None, None)
+            (DecisionKind::Conflict, None, None)
         );
         let answers: Vec<(&str, Vec<&str>)> = (decision.answers.iter())
             .map(|answer| {

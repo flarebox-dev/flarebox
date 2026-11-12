@@ -81,7 +81,7 @@
         },
         "exceeded": {
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/LimitKind"
           },
           "type": "array"
         },
@@ -123,9 +123,13 @@
           ]
         },
         "group": {
-          "type": [
-            "string",
-            "null"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecisionGroup"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "id": {
@@ -138,7 +142,7 @@
           "type": "array"
         },
         "kind": {
-          "type": "string"
+          "$ref": "#/$defs/DecisionKind"
         },
         "requires_choice": {
           "description": "False for a notice that only takes `dismiss`: it holds nothing and blocks nothing.",
@@ -158,6 +162,26 @@
         "answers"
       ],
       "type": "object"
+    },
+    "DecisionGroup": {
+      "enum": [
+        "created_after_restore_point",
+        "changed_on_this_device",
+        "created_on_this_device",
+        "deleted_on_this_device",
+        "requested_before_reset"
+      ],
+      "type": "string"
+    },
+    "DecisionKind": {
+      "enum": [
+        "mass_delete",
+        "remote_mass_delete",
+        "ambiguous_disappearance",
+        "conflict",
+        "recovery"
+      ],
+      "type": "string"
     },
     "ErrorBody": {
       "properties": {
@@ -210,6 +234,13 @@
       ],
       "type": "object"
     },
+    "LimitKind": {
+      "enum": [
+        "deletions",
+        "share"
+      ],
+      "type": "string"
+    },
     "Next": {
       "description": "A command to run next, as the arguments to pass.",
       "properties": {
@@ -252,6 +283,20 @@
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "else": {
+    "properties": {
+      "error": {
+        "type": "null"
+      }
+    }
+  },
+  "if": {
+    "properties": {
+      "outcome": {
+        "const": "error"
+      }
+    }
+  },
   "properties": {
     "command": {
       "const": "service"
@@ -304,6 +349,13 @@
     "decisions",
     "next_commands"
   ],
+  "then": {
+    "properties": {
+      "error": {
+        "type": "object"
+      }
+    }
+  },
   "title": "koi service --json",
   "type": "object"
 }

@@ -98,7 +98,7 @@
         },
         "exceeded": {
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/LimitKind"
           },
           "type": "array"
         },
@@ -140,9 +140,13 @@
           ]
         },
         "group": {
-          "type": [
-            "string",
-            "null"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecisionGroup"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "id": {
@@ -155,7 +159,7 @@
           "type": "array"
         },
         "kind": {
-          "type": "string"
+          "$ref": "#/$defs/DecisionKind"
         },
         "requires_choice": {
           "description": "False for a notice that only takes `dismiss`: it holds nothing and blocks nothing.",
@@ -175,6 +179,26 @@
         "answers"
       ],
       "type": "object"
+    },
+    "DecisionGroup": {
+      "enum": [
+        "created_after_restore_point",
+        "changed_on_this_device",
+        "created_on_this_device",
+        "deleted_on_this_device",
+        "requested_before_reset"
+      ],
+      "type": "string"
+    },
+    "DecisionKind": {
+      "enum": [
+        "mass_delete",
+        "remote_mass_delete",
+        "ambiguous_disappearance",
+        "conflict",
+        "recovery"
+      ],
+      "type": "string"
     },
     "ErrorBody": {
       "properties": {
@@ -226,6 +250,13 @@
         "files"
       ],
       "type": "object"
+    },
+    "LimitKind": {
+      "enum": [
+        "deletions",
+        "share"
+      ],
+      "type": "string"
     },
     "Next": {
       "description": "A command to run next, as the arguments to pass.",
@@ -283,7 +314,7 @@
           ]
         },
         "manager": {
-          "type": "string"
+          "$ref": "#/$defs/ServiceManager"
         },
         "name": {
           "type": "string"
@@ -305,6 +336,13 @@
         "state"
       ],
       "type": "object"
+    },
+    "ServiceManager": {
+      "enum": [
+        "systemd",
+        "launchd"
+      ],
+      "type": "string"
     },
     "State": {
       "description": "What the service manager reports for a service, or what keeps koi from using it.",
@@ -338,7 +376,7 @@
         }
       ]
     },
-    "WithService": {
+    "WithService_Empty": {
       "description": "The data of a command that brings the background service in line with the profile, with the service's report.",
       "properties": {
         "service": {
@@ -352,6 +390,20 @@
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "else": {
+    "properties": {
+      "error": {
+        "type": "null"
+      }
+    }
+  },
+  "if": {
+    "properties": {
+      "outcome": {
+        "const": "error"
+      }
+    }
+  },
   "properties": {
     "command": {
       "const": "server add-device"
@@ -365,7 +417,7 @@
           "$ref": "#/$defs/HelpData"
         },
         {
-          "$ref": "#/$defs/WithService"
+          "$ref": "#/$defs/WithService_Empty"
         }
       ]
     },
@@ -407,6 +459,13 @@
     "decisions",
     "next_commands"
   ],
+  "then": {
+    "properties": {
+      "error": {
+        "type": "object"
+      }
+    }
+  },
   "title": "koi server add-device --json",
   "type": "object"
 }

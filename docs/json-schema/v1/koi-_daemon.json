@@ -81,7 +81,7 @@
         },
         "exceeded": {
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/LimitKind"
           },
           "type": "array"
         },
@@ -96,6 +96,101 @@
         "affected_files",
         "space_files",
         "exceeded"
+      ],
+      "type": "object"
+    },
+    "DaemonLine": {
+      "description": "One line of `koi _daemon --json`, printed as it happens.",
+      "oneOf": [
+        {
+          "properties": {
+            "event": {
+              "const": "started",
+              "type": "string"
+            },
+            "folders": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "socket": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "event",
+            "version",
+            "socket",
+            "folders"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A folder's state changed, with the state named as in `status`.",
+          "properties": {
+            "event": {
+              "const": "folder_state",
+              "type": "string"
+            },
+            "folder": {
+              "type": "string"
+            },
+            "space_id": {
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/$defs/SyncState"
+            }
+          },
+          "required": [
+            "event",
+            "folder",
+            "space_id",
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "event": {
+              "const": "stopping",
+              "type": "string"
+            },
+            "signal": {
+              "$ref": "#/$defs/Signal"
+            }
+          },
+          "required": [
+            "event",
+            "signal"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "event": {
+              "const": "stopped",
+              "type": "string"
+            }
+          },
+          "required": [
+            "event"
+          ],
+          "type": "object"
+        }
+      ],
+      "properties": {
+        "schema_version": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema_version"
       ],
       "type": "object"
     },
@@ -123,9 +218,13 @@
           ]
         },
         "group": {
-          "type": [
-            "string",
-            "null"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecisionGroup"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "id": {
@@ -138,7 +237,7 @@
           "type": "array"
         },
         "kind": {
-          "type": "string"
+          "$ref": "#/$defs/DecisionKind"
         },
         "requires_choice": {
           "description": "False for a notice that only takes `dismiss`: it holds nothing and blocks nothing.",
@@ -158,6 +257,26 @@
         "answers"
       ],
       "type": "object"
+    },
+    "DecisionGroup": {
+      "enum": [
+        "created_after_restore_point",
+        "changed_on_this_device",
+        "created_on_this_device",
+        "deleted_on_this_device",
+        "requested_before_reset"
+      ],
+      "type": "string"
+    },
+    "DecisionKind": {
+      "enum": [
+        "mass_delete",
+        "remote_mass_delete",
+        "ambiguous_disappearance",
+        "conflict",
+        "recovery"
+      ],
+      "type": "string"
     },
     "ErrorBody": {
       "properties": {
@@ -210,6 +329,13 @@
       ],
       "type": "object"
     },
+    "LimitKind": {
+      "enum": [
+        "deletions",
+        "share"
+      ],
+      "type": "string"
+    },
     "Next": {
       "description": "A command to run next, as the arguments to pass.",
       "properties": {
@@ -249,61 +375,108 @@
           "type": "string"
         }
       ]
+    },
+    "Signal": {
+      "enum": [
+        "SIGTERM",
+        "SIGINT"
+      ],
+      "type": "string"
+    },
+    "SyncState": {
+      "enum": [
+        "stopped",
+        "connecting",
+        "bootstrapping",
+        "catching_up",
+        "up_to_date",
+        "offline",
+        "halted"
+      ],
+      "type": "string"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "properties": {
-    "command": {
-      "const": "_daemon"
-    },
-    "data": {
-      "anyOf": [
-        {
-          "type": "null"
-        },
-        {
-          "$ref": "#/$defs/HelpData"
+  "anyOf": [
+    {
+      "else": {
+        "properties": {
+          "error": {
+            "type": "null"
+          }
         }
-      ]
-    },
-    "decisions": {
-      "items": {
-        "$ref": "#/$defs/Decision"
       },
-      "type": "array"
-    },
-    "error": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/ErrorBody"
-        },
-        {
-          "type": "null"
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "error"
+          }
         }
-      ]
-    },
-    "next_commands": {
-      "items": {
-        "$ref": "#/$defs/Next"
       },
-      "type": "array"
+      "properties": {
+        "command": {
+          "const": "_daemon"
+        },
+        "data": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/HelpData"
+            }
+          ]
+        },
+        "decisions": {
+          "items": {
+            "$ref": "#/$defs/Decision"
+          },
+          "type": "array"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorBody"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "next_commands": {
+          "items": {
+            "$ref": "#/$defs/Next"
+          },
+          "type": "array"
+        },
+        "outcome": {
+          "$ref": "#/$defs/Outcome"
+        },
+        "schema_version": {
+          "const": 1
+        }
+      },
+      "required": [
+        "schema_version",
+        "command",
+        "outcome",
+        "data",
+        "error",
+        "decisions",
+        "next_commands"
+      ],
+      "then": {
+        "properties": {
+          "error": {
+            "type": "object"
+          }
+        }
+      },
+      "type": "object"
     },
-    "outcome": {
-      "$ref": "#/$defs/Outcome"
-    },
-    "schema_version": {
-      "const": 1
+    {
+      "$ref": "#/$defs/DaemonLine"
     }
-  },
-  "required": [
-    "schema_version",
-    "command",
-    "outcome",
-    "data",
-    "error",
-    "decisions",
-    "next_commands"
   ],
-  "title": "koi _daemon --json",
-  "type": "object"
+  "title": "koi _daemon --json"
 }
