@@ -5503,6 +5503,105 @@ fn the_status_names_a_node_of_a_refused_commit_and_the_refusal() {
     );
 }
 
+#[test]
+fn a_refused_commit_counts_its_code_and_each_node_it_leaves_out() {
+    use crate::failures::{self, Failure, Refusal};
+
+    let refused = Failure::Refused(Refusal::LimitExceeded);
+    let problem = Failure::ProblemNode(Refusal::LimitExceeded);
+    let before = (failures::count(refused), failures::count(problem));
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::write(site.root.join("notes.txt"), b"written on a").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    let Some(upload @ Work::Upload(_)) = a.work.pop_front() else {
+        panic!("the new file is uploaded");
+    };
+    a.perform(upload, &mut remote).unwrap();
+    let Some(Work::Send(_)) = a.work.pop_front() else {
+        panic!("the commit is sent");
+    };
+    let refusal = koidrive_proto::v1::Error {
+        code: Code::LimitExceeded as i32,
+        message: "the commit of /home/alice/notes.txt is too large".into(),
+        ..Default::default()
+    };
+    let step = a.folder.sent(Err(CallError::Server(ServerError(refusal))));
+    a.take(step).unwrap();
+    assert_eq!(a.folder.engine.commits.problems().len(), 1);
+    assert!(failures::count(refused) > before.0);
+    assert!(failures::count(problem) > before.1);
+}
+
+#[test]
+fn an_upload_that_fails_counts_how_it_failed() {
+    use crate::failures::{self, Failure, Transfer as Failed};
+
+    let unavailable = Failure::Upload(Failed::Unavailable);
+    let before = failures::count(unavailable);
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::write(site.root.join("notes.txt"), b"written on a").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    let Some(Work::Upload(upload)) = a.work.pop_front() else {
+        panic!("the new file is uploaded");
+    };
+    let error = ChunkError::Unavailable {
+        hash: upload.chunks[0].hash.clone(),
+        message: "connection reset".into(),
+    };
+    let step = a.folder.uploaded(Err(error));
+    a.take(step).unwrap();
+    assert!(failures::count(unavailable) > before);
+}
+
+#[test]
+fn a_download_the_server_refuses_counts_how_it_failed_and_the_code() {
+    use crate::failures::{self, Failure, Refusal, Transfer as Failed};
+
+    let counted = [
+        Failure::Download(Failed::Refused),
+        Failure::Refused(Refusal::QuotaExceeded),
+    ];
+    let before = counted.map(failures::count);
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("notes.txt"), b"written on a");
+    let site = Site::new(&remote, "b");
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    *remote.chunks.refusal.lock().unwrap() = Some(ServerError(koidrive_proto::v1::Error {
+        code: koidrive_proto::v1::error::Code::QuotaExceeded as i32,
+        message: "the daily limit is used up".into(),
+        retry_after_ms: 3_600_000,
+        ..Default::default()
+    }));
+    let pending = loop {
+        match b.work.pop_front().expect("an effect is staged") {
+            Work::Stage(pending) => break pending,
+            other => b.perform(other, &mut remote).unwrap(),
+        }
+    };
+    let staged = ready(pending.stage(&remote.chunks));
+    let step = b.folder.staged(pending, staged);
+    b.take(step).unwrap();
+    let after = counted.map(failures::count);
+    assert!(after[0] > before[0] && after[1] > before[1], "{after:?}");
+}
+
+#[test]
+fn a_conflict_copy_is_counted_as_a_question_asked() {
+    use crate::failures::{self, Asked, Failure};
+
+    let asked = Failure::Asked(Asked::Conflict);
+    let before = failures::count(asked);
+    let mut remote = Remote::new();
+    let (_, (_, mut b)) = edited_on_both(&mut remote);
+    assert!(b.folder.take_questions_changed());
+    assert!(failures::count(asked) > before);
+}
+
 /// GUN-388, for an effect that failed: the node is named with why the effect failed.
 #[test]
 fn the_status_names_a_node_whose_effect_failed_and_why() {

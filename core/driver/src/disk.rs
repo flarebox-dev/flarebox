@@ -59,6 +59,7 @@ use koidrive_store::{Link, Store, Tx};
 use prost::Message;
 
 use crate::engine::{Engine, file_id, file_identity};
+use crate::failures::{self, Failure};
 use crate::observe::{FsObserver, Observation, Observed, Observer, Reset, open_under};
 use crate::policy::{self, Disposition};
 use crate::status::WaitKind;
@@ -828,6 +829,10 @@ impl Pending {
     /// What a failed transfer means for the effect: a chunk the server no longer has, or whose bytes never matched,
     /// fails it; a refusal the server asks to retry stalls it; anything else halts the task with the effect in flight.
     fn failed_transfer(&self, error: ChunkError, corrupt: bool) -> Result<Staged, Stall> {
+        match corrupt {
+            true => failures::failed(Failure::Download(failures::Transfer::Corrupt)),
+            false => failures::transfer_failed(&error, Failure::Download),
+        }
         let disposition = match &error {
             _ if corrupt => None,
             ChunkError::Corrupt { .. } | ChunkError::NoTarget { .. } => None,

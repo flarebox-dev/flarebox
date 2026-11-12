@@ -34,7 +34,7 @@ use serde_json::Value;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
 
-use koidrive_telemetry::schema::SetupStep;
+use koidrive_telemetry::schema::{DaemonStart, Failure, SetupStep};
 
 use crate::error::{CliError, Code};
 use crate::ipc::{Request, Response};
@@ -700,17 +700,29 @@ async fn daemon(paths: Paths, json: bool) -> Result<Done, CliError> {
             println!("{}", event.line());
         }
     };
+    let failed = |why| telemetry::failed(Failure::DaemonStart(why));
     let driver = Driver::open(paths).map_err(|error| match error {
         DriverError::Busy(_) => {
+            failed(DaemonStart::Busy);
             CliError::from("another Koidrive daemon or command is using this profile")
         }
-        other => CliError::from(other),
+        other => {
+            failed(DaemonStart::Profile);
+            CliError::from(other)
+        }
     })?;
     let socket = driver.paths().socket();
-    let listener = ipc::bind(&socket)
-        .map_err(|error| format!("cannot listen on {}: {error}", socket.display()))?;
-    let mut terminate = signal(SignalKind::terminate()).map_err(|error| error.to_string())?;
-    let mut interrupt = signal(SignalKind::interrupt()).map_err(|error| error.to_string())?;
+    let listener = ipc::bind(&socket).map_err(|error| {
+        failed(DaemonStart::Socket);
+        format!("cannot listen on {}: {error}", socket.display())
+    })?;
+    let signals = signal(SignalKind::terminate()).and_then(|terminate| {
+        signal(SignalKind::interrupt()).map(|interrupt| (terminate, interrupt))
+    });
+    let (mut terminate, mut interrupt) = signals.map_err(|error| {
+        failed(DaemonStart::Signals);
+        error.to_string()
+    })?;
     let notifications = notify::decisions(driver.clone());
     driver.start();
     let server = tokio::spawn(ipc::serve(listener, driver.clone()));

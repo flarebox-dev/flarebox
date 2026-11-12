@@ -248,19 +248,219 @@ pub enum Counter {
     Command(Command),
     /// What the daemon synced, over all its linked folders.
     Sync(Synced),
+    /// Something failed, by its kind. Never its message.
+    Failure(Failure),
 }
 
 impl Counter {
     /// Every counter, for checking the keys of a stored report.
     pub fn all() -> impl Iterator<Item = Counter> {
-        (Command::ALL.into_iter().map(Counter::Command)).chain(Synced::ALL.map(Counter::Sync))
+        (Command::ALL.into_iter().map(Counter::Command))
+            .chain(Synced::ALL.map(Counter::Sync))
+            .chain(Failure::all().map(Counter::Failure))
     }
 
     pub(crate) fn key(self) -> (&'static str, &'static str) {
         match self {
             Counter::Command(command) => ("command", command.name()),
             Counter::Sync(synced) => ("sync", synced.name()),
+            Counter::Failure(failure) => failure.key(),
         }
+    }
+}
+
+/// A kind of failure, counted each time it happens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Failure {
+    /// A folder went from syncing to halted.
+    Halted(Halted),
+    /// An upload of a commit's chunks failed.
+    Upload(Transfer),
+    /// A download of a file's chunks failed.
+    Download(Transfer),
+    /// The server refused a call.
+    Refused(Refusal),
+    /// The server refused an op of a commit, and the folder shows its node as a problem.
+    ProblemNode(Refusal),
+    /// A question for the person was asked, also when one is asked again.
+    Asked(Asked),
+    /// The daemon could not start.
+    DaemonStart(DaemonStart),
+}
+
+impl Failure {
+    pub fn all() -> impl Iterator<Item = Failure> {
+        (Halted::ALL.iter().copied().map(Failure::Halted))
+            .chain(Transfer::ALL.iter().copied().map(Failure::Upload))
+            .chain(Transfer::ALL.iter().copied().map(Failure::Download))
+            .chain(Refusal::ALL.iter().copied().map(Failure::Refused))
+            .chain(Refusal::ALL.iter().copied().map(Failure::ProblemNode))
+            .chain(Asked::ALL.iter().copied().map(Failure::Asked))
+            .chain(DaemonStart::ALL.iter().copied().map(Failure::DaemonStart))
+    }
+
+    fn key(self) -> (&'static str, &'static str) {
+        match self {
+            Failure::Halted(why) => ("halted", why.name()),
+            Failure::Upload(why) => ("upload_failed", why.name()),
+            Failure::Download(why) => ("download_failed", why.name()),
+            Failure::Refused(code) => ("refused", code.name()),
+            Failure::ProblemNode(code) => ("problem_node", code.name()),
+            Failure::Asked(kind) => ("asked", kind.name()),
+            Failure::DaemonStart(why) => ("daemon_start_failed", why.name()),
+        }
+    }
+}
+
+macro_rules! labels {
+    ($(#[$meta:meta])* pub enum $name:ident { $($(#[$doc:meta])* $variant:ident => $label:literal,)* }) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+        pub enum $name {
+            $($(#[$doc])* $variant,)*
+        }
+
+        impl $name {
+            pub const ALL: &[$name] = &[$($name::$variant,)*];
+
+            pub fn name(self) -> &'static str {
+                match self {
+                    $($name::$variant => $label,)*
+                }
+            }
+        }
+    };
+}
+
+labels! {
+    /// Why a folder halted.
+    pub enum Halted {
+        /// The path no longer leads to the folder the task locked.
+        Withdrawn => "withdrawn",
+        /// The folder fails its root check: it is missing, unmounted or marked for another space.
+        Root => "root",
+        /// Another folder took the place of the one the task locked.
+        Replaced => "replaced",
+        /// An observation came from another folder than the one the task locked.
+        OtherRoot => "other_root",
+        /// The folder is inside another linked folder or a private directory.
+        Placement => "placement",
+        /// Another process syncs the folder, or another device linked it.
+        Claim => "claim",
+        /// The folder's file system cannot rename without replacing.
+        NoReplace => "no_replace",
+        /// The folder's sync state is older than the folder.
+        StoreBehind => "store_behind",
+        /// The folder was restored from an older state.
+        DiskBehind => "disk_behind",
+        /// An effect on the folder cannot be carried out.
+        Record => "record",
+        /// The folder's sync state cannot be read or written.
+        Store => "store",
+        /// Reading or writing the folder failed.
+        Io => "io",
+        /// The session cannot start, for example for a bad server URL or TLS.
+        SessionStart => "session_start",
+        /// The session ended on its own.
+        SessionClosed => "session_closed",
+        /// The server refused this device's credentials.
+        CredentialsRefused => "credentials_refused",
+        /// The server revoked this device.
+        DeviceRevoked => "device_revoked",
+        /// The server does not support this client's protocol versions.
+        UnsupportedVersion => "unsupported_version",
+        /// This device is not a member of the space.
+        NotAMember => "not_a_member",
+        /// The server does not know the space.
+        SpaceNotFound => "space_not_found",
+        /// The server refused the connection for good.
+        ConnectionRefused => "connection_refused",
+        /// The store and the server disagree in a way only recovery resolves.
+        Recovery => "recovery",
+        /// The server refused a call for good.
+        Refused => "refused",
+        /// The server sent something this build cannot apply.
+        Protocol => "protocol",
+        /// This device is signed out.
+        SignedOut => "signed_out",
+        /// The folder's task cannot start, for example because another device linked it.
+        Start => "start",
+        /// Unlinking the folder failed.
+        Unlink => "unlink",
+    }
+}
+
+labels! {
+    /// How a transfer of chunks failed.
+    pub enum Transfer {
+        /// A call to the server failed.
+        Call => "call",
+        /// The file changed after it was chunked.
+        SourceChanged => "source_changed",
+        /// The bytes received never matched the chunk.
+        Corrupt => "corrupt",
+        /// The storage refused the transfer.
+        Refused => "refused",
+        /// The transfer kept failing, for example on the network.
+        Unavailable => "unavailable",
+        /// The server gave no usable target.
+        NoTarget => "no_target",
+        /// Reading or writing the chunk on this device failed.
+        Io => "io",
+    }
+}
+
+labels! {
+    /// The code of a server refusal.
+    pub enum Refusal {
+        Unauthenticated => "unauthenticated",
+        Forbidden => "forbidden",
+        InvalidArgument => "invalid_argument",
+        MissingChunks => "missing_chunks",
+        LimitExceeded => "limit_exceeded",
+        QuotaExceeded => "quota_exceeded",
+        ReadOnly => "read_only",
+        RetryLater => "retry_later",
+        UnsupportedVersion => "unsupported_version",
+        Internal => "internal",
+        HistoryMismatch => "history_mismatch",
+        StaleDeviceState => "stale_device_state",
+        HeadMoved => "head_moved",
+        AheadOfServer => "ahead_of_server",
+        NotFound => "not_found",
+        ConfirmationRequired => "confirmation_required",
+        /// A code this build does not know, or none.
+        Unknown => "unknown",
+    }
+}
+
+labels! {
+    /// The kind of a question for the person.
+    pub enum Asked {
+        /// Deletions on this device crossed a limit of the mass-delete guard.
+        MassDelete => "mass_delete",
+        /// Deletions from other devices crossed a limit of the mass-delete guard.
+        RemoteMassDelete => "remote_mass_delete",
+        /// Files disappeared while changes were not tracked.
+        AmbiguousDisappearance => "ambiguous_disappearance",
+        /// A recovery holds a group of files.
+        Recovery => "recovery",
+        /// A write of this device became a conflict copy or took a conflict name.
+        Conflict => "conflict",
+    }
+}
+
+labels! {
+    /// Why the daemon could not start.
+    pub enum DaemonStart {
+        /// Another daemon or command uses the profile.
+        Busy => "busy",
+        /// The profile cannot be opened.
+        Profile => "profile",
+        /// The daemon cannot listen on its socket.
+        Socket => "socket",
+        /// The daemon cannot watch for signals.
+        Signals => "signals",
     }
 }
 
@@ -673,6 +873,31 @@ mod tests {
                 "day": 100,
                 "counters": { "sync": { "bytes_uploaded": 4096 } },
                 "levels": { "sync": { "nodes": 1500, "spaces": 2 } },
+            })
+        );
+    }
+
+    #[test]
+    fn a_stored_report_keeps_only_known_failure_counters() {
+        let stored = serde_json::json!({
+            "day": 100,
+            "counters": {
+                "halted": { "store_behind": 1, "the server refused it: Alice Notes": 1 },
+                "refused": { "quota_exceeded": 2, "418": 1 },
+                "asked": { "conflict": 3 },
+                "/home/alice": { "conflict": 1 },
+            },
+        });
+        let report: DailyReport = serde_json::from_value(stored).unwrap();
+        assert_eq!(
+            serde_json::to_value(&report).unwrap(),
+            serde_json::json!({
+                "day": 100,
+                "counters": {
+                    "asked": { "conflict": 3 },
+                    "halted": { "store_behind": 1 },
+                    "refused": { "quota_exceeded": 2 },
+                },
             })
         );
     }

@@ -1121,6 +1121,7 @@ dependencies = [
  "koidrive-proto",
  "koidrive-sim",
  "koidrive-store",
+ "koidrive-telemetry",
  "proptest",
  "prost",
  "reqwest",

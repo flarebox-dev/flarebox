@@ -25,6 +25,7 @@ use crate::credential::{
     Credential, CredentialError, CredentialFiles, NewCredentialFile, StoredCredential, api_for,
     next_path,
 };
+use crate::failures::{self, Failure, Halted};
 use crate::folder::FolderTask;
 use crate::ignore::{Matcher, local_rules, matcher};
 use crate::paths::{Paths, PathsError};
@@ -750,7 +751,11 @@ impl Driver {
                 if let Some(folder) = folders.get_mut(&link.space_id) {
                     folder.run = None;
                     folder.unlink = None;
-                    halt(folder, format!("the folder could not be unlinked: {error}"));
+                    halt(
+                        folder,
+                        Halted::Unlink,
+                        format!("the folder could not be unlinked: {error}"),
+                    );
                 }
             }
         }
@@ -984,6 +989,7 @@ impl Driver {
             Some(credential) => self.spawn(folder, credential, linked),
             None => halt(
                 folder,
+                Halted::SignedOut,
                 "this device is signed out, for example after restoring a backup, which leaves out its sign-in; set it up again to sync this folder, and its files stay where they are".into(),
             ),
         }
@@ -1017,7 +1023,7 @@ impl Driver {
     fn spawn(&self, folder: &mut Folder, credential: &Credential, linked: Vec<PathBuf>) {
         let task = match self.task(folder, credential, linked) {
             Ok(task) => task,
-            Err(problem) => return halt(folder, problem),
+            Err(problem) => return halt(folder, Halted::Start, problem),
         };
         let requests = task.requests.clone();
         let (stop, stopped) = watch::channel(false);
@@ -1191,13 +1197,16 @@ fn find<'a>(
         .ok_or_else(|| DriverError::NotLinked(folder.to_path_buf()))
 }
 
-fn halt(folder: &mut Folder, problem: String) {
+fn halt(folder: &mut Folder, why: Halted, problem: String) {
     tracing::warn!(
         space_id = folder.link.space_id,
         problem,
         "a folder cannot sync"
     );
     let mut status = folder.status.lock().unwrap();
+    if status.state != FolderState::Halted {
+        failures::failed(Failure::Halted(why));
+    }
     status.state = FolderState::Halted;
     status.problem = Some(problem);
 }
@@ -1581,6 +1590,19 @@ mod tests {
         );
         driver.stop().await;
         assert_eq!(driver.status().folders[0].state, FolderState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn a_folder_whose_task_cannot_start_is_counted_as_halted() {
+        let halted = Failure::Halted(Halted::Start);
+        let before = failures::count(halted);
+        let (_dir, paths, _root) = profile(&[]);
+        credential("d2").save_new(&paths.credential()).unwrap();
+        let driver = Driver::open(paths).unwrap();
+        driver.start();
+        assert_eq!(driver.status().folders[0].state, FolderState::Halted);
+        assert!(failures::count(halted) > before);
+        driver.stop().await;
     }
 
     #[tokio::test]

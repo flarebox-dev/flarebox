@@ -47,6 +47,7 @@ use crate::credential::SET_UP_AGAIN;
 use crate::disk::{Batch, Disk, Pending, Sections, Settled, Staged, Stall, Stop, Upload};
 use crate::driver::check_placement;
 use crate::engine::{Applied, Engine, Staging};
+use crate::failures::{self, Halted};
 use crate::ignore::Matcher;
 use crate::observe::{FsObserver, Observer};
 use crate::policy::{self, Disposition};
@@ -124,6 +125,7 @@ pub(crate) struct Folder {
     stuck_effects: BTreeSet<String>,
     /// Why the server did not take a change of each node, for the nodes it may have left out of commits.
     refused_nodes: BTreeMap<String, String>,
+    asked: BTreeSet<String>,
     /// When the [`Work::RetryAfter`] that is out ends.
     retry_at: Option<Instant>,
     /// Tests stop the task after this many more store transactions, as a crash right after one would.
@@ -281,6 +283,9 @@ impl Folder {
             Some(flight) if flight.result.is_none() => Flight::Unknown,
             _ => Flight::Idle,
         };
+        let asked = (engine.commits.questions().iter())
+            .map(|question| question.id.clone())
+            .collect();
         Ok(Folder {
             link,
             engine,
@@ -302,6 +307,7 @@ impl Folder {
             effect_failures: BTreeMap::new(),
             stuck_effects: BTreeSet::new(),
             refused_nodes: BTreeMap::new(),
+            asked,
             retry_at: None,
             #[cfg(test)]
             crash_after: None,
@@ -615,6 +621,7 @@ impl Folder {
             }
             Err(error) => error,
         };
+        failures::transfer_failed(&error, failures::Failure::Upload);
         let disposition = match &error {
             ChunkError::SourceChanged { .. } | ChunkError::Io { .. } => {
                 tracing::info!(
@@ -762,7 +769,20 @@ impl Folder {
 
     /// Whether a question changed since the last call, also when the number of questions did not.
     pub fn take_questions_changed(&mut self) -> bool {
-        std::mem::take(&mut self.engine.asked)
+        if !std::mem::take(&mut self.engine.asked) {
+            return false;
+        }
+        let questions = self.engine.commits.questions();
+        for question in questions
+            .iter()
+            .filter(|question| !self.asked.contains(&question.id))
+        {
+            failures::failed(failures::Failure::Asked(failures::asked(&question.kind)));
+        }
+        self.asked = (questions.iter())
+            .map(|question| question.id.clone())
+            .collect();
+        true
     }
 
     /// The folder's status as the task knows it.
@@ -1218,7 +1238,10 @@ impl Folder {
             ?failure,
             "a commit was refused"
         );
+        let code = failures::refusal(refusal);
+        failures::failed(failures::Failure::Refused(code));
         for id in self.engine.commits.problems().difference(&before) {
+            failures::failed(failures::Failure::ProblemNode(code));
             let why = format!("the server refused it: {described}");
             self.refused_nodes.insert(id.clone(), why);
         }
@@ -1417,21 +1440,24 @@ pub(crate) struct ObserveFault {
 enum Halt {
     /// The folder at the path is not the one the task locked, or it fails its root check. The task syncs again on
     /// its own once the root passes the check, and only when the path leads to the folder it locked before.
-    #[error("{0}")]
-    Root(String),
+    #[error("{1}")]
+    Root(Halted, String),
     /// Only a person can fix it. The task waits for a restart.
-    #[error("{0}")]
-    Person(String),
+    #[error("{1}")]
+    Person(Halted, String),
 }
 
 impl From<Stop> for Halt {
     fn from(stop: Stop) -> Self {
+        let why = failures::halted(&stop);
         match stop {
-            Stop::Withdrawn(_) | Stop::Root(_) | Stop::OtherRoot => Halt::Root(stop.to_string()),
-            Stop::Session(StopReason::CredentialsRefused | StopReason::DeviceRevoked) => {
-                Halt::Person(format!("{stop}; {SET_UP_AGAIN}"))
+            Stop::Withdrawn(_) | Stop::Root(_) | Stop::OtherRoot => {
+                Halt::Root(why, stop.to_string())
             }
-            stop => Halt::Person(stop.to_string()),
+            Stop::Session(StopReason::CredentialsRefused | StopReason::DeviceRevoked) => {
+                Halt::Person(why, format!("{stop}; {SET_UP_AGAIN}"))
+            }
+            stop => Halt::Person(why, stop.to_string()),
         }
     }
 }
@@ -1560,16 +1586,13 @@ impl FolderTask {
                 return;
             };
             tracing::warn!(space_id, reason = %halted, "sync of a folder halted");
-            let problem = match &halted {
-                Halt::Root(problem) => format!("{problem}; checking the folder again"),
-                Halt::Person(problem) => problem.clone(),
+            let (why, problem) = match &halted {
+                Halt::Root(why, problem) => (*why, format!("{problem}; checking the folder again")),
+                Halt::Person(why, problem) => (*why, problem.clone()),
             };
-            self.update(|status| {
-                status.state = FolderState::Halted;
-                status.problem = Some(problem);
-            });
+            self.halt(why, problem);
             self.join_observer().await;
-            if let Halt::Person(_) = halted {
+            if let Halt::Person(..) = halted {
                 let _ = stop.wait_for(|stop| *stop).await;
                 return;
             }
@@ -1597,11 +1620,11 @@ impl FolderTask {
     async fn sync(&self, locked: &mut Option<Identity>) -> Halt {
         self.wait_for_root().await;
         if let Err(error) = check_placement(&self.link.root, &self.private_dirs, &self.linked) {
-            return Halt::Person(error.to_string());
+            return Halt::Person(Halted::Placement, error.to_string());
         }
         let lock = match self.claim(locked) {
             Ok(lock) => Arc::new(lock),
-            Err(problem) => return Halt::Person(problem),
+            Err(problem) => return Halt::Person(Halted::Claim, problem),
         };
         let local = self.local.clone();
         let mut folder = match Folder::open(self.link.clone(), &lock, &self.store, local) {
@@ -1619,7 +1642,9 @@ impl FolderTask {
         config.retry_later_attempts = 0;
         let (session, mut events) = match Session::start(self.auth.clone(), config) {
             Ok(started) => started,
-            Err(reason) => return Halt::Person(reason.to_string()),
+            Err(reason) => {
+                return Halt::Person(failures::session_ended(&reason), reason.to_string());
+            }
         };
         let transfer = self.transfer();
         self.publish(&mut folder);
@@ -1645,13 +1670,13 @@ impl FolderTask {
                         // first scan is scanned or fails there before the recheck below sees it.
                         FromDisk::Batch(batch, entries) => match folder.observed(batch, entries) {
                             Err(Stop::OtherRoot) if !claim::still_locked(&lock, &self.link.root) => {
-                                break Halt::Root(REPLACED.to_owned());
+                                break Halt::Root(Halted::Replaced, REPLACED.to_owned());
                             }
                             step => step,
                         },
                         FromDisk::Scanned => folder.scanned(),
                         FromDisk::Failed(_) if !claim::still_locked(&lock, &self.link.root) => {
-                            break Halt::Root(REPLACED.to_owned());
+                            break Halt::Root(Halted::Replaced, REPLACED.to_owned());
                         }
                         FromDisk::Failed(why) => Err(Stop::Io(io::Error::other(why))),
                     },
@@ -1670,7 +1695,7 @@ impl FolderTask {
                     }
                     _ = recheck.tick() => {
                         if !claim::still_locked(&lock, &self.link.root) {
-                            break Halt::Root(REPLACED.to_owned());
+                            break Halt::Root(Halted::Replaced, REPLACED.to_owned());
                         }
                         Ok(Vec::new())
                     }
@@ -1743,10 +1768,10 @@ impl FolderTask {
                 }
                 Err(problem) => {
                     tracing::warn!(space_id = self.link.space_id, %problem, "the folder fails its root check");
-                    self.update(|status| {
-                        status.state = FolderState::Halted;
-                        status.problem = Some(format!("{problem}; checking again in 30 seconds"));
-                    });
+                    self.halt(
+                        Halted::Root,
+                        format!("{problem}; checking again in 30 seconds"),
+                    );
                     tokio::time::sleep(ROOT_RECHECK).await;
                 }
             }
@@ -1903,6 +1928,16 @@ impl FolderTask {
         self.changed.send_replace(());
     }
 
+    fn halt(&self, why: Halted, problem: String) {
+        self.update(|status| {
+            if status.state != FolderState::Halted {
+                failures::failed(failures::Failure::Halted(why));
+            }
+            status.state = FolderState::Halted;
+            status.problem = Some(problem);
+        });
+    }
+
     fn update(&self, change: impl FnOnce(&mut FolderStatus)) {
         change(&mut self.status.lock().unwrap());
         self.changed.send_replace(());
@@ -1958,6 +1993,7 @@ fn later(
     mut listing: Listing,
     error: &CallError,
 ) -> Result<Listed, Stop> {
+    failures::call_failed(error);
     let why = match error {
         CallError::Server(refusal) => policy::describe(refusal),
         other => other.to_string(),

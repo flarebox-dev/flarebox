@@ -18,6 +18,7 @@ koidrive-ignore = { path = "../ignore" }
 koidrive-net = { path = "../net" }
 koidrive-proto = { path = "../proto" }
 koidrive-store = { path = "../store" }
+koidrive-telemetry = { path = "../telemetry" }
 prost.workspace = true
 rustix = { version = "1.1.6", features = ["fs", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
