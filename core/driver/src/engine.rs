@@ -43,6 +43,7 @@ pub(crate) struct Engine {
     /// Whether [`Engine::ask`] changed the stored questions since the folder last showed them, also when their
     /// number did not, as when a question is asked again under a new id or a notice's counts grow.
     pub asked: bool,
+    unscanned: Option<BTreeSet<NodeId>>,
 }
 
 /// What applying a batch of the log did.
@@ -108,6 +109,7 @@ impl Engine {
             cursor: tx.cursor()?,
             stored,
             asked: false,
+            unscanned: None,
         })
     }
 
@@ -557,6 +559,12 @@ impl Engine {
     /// ([`Engine::read`]). The rules of a folder whose path L cannot hold are left out, since no node is below it.
     /// When `all` is set the batch lists every rules file its scans read, and the trees forget the rules they had.
     pub fn rules(&mut self, rules: Vec<RulesChange>, all: bool) {
+        self.unscanned = (all || !rules.is_empty()).then(|| {
+            (self.trees.local().iter())
+                .filter(|(id, node)| node.shape.kind == Kind::Dir && !self.scanned(id))
+                .map(|(id, _)| id.clone())
+                .collect()
+        });
         if all {
             self.trees.clear_rules();
         }
@@ -606,7 +614,7 @@ impl Engine {
     /// while another entry takes its name, with what is under it, until its own rename places it. A renamed or
     /// modified entry is the node L holds at its path with its identity, else the node with its identity, else the
     /// node at its path. A created entry with the identity of a node L holds is that node, wherever L had it, except a
-    /// folder L holds on disk, not recorded, at a path no change of the batch leaves and the rules include: the scan kept the folder there
+    /// folder L holds on disk, not recorded, at a path no change of the batch leaves: the scan kept the folder there
     /// with a new identity, as when an entry moved back into a new folder made at its path, so the created folder is a
     /// new one. So is a created entry with the path and identity a node had before an earlier change of the batch took
     /// it out of L, unless the batch placed that node again. That keeps a child's node when its folder is replaced
@@ -628,6 +636,7 @@ impl Engine {
     /// when its folder is in L or arrives in the batch, and keeps its entry otherwise ([`Trees::ignore_local`]); an
     /// entry L never held stays out.
     pub fn observe(&mut self, changes: &[Observed], now_ms: u64) -> BTreeSet<NodeId> {
+        let unscanned = self.unscanned.take();
         let mut before: Vec<Option<NodeId>> = changes
             .iter()
             .map(|change| match change {
@@ -657,11 +666,11 @@ impl Engine {
             })
             .filter(|node| {
                 !self.trees.recorded_local(node)
-                    && (self.path_of(node)).is_some_and(|at| {
-                        !left.iter().any(|path| at.starts_with(path))
-                            && names(&at)
-                                .is_some_and(|names| !self.trees.ignores(&names, Kind::Dir))
-                    })
+                    && (self.path_of(node))
+                        .is_some_and(|at| !left.iter().any(|path| at.starts_with(path)))
+                    && unscanned
+                        .as_ref()
+                        .map_or_else(|| self.scanned(node), |set| !set.contains(*node))
             })
             .cloned()
             .collect();
@@ -874,6 +883,12 @@ impl Engine {
             }
         }
         touched
+    }
+
+    fn scanned(&self, id: &str) -> bool {
+        (self.path_of(id).as_deref())
+            .and_then(names)
+            .is_some_and(|names| !self.trees.ignores(&names, Kind::Dir))
     }
 
     /// L's view of each of `scopes`, relative paths, for the observer: the kind and identity of the placed node at
@@ -1750,6 +1765,7 @@ mod tests {
             cursor: None,
             stored: EngineState::default(),
             asked: false,
+            unscanned: None,
         };
         Case {
             name,
