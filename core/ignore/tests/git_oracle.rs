@@ -1,17 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Differential tests against `git check-ignore`: random trees with random rules files must get
-//! the same verdict from this crate and from git, down to the file and line that excludes each
-//! path. Each tree is written to disk as a git work tree with `.gitignore` files, and the same
-//! bytes are given to the matcher as `.koiignore` files.
-//!
-//! The generators leave out the intentional differences listed in the crate documentation: the
-//! rules files themselves are not compared, names and patterns are ASCII, and under case folding
-//! patterns hold no uppercase bracket members or escaped uppercase letters. Two more runs use
-//! non-ASCII letters and combining marks: random cases, and the boundary matrix from the review of
-//! koidrive#50. This crate gets them spelled NFD or NFC; git gets the NFC text with each non-ASCII
-//! code point replaced by a one-byte stand-in, so git decides every case code point by code point.
-
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
@@ -38,18 +26,14 @@ impl NameKey for Folded {
     }
 }
 
-/// A tree of entries and the rules files in some of its directories.
 #[derive(Clone, Debug)]
 struct Case {
     entries: BTreeMap<Vec<String>, Kind>,
     files: BTreeMap<Vec<String>, String>,
 }
 
-/// What excluded a path: the depth of the rules file's directory and the line, or `None` when
-/// the path is included.
 type Verdict = Option<(usize, u32)>;
 
-/// This crate's verdicts, with every name and rules file respelled by `spell` first.
 fn ours<K: NameKey>(case: &Case, spell: fn(&str) -> String) -> Vec<Verdict> {
     let respell = |path: &[String]| -> Vec<String> { path.iter().map(|n| spell(n)).collect() };
     let mut matcher = Matcher::<K>::new(LocalRules::default());
@@ -67,7 +51,6 @@ fn ours<K: NameKey>(case: &Case, spell: fn(&str) -> String) -> Vec<Verdict> {
         .collect()
 }
 
-/// Git's verdicts, with every name and rules file respelled by `spell` first.
 fn git(case: &Case, ignorecase: bool, spell: fn(&str) -> String) -> Vec<Verdict> {
     let work = tempfile::tempdir().expect("temporary directory");
     let root = work.path();
@@ -182,8 +165,6 @@ fn nfd(text: &str) -> String {
     text.nfd().collect()
 }
 
-/// The non-ASCII code points the Unicode generators can produce after NFC, each with an ASCII
-/// stand-in that nothing else uses.
 const STAND_INS: [(char, char); 10] = [
     ('\u{e9}', '0'),
     ('\u{c9}', '1'),
@@ -215,8 +196,6 @@ fn code_points(text: &str) -> String {
         .collect()
 }
 
-/// Compares this crate on the case respelled by `ours` with git on the case respelled by
-/// `theirs`.
 fn compare<K: NameKey>(
     case: &Case,
     ignorecase: bool,
@@ -238,7 +217,6 @@ fn compare<K: NameKey>(
     Ok(())
 }
 
-/// Git's `trim_trailing_spaces`, to see a line as git compiles it.
 fn trimmed(line: &str) -> &str {
     let bytes = line.as_bytes();
     let mut last_space = None;
@@ -291,8 +269,7 @@ fn name() -> impl Strategy<Value = String> {
     "[abAB.*?\\[\\]\\\\!# -]{1,3}".prop_filter("not . or ..", |n| n != "." && n != "..")
 }
 
-/// Bracket expressions. Under folding, members are lowercase: git leaves them unfolded. Nor does a class leave its
-/// bracket or an escape open under folding, because the next piece would then put an uppercase letter in it.
+/// Bracket expressions. Under folding, members are lowercase: git leaves them unfolded.
 fn class(fold: bool) -> BoxedStrategy<String> {
     let mut classes = vec![
         "[ab]",
@@ -382,9 +359,7 @@ fn line(fold: bool) -> impl Strategy<Value = String> {
 }
 
 /// Whether git with `core.ignorecase` folds every uppercase letter of `line` as this crate does. Git leaves an escaped
-/// letter and a single member of a bracket expression as written, and folds a range end. This reads brackets as git's
-/// `wildmatch` does. It also refuses an escaped letter at a range end, and an uppercase member of a bracket that never
-/// closes, although such a bracket matches nothing in either.
+/// letter and a single member of a bracket expression as written, and folds a range end.
 fn git_folds_every_letter(line: &str) -> bool {
     let line: Vec<char> = line.chars().collect();
     let upper = |at: usize| line.get(at).is_some_and(char::is_ascii_uppercase);
@@ -434,8 +409,6 @@ fn git_folds_every_letter(line: &str) -> bool {
     true
 }
 
-/// Names and patterns with non-ASCII letters and combining marks, spelled NFD for this crate and
-/// with [`code_points`] stand-ins for git.
 fn unicode_name() -> impl Strategy<Value = String> {
     prop_oneof![
         4 => "[aAéÉüÅ.-]{1,3}".prop_filter("not . or ..", |n| n != "." && n != ".."),
@@ -554,7 +527,6 @@ proptest! {
         compare::<Folded>(&case, true, same, same)?;
     }
 
-    /// Names and rules files spelled NFD here get git's verdicts on their NFC code points.
     #[test]
     fn nfd_spellings_agree_with_git_on_nfc_code_points(case in case_with(unicode_name().boxed(), unicode_line().boxed())) {
         compare::<Exact>(&case, false, nfd, code_points)?;
@@ -564,17 +536,12 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(10_000))]
 
-    /// The ignorecase run leaves out the letters git does not fold (see the crate documentation), also where pieces
-    /// meet: `[\` followed by `B` is an escaped member.
     #[test]
     fn ignorecase_lines_hold_no_letter_git_leaves_unfolded(line in line(true)) {
         prop_assert!(git_folds_every_letter(&line), "{:?}", line);
     }
 }
 
-/// Under folding this crate folds escaped letters and bracket members, which git leaves as written, so the ignorecase
-/// run leaves such lines out. A line of that kind gets git's verdicts on its lowercase spelling instead. From a random
-/// run that missed it: `[\B[Z-a]` excludes `B` here and not in git, as `[\b[Z-a]` does in both.
 #[test]
 fn a_folded_escaped_member_agrees_with_git_on_its_lowercase_spelling() {
     let case = |text: &str| Case {
@@ -592,8 +559,6 @@ fn a_folded_escaped_member_agrees_with_git_on_its_lowercase_spelling() {
     assert_ne!(folded, git(&line, true, same), "git leaves \\B unfolded");
 }
 
-/// Hand-picked lines, one rules file each, on one fixed tree. Readable failures for the cases the
-/// random generator only reaches by chance.
 #[test]
 fn curated_lines_agree_with_git() {
     let tree = [
@@ -713,10 +678,6 @@ fn curated_lines_agree_with_git() {
     }
 }
 
-/// The review's boundary matrix: 48 patterns around combining marks against 8 names, 384 cases,
-/// spelled NFC and NFD, with and without case folding. Git decides each one on code-point
-/// stand-ins. Git on the UTF-8 text must agree too, except where its `?` or a bracket expression
-/// reads one byte of a multi-byte code point; the review's three cases are not among those.
 #[test]
 fn combining_mark_boundaries_agree_with_git() {
     let names = [

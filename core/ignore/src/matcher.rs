@@ -1,18 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Evaluating paths against the built-in exclusions, the device-local list and the tree of
-//! `.koiignore` files.
-
 use std::collections::HashMap;
 use std::fmt;
 
 use crate::pattern::{LineError, RuleFile, key};
 use crate::{NameKey, RULES_FILE};
 
-/// Platform files excluded in every directory (design §5.1). `core/fs` deletes the files with exactly these names
-/// that a folder still holds when an effect removes it (design §5.2).
 pub const PLATFORM_FILES: [&str; 4] = [".DS_Store", "Thumbs.db", "desktop.ini", "Icon\r"];
-/// The engine's state directory, excluded at the root (RFC 0001 §2).
 const STATE_DIR: &str = ".koidrive";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,13 +33,9 @@ pub enum Reason {
     Rule { depth: usize, line: u32 },
 }
 
-/// An entry whose status changed. Paths are as the caller gave them, relative to the root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Change {
-    /// This device stops syncing the path. This is never a deletion: the local copy stays as it
-    /// is, and the server and other devices keep the node.
     Excluded { path: Vec<String>, reason: Reason },
-    /// This device syncs the path again. The caller rescans it.
     Included { path: Vec<String> },
 }
 
@@ -254,7 +244,6 @@ impl<K: NameKey> Matcher<K> {
         self.root().status_below(path, kind)
     }
 
-    /// The scope of the root, for walking the tree top-down.
     pub fn root(&self) -> Scope<'_, K> {
         let include = if self.local.include.is_empty() {
             Include::All
@@ -324,8 +313,6 @@ impl<K: NameKey> Matcher<K> {
         changes(entries, before, after)
     }
 
-    /// The statuses of `entries`, all below `dir`, or `None` when `dir` is excluded and
-    /// nothing below it can change.
     fn statuses_below<S: AsRef<str>>(
         &self,
         dir: &[S],
@@ -366,21 +353,14 @@ fn changes(
 
 #[derive(Clone, Debug)]
 enum Include {
-    /// No include list, or inside an included path.
     All,
-    /// On the way to these include entries; their components so far match the path.
     Within(Vec<usize>),
 }
 
-/// An included directory, for evaluating its children. Walk the tree from [`Matcher::root`] with
-/// [`Scope::enter`], which refuses excluded directories, so nothing below them is read.
 pub struct Scope<'a, K> {
     matcher: &'a Matcher<K>,
-    /// The directory's path in key form.
     dir: Vec<String>,
-    /// The same path, components joined by `/`.
     text: Vec<char>,
-    /// The rules files of the directory and its ancestors, with their depths, root first.
     files: Vec<(usize, &'a RuleFile<K>)>,
     include: Include,
 }
@@ -394,12 +374,10 @@ impl<K> fmt::Debug for Scope<'_, K> {
 }
 
 impl<'a, K: NameKey> Scope<'a, K> {
-    /// The status of the child `name` of this directory.
     pub fn status(&self, name: &str, kind: Kind) -> Status {
         self.evaluate(&key::<K>(name), kind).0
     }
 
-    /// The scope of the child directory `name`, or why it is excluded.
     pub fn enter(&self, name: &str) -> Result<Scope<'a, K>, Reason> {
         let name = key::<K>(name);
         let (status, include) = self.evaluate(&name, Kind::Dir);
@@ -440,8 +418,6 @@ impl<'a, K: NameKey> Scope<'a, K> {
         owned.as_ref().unwrap_or(self).status(last.as_ref(), kind)
     }
 
-    /// The status of the child with key `name`, and for an included child the include state
-    /// below it.
     fn evaluate(&self, name: &str, kind: Kind) -> (Status, Option<Include>) {
         let matcher = self.matcher;
         let depth = self.dir.len();
@@ -495,8 +471,6 @@ impl<'a, K: NameKey> Scope<'a, K> {
         (Status::Included, Some(include))
     }
 
-    /// The include state of the child with key `name`, or `None` when the include list leaves
-    /// it out.
     fn include_step(&self, name: &str, kind: Kind) -> Option<Include> {
         let Include::Within(ids) = &self.include else {
             return Some(Include::All);

@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The root marker, the root check and the rename that never replaces its
-//! target, on the file system the tests run on.
-
 use std::fs;
 use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -143,8 +140,7 @@ fn rename_never_replaces_its_target() {
 /// A folder on a file system whose rename refuses the no-replace flag, such
 /// as a FUSE file system without `RENAME_NOREPLACE`. Linux checks an existing
 /// target before the file system sees the flag, so only a rename to a free
-/// name shows the gap. CI has no such mount; the variable names one set up in
-/// a container.
+/// name shows the gap.
 const NO_REPLACE_FREE_DIR: &str = "KOIDRIVE_TEST_NO_REPLACE_FREE_DIR";
 
 #[test]

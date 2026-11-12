@@ -1,22 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Carrying out one disk effect without losing user bytes (design §5.2), and
-//! recovering the effect in flight after a crash (design §5.3).
-//!
-//! Every name change in the sync root is one rename that never replaces an
-//! entry, or one `mkdir`; nothing in the root is unlinked or overwritten.
-//! An entry an effect displaces goes to `.koidrive/quarantine/<effect id>`
-//! first, is compared with what the caller expected, and then goes to the
-//! local trash, or back to its name, or, when the name was taken in the
-//! meantime, to a recovered name beside it. After every rename the source
-//! folder and then the destination folder are flushed.
-//!
-//! One kind of file is deleted: the platform files (`.DS_Store` and the others
-//! of [`PLATFORM_FILES`]) that a folder still holds when it is removed. Scans
-//! leave them out, so nothing removes them first, and a folder that is not
-//! empty never leaves the trash. They are deleted in quarantine, after the
-//! comparison.
-
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
@@ -86,8 +69,7 @@ pub struct Effect {
     pub action: Action,
 }
 
-/// Compares file contents with the ones an effect expects. core/fs does not
-/// chunk files, so the caller compares manifest digests.
+/// Compares file contents with the ones an effect expects.
 pub trait Contents {
     /// Whether `file` holds the content the effect displaces.
     fn displaced(&mut self, file: &File) -> io::Result<bool>;
@@ -161,8 +143,6 @@ fn failed(reason: Reason) -> Outcome {
     }
 }
 
-/// The outcome for a location that does not resolve. Only an answer from
-/// the disk fails the effect; an error is returned.
 fn unresolved(err: Unresolved) -> io::Result<Outcome> {
     match err {
         Unresolved::Missing(_) | Unresolved::NotAFolder(_) | Unresolved::Replaced { .. } => {
@@ -315,8 +295,6 @@ impl Space {
         Ok(outcome)
     }
 
-    /// Steps 2 to 5 of design §5.2 for an effect that displaces an entry,
-    /// with step 4 placing the staged file at `place` when there is one.
     fn displace(
         &self,
         effect: &Effect,
@@ -387,8 +365,6 @@ impl Space {
         Ok(outcome)
     }
 
-    /// Renames the staged file to `name` in `target`, never replacing an entry,
-    /// and returns the staged file's identity with the outcome.
     fn place(
         &self,
         staging: &Folder,
@@ -415,10 +391,6 @@ impl Space {
         })
     }
 
-    /// Returns the quarantined entry `id` to `at`. When that name is taken, or
-    /// its folder is gone, the entry gets a recovered name in that folder or,
-    /// failing that, at the root. Returns the recovered path. A root that is no
-    /// longer held is an error, never a reason to recover the entry.
     fn put_back(
         &self,
         quarantine: &Folder,
@@ -545,11 +517,6 @@ impl Space {
         Ok(failed(Reason::Interrupted))
     }
 
-    /// The outcome of an effect that left nothing in quarantine, when the disk
-    /// holds its final state. A removal is final only once its entry is in the
-    /// local trash. A name found empty with no such entry was emptied by the
-    /// user, who moved or deleted the entry before the effect reached it, so the
-    /// removal fails as it would have failed had it run.
     fn finished(
         &self,
         effect: &Effect,
@@ -595,8 +562,6 @@ impl Space {
         Ok(Some(Outcome::Done { identity }))
     }
 
-    /// The identity of the file at `at` when it holds the content the effect
-    /// writes, read from the descriptor the content was compared through.
     fn written_at(&self, at: &Location, contents: &mut dyn Contents) -> io::Result<Option<FileId>> {
         let (parent, name) = match self.parent(at) {
             Ok(resolved) => resolved,
@@ -625,10 +590,6 @@ impl Space {
     }
 }
 
-/// Why the quarantined entry `id` is not `expected`, or `None` when it is: the
-/// same identity, kind, size, modification time and executable bit, and, for a
-/// file, the content the effect displaces, or, for a folder, nothing inside but
-/// platform files.
 fn differs(
     quarantine: BorrowedFd<'_>,
     id: &OsStr,
@@ -657,8 +618,6 @@ fn differs(
     }
 }
 
-/// Deletes the platform files in the quarantined folder `id`, so that the
-/// folder enters the trash empty. [`differs`] has found nothing else in it.
 fn clear_platform_files(quarantine: BorrowedFd<'_>, id: &OsStr) -> io::Result<()> {
     let dir = rustix::fs::openat(quarantine, id, crate::DIR_FLAGS, Mode::empty())?;
     if list(dir.as_fd())?.is_empty() {
@@ -670,8 +629,6 @@ fn clear_platform_files(quarantine: BorrowedFd<'_>, id: &OsStr) -> io::Result<()
     flush(dir.as_fd())
 }
 
-/// What has `name` in `dir`, or `None` when nothing has. Only "not found"
-/// means absent; any other error is returned.
 fn lookup(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<Option<Stat>> {
     match stat_at(dir, name) {
         Ok(stat) => Ok(Some(stat)),

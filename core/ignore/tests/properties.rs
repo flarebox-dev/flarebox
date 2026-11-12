@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Property tests: incremental updates against evaluating everything again, the invariants of
-//! design §5.10 on random trees, equivalent Unicode spellings, and the parser on arbitrary bytes.
-
 use std::collections::BTreeMap;
 
 use koidrive_ignore::{Change, Kind, LocalRules, Matcher, NameKey, Reason, RuleFile, Status};
@@ -146,8 +143,6 @@ fn build(tree: &Tree, files: &[(Index, String)], local: LocalRules<Folded>) -> M
     matcher
 }
 
-/// Pieces of patterns and names, each with its canonically equivalent spellings; the first is
-/// NFC.
 const PATTERN_PIECES: &[&[&str]] = &[
     &["\u{e9}", "e\u{301}"],
     &["\u{c9}", "E\u{301}"],
@@ -180,7 +175,6 @@ const NAME_PIECES: &[&[&str]] = &[
     &["k"],
 ];
 
-/// The NFC spelling and another equivalent spelling of the same pieces.
 fn spellings(pieces: &[&[&str]], picks: &[(Index, Index)]) -> (String, String) {
     picks
         .iter()
@@ -205,8 +199,6 @@ fn spelled_statuses<K: NameKey>(rules: &str, paths: &[(Vec<String>, Kind)]) -> V
 }
 
 proptest! {
-    /// The changes an update reports are exactly the entries whose status flipped, and a rules
-    /// file only changes entries below its directory.
     #[test]
     fn updates_report_exactly_what_changed(
         tree in tree(),
@@ -248,9 +240,6 @@ proptest! {
         }
     }
 
-    /// Nothing below an excluded directory is included, built-in exclusions always hold, and a
-    /// rules file in an included directory is included. Siblings may share a key (`A` and `a`),
-    /// as on a case-sensitive volume; they are then one directory to the rules.
     #[test]
     fn exclusion_invariants_hold(
         tree in tree(),
@@ -277,7 +266,6 @@ proptest! {
         }
     }
 
-    /// Any bytes parse, without panicking, into rules that can be matched.
     #[test]
     fn any_bytes_parse(
         bytes in prop_oneof![
@@ -298,8 +286,6 @@ proptest! {
         let _ = matcher.status(&path, kind);
         prop_assert_eq!(matcher.status(&[".koiignore"], Kind::File), Status::Included);
     }
-    /// NFC and NFD spellings of a pattern, and of the names it is matched against, give the same
-    /// verdicts (review of koidrive#50).
     #[test]
     fn equivalent_spellings_give_the_same_verdicts(
         lines in prop::collection::vec(prop::collection::vec((any::<Index>(), any::<Index>()), 1..6), 1..4),

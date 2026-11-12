@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The engine's private folder at the root of a space, the root marker in it,
-//! the root check of design §6.2, and the rename that never replaces its target
-//! which effects need (design §5.2).
-
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -58,10 +54,11 @@ pub enum RootProblem {
     OtherSpace(String),
 }
 
-/// Checks the root of space `space_id` before a scan that can report removals
-/// (design §6.2): it exists, is a folder that can be listed, is on device
-/// `dev`, and its marker names the space. Returns the marker. The scan itself
-/// must also come back without unreadable folders
+/// Checks the root of space `space_id` before a scan that can report removals:
+/// it exists, is a folder that can be listed, is on device `dev`, and its marker
+/// names the space. Returns the marker.
+///
+/// The scan itself must also come back without unreadable folders
 /// ([`Rescan::unreadable`](crate::Rescan::unreadable)) before its removals are
 /// acted on.
 pub fn check_root(root: &Path, space_id: &str, dev: u64) -> Result<Marker, RootProblem> {
@@ -128,9 +125,6 @@ pub(crate) fn write_marker_at(root: BorrowedFd<'_>, marker: &Marker) -> io::Resu
     )
 }
 
-/// Replaces the private file `name` in `dir` with `bytes` through the
-/// temporary file `temp`, flushing the file and then `dir`, so a crash leaves
-/// the old contents or the new ones.
 pub(crate) fn replace_file(
     dir: BorrowedFd<'_>,
     name: &str,
@@ -179,7 +173,6 @@ impl Space {
     }
 }
 
-/// The probe of [`probe_no_replace`] in the private folder `private`.
 fn probe_in(private: BorrowedFd<'_>) -> io::Result<bool> {
     let [a, b, _] = PROBE;
     for name in PROBE {
@@ -216,7 +209,6 @@ fn probe_renames(private: BorrowedFd<'_>) -> io::Result<bool> {
     Ok(probe_id(private, a)?.is_none() && probe_id(private, c)? == id_a)
 }
 
-/// The identity of the probe file `name`, or `None` when it is gone.
 fn probe_id(private: BorrowedFd<'_>, name: &OsStr) -> io::Result<Option<FileId>> {
     match stat_at(private, name) {
         Ok(stat) => Ok(Some(stat.id)),
@@ -225,9 +217,6 @@ fn probe_id(private: BorrowedFd<'_>, name: &OsStr) -> io::Result<Option<FileId>>
     }
 }
 
-/// Renames `from` in `from_dir` to `to` in `to_dir`, failing with
-/// `AlreadyExists` instead of replacing an entry at the target. Fails on a file
-/// system without that rename; [`probe_no_replace`] tells in advance.
 pub fn rename_no_replace(
     from_dir: BorrowedFd<'_>,
     from: &OsStr,
@@ -243,22 +232,16 @@ pub fn rename_no_replace(
     )?)
 }
 
-/// Whether the error means the file system has no rename that refuses to
-/// replace its target.
 fn unsupported(err: &io::Error) -> bool {
     [Errno::INVAL, Errno::NOSYS, Errno::NOTSUP, Errno::OPNOTSUPP]
         .iter()
         .any(|errno| err.raw_os_error() == Some(errno.raw_os_error()))
 }
 
-/// Opens the private folder at the root, creating it, and flushing the root
-/// after creating it, when it is missing.
 pub(crate) fn private_dir(root: BorrowedFd<'_>) -> io::Result<OwnedFd> {
     make_dir(root, PRIVATE_DIR)
 }
 
-/// Opens the folder `name` in `dir` without following a link, creating it, and
-/// flushing `dir` after creating it, when it is missing.
 pub(crate) fn make_dir(dir: BorrowedFd<'_>, name: &str) -> io::Result<OwnedFd> {
     match rustix::fs::mkdirat(dir, name, Mode::from_raw_mode(0o755)) {
         Ok(()) => flush(dir)?,
@@ -275,8 +258,8 @@ pub(crate) fn remove_if_present(dir: BorrowedFd<'_>, name: &str) -> io::Result<(
     }
 }
 
-/// Flushes a file or a folder's entries. On macOS `fsync` does not ask the
-/// drive to write its cache, so this uses `F_FULLFSYNC` there (design §5.2).
+/// On macOS `fsync` does not ask the drive to write its cache, so this uses
+/// `F_FULLFSYNC` there.
 pub(crate) fn flush(fd: BorrowedFd<'_>) -> io::Result<()> {
     #[cfg(target_vendor = "apple")]
     rustix::fs::fcntl_fullfsync(fd)?;
