@@ -4388,6 +4388,21 @@ fn a_create_refused_because_another_device_created_the_node_again_is_no_problem(
     assert_eq!(ops(&commit), [mv("n", ROOT, "a")]);
 }
 
+#[test]
+fn a_create_refused_because_another_device_created_and_deleted_the_node_again_is_no_problem() {
+    let mut trees = trees(&[("n", Some(file(ROOT, "a", 1)), None, None)]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(matches!(&ops(&commit)[..], [op::Op::CreateFile(c)] if c.node_id == "n"));
+    trees.set_remote("n".into(), trashed(file(ROOT, "a", 1)));
+    let exists = OpResult {
+        reject_reason: "ID_EXISTS".into(),
+        ..outcome(op_result::Code::Rejected)
+    };
+    acknowledge(&mut commits, &mut trees, vec![exists]);
+    assert!(commits.problems().is_empty());
+}
+
 /// GUN-378. n's move to b is in flight when the user and the other device both move it to c, so S
 /// takes c. The user moves n back to b, and the commit is acknowledged at seq 2 while R already
 /// holds the other device's move to c at seq 3, as after a log replay. S keeps c, the position the
