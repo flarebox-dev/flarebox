@@ -24,6 +24,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use koidrive_engine::commit::{Base, Commits, Failure, Halt as CommitHalt, Reconnect};
+use koidrive_engine::effects::{self, Stuck};
 use koidrive_engine::ignore::LocalRules;
 use koidrive_engine::state::CommitsState;
 use koidrive_engine::tree::{RemoteNode, Tree};
@@ -765,11 +766,19 @@ impl Folder {
 
     /// The folder's status as the task knows it.
     pub fn view(&self) -> View {
+        let trees = &self.engine.trees;
+        let held = match (
+            self.engine.effects.in_flight(),
+            self.engine.commits.in_flight(),
+        ) {
+            (None, None) => effects::stuck(trees),
+            _ => BTreeMap::new(),
+        };
         let state = match &self.stream {
             _ if self.offline => FolderState::Offline,
             Stream::Connecting => FolderState::Connecting,
             Stream::Listing { .. } | Stream::Replaying(_) => FolderState::Bootstrapping,
-            Stream::Following { .. } if self.settled() => FolderState::UpToDate,
+            Stream::Following { .. } if self.settled(&held) => FolderState::UpToDate,
             Stream::Following { .. } => FolderState::CatchingUp,
         };
         let named = |id: &String| {
@@ -786,6 +795,29 @@ impl Folder {
             let why =
                 (self.refused_nodes.get(id)).map_or("the server did not take it", String::as_str);
             reasons.entry(id).or_default().push(why.to_owned());
+        }
+        for (id, stuck) in &held {
+            let why = match stuck {
+                Stuck::HeldBy(by) => {
+                    let why = format!(
+                        "its name here is taken by {}, which this device's rules exclude",
+                        named(by)
+                    );
+                    if !trees.local().get(id).is_some_and(|node| node.parked) {
+                        why
+                    } else {
+                        let parked = Path::new(koidrive_fs::PRIVATE_DIR)
+                            .join(koidrive_fs::PARKED_DIR)
+                            .join(trees.parked_name(id));
+                        format!("{why}; it is kept in {}", parked.display())
+                    }
+                }
+                Stuck::Behind(node) => format!(
+                    "waits for {}, whose name here is taken by an entry this device's rules exclude",
+                    named(node)
+                ),
+            };
+            reasons.entry(id).or_default().push(why);
         }
         let mut stuck: Vec<String> = (reasons.into_iter())
             .map(|(id, whys)| format!("{} ({})", named(id), whys.join("; ")))
@@ -858,9 +890,10 @@ impl Folder {
     /// True when nothing is left to move: R holds the server's head, the folder was scanned, no effect and no
     /// commit is in flight, no rules are awaited, every node the trees still differ on is one that cannot be synced
     /// as it is, that this device leaves out, a folder the user deleted that stays on the server for what this
-    /// device leaves out, or a folder to remove that L holds above a node that cannot be synced, and so is the node of
-    /// every restore that waits.
-    fn settled(&self) -> bool {
+    /// device leaves out, a folder to remove that L holds above a node that cannot be synced, or a node of `held`, which
+    /// this device's rules keep from its place or from S ([`effects::stuck`]), and so is the node of every restore
+    /// that waits.
+    fn settled(&self, held: &BTreeMap<String, Stuck>) -> bool {
         let trees = &self.engine.trees;
         let mut above_blocked = BTreeSet::new();
         for node in self.engine.effects.blocked().keys() {
@@ -881,6 +914,7 @@ impl Folder {
                 || trees.excluded(id)
                 || trees.kept_for_excluded(id)
                 || (above_blocked.contains(id.as_str()) && trees.remote().live(id).is_none())
+                || held.contains_key(id)
         };
         let commits = &self.engine.commits;
         self.caught_up()
