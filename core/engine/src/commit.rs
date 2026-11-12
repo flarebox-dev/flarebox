@@ -479,10 +479,6 @@ impl Commits {
         }
     }
 
-    /// Asks again about what a first link holds, as L holds it now (section 6.4), and takes the
-    /// answer to the question if it still holds what it listed. A held entry the user deleted
-    /// leaves the question, one the user edited or moved stays, and either change replaces the
-    /// question with a new one, which drops the answer.
     fn ask_again(&mut self, trees: &mut Trees, ids: &mut IdGen, now_ms: u64) {
         let shows = |question: &Question| first_link::asks(question) && !question.shown.is_empty();
         let Some(index) = self.questions.iter().position(shows) else {

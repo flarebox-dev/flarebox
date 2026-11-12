@@ -134,8 +134,6 @@ pub(crate) fn ask(
     })
 }
 
-/// `top` and the nodes of L below it that S does not hold, with their shapes in L. A node S holds
-/// is synced, so neither it nor what is below it is held; neither is an excluded node.
 fn unsynced(trees: &Trees, top: &str) -> BTreeMap<NodeId, Shape> {
     let mut members = BTreeMap::new();
     let mut pending = vec![top.to_owned()];
@@ -143,7 +141,8 @@ fn unsynced(trees: &Trees, top: &str) -> BTreeMap<NodeId, Shape> {
         let Some(node) = trees.local().get(&id) else {
             continue;
         };
-        if trees.synced().get(&id).is_some() || trees.excluded(&id) {
+        let known = trees.synced().get(&id).is_some() || trees.remote().get(&id).is_some();
+        if known || (id != top && trees.excluded(&id)) {
             continue;
         }
         pending.extend(trees.local_children(&id).cloned());

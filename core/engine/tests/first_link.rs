@@ -342,6 +342,37 @@ fn a_held_entry_the_user_deletes_leaves_the_question_and_the_last_one_ends_it() 
     assert!(commits.questions().is_empty());
 }
 
+#[test]
+fn a_held_entry_the_rules_leave_out_for_a_while_stays_held_until_the_person_answers() {
+    let (mut commits, mut trees, mut ids) = linked();
+    let root: [&str; 0] = [];
+    let held = ["l-b", "l-inside", "l-new", "l-notes"];
+    trees.set_rules(&root, Some(RuleFile::parse(b"notes\nnew/\n")));
+    assert!(trees.excluded("l-notes") && trees.excluded("l-new"));
+    assert_eq!(ops(&mut commits, &mut trees, &mut ids), []);
+
+    trees.set_rules(&root, None);
+    assert_eq!(
+        ops(&mut commits, &mut trees, &mut ids),
+        [],
+        "nothing held is sent once the rules let it in again"
+    );
+    assert!(held.iter().all(|id| trees.held(id)));
+
+    assert!(commits.decide(&question(&commits).id, Answer::Publish));
+    let mut sent = ops(&mut commits, &mut trees, &mut ids);
+    sent.sort();
+    assert_eq!(
+        sent,
+        [
+            ("create dir", "l-new".to_owned()),
+            ("create file", "l-b".to_owned()),
+            ("create file", "l-inside".to_owned()),
+            ("create file", "l-notes".to_owned()),
+        ]
+    );
+}
+
 /// An entry created after the first link, beside the held ones, is an ordinary create.
 #[test]
 fn an_entry_created_after_the_first_link_is_sent_at_once() {

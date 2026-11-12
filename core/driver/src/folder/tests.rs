@@ -2100,6 +2100,56 @@ fn discarding_a_held_folder_that_holds_an_entry_l_does_not_know_keeps_the_folder
 }
 
 #[test]
+fn a_first_link_holds_what_another_devices_rules_leave_out_for_a_while_until_the_person_publishes_it()
+ {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("notes.txt"), b"written on a");
+
+    let site = Site::new(&remote, "b");
+    fs::write(site.root.join("mine.txt"), b"mine").unwrap();
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    assert_eq!(b.folder.view().questions, 1);
+
+    let rules = site_a.root.join(".koiignore");
+    for (written, left_out) in [(&b"mine.txt\n"[..], true), (b"other.txt\n", false)] {
+        a.create(&mut remote, &rules, written);
+        b.pull(&remote);
+        b.run(&mut remote);
+        b.scan_until(|b| !b.folder.disk.awaits_rules());
+        b.run(&mut remote);
+        b.settle();
+        b.run(&mut remote);
+        let id = (b.folder.engine.trees.local().iter())
+            .find(|(_, node)| node.shape.name == "mine.txt")
+            .map(|(id, _)| id.clone())
+            .unwrap();
+        assert_eq!(b.folder.engine.trees.excluded(&id), left_out);
+        assert!(b.sent.is_empty(), "mine.txt waits for the person's answer");
+    }
+    assert_eq!(remote.names(), [".koiignore", "notes.txt"]);
+    assert_eq!(b.folder.view().questions, 1);
+
+    let question = answer(&site, Answer::Publish);
+    let held: Vec<_> = (question.items.iter())
+        .map(|item| item.path.as_str())
+        .collect();
+    assert_eq!(held, ["mine.txt"]);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    assert_eq!(remote.names(), [".koiignore", "mine.txt", "notes.txt"]);
+    assert_eq!(b.folder.view().questions, 0);
+}
+
+#[test]
 fn a_first_link_adopts_what_the_space_holds_alike_and_publishes_the_rest_when_asked() {
     let mut remote = Remote::new();
     let site_a = Site::new(&remote, "a");

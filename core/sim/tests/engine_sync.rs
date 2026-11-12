@@ -1165,6 +1165,8 @@ fn run_ignoring(
                 Some(op::Op::Delete(delete)) => &delete.node_id,
                 Some(op::Op::CreateFile(create)) => &create.node_id,
                 Some(op::Op::CreateDir(create)) => &create.node_id,
+                Some(op::Op::Move(moved)) => &moved.node_id,
+                Some(op::Op::UpdateContent(update)) => &update.node_id,
                 _ => continue,
             };
             // A discarded entry the user changed, or a discarded folder the user put an entry in,
@@ -1508,6 +1510,61 @@ proptest! {
         cut in prop::sample::select(CUTS.to_vec()),
     ) {
         run_ignoring(&seed, &local, &[], fits, false, &during, cut, &[], answer, true)?;
+    }
+
+    #[test]
+    fn a_first_link_sends_nothing_the_rules_leave_out_for_a_while_until_the_person_publishes_it(
+        seed in prop::collection::vec(action(2), 1..12),
+        local in prop::collection::vec(action(2), 1..8),
+        fits in prop_oneof![Just(MAX_OPS), 1usize..4],
+        during in prop::collection::vec(
+            (any::<bool>(), prop::collection::vec(action(4), 1..4)),
+            0..6,
+        ),
+        rulings in prop::collection::vec(ruling(), 0..7),
+        cut in prop::sample::select(CUTS.to_vec()),
+    ) {
+        let answer = Answer::Publish;
+        run_ignoring(&seed, &local, &[], fits, false, &during, cut, &rulings, answer, true)?;
+    }
+}
+
+#[test]
+fn a_server_file_moved_into_a_held_folder_while_its_s_update_waits_is_not_held() {
+    let seed = [
+        act(0, 0, 0, 2, 0),
+        act(1, 0, 0, 0, 0),
+        act(1, 0, 0, 0, 0),
+        act(1, 0, 0, 0, 0),
+    ];
+    let local = [
+        act(0, 0, 0, 0, 0),
+        act(0, 0, 0, 2, 0),
+        act(0, 0, 0, 3, 0),
+        act(0, 0, 3, 0, 0),
+    ];
+    let during = [
+        (
+            false,
+            vec![act(4, 0, 0, 0, 0), act(4, 1, 0, 0, 0), act(1, 0, 0, 2, 0)],
+        ),
+        (true, vec![act(3, 0, 1, 0, 0), act(2, 1, 0, 0, 0)]),
+        (true, vec![act(4, 0, 0, 0, 0)]),
+    ];
+    for answer in [Answer::Publish, Answer::Discard] {
+        run_ignoring(
+            &seed,
+            &local,
+            &[],
+            MAX_OPS,
+            false,
+            &during,
+            Cut::None,
+            &[],
+            answer,
+            true,
+        )
+        .unwrap();
     }
 }
 
