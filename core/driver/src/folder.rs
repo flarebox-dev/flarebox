@@ -2007,25 +2007,23 @@ async fn stage_effect(
     (pending, staged)
 }
 
-/// Uploads the chunks of `upload` the server lacks, and counts the bytes of each in [`crate::volume`] once it is
-/// stored.
+/// Uploads the chunks of `upload` the server lacks, and adds the bytes of each to [`crate::volume`] once it is stored.
 async fn upload_chunks(
     session: &Session,
     transfer: &Transfer,
     upload: Upload,
 ) -> Result<Vec<UploadReceipt>, ChunkError> {
-    let (receipts, bytes) = upload_counted(session, transfer, upload).await;
-    crate::volume::uploaded(bytes);
-    receipts
+    upload_counted(session, transfer, upload, crate::volume::uploaded).await
 }
 
-/// Uploads the chunks of `upload` the server lacks, each read on a thread that may block. Returns the outcome with the
-/// bytes of the chunks stored, also when the upload failed after storing some.
+/// Uploads the chunks of `upload` the server lacks, each read on a thread that may block, and passes the size of each
+/// to `stored` once it is stored.
 async fn upload_counted(
     session: &Session,
     transfer: &Transfer,
     upload: Upload,
-) -> (Result<Vec<UploadReceipt>, ChunkError>, u64) {
+    mut stored: impl FnMut(u64),
+) -> Result<Vec<UploadReceipt>, ChunkError> {
     let upload = Arc::new(upload);
     let read = |chunk: &ChunkRef| {
         let (upload, chunk) = (upload.clone(), chunk.clone());
@@ -2035,10 +2033,8 @@ async fn upload_counted(
                 .map_err(io::Error::other)?
         }
     };
-    let mut bytes = 0;
-    let stored = |chunk: &ChunkRef| bytes += u64::from(chunk.size);
-    let receipts = (transfer.upload_observed(session, &upload.chunks, read, stored)).await;
-    (receipts, bytes)
+    let stored = |chunk: &ChunkRef| stored(u64::from(chunk.size));
+    (transfer.upload_observed(session, &upload.chunks, read, stored)).await
 }
 
 #[cfg(test)]

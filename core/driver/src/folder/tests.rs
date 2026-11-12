@@ -1721,7 +1721,9 @@ fn a_chunk_sent_again_after_a_refused_ticket_counts_its_bytes_once() {
         let (relay, seen) = crate::scripted::relay_refusing(1, 1).await;
         let (session, _events, api) = crate::scripted::session(relay).await;
         let transfer = Transfer::new(&api);
-        (upload_counted(&session, &transfer, upload).await, seen)
+        let mut bytes = 0;
+        let receipts = upload_counted(&session, &transfer, upload, |size| bytes += size).await;
+        ((receipts, bytes), seen)
     });
     let (receipts, bytes) = result;
     assert_eq!(receipts.unwrap().len(), 3);
@@ -1761,7 +1763,9 @@ fn an_upload_that_fails_after_storing_some_chunks_counts_the_bytes_of_those() {
             initial: Duration::from_millis(1),
             max: Duration::from_millis(1),
         };
-        (upload_counted(&session, &transfer, upload).await, seen)
+        let mut bytes = 0;
+        let receipts = upload_counted(&session, &transfer, upload, |size| bytes += size).await;
+        ((receipts, bytes), seen)
     });
     let (receipts, bytes) = result;
     assert!(receipts.is_err(), "the refused chunk ends the upload");
