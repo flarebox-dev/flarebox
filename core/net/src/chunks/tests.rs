@@ -570,23 +570,27 @@ async fn an_upload_target_that_expires_during_its_batch_is_prepared_again_before
     .await;
 
     let mut reads = Vec::new();
-    let receipts = Transfer {
-        gate: UploadGate::new(1),
-        ..transfer()
-    }
-    .upload(&session, &[b.clone(), a.clone()], |chunk| {
-        reads.push(chunk.hash.clone());
-        let (bytes, delay): (&'static [u8], _) = if chunk.hash == b.hash {
-            (b"chunk b", Duration::from_millis(1500))
-        } else {
-            (b"chunk a", Duration::ZERO)
-        };
-        async move {
-            tokio::time::sleep(delay).await;
-            Ok(Bytes::from_static(bytes))
+    let receipts = tokio::time::timeout(
+        Duration::from_secs(30),
+        Transfer {
+            gate: UploadGate::new(1),
+            ..transfer()
         }
-    })
+        .upload(&session, &[b.clone(), a.clone()], |chunk| {
+            reads.push(chunk.hash.clone());
+            let (bytes, delay): (&'static [u8], _) = if chunk.hash == b.hash {
+                (b"chunk b", Duration::from_millis(1500))
+            } else {
+                (b"chunk a", Duration::ZERO)
+            };
+            async move {
+                tokio::time::sleep(delay).await;
+                Ok(Bytes::from_static(bytes))
+            }
+        }),
+    )
     .await
+    .expect("a chunk deferred for expiry gives its place in the gate back")
     .unwrap();
 
     assert_eq!(*tickets.lock().unwrap(), ["b", "fresh"]);
@@ -1189,11 +1193,12 @@ async fn a_chunk_refused_for_good_ends_the_upload_without_waiting_for_slower_one
         }
     })
     .await;
+    let seen = seen.lock().unwrap();
     assert!(
         abandoned.is_ok(),
         "the client closes every slower upload: {:?} sent, {:?} closed",
-        seen.lock().unwrap().tickets,
-        seen.lock().unwrap().left
+        seen.tickets,
+        seen.left
     );
 }
 
