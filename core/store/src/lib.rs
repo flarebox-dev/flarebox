@@ -865,7 +865,7 @@ impl Tx<'_> {
     }
 
     /// Inserts or replaces the local node. `dev` is stored as its two's-complement `i64` bit
-    /// pattern and `ino` as [`ino_columns`] splits it, so every value round-trips.
+    /// pattern and `ino` as the bit patterns of its low and high 64 bits, so every value round-trips.
     pub fn put_local_node(&self, node: &LocalNode) -> Result<()> {
         let shape = &node.shape;
         self.0

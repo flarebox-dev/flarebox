@@ -174,7 +174,7 @@ impl Disk {
             .any(|entry| entry.content.as_ref().is_some_and(|c| c.mtime_ns == write))
     }
 
-    pub fn reads(&self, at: &Location, ino: u64, write: i64) -> bool {
+    pub fn reads(&self, at: &Location, ino: u128, write: i64) -> bool {
         self.locate(at).is_ok_and(|(place, name)| {
             self.child(&place, &name) == Some(ino)
                 && (self.entries[&ino].content.as_ref()).is_some_and(|c| c.mtime_ns == write)

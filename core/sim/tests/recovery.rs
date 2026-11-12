@@ -482,7 +482,7 @@ fn commit_refused_after_store_rollback() {
 }
 
 fn erase_disk(world: &mut World, d: usize) {
-    let inos: Vec<u64> = world.devices[d].disk.entries().keys().copied().collect();
+    let inos: Vec<u128> = world.devices[d].disk.entries().keys().copied().collect();
     for ino in inos {
         world.devices[d].disk.delete(ino);
     }

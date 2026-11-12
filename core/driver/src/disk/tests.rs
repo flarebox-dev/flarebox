@@ -2466,7 +2466,7 @@ fn a_parked_fork_whose_name_is_taken_is_uploaded_from_the_parked_directory() {
                 },
                 identity: FileIdentity {
                     dev: meta.dev(),
-                    ino: meta.ino(),
+                    ino: meta.ino().into(),
                     birth_ns: None,
                 },
                 parked: true,
