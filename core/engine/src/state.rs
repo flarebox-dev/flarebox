@@ -97,6 +97,9 @@ pub struct CommitsState {
     pub slots: BTreeMap<u64, u64>,
     /// The open questions, in the order they were asked.
     pub questions: Vec<Question>,
+    /// The local entries a Publish answer to a first link's question released, until the server
+    /// applies their create.
+    pub published: BTreeSet<NodeId>,
     /// The mass-delete guard's window and confirmed deletions.
     pub guard: GuardState,
 }

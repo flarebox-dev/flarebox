@@ -139,6 +139,7 @@ mod tests {
                 node_id: "n1".into(),
                 path: "d".into(),
                 files: 11,
+                device_id: None,
             }],
             lineage: lineage.into(),
         }

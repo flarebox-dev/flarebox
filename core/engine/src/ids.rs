@@ -22,6 +22,11 @@ pub fn uuid_v7(unix_ms: u64, random: u128) -> String {
     )
 }
 
+/// The Unix time in milliseconds of a UUIDv7, or `None` for anything else.
+pub fn unix_ms(value: &str) -> Option<u64> {
+    is_uuid_v7(value).then(|| u64::from_str_radix(&value[..13].replace('-', ""), 16).ok())?
+}
+
 /// True for a lowercase UUID with version 7 and the RFC 9562 variant, as the server requires.
 pub fn is_uuid_v7(value: &str) -> bool {
     let bytes = value.as_bytes();
@@ -70,6 +75,16 @@ mod tests {
         assert!(is_uuid_v7(&id));
         assert!(is_uuid_v7(&uuid_v7(0, 0)));
         assert_eq!(uuid_v7(0, 0), "00000000-0000-7000-8000-000000000000");
+    }
+
+    #[test]
+    fn reads_the_time_of_version_7_ids() {
+        assert_eq!(
+            unix_ms(&uuid_v7(0x0190_f3a0_1234, 7)),
+            Some(0x0190_f3a0_1234)
+        );
+        assert_eq!(unix_ms("0190f3a0-1234-4fff-bfff-ffffffffffff"), None);
+        assert_eq!(unix_ms("q1"), None);
     }
 
     #[test]

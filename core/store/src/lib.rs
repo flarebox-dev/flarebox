@@ -377,6 +377,11 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE remote_cursor ADD COLUMN commit_id TEXT NOT NULL DEFAULT '';
     ALTER TABLE remote_cursor ADD COLUMN committed_at_ms INTEGER NOT NULL DEFAULT 0;
 ",
+    "
+    CREATE TABLE published_nodes (
+        node_id TEXT PRIMARY KEY
+    ) STRICT, WITHOUT ROWID;
+",
 ];
 
 /// The schema version this build writes.
@@ -746,6 +751,20 @@ impl Tx<'_> {
     pub fn clear_remote_nodes(&self) -> Result<()> {
         self.0.execute("DELETE FROM remote_nodes", [])?;
         Ok(())
+    }
+
+    /// The device that wrote the current version of the remote node, if R holds the node with one.
+    pub fn remote_writer(&self, node_id: &str) -> Result<Option<String>> {
+        let current: Option<Option<Vec<u8>>> = self
+            .0
+            .query_row(
+                "SELECT current FROM remote_nodes WHERE node_id = ?1",
+                [node_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let version = decode::<VersionInfo>(current.flatten())?;
+        Ok(version.map(|version| version.device_id))
     }
 
     /// How many nodes the remote tree holds, live and trashed.

@@ -12,9 +12,9 @@ use prost::Message;
 use crate::classify::{Class, Origin, Trees, Waiting, classify};
 use crate::first_link;
 use crate::guard::{self, GuardState, RemoteRemoval};
-use crate::ids::IdGen;
+use crate::ids::{IdGen, unix_ms};
 use crate::names::{MAX_NAME_BYTES, name_key, nfc};
-use crate::question::{Answer, Question, QuestionKind};
+use crate::question::{Answer, ConflictFile, Question, QuestionKind, Revisions};
 use crate::restore::{Outcome, RESOLVED_KEPT, Rejection, Resolved, RestoreId, RestoreIntent};
 use crate::state::{Agreed, CommitsState, StateError};
 use crate::tree::{Content, Kind, Names, NodeId, Shape, same, same_content};
@@ -168,6 +168,10 @@ pub struct Commits {
     slots: BTreeMap<u64, u64>,
     /// The open questions, in the order they were asked.
     questions: Vec<Question>,
+    /// The local entries a [`Answer::Publish`] to a first link's question released (section 6.4),
+    /// until the server applies their create. The person chose to keep them beside what R holds,
+    /// so a create of one that takes a conflict name asks nothing.
+    published: BTreeSet<NodeId>,
     guard: GuardState,
 }
 
@@ -186,6 +190,7 @@ impl Commits {
             resolved: self.resolved.clone(),
             slots: self.slots.clone(),
             questions: self.questions.clone(),
+            published: self.published.clone(),
             guard: self.guard.clone(),
         }
     }
@@ -244,6 +249,7 @@ impl Commits {
             resolved,
             slots,
             questions,
+            published,
             guard,
         } = state;
         Ok(Self {
@@ -258,6 +264,7 @@ impl Commits {
             resolved,
             slots,
             questions,
+            published,
             guard,
         })
     }
@@ -366,7 +373,9 @@ impl Commits {
 
     /// Takes the person's answer to the open question `id`, routed by its kind. [`Answer::Dismiss`]
     /// closes a notice about other devices' deletions at once (section 6.1), and the guard never
-    /// counts its deletions again. Any other answer stays on the question until the next build,
+    /// counts its deletions again. [`Answer::KeepBoth`] closes a conflict at once (section 2.7).
+    /// [`Answer::KeepOriginal`] and [`Answer::KeepCopy`] stay on the conflict until a build carries
+    /// them out ([`Commits::build`]). Any other answer stays on the question until the next build,
     /// which takes it only if the question still holds what it listed, and asks a new question
     /// otherwise.
     ///
@@ -377,7 +386,8 @@ impl Commits {
     ///
     /// For a first link's question about entries created on this device (section 6.4),
     /// [`Answer::Publish`] lets the build send them as creates, and the server renames one whose
-    /// name R holds. [`Answer::Discard`] sets S to L for every entry, so that, R holding none of
+    /// name R holds. The person chose to keep both files then, so no conflict question is asked
+    /// about it. [`Answer::Discard`] sets S to L for every entry, so that, R holding none of
     /// them, the effects move them to the local trash, and then download what R holds at their
     /// paths.
     ///
@@ -391,16 +401,22 @@ impl Commits {
                 && question.kind.answers().contains(&answer)
                 && (matches!(
                     question.kind,
-                    QuestionKind::MassDelete { .. } | QuestionKind::RemoteMassDelete { .. }
+                    QuestionKind::MassDelete { .. }
+                        | QuestionKind::RemoteMassDelete { .. }
+                        | QuestionKind::Conflict { .. }
                 ) || first_link::asks(question))
         }) else {
             return false;
         };
-        if let QuestionKind::RemoteMassDelete { .. } = self.questions[index].kind {
-            self.questions.remove(index);
-            self.guard.dismiss_remote();
-        } else {
-            self.questions[index].answer = Some(answer);
+        match self.questions[index].kind {
+            QuestionKind::RemoteMassDelete { .. } => {
+                self.questions.remove(index);
+                self.guard.dismiss_remote();
+            }
+            QuestionKind::Conflict { .. } if answer == Answer::KeepBoth => {
+                self.questions.remove(index);
+            }
+            _ => self.questions[index].answer = Some(answer),
         }
         true
     }
@@ -485,6 +501,8 @@ impl Commits {
                     for (id, shape) in update_synced(trees, updates) {
                         trees.wait(id, shape, Origin::Other);
                     }
+                } else {
+                    self.published.extend(question.shown.into_keys());
                 }
             }
             None => {
@@ -616,6 +634,14 @@ impl Commits {
             .collect();
         skip.extend(excluded);
         let needed = self.retry_waiting(trees, needed, agreed);
+        let cap = self.cap.unwrap_or(MAX_OPS);
+        let (asking, answered): (Vec<String>, Vec<proto::Op>) = self
+            .conflicts(trees, &skip, cap, ids, now_ms)
+            .into_iter()
+            .unzip();
+        skip.extend(
+            (answered.iter().filter_map(|op| op.op.as_ref())).map(|op| op_node(op).to_owned()),
+        );
         let guarded =
             |question: &Question| matches!(question.kind, QuestionKind::MassDelete { .. });
         let index = self.questions.iter().position(guarded);
@@ -644,14 +670,15 @@ impl Commits {
         }
         self.hold(trees);
         self.split.retain(|id| trees.synced().live(id).is_some());
+        self.published.retain(|id| trees.local().get(id).is_some());
         self.aliases
             .retain(|id, _| trees.local().get(id).is_some() && trees.reverted().contains(id));
-        let cap = self.cap.unwrap_or(MAX_OPS);
-        let (ops, deletes, reverts) = plan(
+        let (planned, deletes, reverts) = plan(
             trees,
             &skip,
             &needed,
             cap,
+            &answered,
             &self.split,
             &self.aliases,
             &self.restores,
@@ -659,6 +686,7 @@ impl Commits {
         for id in reverts {
             trees.revert(id);
         }
+        let ops: Vec<proto::Op> = planned.into_iter().chain(answered).collect();
         if ops.is_empty() {
             return None;
         }
@@ -673,9 +701,18 @@ impl Commits {
             Some(op::Op::Move(moved)) => Some(moved.node_id.clone()),
             _ => None,
         }));
+
+        let commit_id = ids.uuid_v7(now_ms);
+        for question in &mut self.questions {
+            if let QuestionKind::Conflict { sent_in, .. } = &mut question.kind
+                && asking.contains(&question.id)
+            {
+                *sent_in = Some(commit_id.clone());
+            }
+        }
         self.in_flight = Some(InFlight {
             commit: proto::Commit {
-                commit_id: ids.uuid_v7(now_ms),
+                commit_id,
                 base_seq: base.seq,
                 base_commit_id: base.commit_id,
                 base_committed_at_ms: base.committed_at_ms,
@@ -688,6 +725,179 @@ impl Commits {
             result: None,
         });
         self.in_flight.as_ref().map(|flight| &flight.commit)
+    }
+
+    /// Goes through the conflict questions (section 2.7) and returns the ops of the answers that
+    /// can be carried out now, at most `cap` of them. A conflict ends once R no longer holds either
+    /// file live with the meta revision it was asked with, or L moved or deleted a file S holds:
+    /// someone renamed, moved or deleted one by hand. It is asked again, under a new ID and
+    /// without its answer, once R holds another content revision of either file. An answer waits
+    /// until both files are in sync and planned (`skip` lists the nodes that are not), and a
+    /// build carries out one op per conflict and none for a node another answer already took.
+    /// [`Answer::KeepOriginal`] deletes the copy. [`Answer::KeepCopy`] first gives the original
+    /// the copy's content, so the original's own content stays in its version history, and once
+    /// that has reached L it deletes the copy. S is left as it is, so the result reaches the disk
+    /// as a remote change would, and only a file L still holds as S does is changed or removed.
+    fn conflicts(
+        &mut self,
+        trees: &Trees,
+        skip: &BTreeSet<NodeId>,
+        cap: usize,
+        ids: &mut IdGen,
+        now_ms: u64,
+    ) -> Vec<(String, proto::Op)> {
+        let mut ops = Vec::new();
+        let mut kept = Vec::new();
+        let mut taken = BTreeSet::new();
+        for mut question in std::mem::take(&mut self.questions) {
+            let QuestionKind::Conflict { original, copy, .. } = &mut question.kind else {
+                kept.push(question);
+                continue;
+            };
+            match drift(trees, original, copy) {
+                Drift::Ended => continue,
+                Drift::Content => {
+                    for file in [&mut *original, &mut *copy] {
+                        let remote = trees.remote().get(&file.node_id).expect("live in R");
+                        file.revisions.content_rev = remote.content_rev;
+                    }
+                    question.id = ids.uuid_v7(now_ms);
+                    question.asked_at_ms = now_ms;
+                    question.answer = None;
+                    kept.push(question);
+                    continue;
+                }
+                Drift::None => {}
+            }
+            let ready = in_sync(trees, original, copy)
+                && !skip.contains(&original.node_id)
+                && !skip.contains(&copy.node_id);
+            let free = !taken.contains(&original.node_id) && !taken.contains(&copy.node_id);
+            let content = |file: &ConflictFile| {
+                let remote = trees.remote().get(&file.node_id).expect("live in R");
+                remote.shape.content.clone()
+            };
+            let delete_copy = op::Op::Delete(proto::Delete {
+                node_id: copy.node_id.clone(),
+            });
+            let op = match question.answer {
+                Some(Answer::KeepOriginal) => Some(delete_copy),
+                Some(Answer::KeepCopy) => match (content(original), content(copy)) {
+                    (Some(current), Some(copied)) if same_content(&current, &copied) => {
+                        Some(delete_copy)
+                    }
+                    (Some(_), Some(copied))
+                        if copied.chunks.len() == copied.chunk_count as usize =>
+                    {
+                        Some(op::Op::UpdateContent(proto::UpdateContent {
+                            node_id: original.node_id.clone(),
+                            content: Some(copied),
+                        }))
+                    }
+                    _ => {
+                        question.answer = None;
+                        None
+                    }
+                },
+                _ => None,
+            };
+            if let Some(op) = op
+                && ready
+                && free
+                && ops.len() < cap
+            {
+                taken.insert(original.node_id.clone());
+                taken.insert(copy.node_id.clone());
+                ops.push((question.id.clone(), proto::Op { op: Some(op) }));
+            }
+            kept.push(question);
+        }
+        self.questions = kept;
+        ops
+    }
+
+    /// Whether a build has something to do for a conflict question: a file of it was renamed,
+    /// moved, deleted or changed since it was asked, or its answer can be carried out
+    /// ([`Commits::conflicts`]). The caller builds then even when nothing else changed.
+    pub fn conflicts_due(&self, trees: &Trees) -> bool {
+        self.questions.iter().any(|question| match &question.kind {
+            QuestionKind::Conflict { original, copy, .. } => {
+                drift(trees, original, copy) != Drift::None
+                    || (question.answer.is_some() && in_sync(trees, original, copy))
+            }
+            _ => false,
+        })
+    }
+
+    /// The ID of the conflict question whose answer `op` of commit `commit_id` carries out
+    /// ([`Commits::conflicts`]): the commit was built with it, and the op is its `Delete` of the copy
+    /// or `UpdateContent` of the original. Such an op leaves S as it is when it is acknowledged,
+    /// and its node is not marked as a problem. Another op for either file, such as the upload of
+    /// an edit, is acknowledged as any op is.
+    fn answer_for(&self, commit_id: &str, op: &op::Op) -> Option<String> {
+        let question = self.questions.iter().find(|question| {
+            let QuestionKind::Conflict {
+                original,
+                copy,
+                sent_in,
+            } = &question.kind
+            else {
+                return false;
+            };
+            sent_in.as_deref() == Some(commit_id)
+                && match op {
+                    op::Op::Delete(delete) => delete.node_id == copy.node_id,
+                    op::Op::UpdateContent(update) => update.node_id == original.node_id,
+                    _ => false,
+                }
+        });
+        question.map(|question| question.id.clone())
+    }
+
+    /// Asks about the conflict between the files `original` and `copy` that op `index` of commit
+    /// `commit_id` made, unless one of them is not a live file in R or it is already asked. The
+    /// question's ID comes from the op, so acknowledging the commit again asks the same question,
+    /// and it is asked when the commit was built.
+    fn ask_conflict(
+        &mut self,
+        trees: &Trees,
+        commit_id: &str,
+        index: usize,
+        original: NodeId,
+        copy: NodeId,
+    ) {
+        let file = |id: NodeId| {
+            let node = trees.remote().get(&id)?;
+            (!node.trashed && node.shape.kind == Kind::File).then_some(ConflictFile {
+                node_id: id,
+                revisions: Revisions {
+                    content_rev: node.content_rev,
+                    meta_rev: node.meta_rev,
+                },
+            })
+        };
+        let (Some(original), Some(copy)) = (file(original), file(copy)) else {
+            return;
+        };
+        let asked = self.questions.iter().any(|question| {
+            matches!(&question.kind, QuestionKind::Conflict { original: o, copy: c, .. }
+                if o.node_id == original.node_id && c.node_id == copy.node_id)
+        });
+        if asked {
+            return;
+        }
+        self.questions.push(Question {
+            id: format!("{commit_id}-{index}"),
+            asked_at_ms: unix_ms(commit_id).unwrap_or_default(),
+            kind: QuestionKind::Conflict {
+                original,
+                copy,
+                sent_in: None,
+            },
+            held: BTreeMap::new(),
+            answer: None,
+            shown: BTreeMap::new(),
+        });
     }
 
     /// Keeps the result of the commit in flight until it can be acknowledged.
@@ -752,9 +962,17 @@ impl Commits {
         let mut agreed: BTreeMap<NodeId, Agreed> = BTreeMap::new();
         let mut unreverted: BTreeSet<NodeId> = BTreeSet::new();
         let aliases = self.aliases.clone();
-        for (op, outcome) in flight.commit.ops.iter().zip(&result.results) {
+        let mut conflicts: Vec<(usize, NodeId, NodeId)> = Vec::new();
+        let mut answers = Vec::new();
+        for (index, (op, outcome)) in flight.commit.ops.iter().zip(&result.results).enumerate() {
             use op_result::Code;
             let code = Code::try_from(outcome.code).unwrap_or(Code::Unspecified);
+            if let Some(sent) = &op.op
+                && let Some(id) = self.answer_for(&flight.commit.commit_id, sent)
+            {
+                answers.push((id, index, sent, code, &outcome.node_id));
+                continue;
+            }
             let applied = matches!(code, Code::Applied | Code::AppliedRenamed);
             let taken = code == Code::Rejected && outcome.reject_reason == "ID_EXISTS";
             let parent = |sent: &str| merged.get(sent).cloned().unwrap_or_else(|| sent.to_owned());
@@ -836,6 +1054,9 @@ impl Commits {
                     if applied {
                         trees.record_edited(id, result.seq);
                     }
+                    if code == Code::ConflictCopy {
+                        conflicts.push((index, id.clone(), outcome.node_id.clone()));
+                    }
                     (id, applied || code == Code::ConflictCopy)
                 }
                 Some(op::Op::Move(moved)) => {
@@ -871,6 +1092,21 @@ impl Commits {
                 }
                 _ => continue,
             };
+            let published = matches!(&op.op, Some(op::Op::CreateDir(_) | op::Op::CreateFile(_)))
+                && done
+                && self.published.remove(node);
+            if renamed
+                && !published
+                && let Some((sent_parent, sent_name)) = sent
+                && let Some(original) = holder(
+                    trees,
+                    merged.get(sent_parent).unwrap_or(sent_parent),
+                    sent_name,
+                    node,
+                )
+            {
+                conflicts.push((index, original, node.clone()));
+            }
             let follows = trees.local().get(node).is_some_and(|local| {
                 let held = &local.shape.parent;
                 aliases.contains_key(held) || merged.contains_key(held)
@@ -917,6 +1153,48 @@ impl Commits {
         }
         for (id, shape) in rest {
             trees.wait(id, shape, Origin::Commit(flight.commit.device_seq));
+        }
+        let mut closed = BTreeSet::new();
+        for (id, index, sent, code, made) in answers {
+            use op_result::Code;
+            let question = self.questions.iter_mut().find(|question| question.id == id);
+            let Some(question) = question else {
+                continue;
+            };
+            let QuestionKind::Conflict {
+                original, sent_in, ..
+            } = &mut question.kind
+            else {
+                continue;
+            };
+            *sent_in = None;
+            match (sent, code) {
+                (op::Op::Delete(delete), Code::Applied) => {
+                    trees.record_trashed(&delete.node_id, result.seq);
+                    closed.insert(id);
+                }
+                (op::Op::UpdateContent(update), Code::Applied) => {
+                    trees.record_edited(&update.node_id, result.seq);
+                    let remote = trees.remote().get(&original.node_id);
+                    let took = remote.filter(|node| {
+                        (node.shape.content.as_ref().zip(update.content.as_ref()))
+                            .is_some_and(|(now, sent)| same_content(now, sent))
+                    });
+                    if let Some(node) = took {
+                        original.revisions.content_rev = node.content_rev;
+                    }
+                }
+                (op::Op::UpdateContent(_), Code::ConflictCopy) => {
+                    question.answer = None;
+                    conflicts.push((index, original.node_id.clone(), made.clone()));
+                }
+                _ => question.answer = None,
+            }
+        }
+        self.questions
+            .retain(|question| !closed.contains(&question.id));
+        for (index, original, copy) in conflicts {
+            self.ask_conflict(trees, &flight.commit.commit_id, index, original, copy);
         }
         let restored = carried(&self.restores, &flight.commit.ops);
         for (index, id) in restored.expect("a Restore op in flight is queued") {
@@ -1213,6 +1491,66 @@ fn update_synced(
         }
     }
     left
+}
+
+/// What changed about the files of a conflict since it was asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Drift {
+    None,
+    /// R holds another content revision of a file.
+    Content,
+    /// A file was renamed, moved or deleted: R no longer holds it live with the meta revision it
+    /// was asked with, or L moved or deleted it while S holds it. A reverted file L still holds
+    /// where it was is not moved: the effects move it to the name the server gave it.
+    Ended,
+}
+
+fn drift(trees: &Trees, original: &ConflictFile, copy: &ConflictFile) -> Drift {
+    let files = [original, copy];
+    let moved_here = |id: &str| {
+        (trees.synced().live(id)).is_some_and(|synced| {
+            (trees.local().get(id)).is_none_or(|local| {
+                !trees.reverted().contains(id) && !local.shape.same_position(synced)
+            })
+        })
+    };
+    let ended = files.iter().any(|file| {
+        let remote = trees
+            .remote()
+            .get(&file.node_id)
+            .filter(|node| !node.trashed);
+        moved_here(&file.node_id)
+            || remote.is_none_or(|node| node.meta_rev != file.revisions.meta_rev)
+    });
+    let changed = files.iter().any(|file| {
+        let remote = trees.remote().get(&file.node_id);
+        remote.is_some_and(|node| node.content_rev != file.revisions.content_rev)
+    });
+    match (ended, changed) {
+        (true, _) => Drift::Ended,
+        (false, true) => Drift::Content,
+        (false, false) => Drift::None,
+    }
+}
+
+/// Whether L, S and R agree on both files of a conflict.
+fn in_sync(trees: &Trees, original: &ConflictFile, copy: &ConflictFile) -> bool {
+    [original, copy]
+        .iter()
+        .all(|file| trees.class(&file.node_id) == Class::InSync)
+}
+
+/// The node other than `other` that R holds live under `parent` with the name key of `name`.
+fn holder(trees: &Trees, parent: &str, name: &str, other: &str) -> Option<NodeId> {
+    let key = name_key(name);
+    (trees.remote().iter())
+        .find(|(id, node)| {
+            !node.trashed
+                && *id != other
+                && node.shape.parent == parent
+                && name_key(&node.shape.name) == key
+        })
+        .map(|(id, _)| id.clone())
 }
 
 /// Gives the local node `from` the ID `to`; its children follow, and so does a folder's unknown
@@ -1568,12 +1906,14 @@ type Planned = (Vec<proto::Op>, BTreeMap<NodeId, Vec<NodeId>>, Vec<NodeId>);
 /// The ops for every queued restore and every local change, in an order valid on a scratch copy
 /// of R, the nodes each delete covers, and the nodes to revert: moves that close a cycle, and
 /// nodes in a merged folder that S or R already has where the folder it was merged into holds
-/// them, so they follow R.
+/// them, so they follow R. The ops `answered` already holds for the commit count toward its limits.
+#[allow(clippy::too_many_arguments)]
 fn plan(
     trees: &Trees,
     problems: &BTreeSet<NodeId>,
     needed: &BTreeSet<NodeId>,
     cap: usize,
+    answered: &[proto::Op],
     split: &BTreeSet<NodeId>,
     aliases: &BTreeMap<NodeId, NodeId>,
     restores: &BTreeMap<RestoreId, RestoreIntent>,
@@ -1789,7 +2129,15 @@ fn plan(
         };
         ops.push(proto::Op { op: Some(op) });
     };
-    let (mut emitted, mut bytes) = (0, 0);
+    let mut emitted = answered.len();
+    let mut bytes = (answered.iter().filter_map(|op| op.op.as_ref()))
+        .map(|op| match op {
+            op::Op::UpdateContent(update) => {
+                RECORD_BYTES + update.content.as_ref().map_or(0, |c| c.encoded_len())
+            }
+            op => record_cost(trees.synced().live(op_node(op))),
+        })
+        .sum();
     let fits = |emitted: usize, bytes: usize, ops: usize, cost: usize| {
         emitted + ops <= cap && (emitted == 0 || bytes + cost <= MAX_COMMIT_BYTES)
     };

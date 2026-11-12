@@ -134,6 +134,13 @@ impl Tx<'_> {
         }
         let mut stmt = self
             .0
+            .prepare_cached("SELECT node_id FROM published_nodes")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            state.commits.published.insert(row.get(0)?);
+        }
+        let mut stmt = self
+            .0
             .prepare_cached("SELECT node_id, dev, ino, birth_ns FROM recorded_nodes")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
@@ -238,6 +245,7 @@ impl Tx<'_> {
             "watched_positions",
             "trashed_here",
             "discarded_nodes",
+            "published_nodes",
             "recorded_nodes",
             "edited_here",
             "effect_state",
@@ -483,6 +491,18 @@ impl Tx<'_> {
         }
         if old.questions != new.questions {
             self.set_open_questions(&new.questions)?;
+        }
+        let mut remove = self
+            .0
+            .prepare_cached("DELETE FROM published_nodes WHERE node_id = ?1")?;
+        for node in old.published.difference(&new.published) {
+            remove.execute([node])?;
+        }
+        let mut insert = self
+            .0
+            .prepare_cached("INSERT INTO published_nodes (node_id) VALUES (?1)")?;
+        for node in new.published.difference(&old.published) {
+            insert.execute([node])?;
         }
         if old.guard != new.guard {
             self.update_guard(&old.guard, &new.guard)?;

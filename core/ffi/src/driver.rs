@@ -749,7 +749,9 @@ fn notice(asked: driver::Question) -> Option<Notice> {
 // are inferred here. `None` for a notice ([`notice`]).
 fn question(question: driver::Question) -> Option<Question> {
     let kind = match question.kind {
-        driver::QuestionKind::RemoteMassDelete { .. } => return None,
+        driver::QuestionKind::RemoteMassDelete { .. } | driver::QuestionKind::Conflict { .. } => {
+            return None;
+        }
         driver::QuestionKind::MassDelete {
             deletions,
             affected_files,
@@ -1035,11 +1037,13 @@ mod tests {
                     node_id: "n1".into(),
                     path: "Archive".into(),
                     files: 1_499,
+                    device_id: None,
                 },
                 driver::HeldItem {
                     node_id: "n2".into(),
                     path: "notes.txt".into(),
                     files: 1,
+                    device_id: None,
                 },
             ],
         })

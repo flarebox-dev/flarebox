@@ -33,6 +33,9 @@ pub struct HeldItem {
     pub path: String,
     /// Files the answer affects through this item: 1 for a file, the files it holds for a folder.
     pub files: u64,
+    /// For a file of a conflict, the device that wrote its current version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -67,6 +70,7 @@ mod tests {
                 node_id: "n1".into(),
                 path: "a/b".into(),
                 files: 1,
+                device_id: None,
             }],
             lineage: "q1".into(),
         };

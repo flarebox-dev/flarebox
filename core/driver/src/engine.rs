@@ -18,7 +18,8 @@ use koidrive_engine::effects::Effects;
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::question as engine;
 use koidrive_engine::tree::{
-    Content, FileIdentity, Kind, LocalNode, Names, NodeId, RemoteNode, Shape, Tree, same_content,
+    Content, FileIdentity, Kind, LocalNode, Names, Node, NodeId, RemoteNode, Shape, Tree,
+    same_content,
 };
 use koidrive_fs::{Entry, EntryKind, FileId, Known, Snapshot};
 use koidrive_proto::v1::{
@@ -165,7 +166,9 @@ impl Engine {
     /// asks, for `Driver::questions` to show. A question whose counts changed under the same id, as a notice's do, is
     /// shown with the new counts and keeps any answer it was given. Sets [`Engine::asked`] when it changed a row. A new question that takes the place of one the
     /// engine stopped asking, of the same kind and still unanswered, continues that one's lineage: the guard asks
-    /// again under a new id when the held set changes, and this is the one place that sees both in one step.
+    /// again under a new id when the held set changes, and this is the one place that sees both in one step. A
+    /// question whose answer the engine dropped, as it does for a conflict whose answer the server refused, is shown
+    /// again without it. A conflict is shown again when the paths of its files change, as when a folder above them is renamed.
     pub fn ask(&mut self, tx: &Tx<'_>, space_id: &str) -> Result<(), Error> {
         let asked = &self.stored.commits.questions;
         let asking = self.commits.questions();
@@ -197,12 +200,35 @@ impl Engine {
             let kept = rows
                 .get(&question.id)
                 .map_or_else(|| question.id.clone(), lineage);
-            let body = serde_json::to_vec(&self.shown(space_id, question, kept))
+            let body = serde_json::to_vec(&self.shown(tx, space_id, question, kept)?)
                 .expect("a question serializes");
             tx.reshow_question(&question.id, &body)?;
             changed = true;
         }
-        for question in asking.iter().filter(|question| !open(asked, &question.id)) {
+        let dropped = |question: &engine::Question| {
+            question.answer.is_none()
+                && (asked.iter()).any(|before| before.id == question.id && before.answer.is_some())
+        };
+        for question in asking.iter().filter(|question| {
+            matches!(question.kind, engine::QuestionKind::Conflict { .. })
+                && (asked.iter())
+                    .any(|before| before.id == question.id && before.kind == question.kind)
+                && !dropped(question)
+        }) {
+            let Some(row) = rows.get(&question.id) else {
+                continue;
+            };
+            let body = serde_json::to_vec(&self.shown(tx, space_id, question, lineage(row))?)
+                .expect("a question serializes");
+            if body != row.body {
+                tx.reshow_question(&question.id, &body)?;
+                changed = true;
+            }
+        }
+        for question in asking
+            .iter()
+            .filter(|question| !open(asked, &question.id) || dropped(question))
+        {
             let continued = (replaced.iter())
                 .find(|(before, _)| same_kind(&before.kind, &question.kind))
                 .map_or_else(|| question.id.clone(), |(_, lineage)| lineage.clone());
@@ -217,7 +243,7 @@ impl Engine {
             tx.put_question(&StoredQuestion {
                 question_id: question.id.clone(),
                 asked_at_ms: question.asked_at_ms as i64,
-                body: serde_json::to_vec(&self.shown(space_id, question, continued))
+                body: serde_json::to_vec(&self.shown(tx, space_id, question, continued)?)
                     .expect("a question serializes"),
                 answer: None,
             })?;
@@ -227,24 +253,49 @@ impl Engine {
         Ok(())
     }
 
-    /// The question as the person sees it: each item the engine holds with its path, in path order.
-    fn shown(&self, space_id: &str, asked: &engine::Question, lineage: String) -> Question {
-        let mut items: Vec<HeldItem> = (asked.held.iter())
-            .map(|(id, held)| HeldItem {
-                node_id: id.clone(),
-                path: self.path(id),
-                files: held.files,
-            })
-            .collect();
+    /// The question as the person sees it, with its items in path order: each item the engine holds with its path
+    /// ([`Self::path`]), or both files of a conflict with their paths in R and the devices that wrote them.
+    fn shown(
+        &self,
+        tx: &Tx<'_>,
+        space_id: &str,
+        asked: &engine::Question,
+        lineage: String,
+    ) -> Result<Question, Error> {
+        let mut items: Vec<HeldItem> = match &asked.kind {
+            engine::QuestionKind::Conflict { original, copy, .. } => [original, copy]
+                .into_iter()
+                .map(|file| {
+                    Ok(HeldItem {
+                        node_id: file.node_id.clone(),
+                        path: path(self.trees.remote(), &file.node_id),
+                        files: 1,
+                        device_id: tx.remote_writer(&file.node_id)?,
+                    })
+                })
+                .collect::<Result<_, Error>>()?,
+            _ => (asked.held.iter())
+                .map(|(id, held)| HeldItem {
+                    node_id: id.clone(),
+                    path: self.path(id),
+                    files: held.files,
+                    device_id: None,
+                })
+                .collect(),
+        };
         items.sort_by(|a, b| a.path.cmp(&b.path));
-        Question {
+        let mut kind = asked.kind.clone();
+        if let engine::QuestionKind::Conflict { sent_in, .. } = &mut kind {
+            *sent_in = None;
+        }
+        Ok(Question {
             id: asked.id.clone(),
             space_id: space_id.to_owned(),
             asked_at_ms: asked.asked_at_ms as i64,
-            kind: asked.kind.clone(),
+            kind,
             items,
             lineage,
-        }
+        })
     }
 
     /// The path of a node relative to the linked folder: where L holds it, or where S holds it when L does not, as
@@ -1001,6 +1052,18 @@ impl Engine {
 /// The nodes a batch took out of L, by the path each had, with the identity it had.
 type Gone = BTreeMap<PathBuf, (NodeId, FileIdentity)>;
 
+/// The path of a node `tree` holds live, relative to the linked folder.
+fn path<N: Node>(tree: &Tree<N>, id: &str) -> String {
+    let mut names = Vec::new();
+    let mut current = id;
+    while let Some(shape) = tree.live(current).filter(|_| names.len() <= tree.len()) {
+        names.push(shape.name.as_str());
+        current = &shape.parent;
+    }
+    names.reverse();
+    names.join("/")
+}
+
 /// The placed node of L at `path`, or the root for the empty path.
 fn local_at(trees: &Trees, path: &Path) -> Option<NodeId> {
     let mut current = trees.local().root.clone();
@@ -1238,6 +1301,14 @@ fn same_kind(before: &engine::QuestionKind, after: &engine::QuestionKind) -> boo
             engine::QuestionKind::Recovery { group: a },
             engine::QuestionKind::Recovery { group: b },
         ) => a == b,
+        (
+            engine::QuestionKind::Conflict { original, copy, .. },
+            engine::QuestionKind::Conflict {
+                original: other,
+                copy: other_copy,
+                ..
+            },
+        ) => original.node_id == other.node_id && copy.node_id == other_copy.node_id,
         (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
     }
 }
@@ -1245,7 +1316,7 @@ fn same_kind(before: &engine::QuestionKind, after: &engine::QuestionKind) -> boo
 #[cfg(test)]
 mod tests {
     use koidrive_engine::effects::{Base, Effect, EffectRecord, Location};
-    use koidrive_engine::state::EffectsState;
+    use koidrive_engine::state::{CommitsState, EffectsState};
     use koidrive_proto::v1::{NodePurged, NodeStatus, SpaceUpdated};
     use koidrive_store::Store;
 
@@ -1489,6 +1560,58 @@ mod tests {
                 assert!(matches!(stop, Stop::Protocol(_)), "{stop}");
                 assert_eq!(names(tx, &engine), ["a"]);
                 assert_eq!(tx.cursor()?, Some(cursor(3)));
+                Ok::<_, Stop>(())
+            })
+            .unwrap();
+    }
+
+    /// The engine dropped the answer to a conflict without sending an op, as it does for keep the copy when R's record
+    /// of the copy leaves out its chunk list. It still asks the question under the same id and kind, and
+    /// `accept_answers` removed its row when it took the answer. Asking puts the row back unanswered and marks the
+    /// questions changed.
+    #[test]
+    fn a_conflict_answer_dropped_before_it_was_sent_is_shown_again_under_the_same_id() {
+        use engine::{Answer, ConflictFile, QuestionKind, Revisions};
+
+        let file = |id: &str| ConflictFile {
+            node_id: id.into(),
+            revisions: Revisions {
+                content_rev: 1,
+                meta_rev: 1,
+            },
+        };
+        let asking = engine::Question {
+            id: "conflict".into(),
+            asked_at_ms: 1,
+            kind: QuestionKind::Conflict {
+                original: file("original"),
+                copy: file("copy"),
+                sent_in: None,
+            },
+            held: BTreeMap::new(),
+            answer: None,
+            shown: BTreeMap::new(),
+        };
+        let answered = engine::Question {
+            answer: Some(Answer::KeepCopy),
+            ..asking.clone()
+        };
+        let (_dir, mut store) = store();
+        store
+            .transaction(|tx| {
+                let mut engine = Engine::load(tx, ROOT)?;
+                engine.stored.commits.questions = vec![answered];
+                engine.commits = Commits::from_state(CommitsState {
+                    questions: vec![asking],
+                    ..Default::default()
+                })
+                .unwrap();
+                engine.ask(tx, ROOT)?;
+                let rows: Vec<_> = (tx.questions()?.into_iter())
+                    .map(|row| (row.question_id, row.answer))
+                    .collect();
+                assert_eq!(rows, [("conflict".to_owned(), None)]);
+                assert!(engine.asked, "the questions changed");
                 Ok::<_, Stop>(())
             })
             .unwrap();
