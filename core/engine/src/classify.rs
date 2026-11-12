@@ -776,7 +776,14 @@ impl Trees {
         if local == Some(false) && moved {
             return false;
         }
-        local == Some(true)
+        local == Some(true) || self.ignored_once_parked(id)
+    }
+
+    pub(crate) fn ignored_once_parked(&self, id: &str) -> bool {
+        let ignored =
+            |path: Option<(Vec<&str>, Kind)>| path.map(|(names, kind)| self.ignores(&names, kind));
+        self.recorded_local(id)
+            || self.displaced.contains_key(id)
             || ignored(path(&self.s, id)) == Some(true)
             || ignored(path(&self.r, id)) == Some(true)
     }

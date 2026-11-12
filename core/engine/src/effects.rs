@@ -910,6 +910,7 @@ impl<'a> View<'a> {
                     && !(trees.remote().live(id))
                         .is_some_and(|remote| node.shape.same_position(remote))
             })
+            && !trees.ignored_once_parked(id)
             && self.stuck(id, trees.local().len()).is_none()
     }
 
