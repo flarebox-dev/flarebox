@@ -1325,7 +1325,11 @@ mod tests {
     use koidrive_engine::effects::{Base, Effect, EffectRecord, Location};
     use koidrive_engine::state::{CommitsState, EffectsState};
     use koidrive_proto::v1::{NodePurged, NodeStatus, SpaceUpdated};
+    use std::fs;
+
+    use koidrive_fs::Change;
     use koidrive_store::Store;
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -2546,5 +2550,142 @@ mod tests {
         );
         assert_eq!(holding(&engine, "three"), Some(one));
         assert_eq!(holding(&engine, "four"), Some(two));
+    }
+
+    /// Names that the edits of [`batches`] pick from, few enough that entries often take each other's names.
+    const EDITED: [&str; 3] = ["a", "b", "ß"];
+
+    /// One thing a person does to the folder between two scans. Indexes pick from the entries and folders on disk.
+    #[derive(Clone, Debug)]
+    enum Edit {
+        File {
+            folder: usize,
+            name: usize,
+        },
+        Folder {
+            folder: usize,
+            name: usize,
+        },
+        Move {
+            entry: usize,
+            folder: usize,
+            name: usize,
+        },
+        Remove {
+            entry: usize,
+        },
+    }
+
+    fn edit() -> impl Strategy<Value = Edit> {
+        let name = 0..EDITED.len();
+        prop_oneof![
+            2 => (any::<usize>(), name.clone()).prop_map(|(folder, name)| Edit::File { folder, name }),
+            2 => (any::<usize>(), name.clone()).prop_map(|(folder, name)| Edit::Folder { folder, name }),
+            3 => (any::<usize>(), any::<usize>(), name)
+                .prop_map(|(entry, folder, name)| Edit::Move { entry, folder, name }),
+            1 => any::<usize>().prop_map(|entry| Edit::Remove { entry }),
+        ]
+    }
+
+    /// Makes `edit` on the disk under `root`. An edit the file system refuses, such as a move into the moved
+    /// folder itself, changes nothing, as it would for a person.
+    fn make(root: &Path, edit: &Edit) {
+        let mut entries = Vec::new();
+        let mut folders = vec![root.to_owned()];
+        let mut next = 0;
+        while let Some(folder) = folders.get(next).cloned() {
+            let mut listed: Vec<PathBuf> = (fs::read_dir(&folder).unwrap())
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            listed.sort();
+            folders.extend(listed.iter().filter(|path| path.is_dir()).cloned());
+            entries.extend(listed);
+            next += 1;
+        }
+        let at = |folder: usize, name: usize| folders[folder % folders.len()].join(EDITED[name]);
+        match *edit {
+            Edit::File { folder, name } => fs::write(at(folder, name), EDITED[name]).ok(),
+            Edit::Folder { folder, name } => fs::create_dir(at(folder, name)).ok(),
+            Edit::Move { .. } | Edit::Remove { .. } if entries.is_empty() => None,
+            Edit::Move {
+                entry,
+                folder,
+                name,
+            } => fs::rename(&entries[entry % entries.len()], at(folder, name)).ok(),
+            Edit::Remove { entry } => match &entries[entry % entries.len()] {
+                path if path.is_dir() => fs::remove_dir_all(path).ok(),
+                path => fs::remove_file(path).ok(),
+            },
+        };
+    }
+
+    /// The batch an observer reports for what changed under `root` since `snapshot`, with a file's size standing for
+    /// its content.
+    fn scan(snapshot: &mut Snapshot, root: &Path) -> Vec<Observed> {
+        let changes = snapshot.rescan(root, [PathBuf::new()]).unwrap().changes;
+        let entry = |path: &Path| snapshot.entries[path];
+        (changes.into_iter())
+            .filter_map(|change| match change {
+                Change::Created { path, kind } => Some(Observed::Created {
+                    content: (kind == EntryKind::File).then(|| bytes(entry(&path).size)),
+                    id: entry(&path).id,
+                    linked: false,
+                    path,
+                    kind,
+                }),
+                Change::Modified { path } => {
+                    (entry(&path).kind == EntryKind::File).then(|| Observed::Modified {
+                        content: Some(bytes(entry(&path).size)),
+                        id: entry(&path).id,
+                        linked: false,
+                        path,
+                    })
+                }
+                Change::Renamed { from, to, kind } => Some(Observed::Renamed {
+                    id: entry(&to).id,
+                    linked: false,
+                    from,
+                    to,
+                    kind,
+                }),
+                Change::Removed { path, kind } => Some(Observed::Removed { path, kind }),
+                Change::Ignored { .. } => unreachable!("a scan without rules ignores nothing"),
+            })
+            .collect()
+    }
+
+    proptest! {
+        /// Whatever a person does to the folder between scans, each batch leaves L a tree that holds every entry on
+        /// disk at its path, with its kind and a file's identity, and nothing else. A scan takes a folder at the
+        /// same path for the same folder whatever its identity, so a folder's identity is not compared.
+        #[test]
+        fn batches_leave_l_a_tree_that_holds_the_disk(
+            rounds in prop::collection::vec(prop::collection::vec(edit(), 1..8), 1..5),
+        ) {
+            let (_dir, mut engine) = mapper();
+            let folder = tempfile::tempdir().unwrap();
+            let mut snapshot = Snapshot::default();
+            for edits in rounds {
+                for edit in &edits {
+                    make(folder.path(), edit);
+                }
+                let batch = scan(&mut snapshot, folder.path());
+                engine.observe(&batch, 0);
+                prop_assert_eq!(engine.trees.check(), Ok(()), "after {:?}", batch);
+                let disk: BTreeMap<PathBuf, Option<FileIdentity>> = (snapshot.entries.iter())
+                    .map(|(path, entry)| {
+                        let file = entry.kind == EntryKind::File;
+                        (path.clone(), file.then(|| file_identity(entry.id)))
+                    })
+                    .collect();
+                let held: BTreeMap<PathBuf, Option<FileIdentity>> = (engine.trees.local().iter())
+                    .filter_map(|(id, node)| {
+                        let file = node.shape.kind == Kind::File;
+                        Some((engine.path_of(id)?, file.then_some(node.identity)))
+                    })
+                    .collect();
+                prop_assert_eq!(held, disk, "after {:?}", batch);
+            }
+        }
     }
 }
