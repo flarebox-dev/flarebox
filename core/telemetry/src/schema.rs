@@ -269,10 +269,11 @@ pub enum Command {
     Service,
     Daemon,
     Telemetry,
+    Diagnose,
 }
 
 impl Command {
-    pub const ALL: [Command; 12] = [
+    pub const ALL: [Command; 13] = [
         Command::Status,
         Command::Resolve,
         Command::Setup,
@@ -285,6 +286,7 @@ impl Command {
         Command::Service,
         Command::Daemon,
         Command::Telemetry,
+        Command::Diagnose,
     ];
 
     pub fn name(self) -> &'static str {
@@ -301,6 +303,7 @@ impl Command {
             Command::Service => "service",
             Command::Daemon => "daemon",
             Command::Telemetry => "telemetry",
+            Command::Diagnose => "diagnose",
         }
     }
 }
