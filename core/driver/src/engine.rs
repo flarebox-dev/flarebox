@@ -1901,10 +1901,18 @@ mod tests {
                 &edit,
                 0,
                 |trees| {
-                    trees.remove_local("n");
-                    trees.set_local("u".into(), held(file(ROOT, "a", 1), 1));
+                    trees.set_local("n".into(), held(file(ROOT, "a", 1), 5));
+                    trees.set_local("u".into(), held(file(ROOT, "b", 1), 1));
                 },
                 false,
+            ),
+            case(
+                "another node links the file too",
+                "replace a file",
+                &edit,
+                0,
+                |trees| trees.set_local("u".into(), held(file(ROOT, "b", 1), 1)),
+                true,
             ),
             case("nothing changed", "move", &rename, 0, unchanged, true),
             case(
@@ -1976,6 +1984,14 @@ mod tests {
                     trees.set_local("u".into(), held(file(ROOT, "x", 1), 1));
                 },
                 false,
+            ),
+            case(
+                "another node links the file too",
+                "park",
+                &swap,
+                0,
+                |trees| trees.set_local("u".into(), held(file(ROOT, "z", 1), 1)),
+                true,
             ),
             case(
                 "the file was renamed and its name went to another node",
@@ -2079,12 +2095,9 @@ mod tests {
         assert_eq!(refused.into_iter().collect::<Vec<_>>(), every);
     }
 
-    /// What keeps a refused effect from being planned and refused in a loop: unblocked, with nothing in flight, the
-    /// planner gives its node no effect for that L. The one exception is a folder whose new folder moved into it,
-    /// which the planner parks, and L takes a parked node.
     #[test]
     fn an_effect_that_l_does_not_take_is_not_planned_again_for_that_l() {
-        let mut parked = Vec::new();
+        let mut replanned = Vec::new();
         for mut case in cases().into_iter().filter(|case| !case.takes) {
             let state = EffectsState {
                 in_flight: None,
@@ -2106,9 +2119,15 @@ mod tests {
             let context = format!("{}, {}: {planned:?}", case.kind, case.name);
             assert_ne!(planned.effect, case.record.effect, "{context}");
             assert!(planned.applies(&case.engine.trees), "{context}");
-            parked.push((case.name, kind(&planned.effect)));
+            replanned.push((case.name, kind(&planned.effect)));
         }
-        assert_eq!(parked, [("its new folder moved into it", "park")]);
+        assert_eq!(
+            replanned,
+            [
+                ("another node took the file", "replace a file"),
+                ("its new folder moved into it", "park"),
+            ]
+        );
     }
 
     /// An engine with an empty space whose R is caught up, for tests of the mapper.
