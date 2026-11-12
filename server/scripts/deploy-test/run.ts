@@ -9,6 +9,8 @@ import { fileURLToPath } from "node:url";
 import {
   type Account,
   ApiError,
+  type Deadline,
+  DeadlineError,
   LISTING_MS,
   newestDeployment,
   createBucket,
@@ -37,6 +39,7 @@ const SERVING_MS = 3 * 60_000;
 const CLAIM_LOG_MS = 4 * 60_000;
 const CLAIM_LOG_EVERY_MS = 5_000;
 const CLOCK_SKEW_MS = 60_000;
+const CODE_WINDOW_MS = 55 * 60_000;
 const DEPLOY_ATTEMPTS = 3;
 const DEPLOY_RETRY_MS = 10_000;
 const PROPAGATION_MS = 15_000;
@@ -247,11 +250,11 @@ async function deploy(account: Account, ref: string): Promise<void> {
   console.log(url + " serves Koidrive " + info.serverVersion + (info.claimed ? ", claimed" : ", not claimed yet"));
 }
 
-async function provenKey(account: Account, name: string, fromMs: number, marker: string): Promise<WorkerKey | undefined> {
+async function provenKey(account: Account, name: string, fromMs: number, marker: string, deadline: Deadline): Promise<WorkerKey | undefined> {
   for (const key of WORKER_KEYS) {
     let events: string[];
     try {
-      events = await workerEvents(account, key, name, fromMs);
+      events = await workerEvents(account, key, name, fromMs, deadline);
     } catch (error) {
       if (error instanceof ApiError && error.status === 400) continue;
       throw error;
@@ -261,8 +264,8 @@ async function provenKey(account: Account, name: string, fromMs: number, marker:
   return undefined;
 }
 
-async function claimCode(account: Account, key: WorkerKey, name: string, fromMs: number): Promise<string | undefined> {
-  for (const event of await workerEvents(account, key, name, fromMs)) {
+async function claimCode(account: Account, key: WorkerKey, name: string, fromMs: number, deadline: Deadline): Promise<string | undefined> {
+  for (const event of await workerEvents(account, key, name, fromMs, deadline)) {
     const code = CLAIM_CODE.exec(event)?.[1];
     if (code) return code;
   }
@@ -273,30 +276,28 @@ async function claim(account: Account): Promise<void> {
   const state = readState();
   const first = state.deployments[0] ?? fail("nothing is deployed yet");
   const url = state.url!;
-  const fromMs = first.atMs - CLOCK_SKEW_MS;
+  const fromMs = Math.max(first.atMs, Date.now() - CODE_WINDOW_MS) - CLOCK_SKEW_MS;
   const marker = "/deploy-test-probe-" + randomBytes(8).toString("hex");
   await fetch(url + marker, { signal: AbortSignal.timeout(15_000) }).then((response) => response.body?.cancel(), () => undefined);
-  const probeDeadline = Date.now() + CLAIM_LOG_MS;
+  const probe = { atMs: Date.now() + CLAIM_LOG_MS, what: "no query of this Worker's logs showed its request to " + marker + " within " + CLAIM_LOG_MS / 1000 + " s" };
   let key: WorkerKey | undefined;
   try {
-    while (!(key = await provenKey(account, state.name, fromMs, marker))) {
-      if (Date.now() > probeDeadline) {
-        fail("no query of this Worker's logs showed its request to " + marker + " within " + CLAIM_LOG_MS / 1000 + " s, so /setup was not opened and no claim code was spent");
-      }
+    while (!(key = await provenKey(account, state.name, fromMs, marker, probe))) {
+      if (Date.now() > probe.atMs) throw new DeadlineError(probe.what);
       await sleep(CLAIM_LOG_EVERY_MS);
     }
   } catch (error) {
     if (!(error instanceof ApiError)) throw error;
-    fail("cannot query this Worker's logs, so /setup was not opened and no claim code was spent: " + error.message);
+    fail(error.message + ", so /setup was not opened and no claim code was spent");
   }
   console.log("Workers Logs shows this Worker's request to " + marker + " when filtered on " + key);
   const setup = await fetch(url + "/setup", { signal: AbortSignal.timeout(15_000) });
   const page = await setup.text();
   if (!setup.ok || !page.includes("claim code")) fail("/setup did not issue a claim code (HTTP " + setup.status + "): " + page.slice(0, 200));
-  const deadline = Date.now() + CLAIM_LOG_MS;
+  const wait = { atMs: Date.now() + CLAIM_LOG_MS, what: "the claim code did not appear in this Worker's logs within " + CLAIM_LOG_MS / 1000 + " s" };
   let code: string | undefined;
-  while (!(code = await claimCode(account, key, state.name, fromMs))) {
-    if (Date.now() > deadline) fail("the claim code did not appear in this Worker's logs within " + CLAIM_LOG_MS / 1000 + " s");
+  while (!(code = await claimCode(account, key, state.name, fromMs, wait))) {
+    if (Date.now() > wait.atMs) fail(wait.what);
     await sleep(CLAIM_LOG_EVERY_MS);
   }
   console.log("Read the claim code from this Worker's logs");
