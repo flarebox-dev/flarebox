@@ -2731,18 +2731,23 @@ mod tests {
         let root = folder.path();
         let mut snapshot = Snapshot::default();
         for edits in rounds {
-            for edit in *edits {
-                match edit.split(' ').collect::<Vec<_>>()[..] {
-                    ["mkdir", path] => fs::create_dir(root.join(path)).unwrap(),
-                    ["write", path] => fs::write(root.join(path), path).unwrap(),
-                    ["mv", from, to] => fs::rename(root.join(from), root.join(to)).unwrap(),
-                    _ => panic!("{edit}"),
-                }
-            }
+            run(root, edits);
             let batch = scan(&mut snapshot, root);
             engine.observe(&batch, 0);
             assert_eq!(engine.trees.check(), Ok(()), "after {batch:?}");
             assert_eq!(in_l(&engine), on_disk(&snapshot), "after {batch:?}");
+        }
+    }
+
+    /// Makes `mkdir`, `write` and `mv` edits on the disk under `root`.
+    fn run(root: &Path, edits: &[&str]) {
+        for edit in edits {
+            match edit.split(' ').collect::<Vec<_>>()[..] {
+                ["mkdir", path] => fs::create_dir(root.join(path)).unwrap(),
+                ["write", path] => fs::write(root.join(path), path).unwrap(),
+                ["mv", from, to] => fs::rename(root.join(from), root.join(to)).unwrap(),
+                _ => panic!("{edit}"),
+            }
         }
     }
 
@@ -2773,5 +2778,45 @@ mod tests {
             &["mkdir d", "mkdir d/s"],
             &["mv d d.old", "mkdir d", "mv d.old/s d/s", "write d/s/n"],
         ]);
+    }
+
+    /// After an entry moved back into a new folder at its path, the client stops and the user edits the entry. The
+    /// restart's snapshot comes from L, which still gives the folder its old identity, and the edited entry is still
+    /// the one that was there, so the scan reports the edit alone and the entry keeps its node.
+    #[test]
+    fn an_entry_moved_back_and_edited_while_stopped_keeps_its_node() {
+        let (_dir, mut engine) = mapper();
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        let mut snapshot = Snapshot::default();
+        for edits in [
+            &["mkdir d", "write d/x"][..],
+            &["mv d d.old", "mkdir d", "mv d.old/x d/x"],
+        ] {
+            run(root, edits);
+            let batch = scan(&mut snapshot, root);
+            engine.observe(&batch, 0);
+        }
+        let x = local_at(&engine.trees, Path::new("d/x"));
+        let seen = snapshot;
+        let mut snapshot = engine.snapshot();
+        for (path, entry) in snapshot.entries.iter_mut() {
+            if let Some(before) = seen
+                .entries
+                .get(path)
+                .filter(|before| before.id == entry.id)
+            {
+                entry.mtime_ns = before.mtime_ns;
+            }
+        }
+        fs::write(root.join("d/x"), "edited").unwrap();
+        let batch = scan(&mut snapshot, root);
+        assert!(
+            matches!(batch[..], [Observed::Modified { .. }]),
+            "{batch:?}"
+        );
+        engine.observe(&batch, 0);
+        assert_eq!(local_at(&engine.trees, Path::new("d/x")), x);
+        assert_eq!(in_l(&engine), on_disk(&snapshot));
     }
 }
