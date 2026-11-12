@@ -677,7 +677,8 @@ impl Commits {
             trees,
             &skip,
             &needed,
-            cap - answered.len(),
+            cap,
+            &answered,
             &self.split,
             &self.aliases,
             &self.restores,
@@ -1900,12 +1901,14 @@ type Planned = (Vec<proto::Op>, BTreeMap<NodeId, Vec<NodeId>>, Vec<NodeId>);
 /// The ops for every queued restore and every local change, in an order valid on a scratch copy
 /// of R, the nodes each delete covers, and the nodes to revert: moves that close a cycle, and
 /// nodes in a merged folder that S or R already has where the folder it was merged into holds
-/// them, so they follow R.
+/// them, so they follow R. The ops `answered` already holds for the commit count toward its limits.
+#[allow(clippy::too_many_arguments)]
 fn plan(
     trees: &Trees,
     problems: &BTreeSet<NodeId>,
     needed: &BTreeSet<NodeId>,
     cap: usize,
+    answered: &[proto::Op],
     split: &BTreeSet<NodeId>,
     aliases: &BTreeMap<NodeId, NodeId>,
     restores: &BTreeMap<RestoreId, RestoreIntent>,
@@ -2121,7 +2124,15 @@ fn plan(
         };
         ops.push(proto::Op { op: Some(op) });
     };
-    let (mut emitted, mut bytes) = (0, 0);
+    let mut emitted = answered.len();
+    let mut bytes = (answered.iter().filter_map(|op| op.op.as_ref()))
+        .map(|op| match op {
+            op::Op::UpdateContent(update) => {
+                RECORD_BYTES + update.content.as_ref().map_or(0, |c| c.encoded_len())
+            }
+            op => record_cost(trees.synced().live(op_node(op))),
+        })
+        .sum();
     let fits = |emitted: usize, bytes: usize, ops: usize, cost: usize| {
         emitted + ops <= cap && (emitted == 0 || bytes + cost <= MAX_COMMIT_BYTES)
     };

@@ -4,12 +4,16 @@
 //! sections 2.4, 2.6, 2.7, 2.8 and 4.2, and RFC 0002), on hand-built trees and results.
 
 use koidrive_engine::classify::{Class, Origin, Trees};
-use koidrive_engine::commit::{Commits, Failure, Halt, Lift, LiftError, MAX_OPS, Reconnect};
+use koidrive_engine::commit::{
+    Commits, Failure, Halt, Lift, LiftError, MAX_COMMIT_BYTES, MAX_OPS, Reconnect,
+};
 use koidrive_engine::effects::{Effect, EffectError, Effects, Location};
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::names::{MAX_NAME_BYTES, nfc, normalize_name};
+use koidrive_engine::question::Answer;
 use koidrive_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
 use koidrive_proto::v1::{self as proto, CommitResult, OpResult, Welcome, error, op, op_result};
+use prost::Message;
 
 const ROOT: &str = "root";
 const NOW: u64 = 1_794_268_740_000;
@@ -1498,6 +1502,75 @@ fn a_commit_stops_before_its_change_records_outgrow_one_message() {
     let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert_eq!(commit.ops.len(), 3);
+}
+
+/// The answer to a conflict keeps the copy, a file of 8,192 chunks, so the original takes the
+/// copy's content in an op of about 330 KiB. It counts toward the commit's change records, and
+/// the files queued after it wait for the next commit.
+#[test]
+fn a_conflict_answer_counts_toward_the_change_records_of_its_commit() {
+    let mut trees = trees(&[(
+        "f",
+        Some(file(ROOT, "f", 2)),
+        Some(file(ROOT, "f", 1)),
+        Some(remote(file(ROOT, "f", 1))),
+    )]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    let chunk = proto::ChunkRef {
+        hash: vec![7; 32],
+        size: 4 << 20,
+        encoding: 0,
+    };
+    let copied = Content {
+        chunks: vec![chunk; 8192],
+        chunk_count: 8192,
+        ..content(2)
+    };
+    let copy = Shape {
+        content: Some(copied.clone()),
+        ..file(ROOT, "f (conflict)", 2)
+    };
+    trees.set_remote("f".into(), remote(file(ROOT, "f", 3)));
+    trees.set_remote("y".into(), remote(copy.clone()));
+    let made = OpResult {
+        node_id: "y".into(),
+        ..outcome(op_result::Code::ConflictCopy)
+    };
+    acknowledge(&mut commits, &mut trees, vec![made]);
+    for (id, shape, ino) in [("f", file(ROOT, "f", 3), 1), ("y", copy, 2)] {
+        trees.set_local(id.into(), local(shape.clone(), ino));
+        trees.set_synced(id.into(), Some(shape));
+    }
+    for i in 0..4 {
+        trees.set_local(format!("g{i}"), local(large(ROOT, &format!("{i}")), i + 3));
+    }
+    trees.settle();
+    let question = commits.questions()[0].id.clone();
+    assert!(commits.decide(&question, Answer::KeepCopy));
+
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(commit.encoded_len() <= MAX_COMMIT_BYTES);
+    let answer = op::Op::UpdateContent(proto::UpdateContent {
+        node_id: "f".into(),
+        content: Some(copied.clone()),
+    });
+    let sent = ops(&commit);
+    assert!(sent.contains(&answer));
+    assert_eq!(sent.len(), 2);
+
+    let mut took = remote(file(ROOT, "f", 3));
+    took.shape.content = Some(copied);
+    took.content_rev = 2;
+    trees.set_remote("f".into(), took);
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied); 2],
+    );
+    let next = ops(&build(&mut commits, &mut trees, &mut ids).unwrap());
+    assert_eq!(next.len(), 3);
+    assert!(next.iter().all(|op| matches!(op, op::Op::CreateFile(_))));
 }
 
 #[test]
