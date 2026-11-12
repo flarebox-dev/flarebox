@@ -863,7 +863,7 @@ fn a_bounded_search_ends_where_an_unbounded_one_does() {
             assert!(unbounded.rescan(root), "seed {seed}");
             if seed % 2 == 0 {
                 bounded.settle(root);
-                let mut gone = |run: &mut Run| {
+                let gone = |run: &mut Run| {
                     let mut gone = std::mem::take(&mut run.synced.gone);
                     gone.sort_by_key(|gone| format!("{gone:?}"));
                     gone
