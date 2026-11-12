@@ -461,7 +461,7 @@ fn engine_state() -> EngineState {
                 },
             )]),
             edited_here: BTreeMap::from([("e".into(), 6)]),
-            unsent_edits: BTreeMap::from([("u".into(), content(5))]),
+            unsent_edits: nodes(["u"]),
         },
         commits: CommitsState {
             accepted: 4,

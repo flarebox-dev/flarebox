@@ -111,8 +111,8 @@ fn content(digest: u8) -> Content {
     }
 }
 
-/// Trees whose file `f` L, S and R hold with content 2, and a state that records content 2 as an
-/// edit of this device the server does not hold.
+/// Trees whose file `f` L, S and R hold with content 2, and a state that records the content in L
+/// as an edit of this device the server does not hold.
 fn unsent() -> (Trees, TreesState) {
     let mut trees = Trees::new(ROOT);
     let shape = Shape {
@@ -136,16 +136,16 @@ fn unsent() -> (Trees, TreesState) {
     trees.set_synced("f".into(), Some(shape));
     let state = TreesState {
         dirty: ["f".into()].into(),
-        unsent_edits: [("f".into(), content(2))].into(),
+        unsent_edits: ["f".into()].into(),
         ..Default::default()
     };
     (trees, state)
 }
 
-/// A file L, S and R hold alike is still a local edit while its content is recorded as one the
-/// server does not hold, so the state keeps it dirty.
+/// A file L, S and R hold alike is still a local edit while it is recorded as one the server does
+/// not hold, so the state keeps it dirty, and L holds it.
 #[test]
-fn an_unsent_edit_restores_while_l_holds_its_content_and_the_file_is_dirty() {
+fn an_unsent_edit_restores_while_l_holds_the_file_and_it_is_dirty() {
     let (mut trees, state) = unsent();
     trees.restore(state.clone()).unwrap();
     assert_eq!(trees.state(), state);
@@ -156,14 +156,14 @@ fn an_unsent_edit_restores_while_l_holds_its_content_and_the_file_is_dirty() {
         ..state
     };
     assert_eq!(trees.restore(clean), Err(StateError::NotDirty("f".into())));
-    let (mut trees, mut state) = unsent();
-    state.unsent_edits.insert("f".into(), content(3));
+    let (mut trees, state) = unsent();
+    trees.remove_local("f");
     assert_eq!(
         trees.restore(state),
         Err(StateError::NotUnsentEdit("f".into()))
     );
     let (mut trees, mut state) = unsent();
-    state.unsent_edits.insert("g".into(), content(2));
+    state.unsent_edits.insert("g".into());
     assert_eq!(
         trees.restore(state),
         Err(StateError::NotUnsentEdit("g".into()))

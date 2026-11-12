@@ -169,13 +169,10 @@ impl Tx<'_> {
         while let Some(row) = rows.next()? {
             state.trees.edited_here.insert(row.get(0)?, row.get(1)?);
         }
-        let mut stmt = self
-            .0
-            .prepare_cached("SELECT node_id, content FROM unsent_edits")?;
+        let mut stmt = self.0.prepare_cached("SELECT node_id FROM unsent_edits")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
-            let content = Content::decode(row.get::<_, Vec<u8>>(1)?.as_slice())?;
-            state.trees.unsent_edits.insert(row.get(0)?, content);
+            state.trees.unsent_edits.insert(row.get(0)?);
         }
 
         if let Some((accepted, halt, code, cap)) = self
@@ -444,15 +441,15 @@ impl Tx<'_> {
         let mut remove = self
             .0
             .prepare_cached("DELETE FROM unsent_edits WHERE node_id = ?1")?;
-        let mut put = self.0.prepare_cached(
-            "INSERT OR REPLACE INTO unsent_edits (node_id, content) VALUES (?1, ?2)",
-        )?;
-        let (removed, changed) = differences(&before.trees.unsent_edits, &after.trees.unsent_edits);
-        for node in removed {
+        let mut put = self
+            .0
+            .prepare_cached("INSERT OR IGNORE INTO unsent_edits (node_id) VALUES (?1)")?;
+        let (old, new) = (&before.trees.unsent_edits, &after.trees.unsent_edits);
+        for node in old.difference(new) {
             remove.execute([node])?;
         }
-        for (node, content) in changed {
-            put.execute(params![node, content.encode_to_vec()])?;
+        for node in new.difference(old) {
+            put.execute([node])?;
         }
 
         let (old, new) = (&before.commits, &after.commits);

@@ -393,8 +393,7 @@ const MIGRATIONS: &[&str] = &[
 ",
     "
     CREATE TABLE unsent_edits (
-        node_id TEXT PRIMARY KEY,
-        content BLOB NOT NULL
+        node_id TEXT PRIMARY KEY
     ) STRICT, WITHOUT ROWID;
 ",
 ];
