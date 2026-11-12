@@ -77,8 +77,8 @@ pub struct Pending {
     pub sent: String,
     /// The name L gave the node, which it takes once it leaves the pending name.
     pub name: String,
-    /// Whether the commit that sent the node under \`sent\` was acknowledged. Until then R need not
-    /// hold the node there.
+    /// Whether R has held the node under `sent`. Until then the commit that sends it there may
+    /// still be in flight, and R need not hold it there.
     pub landed: bool,
 }
 

@@ -968,11 +968,6 @@ impl Commits {
     /// elsewhere, each is made as soon as it fits and the rest wait (see [`Trees::waiting`]).
     pub fn acknowledge(&mut self, trees: &mut Trees, last_seq: u64) -> bool {
         let acknowledged = self.acknowledge_flight(trees, last_seq);
-        if acknowledged {
-            for pending in self.pending.values_mut() {
-                pending.landed = true;
-            }
-        }
         self.retire_pending(trees);
         acknowledged
     }
@@ -986,10 +981,13 @@ impl Commits {
                         if moved.node_id == *id && nfc(&moved.new_name) == nfc(&pending.name))
                 })
             });
-            (flight.is_some() && !pending.landed)
-                || owed_in_flight
-                || (trees.remote().get(id))
-                    .is_some_and(|remote| nfc(&remote.shape.name) == nfc(&pending.sent))
+            if (trees.remote().get(id))
+                .is_some_and(|remote| nfc(&remote.shape.name) == nfc(&pending.sent))
+            {
+                pending.landed = true;
+                return true;
+            }
+            (flight.is_some() && !pending.landed) || owed_in_flight
         });
     }
 

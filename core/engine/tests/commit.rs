@@ -6285,3 +6285,47 @@ fn a_rename_another_device_makes_while_this_device_moves_the_node_ends_the_owed_
         next.as_ref().map(ops)
     );
 }
+
+#[test]
+fn a_rename_another_device_makes_once_a_pending_create_lands_ends_the_owed_rename_before_the_result()
+ {
+    let mut trees = trees(&[
+        (
+            "h",
+            Some(file("n", "child", 1)),
+            Some(file(ROOT, "a", 1)),
+            Some(remote(file(ROOT, "a", 1))),
+        ),
+        ("n", Some(dir(ROOT, "a")), None, None),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let first = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(first.ops.len(), 2);
+    assert!(!commits.state().pending["n"].landed);
+    trees.remove_local("h");
+    trees.remove_local("n");
+    trees.set_remote("n".into(), remote_at(dir(ROOT, "a (pending)"), 8));
+    trees.set_remote("h".into(), remote_at(file("n", "child", 1), 8));
+    assert!(!commits.acknowledge(&mut trees, 8));
+    assert!(commits.state().pending["n"].landed);
+    trees.set_remote("n".into(), remote_at(dir(ROOT, "c"), 9));
+    trees.set_remote("h".into(), remote_at(file("n", "child", 2), 9));
+    assert!(!commits.acknowledge(&mut trees, 9));
+    assert!(!commits.state().pending.contains_key("n"));
+    trees.set_remote("n".into(), remote_at(dir(ROOT, "a (pending)"), 10));
+    assert!(!commits.acknowledge(&mut trees, 10));
+    commits
+        .received(result(8, vec![outcome(op_result::Code::Applied); 2]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 10));
+    trees.settle();
+    let _ = build(&mut commits, &mut trees, &mut ids);
+    effects_for(&mut trees, &mut ids, "n");
+    let next = build(&mut commits, &mut trees, &mut ids);
+    assert!(
+        next.as_ref()
+            .is_none_or(|commit| !ops(commit).contains(&mv("n", ROOT, "a"))),
+        "{:?}",
+        next.as_ref().map(ops)
+    );
+}
