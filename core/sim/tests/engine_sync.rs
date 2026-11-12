@@ -3557,3 +3557,207 @@ fn a_folder_the_user_deleted_comes_back_for_a_waiting_file_the_server_moves_into
     ];
     run(&seed, &local, &remote, 1, true, &during).unwrap();
 }
+
+#[test]
+fn a_file_the_user_deleted_while_its_server_move_waited_in_s_is_deleted_on_the_server() {
+    let seed = vec![
+        Action {
+            kind: 0,
+            target: 4614810417318265143,
+            parent: 4864179259767229626,
+            name: 1,
+            text: 2,
+        },
+        Action {
+            kind: 0,
+            target: 12119355532117708331,
+            parent: 14757475804517505032,
+            name: 5,
+            text: 2,
+        },
+        Action {
+            kind: 1,
+            target: 6625108946950071779,
+            parent: 9918011999374063130,
+            name: 3,
+            text: 2,
+        },
+        Action {
+            kind: 0,
+            target: 12576383093733275581,
+            parent: 4466178185947277735,
+            name: 3,
+            text: 2,
+        },
+    ];
+    let local = vec![
+        Action {
+            kind: 2,
+            target: 5819694219100739927,
+            parent: 2036847718054668352,
+            name: 6,
+            text: 3,
+        },
+        Action {
+            kind: 5,
+            target: 2270324102383091549,
+            parent: 7093835583652112558,
+            name: 1,
+            text: 2,
+        },
+        Action {
+            kind: 1,
+            target: 13656694315896170903,
+            parent: 15331058797787251121,
+            name: 1,
+            text: 3,
+        },
+        Action {
+            kind: 2,
+            target: 1710332307205056776,
+            parent: 7320500736078956321,
+            name: 1,
+            text: 2,
+        },
+        Action {
+            kind: 0,
+            target: 14507846936884681424,
+            parent: 12527369109280507380,
+            name: 4,
+            text: 2,
+        },
+        Action {
+            kind: 1,
+            target: 8650148038972097623,
+            parent: 6435848661095480790,
+            name: 4,
+            text: 2,
+        },
+    ];
+    let remote = vec![
+        Action {
+            kind: 6,
+            target: 807225587938069940,
+            parent: 17863857293020369369,
+            name: 5,
+            text: 3,
+        },
+        Action {
+            kind: 4,
+            target: 13730757541944084961,
+            parent: 11742315858831314384,
+            name: 1,
+            text: 1,
+        },
+        Action {
+            kind: 0,
+            target: 14107778014734974581,
+            parent: 14200207690007878352,
+            name: 4,
+            text: 1,
+        },
+        Action {
+            kind: 3,
+            target: 5566379684988951548,
+            parent: 4569525365923634314,
+            name: 3,
+            text: 3,
+        },
+    ];
+    let fits = MAX_OPS;
+    let fresh_dir_names = true;
+    let during = vec![
+        (
+            false,
+            vec![
+                Action {
+                    kind: 3,
+                    target: 17702201595369440910,
+                    parent: 11821905956357519784,
+                    name: 0,
+                    text: 2,
+                },
+                Action {
+                    kind: 4,
+                    target: 2762722298416582515,
+                    parent: 8244077946071889904,
+                    name: 3,
+                    text: 3,
+                },
+            ],
+        ),
+        (
+            true,
+            vec![
+                Action {
+                    kind: 0,
+                    target: 13793337169377006733,
+                    parent: 3592739378196482913,
+                    name: 5,
+                    text: 3,
+                },
+                Action {
+                    kind: 4,
+                    target: 7353629600874959317,
+                    parent: 3775275498239273878,
+                    name: 6,
+                    text: 0,
+                },
+                Action {
+                    kind: 1,
+                    target: 1401826479567066740,
+                    parent: 10805880149766239377,
+                    name: 6,
+                    text: 0,
+                },
+            ],
+        ),
+        (
+            true,
+            vec![
+                Action {
+                    kind: 5,
+                    target: 3508424595374466801,
+                    parent: 13652394482325166857,
+                    name: 4,
+                    text: 1,
+                },
+                Action {
+                    kind: 0,
+                    target: 12196094243527756545,
+                    parent: 6472941235758237528,
+                    name: 1,
+                    text: 1,
+                },
+            ],
+        ),
+        (
+            false,
+            vec![
+                Action {
+                    kind: 4,
+                    target: 5237472451013669662,
+                    parent: 3865121539495492564,
+                    name: 3,
+                    text: 2,
+                },
+                Action {
+                    kind: 0,
+                    target: 4275436719165289791,
+                    parent: 10695791634680114475,
+                    name: 1,
+                    text: 2,
+                },
+                Action {
+                    kind: 4,
+                    target: 113406059743004084,
+                    parent: 11482615632212085002,
+                    name: 1,
+                    text: 0,
+                },
+            ],
+        ),
+    ];
+    let cut = Cut::Answered;
+    run_cut(&seed, &local, &remote, fits, fresh_dir_names, &during, cut).unwrap();
+}

@@ -1456,7 +1456,7 @@ impl Synced {
 fn deletes(trees: &Trees, id: &str, needed: &BTreeSet<NodeId>) -> bool {
     trees.local().get(id).is_none()
         && trees.synced().live(id).is_some()
-        && trees.class(id) == Class::Local
+        && trees.acknowledged_class(id) == Class::Local
         && !needed.contains(id)
 }
 
@@ -1801,29 +1801,31 @@ fn agree(trees: &Trees, id: &str, seq: u64) -> Option<(NodeId, Agreed)> {
     (trees.position_after(id, seq)).map(|at| (id.to_owned(), at.clone()))
 }
 
-/// Whether L changed a node whose S update waits: L edited it, or moved it away from the waiting
-/// position while R still holds it there. Such a node is planned and rebased against the waiting
-/// shape. An edit is uploaded while only the position waits, wherever R holds the node, and a move
-/// is planned because the update may never fit while L holds the node elsewhere, as when a folder
-/// R trashed takes its name key in S and L cannot remove that folder while the node is inside it.
+/// Whether L changed a node whose S update waits: L edited it, or moved it away from or deleted it
+/// at the waiting position while R still holds it there. Such a node is planned and rebased against
+/// the waiting shape. An edit is uploaded while only the position waits, wherever R holds the node,
+/// and a move or a delete is planned because the update may never fit while L holds the node
+/// elsewhere or not at all, as when a folder R trashed takes its name key in S and L cannot remove
+/// that folder while the node is inside it.
 fn changed_locally(trees: &Trees, id: &str) -> bool {
-    let (
-        Some(local),
-        Some(Waiting {
-            shape: Some(waiting),
-            ..
-        }),
-    ) = (trees.local().live(id), trees.waiting().get(id))
+    let Some(Waiting {
+        shape: Some(waiting),
+        ..
+    }) = trees.waiting().get(id)
     else {
         return false;
+    };
+    let remote = trees.remote().live(id);
+    let Some(local) = trees.local().live(id) else {
+        return remote.is_some_and(|remote| remote.same_position(waiting));
     };
     let edited = local.kind != waiting.kind
         || match (&local.content, &waiting.content) {
             (Some(a), Some(b)) => !same_content(a, b),
             (a, b) => a.is_some() != b.is_some(),
         };
-    let moved = !local.same_position(waiting)
-        && (trees.remote().live(id)).is_some_and(|remote| remote.same_position(waiting));
+    let moved =
+        !local.same_position(waiting) && remote.is_some_and(|remote| remote.same_position(waiting));
     edited || moved
 }
 
