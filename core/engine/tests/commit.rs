@@ -3893,6 +3893,46 @@ fn a_late_acknowledgement_renamed_by_the_server_keeps_the_position_s_took_after_
     a_late_acknowledgement_keeps_the_position_s_took_after_the_commit(false, true);
 }
 
+/// n's move to b is in flight with m's move to d, which the server rejects, so m is a problem and
+/// S keeps it at c. The other device moves m to e, and both sides move n to c, so n's agreement
+/// waits behind m. The user then edits n: the edit is uploaded while the position waits.
+#[test]
+fn an_edit_of_a_node_waiting_behind_a_problem_node_is_uploaded() {
+    let mut trees = trees(&[
+        (
+            "n",
+            Some(file(ROOT, "b", 1)),
+            Some(file(ROOT, "a", 1)),
+            Some(remote(file(ROOT, "a", 1))),
+        ),
+        (
+            "m",
+            Some(file(ROOT, "d", 2)),
+            Some(file(ROOT, "c", 2)),
+            Some(remote(file(ROOT, "c", 2))),
+        ),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("m", ROOT, "d"), mv("n", ROOT, "b")]);
+    let rejected = OpResult {
+        reject_reason: "NAME_INVALID".into(),
+        ..outcome(op_result::Code::Rejected)
+    };
+    trees.set_remote("m".into(), remote_at(file(ROOT, "e", 2), 3));
+    trees.set_local("n".into(), local(file(ROOT, "c", 1), 1));
+    trees.set_remote("n".into(), remote_at(file(ROOT, "c", 1), 4));
+    trees.settle();
+    let results = vec![rejected, outcome(op_result::Code::Applied)];
+    commits.received(result(2, results)).unwrap();
+    assert!(commits.acknowledge(&mut trees, 4));
+    trees.settle();
+    trees.set_local("n".into(), local(file(ROOT, "c", 9), 1));
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids);
+    assert_eq!(commit.as_ref().map(ops), Some(vec![update("n", 9)]));
+}
+
 /// n's move to b is in flight. The user and the other device move m from c to d with different
 /// content, so S keeps m at c, and then both move n to c. The other device then moves n on to x.
 /// S cannot take the agreed c while m holds it, so the agreement waits: n is not planned, and once
