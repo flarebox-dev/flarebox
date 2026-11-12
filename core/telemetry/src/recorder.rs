@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The in-memory sums of what a process recorded, per UTC day, until [`Store::absorb`](crate::Store::absorb) moves
-//! them to disk.
-
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -65,7 +62,6 @@ impl Recorder {
         taken
     }
 
-    /// Hands back what a failed write took, so it is not lost.
     pub fn restore(&self, taken: Pending) {
         self.with(|pending| {
             for (day, report) in taken.days {

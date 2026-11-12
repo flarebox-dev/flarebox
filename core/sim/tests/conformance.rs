@@ -1,10 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Runs spec/testdata/scenarios/space-conformance-v1.json against the reference Space DO. The
-//! TypeScript server runs the same file, so both implementations meet the same hand-written
-//! expectations. The file's own conventions list describes every field read here; a field that is
-//! unknown or has the wrong type fails its scenario instead of being ignored.
-
 use std::collections::{BTreeSet, HashMap};
 
 use koidrive_engine::ids::IdGen;
@@ -68,11 +63,8 @@ fn main() {
     }
 }
 
-/// The scenario whose missing-chunk list is longer than one error can carry.
 const LONG_MISSING_LIST: &str = "a-long-missing-chunk-list-is-capped-and-the-resent-commit-applies";
 
-/// Mutations of a scenario that a correct runner must reject, each with the failure it must
-/// report. The first two and the total once passed.
 fn self_tests(doc: &Value) -> Vec<(&'static str, Outcome)> {
     let base = &doc["scenarios"][0];
     let long = doc["scenarios"]
@@ -157,7 +149,6 @@ fn object<'a>(value: &'a Value, what: &str) -> Result<&'a Map<String, Value>, St
         .ok_or_else(|| format!("{what} must be an object, got {value}"))
 }
 
-/// Fails on any key outside `allowed`, so that a misspelled assertion cannot vanish.
 fn keys(value: &Value, what: &str, allowed: &[&str]) -> Outcome {
     for key in object(value, what)?.keys() {
         if !allowed.contains(&key.as_str()) {
@@ -236,8 +227,6 @@ fn check_doc(doc: &Value) -> Outcome {
     Ok(())
 }
 
-/// A call step's expectations. With `error` only the fields of the error branch apply, without it
-/// only those of the success branch, so a field for the other branch fails instead of being ignored.
 fn expectation<'a>(
     step: &'a Value,
     on_error: &[&str],
@@ -306,12 +295,8 @@ struct Run {
     devices: HashMap<String, Session>,
     contents: HashMap<String, Content>,
     wallets: HashMap<(String, String), Vec<UploadReceipt>>,
-    /// Per device and space, the `device_seq` of the device's last commit there that was applied.
     slots: HashMap<(String, String), u64>,
-    /// Per device, space and `commit_id`, the `device_seq` the commit was first sent with: a retry
-    /// keeps it (RFC 0002 section 2).
     sent_slots: HashMap<(String, String, String), u64>,
-    /// Per space, the highest seq a commit returned.
     top_seq: HashMap<String, u64>,
     last_missing: HashMap<(String, String), Vec<Vec<u8>>>,
     symbols: HashMap<String, String>,
@@ -433,7 +418,6 @@ impl Run {
         Ok(())
     }
 
-    /// What `root` or a `=` literal stands for, which never binds.
     fn fixed(&self, space: &str, symbol: &str) -> Result<Option<String>, String> {
         if symbol == "root" {
             return Ok(Some(self.space(space)?.space_id().to_owned()));
@@ -441,7 +425,6 @@ impl Run {
         Ok(symbol.strip_prefix('=').map(str::to_owned))
     }
 
-    /// The ID a symbol stands for in a request, minting one for a symbol not seen before.
     fn id(&mut self, space: &str, symbol: &str) -> Result<String, String> {
         if let Some(value) = self.fixed(space, symbol)? {
             return Ok(value);
@@ -454,7 +437,6 @@ impl Run {
         Ok(value)
     }
 
-    /// The ID a symbol in an expected set stands for; such a symbol must already be bound.
     fn known(&self, space: &str, symbol: &str) -> Result<String, String> {
         if let Some(value) = self.fixed(space, symbol)? {
             return Ok(value);
@@ -465,8 +447,6 @@ impl Run {
             .ok_or_else(|| format!("unbound symbol {symbol}"))
     }
 
-    /// Checks a returned ID: `root` and literals compare exactly, a bound symbol must match, and an
-    /// unbound one binds.
     fn expect_id(&mut self, space: &str, symbol: &str, value: &str) -> Outcome {
         match self.fixed(space, symbol)? {
             Some(fixed) if fixed == value => Ok(()),

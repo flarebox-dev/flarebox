@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Applies the ops of one commit to a copy of the space state, following spec v0 section 6. A port of
-//! the server's `CommitApplier` (server/src/space/commit.ts), rule by rule.
-
 use std::collections::{BTreeSet, HashMap};
 
 use koidrive_engine::names::{conflict_name, is_reserved_at_root, name_key, normalize_name};
@@ -17,7 +14,6 @@ pub const MAX_DEPTH: usize = 256;
 
 pub(super) struct Context<'a> {
     pub seq: u64,
-    /// The commit's ID, which names the trash groups of its deletes (RFC 0012).
     pub commit_id: &'a str,
     pub base_seq: u64,
     pub now_ms: i64,
@@ -135,9 +131,7 @@ impl<'a> Applier<'a> {
         node.meta_rev > self.ctx.base_seq && node.meta_dev != self.dev()
     }
 
-    /// Whether this commit's device has not seen where `node` is now (RFC 0002 section 9). The commit
-    /// that last put `node` under its parent or brought it back from the trash came after the base,
-    /// and its device is another one or not recorded.
+    /// RFC 0002 section 9.
     fn unseen_parent(&self, node: &Node) -> bool {
         node.parent_rev > self.ctx.base_seq && node.parent_dev != self.dev()
     }
@@ -165,9 +159,6 @@ impl<'a> Applier<'a> {
         Ok(())
     }
 
-    /// Rejects the commit when placing `node` under `parent` would put it or a descendant, trashed ones
-    /// included, deeper than [`MAX_DEPTH`]. A destination no deeper than the current position cannot,
-    /// because the tree already satisfies the limit.
     fn check_subtree_depth(&self, node: &Node, parent: &Node) -> Result<(), Error> {
         let new_depth = self.depth(parent) + 1;
         if new_depth <= self.depth(node) {
@@ -214,8 +205,6 @@ impl<'a> Applier<'a> {
             .min_by_key(|n| n.row)
     }
 
-    /// R1: the desired name, or the first free conflict name. A name reserved at the root counts as
-    /// taken there.
     fn pick_name(&self, parent_id: &str, desired: &str, exclude_id: &str) -> (String, bool) {
         let at_root = self.is_root(parent_id);
         let mut name = desired.to_string();
@@ -254,8 +243,6 @@ impl<'a> Applier<'a> {
             .expect("an unbounded search finds a free name")
     }
 
-    /// Brings one trashed node back under `parent_id`, renaming it on a name clash. `parent_dev` is
-    /// empty unless the op named both.
     fn revive_one(
         &mut self,
         node_id: &str,
@@ -279,7 +266,6 @@ impl<'a> Applier<'a> {
         (name, renamed)
     }
 
-    /// R8: revives the trashed ancestor chain ending at `node_id`, top-down.
     fn revive_chain(&mut self, node_id: &str) {
         let mut chain = Vec::new();
         let mut cur = self.st.nodes.get(node_id);
@@ -297,7 +283,6 @@ impl<'a> Applier<'a> {
         }
     }
 
-    /// Revives the trashed descendants of `parent_id` that went to the trash with it.
     fn revive_group(&mut self, parent_id: &str, group: &str) {
         let children = self.st.children(parent_id, NodeStatus::Trashed);
         for child in children
@@ -309,9 +294,6 @@ impl<'a> Applier<'a> {
         }
     }
 
-    /// R8 for the target of an edit or move: its ancestors, itself and its trash group come back.
-    /// Revives a trashed op target with its ancestor chain and trash group (R8), and reports whether
-    /// it had to take a conflict name to do so (R1).
     fn revive_target(&mut self, node: Node) -> (Node, bool) {
         if node.status != NodeStatus::Trashed {
             return (node, false);
@@ -327,7 +309,6 @@ impl<'a> Applier<'a> {
         (self.st.nodes[&node.node_id].clone(), renamed)
     }
 
-    /// Resolves a parent for a create or move, reviving it when trashed.
     fn parent_for(&mut self, parent_id: &str) -> Result<Result<Node, Reject>, Error> {
         let Some(parent) = self.node(parent_id) else {
             return Ok(Err("NOT_FOUND"));
@@ -592,9 +573,6 @@ impl<'a> Applier<'a> {
         Ok(applied(renamed, &name))
     }
 
-    /// R7 and RFC 0002 section 9: trashes the part of the subtree whose placement this commit's device
-    /// has seen. Nodes with unseen changes stay with their ancestors, and a node with an unseen
-    /// placement stays with its whole subtree. Returns true when the node stays.
     fn trash_subtree(&mut self, node: &Node, group: &str) -> bool {
         if self.unseen_parent(node) {
             return true;
