@@ -209,7 +209,10 @@ fn remote_action(space: &mut SpaceDo, ids: &mut IdGen, device: u8, action: &Acti
             }
         }
         _ => match target(&all) {
-            Some(node_id) => op::Op::Delete(Delete { node_id }),
+            Some(node_id) => op::Op::Delete(Delete {
+                node_id,
+                requires: None,
+            }),
             None => return,
         },
     };

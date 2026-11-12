@@ -770,6 +770,7 @@ impl Commits {
             };
             let delete_copy = op::Op::Delete(proto::Delete {
                 node_id: copy.node_id.clone(),
+                requires: None,
             });
             let op = match question.answer {
                 Some(Answer::KeepOriginal) => Some(delete_copy),
@@ -2155,7 +2156,10 @@ fn plan(
             Want::Delete { id, members } => {
                 scratch.trash(&id);
                 deletes.insert(id.clone(), members.into_iter().collect());
-                op::Op::Delete(proto::Delete { node_id: id })
+                op::Op::Delete(proto::Delete {
+                    node_id: id,
+                    requires: None,
+                })
             }
             Want::Restore { op, .. } => {
                 let trashed = (trees.remote().get(&op.node_id))

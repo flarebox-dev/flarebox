@@ -386,6 +386,7 @@ fn engine_state() -> EngineState {
             Op {
                 op: Some(op::Op::Delete(Delete {
                     node_id: "old".into(),
+                    requires: None,
                 })),
             },
             Op {

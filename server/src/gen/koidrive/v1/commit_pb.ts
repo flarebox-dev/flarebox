@@ -14,7 +14,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file koidrive/v1/commit.proto.
  */
 export const file_koidrive_v1_commit: GenFile = /*@__PURE__*/
-  fileDesc("Chhrb2lkcml2ZS92MS9jb21taXQucHJvdG8SC2tvaWRyaXZlLnYxIpECCgJPcBIsCgpjcmVhdGVfZGlyGAEgASgLMhYua29pZHJpdmUudjEuQ3JlYXRlRGlySAASLgoLY3JlYXRlX2ZpbGUYAiABKAsyFy5rb2lkcml2ZS52MS5DcmVhdGVGaWxlSAASNAoOdXBkYXRlX2NvbnRlbnQYAyABKAsyGi5rb2lkcml2ZS52MS5VcGRhdGVDb250ZW50SAASIQoEbW92ZRgEIAEoCzIRLmtvaWRyaXZlLnYxLk1vdmVIABIlCgZkZWxldGUYBSABKAsyEy5rb2lkcml2ZS52MS5EZWxldGVIABInCgdyZXN0b3JlGAYgASgLMhQua29pZHJpdmUudjEuUmVzdG9yZUgAQgQKAm9wIj0KCUNyZWF0ZURpchIPCgdub2RlX2lkGAEgASgJEhEKCXBhcmVudF9pZBgCIAEoCRIMCgRuYW1lGAMgASgJImUKCkNyZWF0ZUZpbGUSDwoHbm9kZV9pZBgBIAEoCRIRCglwYXJlbnRfaWQYAiABKAkSDAoEbmFtZRgDIAEoCRIlCgdjb250ZW50GAQgASgLMhQua29pZHJpdmUudjEuQ29udGVudCJHCg1VcGRhdGVDb250ZW50Eg8KB25vZGVfaWQYASABKAkSJQoHY29udGVudBgCIAEoCzIULmtvaWRyaXZlLnYxLkNvbnRlbnQiQAoETW92ZRIPCgdub2RlX2lkGAEgASgJEhUKDW5ld19wYXJlbnRfaWQYAiABKAkSEAoIbmV3X25hbWUYAyABKAkiGQoGRGVsZXRlEg8KB25vZGVfaWQYASABKAkiVgoHUmVzdG9yZRIPCgdub2RlX2lkGAEgASgJEhIKCnZlcnNpb25faWQYAiABKAkSGAoQdGFyZ2V0X3BhcmVudF9pZBgDIAEoCRIMCgRuYW1lGAQgASgJIjoKDVVwbG9hZFJlY2VpcHQSDAoEaGFzaBgBIAEoDBIMCgRzaXplGAIgASgNEg0KBXRva2VuGAMgASgJIv0BCgZDb21taXQSEQoJY29tbWl0X2lkGAEgASgJEhAKCGJhc2Vfc2VxGAIgASgEEhwKA29wcxgDIAMoCzIPLmtvaWRyaXZlLnYxLk9wEiwKCHJlY2VpcHRzGAQgAygLMhoua29pZHJpdmUudjEuVXBsb2FkUmVjZWlwdBISCgpoaXN0b3J5X2lkGAUgASgJEhIKCmRldmljZV9zZXEYBiABKAQSFAoMcmVxdWlyZV9oZWFkGAcgASgIEg4KBnJ1bl9pZBgIIAEoCRIWCg5iYXNlX2NvbW1pdF9pZBgJIAEoCRIcChRiYXNlX2NvbW1pdHRlZF9hdF9tcxgKIAEoAyKLAgoIT3BSZXN1bHQSKAoEY29kZRgBIAEoDjIaLmtvaWRyaXZlLnYxLk9wUmVzdWx0LkNvZGUSDwoHbm9kZV9pZBgCIAEoCRIMCgRuYW1lGAMgASgJEhUKDXJlamVjdF9yZWFzb24YBCABKAkingEKBENvZGUSFAoQQ09ERV9VTlNQRUNJRklFRBAAEhAKDENPREVfQVBQTElFRBABEhgKFENPREVfQVBQTElFRF9SRU5BTUVEEAISFgoSQ09ERV9DT05GTElDVF9DT1BZEAMSFAoQQ09ERV9NRVJHRURfSU5UTxAEEhMKD0NPREVfU1VQRVJTRURFRBAFEhEKDUNPREVfUkVKRUNURUQQBiKIAQoMQ29tbWl0UmVzdWx0EgsKA3NlcRgBIAEoBBImCgdyZXN1bHRzGAIgAygLMhUua29pZHJpdmUudjEuT3BSZXN1bHQSKgoHY2hhbmdlcxgDIAMoCzIZLmtvaWRyaXZlLnYxLkNoYW5nZVJlY29yZBIXCg9jb21taXR0ZWRfYXRfbXMYBCABKANiBnByb3RvMw", [file_koidrive_v1_model]);
+  fileDesc("Chhrb2lkcml2ZS92MS9jb21taXQucHJvdG8SC2tvaWRyaXZlLnYxIpECCgJPcBIsCgpjcmVhdGVfZGlyGAEgASgLMhYua29pZHJpdmUudjEuQ3JlYXRlRGlySAASLgoLY3JlYXRlX2ZpbGUYAiABKAsyFy5rb2lkcml2ZS52MS5DcmVhdGVGaWxlSAASNAoOdXBkYXRlX2NvbnRlbnQYAyABKAsyGi5rb2lkcml2ZS52MS5VcGRhdGVDb250ZW50SAASIQoEbW92ZRgEIAEoCzIRLmtvaWRyaXZlLnYxLk1vdmVIABIlCgZkZWxldGUYBSABKAsyEy5rb2lkcml2ZS52MS5EZWxldGVIABInCgdyZXN0b3JlGAYgASgLMhQua29pZHJpdmUudjEuUmVzdG9yZUgAQgQKAm9wIj0KCUNyZWF0ZURpchIPCgdub2RlX2lkGAEgASgJEhEKCXBhcmVudF9pZBgCIAEoCRIMCgRuYW1lGAMgASgJImUKCkNyZWF0ZUZpbGUSDwoHbm9kZV9pZBgBIAEoCRIRCglwYXJlbnRfaWQYAiABKAkSDAoEbmFtZRgDIAEoCRIlCgdjb250ZW50GAQgASgLMhQua29pZHJpdmUudjEuQ29udGVudCJHCg1VcGRhdGVDb250ZW50Eg8KB25vZGVfaWQYASABKAkSJQoHY29udGVudBgCIAEoCzIULmtvaWRyaXZlLnYxLkNvbnRlbnQiQAoETW92ZRIPCgdub2RlX2lkGAEgASgJEhUKDW5ld19wYXJlbnRfaWQYAiABKAkSEAoIbmV3X25hbWUYAyABKAkiRwoGRGVsZXRlEg8KB25vZGVfaWQYASABKAkSLAoIcmVxdWlyZXMYAiABKAsyGi5rb2lkcml2ZS52MS5Ob2RlUmV2aXNpb25zIkcKDU5vZGVSZXZpc2lvbnMSDwoHbm9kZV9pZBgBIAEoCRITCgtjb250ZW50X3JldhgCIAEoBBIQCghtZXRhX3JldhgDIAEoBCJWCgdSZXN0b3JlEg8KB25vZGVfaWQYASABKAkSEgoKdmVyc2lvbl9pZBgCIAEoCRIYChB0YXJnZXRfcGFyZW50X2lkGAMgASgJEgwKBG5hbWUYBCABKAkiOgoNVXBsb2FkUmVjZWlwdBIMCgRoYXNoGAEgASgMEgwKBHNpemUYAiABKA0SDQoFdG9rZW4YAyABKAki/QEKBkNvbW1pdBIRCgljb21taXRfaWQYASABKAkSEAoIYmFzZV9zZXEYAiABKAQSHAoDb3BzGAMgAygLMg8ua29pZHJpdmUudjEuT3ASLAoIcmVjZWlwdHMYBCADKAsyGi5rb2lkcml2ZS52MS5VcGxvYWRSZWNlaXB0EhIKCmhpc3RvcnlfaWQYBSABKAkSEgoKZGV2aWNlX3NlcRgGIAEoBBIUCgxyZXF1aXJlX2hlYWQYByABKAgSDgoGcnVuX2lkGAggASgJEhYKDmJhc2VfY29tbWl0X2lkGAkgASgJEhwKFGJhc2VfY29tbWl0dGVkX2F0X21zGAogASgDIosCCghPcFJlc3VsdBIoCgRjb2RlGAEgASgOMhoua29pZHJpdmUudjEuT3BSZXN1bHQuQ29kZRIPCgdub2RlX2lkGAIgASgJEgwKBG5hbWUYAyABKAkSFQoNcmVqZWN0X3JlYXNvbhgEIAEoCSKeAQoEQ29kZRIUChBDT0RFX1VOU1BFQ0lGSUVEEAASEAoMQ09ERV9BUFBMSUVEEAESGAoUQ09ERV9BUFBMSUVEX1JFTkFNRUQQAhIWChJDT0RFX0NPTkZMSUNUX0NPUFkQAxIUChBDT0RFX01FUkdFRF9JTlRPEAQSEwoPQ09ERV9TVVBFUlNFREVEEAUSEQoNQ09ERV9SRUpFQ1RFRBAGIogBCgxDb21taXRSZXN1bHQSCwoDc2VxGAEgASgEEiYKB3Jlc3VsdHMYAiADKAsyFS5rb2lkcml2ZS52MS5PcFJlc3VsdBIqCgdjaGFuZ2VzGAMgAygLMhkua29pZHJpdmUudjEuQ2hhbmdlUmVjb3JkEhcKD2NvbW1pdHRlZF9hdF9tcxgEIAEoA2IGcHJvdG8z", [file_koidrive_v1_model]);
 
 /**
  * An intended change sent by a client.
@@ -187,6 +187,14 @@ export type Delete = Message<"koidrive.v1.Delete"> & {
    * @generated from field: string node_id = 1;
    */
   nodeId: string;
+
+  /**
+   * When set, the delete applies only while this node is live at these revisions; otherwise it is answered with
+   * CODE_SUPERSEDED and trashes nothing (RFC 0015).
+   *
+   * @generated from field: koidrive.v1.NodeRevisions requires = 2;
+   */
+  requires?: NodeRevisions | undefined;
 };
 
 /**
@@ -195,6 +203,35 @@ export type Delete = Message<"koidrive.v1.Delete"> & {
  */
 export const DeleteSchema: GenMessage<Delete> = /*@__PURE__*/
   messageDesc(file_koidrive_v1_commit, 5);
+
+/**
+ * A node at the revisions of its NodeState.
+ *
+ * @generated from message koidrive.v1.NodeRevisions
+ */
+export type NodeRevisions = Message<"koidrive.v1.NodeRevisions"> & {
+  /**
+   * @generated from field: string node_id = 1;
+   */
+  nodeId: string;
+
+  /**
+   * @generated from field: uint64 content_rev = 2;
+   */
+  contentRev: bigint;
+
+  /**
+   * @generated from field: uint64 meta_rev = 3;
+   */
+  metaRev: bigint;
+};
+
+/**
+ * Describes the message koidrive.v1.NodeRevisions.
+ * Use `create(NodeRevisionsSchema)` to create a new message.
+ */
+export const NodeRevisionsSchema: GenMessage<NodeRevisions> = /*@__PURE__*/
+  messageDesc(file_koidrive_v1_commit, 6);
 
 /**
  * @generated from message koidrive.v1.Restore
@@ -226,7 +263,7 @@ export type Restore = Message<"koidrive.v1.Restore"> & {
  * Use `create(RestoreSchema)` to create a new message.
  */
 export const RestoreSchema: GenMessage<Restore> = /*@__PURE__*/
-  messageDesc(file_koidrive_v1_commit, 6);
+  messageDesc(file_koidrive_v1_commit, 7);
 
 /**
  * @generated from message koidrive.v1.UploadReceipt
@@ -253,7 +290,7 @@ export type UploadReceipt = Message<"koidrive.v1.UploadReceipt"> & {
  * Use `create(UploadReceiptSchema)` to create a new message.
  */
 export const UploadReceiptSchema: GenMessage<UploadReceipt> = /*@__PURE__*/
-  messageDesc(file_koidrive_v1_commit, 7);
+  messageDesc(file_koidrive_v1_commit, 8);
 
 /**
  * @generated from message koidrive.v1.Commit
@@ -327,7 +364,7 @@ export type Commit = Message<"koidrive.v1.Commit"> & {
  * Use `create(CommitSchema)` to create a new message.
  */
 export const CommitSchema: GenMessage<Commit> = /*@__PURE__*/
-  messageDesc(file_koidrive_v1_commit, 8);
+  messageDesc(file_koidrive_v1_commit, 9);
 
 /**
  * @generated from message koidrive.v1.OpResult
@@ -363,7 +400,7 @@ export type OpResult = Message<"koidrive.v1.OpResult"> & {
  * Use `create(OpResultSchema)` to create a new message.
  */
 export const OpResultSchema: GenMessage<OpResult> = /*@__PURE__*/
-  messageDesc(file_koidrive_v1_commit, 9);
+  messageDesc(file_koidrive_v1_commit, 10);
 
 /**
  * @generated from enum koidrive.v1.OpResult.Code
@@ -409,7 +446,7 @@ export enum OpResult_Code {
  * Describes the enum koidrive.v1.OpResult.Code.
  */
 export const OpResult_CodeSchema: GenEnum<OpResult_Code> = /*@__PURE__*/
-  enumDesc(file_koidrive_v1_commit, 9, 0);
+  enumDesc(file_koidrive_v1_commit, 10, 0);
 
 /**
  * @generated from message koidrive.v1.CommitResult
@@ -443,5 +480,5 @@ export type CommitResult = Message<"koidrive.v1.CommitResult"> & {
  * Use `create(CommitResultSchema)` to create a new message.
  */
 export const CommitResultSchema: GenMessage<CommitResult> = /*@__PURE__*/
-  messageDesc(file_koidrive_v1_commit, 10);
+  messageDesc(file_koidrive_v1_commit, 11);
 

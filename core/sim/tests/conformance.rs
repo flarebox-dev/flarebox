@@ -1242,7 +1242,10 @@ impl Run {
                     new_parent_id: parent,
                     new_name: name,
                 }),
-                "delete" => op::Op::Delete(Delete { node_id: node }),
+                "delete" => op::Op::Delete(Delete {
+                    node_id: node,
+                    requires: None,
+                }),
                 _ => op::Op::Restore(Restore {
                     node_id: node,
                     version_id: match opt_str(body, "version")? {

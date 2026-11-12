@@ -218,7 +218,10 @@ fn mv(id: &str, parent: &str, name: &str) -> Op {
 }
 
 fn delete(id: &str) -> Op {
-    wrap(op::Op::Delete(Delete { node_id: id.into() }))
+    wrap(op::Op::Delete(Delete {
+        node_id: id.into(),
+        requires: None,
+    }))
 }
 
 fn restore(id: &str, version_id: &str) -> Op {

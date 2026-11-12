@@ -471,7 +471,10 @@ fn a_restore_follows_the_delete_of_its_own_node() {
     let intent = from_trash(&n);
     commits.restore(id(100), intent.clone());
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
-    let delete = op::Op::Delete(proto::Delete { node_id: n });
+    let delete = op::Op::Delete(proto::Delete {
+        node_id: n,
+        requires: None,
+    });
     assert_eq!(ops(&commit), [delete, restore_op(&intent)]);
 }
 

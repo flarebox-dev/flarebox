@@ -137,6 +137,7 @@ fn mv(node: &str, parent: &str, name: &str) -> op::Op {
 fn delete(node: &str) -> op::Op {
     op::Op::Delete(proto::Delete {
         node_id: node.into(),
+        requires: None,
     })
 }
 
@@ -1335,7 +1336,8 @@ fn a_renamed_file_the_user_deletes_before_it_moves_is_deleted() {
     assert_eq!(
         ops(&commit),
         [op::Op::Delete(proto::Delete {
-            node_id: "a".into()
+            node_id: "a".into(),
+            requires: None
         })]
     );
 }

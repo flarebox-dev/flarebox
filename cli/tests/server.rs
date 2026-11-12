@@ -1057,7 +1057,10 @@ async fn trash_and_versions_list_what_the_space_keeps() {
                 node_id: note,
                 content: Some(file_content(b"second!")),
             }),
-            op::Op::Delete(Delete { node_id: gone }),
+            op::Op::Delete(Delete {
+                node_id: gone,
+                requires: None,
+            }),
         ],
     )
     .await;
@@ -1224,7 +1227,10 @@ async fn restore_brings_back_a_deleted_file_and_an_earlier_version() {
                 node_id: note,
                 content: Some(file_content(b"second!")),
             }),
-            op::Op::Delete(Delete { node_id: gone }),
+            op::Op::Delete(Delete {
+                node_id: gone,
+                requires: None,
+            }),
         ],
     )
     .await;

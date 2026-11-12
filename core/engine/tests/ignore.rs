@@ -133,6 +133,7 @@ fn nodes(effects: &[(String, Effect)]) -> Vec<&str> {
 fn delete(node: &str) -> op::Op {
     op::Op::Delete(proto::Delete {
         node_id: node.into(),
+        requires: None,
     })
 }
 

@@ -44,6 +44,16 @@ message Move {
 
 message Delete {
   string node_id = 1;
+  // When set, the delete applies only while this node is live at these revisions; otherwise it is answered with
+  // CODE_SUPERSEDED and trashes nothing (RFC 0015).
+  NodeRevisions requires = 2;
+}
+
+// A node at the revisions of its NodeState.
+message NodeRevisions {
+  string node_id = 1;
+  uint64 content_rev = 2;
+  uint64 meta_rev = 3;
 }
 
 message Restore {
