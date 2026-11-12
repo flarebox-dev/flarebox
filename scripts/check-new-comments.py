@@ -17,9 +17,11 @@ LANGUAGES = {
     ".mjs": "js",
     ".cjs": "js",
 }
-ALLOWED = re.compile(r"SPDX-License-Identifier|SAFETY:|@generated|eslint-|prettier-ignore|swiftlint:|https?://")
+PRAGMA = re.compile(r"^[/*!\s]*(SPDX-License-Identifier|SAFETY:|@generated|eslint-|prettier-ignore|swiftlint:|swift-tools-version:)")
+LINK = re.compile(r"https?://")
+CLAP_DERIVE = re.compile(r"derive\([^)]*\b(Parser|Subcommand|Args|ValueEnum)\b")
 MARKER = re.compile(r"\b(TODO|FIXME|XXX|HACK)\b|\bfor now\b", re.IGNORECASE)
-INTERNAL = re.compile(r"^(server|apps/macos/Koidrive|cli/tests)/|(^|/)(tests?|Tests)/|(^|/)tests\.rs$|\.test\.[cm]?[jt]sx?$")
+INTERNAL = re.compile(r"^(server|apps/macos/Koidrive|cli/tests)/|(^|/)(tests?|Tests|examples|benches)/|(^|/)src/bin/|(^|/)(tests|build)\.rs$|\.test\.[cm]?[jt]sx?$")
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 WORD = re.compile(r"\w+")
 IDENT = re.compile(r"[A-Za-z0-9_$]+")
@@ -38,6 +40,7 @@ MESSAGES = {
 def comment_spans(src, lang, tokens=None):
     found = []
     n = len(src)
+    tokens_end = [None]
 
     def block(i):
         depth, j = 1, i + 2
@@ -106,7 +109,7 @@ def comment_spans(src, lang, tokens=None):
             if c in "\"'":
                 return quoted(i, c, False, None)
             if c == "\x60":
-                return quoted(i, "\x60", True, "\${")
+                return quoted(i, "\x60", True, "${")
             if c == "/" and prev in REGEX_BEFORE:
                 return regex(i)
         m = IDENT.match(src, i)
@@ -136,7 +139,8 @@ def comment_spans(src, lang, tokens=None):
                 i = token(i, prev)
                 prev = src[start:i]
                 if tokens is not None:
-                    tokens.append(prev)
+                    tokens.append((prev, lang == "js" and tokens_end[0] is not None and "\n" in src[tokens_end[0]:start]))
+                    tokens_end[0] = i
         return i
 
     code(src.find("\n") if src.startswith("#!") else 0, None)
@@ -174,10 +178,17 @@ def is_subsequence(words, run):
     return all(w in it for w in words)
 
 
+def macro_docs(src, lang):
+    return lang == "rust" and bool(CLAP_DERIVE.search(src))
+
+
 def code_tokens(src, lang):
     tokens = []
-    comment_spans(src, lang, tokens)
-    return tokens
+    spans = comment_spans(src, lang, tokens)
+    if lang != "rust":
+        return tokens, []
+    docs = [src[s:e] for s, e in spans if is_doc(src[s:e], lang)]
+    return tokens, [d for d in docs if macro_docs(src, lang) or "```" in d]
 
 
 def differences_beyond_comments(base, head):
@@ -188,9 +199,22 @@ def differences_beyond_comments(base, head):
         lang = LANGUAGES.get("." + path.rsplit(".", 1)[-1])
         if status != "M" or not lang:
             problems.append(f"{path}: {status} on a file that is not Rust, Swift, TypeScript or JavaScript" if status == "M" else f"{path}: status {status}")
-        elif code_tokens(git("show", f"{base}:{path}"), lang) != code_tokens(git("show", f"{head}:{path}"), lang):
-            problems.append(f"{path}: code differs once comments are stripped")
+        else:
+            (old_code, old_docs), (new_code, new_docs) = (code_tokens(git("show", f"{rev}:{path}"), lang) for rev in (base, head))
+            if old_code != new_code:
+                problems.append(f"{path}: code differs once comments are stripped")
+            elif old_docs != new_docs:
+                problems.append(f"{path}: a doc comment that is code changed (clap --help text in a file with clap derives, or a doctest)")
     return len(changed), problems
+
+
+def comment_run(lines, number):
+    first, last = number, number
+    while first - 1 in lines:
+        first -= 1
+    while last + 1 in lines:
+        last += 1
+    return [piece for n in range(first, last + 1) for _, piece in lines[n]]
 
 
 def check(base, head):
@@ -227,17 +251,19 @@ def check(base, head):
         if not path or not f["added"] or "/gen/" in path:
             continue
         lang = LANGUAGES["." + path.rsplit(".", 1)[-1]]
-        new_lines = comment_lines(git("show", f"{head}:{path}"), lang)
+        new_src = git("show", f"{head}:{path}")
+        new_lines = comment_lines(new_src, lang)
+        help_text = macro_docs(new_src, lang)
         for number in f["added"]:
             for doc, piece in new_lines.get(number, []):
                 words = [w.lower() for w in WORD.findall(piece)]
-                if not words:
+                if not words or (doc and help_text):
                     continue
                 if MARKER.search(piece):
                     problems.append((path, number, "marker", piece))
                 elif any(is_subsequence(words, run) for run in runs):
                     continue
-                elif ALLOWED.search(piece):
+                elif PRAGMA.search(piece) or any(LINK.search(p) for p in comment_run(new_lines, number)):
                     continue
                 elif not doc:
                     problems.append((path, number, "comment", piece))

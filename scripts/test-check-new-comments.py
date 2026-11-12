@@ -110,7 +110,7 @@ class NewComments(unittest.TestCase):
             {"core/a/src/lib.rs": "fn a() {}\n", "server/src/a.ts": "export const a = 1;\n", "apps/macos/Koidrive/A.swift": "let a = 1\n"},
             {
                 "core/a/src/lib.rs": 'fn a() {\n    let u = "http://x // y";\n    let r = r#"a // "b" /* c"#;\n    let c = \'/\';\n    let s = "line\n// still a string";\n}\n',
-                "server/src/a.ts": "export const a = '//';\nconst re = /\\/\\//g;\nconst t = \x60x \${'// y'} \${\x60//\x60} //\x60;\nconst d = 4 / 2 / 1;\n",
+                "server/src/a.ts": "export const a = '//';\nconst re = /\\/\\//g;\nconst t = \x60x ${'// y'} ${\x60//\x60} //\x60;\nconst d = 4 / 2 / 1;\n",
                 "apps/macos/Koidrive/A.swift": 'let a = "x \\("//") y"\nlet b = #"a // "b""#\nlet c = """\n// text\n"""\n',
             },
         )
@@ -118,7 +118,7 @@ class NewComments(unittest.TestCase):
     def test_comments_after_strings_still_fail(self):
         self.assertFlags(
             {"server/src/a.ts": "export const a = 1;\n", "core/a/src/lib.rs": "fn a() {}\n"},
-            {"server/src/a.ts": "const t = \x60\${'x'}\x60; // after a template\nconst re = /a/; // after a regex\n", "core/a/src/lib.rs": 'fn a<\'a>(x: &\'a str) -> char { \'"\' } // after a lifetime and a char\n'},
+            {"server/src/a.ts": "const t = \x60${'x'}\x60; // after a template\nconst re = /a/; // after a regex\n", "core/a/src/lib.rs": 'fn a<\'a>(x: &\'a str) -> char { \'"\' } // after a lifetime and a char\n'},
             ("core/a/src/lib.rs", 1),
             ("server/src/a.ts", 1),
             ("server/src/a.ts", 2),
@@ -159,6 +159,56 @@ class NewComments(unittest.TestCase):
         code, out = self.comments_only({"server/src/a.ts": "export const a = 1;\n", "notes.md": "a\n"}, {"server/src/a.ts": None, "server/src/b.ts": "export const a = 1;\n", "notes.md": "b\n"})
         self.assertEqual(code, 1, out)
         self.assertEqual(out.splitlines()[:3], ["notes.md: M on a file that is not Rust, Swift, TypeScript or JavaScript", "server/src/a.ts: status D", "server/src/b.ts: status A"])
+    def test_template_interpolations_are_code(self):
+        self.assertFlags(
+            {"server/src/a.ts": "export const a = 1;\n"},
+            {"server/src/a.ts": "const t = \x60${\x60a//b\x60}\x60;\nconst u = \x60${ /* why */ 1}\x60;\n"},
+            ("server/src/a.ts", 2),
+        )
+
+    def test_pragmas_count_only_at_the_start_of_a_comment(self):
+        self.assertFlags(
+            {"apps/macos/KoidriveFFI/Package.swift": "let a = 1\n", "cli/src/a.rs": "fn a() {}\n"},
+            {"apps/macos/KoidriveFFI/Package.swift": "// swift-tools-version: 6.1\nlet a = 1\n", "cli/src/a.rs": "// Not a SAFETY: issue, retry because it races.\nfn a() {}\n"},
+            ("cli/src/a.rs", 1),
+        )
+
+    def test_a_link_anywhere_in_a_comment_run_allows_the_run(self):
+        self.assertFlags(
+            {"server/src/a.ts": "export const a = 1;\n"},
+            {"server/src/a.ts": "// Durable Objects drop the alarm on eviction, see\n// https://developers.cloudflare.com/durable-objects/api/alarms/\nexport const a = 1;\n"},
+        )
+
+    def test_docs_on_build_scripts_binaries_examples_and_benches_fail(self):
+        self.assertFlags(
+            {"core/a/build.rs": "fn main() {}\n", "core/a/src/bin/b.rs": "fn main() {}\n", "core/a/benches/c.rs": "fn c() {}\n"},
+            {"core/a/build.rs": "/// Builds.\nfn main() {}\n", "core/a/src/bin/b.rs": "//! A tool.\nfn main() {}\n", "core/a/benches/c.rs": "/// Measures.\nfn c() {}\n"},
+            ("core/a/benches/c.rs", 1),
+            ("core/a/build.rs", 1),
+            ("core/a/src/bin/b.rs", 1),
+        )
+
+    def test_clap_help_text_is_not_a_comment(self):
+        self.assertFlags(
+            {"cli/tests/t.rs": "#[derive(Parser)]\nstruct Cli {}\n"},
+            {"cli/tests/t.rs": "#[derive(Parser)]\n/// Syncs folders.\nstruct Cli {}\n"},
+        )
+
+    def test_comments_only_counts_clap_help_and_doctests_as_code(self):
+        clap = "#[derive(Subcommand)]\nenum Command {\n    /// Show sync history\n    History,\n}\n"
+        doctest = "/// Adds.\n///\n/// ```\n/// assert_eq!(a::add(1, 1), 2);\n/// ```\npub fn add(a: u8, b: u8) -> u8 { a + b }\n"
+        code, out = self.comments_only({"cli/src/main.rs": clap, "core/a/src/lib.rs": doctest}, {"cli/src/main.rs": clap.replace("    /// Show sync history\n", ""), "core/a/src/lib.rs": doctest.split("\n", 5)[5]})
+        self.assertEqual(code, 1, out)
+        self.assertEqual([line.split(":")[0] for line in out.splitlines()[:2]], ["cli/src/main.rs", "core/a/src/lib.rs"])
+
+    def test_comments_only_passes_plain_rust_doc_removal(self):
+        code, out = self.comments_only({"core/a/src/lib.rs": "/// Adds.\npub fn add(a: u8, b: u8) -> u8 { a + b }\n"}, {"core/a/src/lib.rs": "pub fn add(a: u8, b: u8) -> u8 { a + b }\n"})
+        self.assertEqual(code, 0, out)
+
+    def test_comments_only_keeps_line_breaks_that_change_javascript(self):
+        code, out = self.comments_only({"server/src/a.ts": "export function f() {\n  return /*\n  */ 1;\n}\n"}, {"server/src/a.ts": "export function f() {\n  return 1;\n}\n"})
+        self.assertEqual((code, out.splitlines()[0]), (1, "server/src/a.ts: code differs once comments are stripped"))
+
 
 if __name__ == "__main__":
     unittest.main()
