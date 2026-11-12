@@ -574,6 +574,28 @@ fn a_renamed_result_reverts_the_local_name_to_the_server_one() {
     moves_back(&mut trees, &mut ids, "a");
 }
 
+/// Another device created a file at x first, so the server gives this device's new file another
+/// name, and the two are a conflict. A build before the local file takes the server's name, as
+/// while its move waits for a retry, keeps the question: the name L holds is not the person's move.
+#[test]
+fn a_conflict_about_a_renamed_create_stays_open_while_the_local_file_waits_for_its_name() {
+    let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    trees.set_remote("o".into(), remote(file(ROOT, "x", 2)));
+    trees.set_remote("a".into(), remote(file(ROOT, "x (conflict)", 1)));
+    let renamed = OpResult {
+        name: "x (conflict)".into(),
+        ..outcome(op_result::Code::AppliedRenamed)
+    };
+    acknowledge(&mut commits, &mut trees, vec![renamed]);
+    assert!(trees.reverted().contains("a"));
+    let asked = commits.questions().to_vec();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    assert_eq!(commits.questions(), asked);
+}
+
 /// Another device renames and rewrites n, and the disk takes both, so L and R agree. S cannot take
 /// the new name yet, because the folder p it holds there is parked on its way to q. S still takes
 /// the content both sides hold, so the other device's next edit is not taken for a concurrent one

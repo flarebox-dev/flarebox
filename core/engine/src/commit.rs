@@ -1500,7 +1500,8 @@ enum Drift {
     /// R holds another content revision of a file.
     Content,
     /// A file was renamed, moved or deleted: R no longer holds it live with the meta revision it
-    /// was asked with, or L moved or deleted it while S holds it.
+    /// was asked with, or L moved or deleted it while S holds it. A reverted file L still holds
+    /// where it was is not moved: the effects move it to the name the server gave it.
     Ended,
 }
 
@@ -1508,7 +1509,9 @@ fn drift(trees: &Trees, original: &ConflictFile, copy: &ConflictFile) -> Drift {
     let files = [original, copy];
     let moved_here = |id: &str| {
         (trees.synced().live(id)).is_some_and(|synced| {
-            (trees.local().get(id)).is_none_or(|local| !local.shape.same_position(synced))
+            (trees.local().get(id)).is_none_or(|local| {
+                !trees.reverted().contains(id) && !local.shape.same_position(synced)
+            })
         })
     };
     let ended = files.iter().any(|file| {
