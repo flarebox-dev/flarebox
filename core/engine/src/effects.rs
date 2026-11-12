@@ -113,8 +113,8 @@ impl EffectRecord {
     /// may have given the effect's name to another node, taken a folder on its way out of L, moved
     /// such a folder under the node, put an entry into a folder it removes, or put the node it
     /// creates into L. A commit's rebase or result may also have given the entry that a move or a
-    /// replacement takes to another node of L. The planner plans none of these either, so an effect that fails for one of
-    /// them and is unblocked is planned again only once L has changed.
+    /// replacement takes to another node of L. The planner plans none of these either, so an effect
+    /// that fails for one of them and is unblocked is planned again only once L has changed.
     pub fn applies(&self, trees: &Trees) -> bool {
         View::new(trees).applies(self)
     }
