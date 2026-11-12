@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment:
-      name: site
+      name: ${{ github.event_name == 'push' && 'site' || 'site-preview' }}
       url: ${{ steps.deploy.outputs.url }}
     permissions:
       contents: read
@@ -40,6 +40,7 @@ jobs:
     env:
       PROJECT: koidrive-site
       WRANGLER_VERSION: 4.160.0
+      ENVIRONMENT: ${{ github.event_name == 'push' && 'site' || 'site-preview' }}
     steps:
       - name: Check for the Cloudflare credentials
         id: credentials
@@ -51,7 +52,7 @@ jobs:
           [ -n "$CLOUDFLARE_API_TOKEN" ] || missing+=(CLOUDFLARE_API_TOKEN)
           [ -n "$CLOUDFLARE_ACCOUNT_ID" ] || missing+=(CLOUDFLARE_ACCOUNT_ID)
           if [ ${#missing[@]} -gt 0 ]; then
-            message="Deploy skipped: the site environment has no ${missing[*]} secret. Add it under Settings > Environments > site, then re-run this job."
+            message="Deploy skipped: the $ENVIRONMENT environment has no ${missing[*]} secret. Add it under Settings > Environments > $ENVIRONMENT, then re-run this job."
             echo "::notice title=Site deploy skipped::$message"
             echo "$message" >> "$GITHUB_STEP_SUMMARY"
             echo "ready=false" >> "$GITHUB_OUTPUT"
@@ -118,10 +119,9 @@ jobs:
           served="$RUNNER_TEMP/served-install.sh"
           headers="$RUNNER_TEMP/served-install.headers"
           for attempt in 1 2 3 4 5 6; do
-            if curl --silent --show-error --fail --dump-header "$headers" --output "$served" "$URL/install.sh"; then
-              break
-            fi
-            [ "$attempt" -lt 6 ] || { echo "::error::$URL/install.sh did not return 200 after 6 attempts."; exit 1; }
+            status="$(curl --silent --show-error --dump-header "$headers" --output "$served" --write-out '%{http_code}' "$URL/install.sh")" || status=000
+            [ "$status" != 200 ] || break
+            [ "$attempt" -lt 6 ] || { echo "::error::$URL/install.sh returned HTTP $status, not 200, after 6 attempts."; exit 1; }
             sleep 10
           done
           if ! cmp install.sh "$served"; then
@@ -129,10 +129,11 @@ jobs:
             exit 1
           fi
           type="$(tr -d '\r' <"$headers" | awk 'tolower($1) == "content-type:" { $1 = ""; sub(/^ /, ""); print }' | tail -n 1)"
-          case "$type" in
-            text/plain*) ;;
-            *) echo "::error::$URL/install.sh is served as '$type', not text/plain. Check site/_headers."; exit 1 ;;
-          esac
+          media="$(printf '%s' "${type%%;*}" | tr -d ' \t' | tr '[:upper:]' '[:lower:]')"
+          if [ "$media" != text/plain ]; then
+            echo "::error::$URL/install.sh is served as '$type', not text/plain. Check site/_headers."
+            exit 1
+          fi
           echo "$URL/install.sh matches install.sh ($(wc -c <install.sh) bytes, sha256 $(sha256sum install.sh | cut -d' ' -f1)) and is served as $type."
           grep -i '^cache-control:' "$headers" || true
       - name: Attach koidrive.com, its DNS records and the www redirect
