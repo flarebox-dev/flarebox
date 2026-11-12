@@ -6,11 +6,13 @@ import { readState } from "./state.ts";
 
 class Failed extends Error {}
 
+const SUPPORTED_NS = ["1"];
+
 function inputs(): { ns: string; repetitions: string } {
   const ns = process.env.KOIDRIVE_BENCH_NS ?? "1";
   const values = ns.split(",");
-  if (values.length > 4 || new Set(values).size !== values.length || values.some((n) => !/^(1|2|4|8)$/.test(n))) {
-    throw new Failed("KOIDRIVE_BENCH_NS must be a comma-separated list of unique values from 1,2,4,8, with at most four entries");
+  if (values.length > 4 || new Set(values).size !== values.length || values.some((n) => !SUPPORTED_NS.includes(n))) {
+    throw new Failed("KOIDRIVE_BENCH_NS supports only " + SUPPORTED_NS.join(",") + " on this build; provide distinct comma-separated values");
   }
   const repetitions = process.env.KOIDRIVE_BENCH_REPETITIONS ?? "3";
   if (!/^[1-3]$/.test(repetitions)) throw new Failed("KOIDRIVE_BENCH_REPETITIONS must be an integer from 1 to 3");

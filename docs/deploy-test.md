@@ -95,7 +95,7 @@ For `upgrade`, `from_ref` is the release to upgrade from. Left empty, it is the 
 
 ## Benchmark chunk uploads
 
-Choose `bench` as shown above to deploy, claim, and run the Rust release test `upload_benchmark` in target `upload_bench`. `bench_ns` defaults to `1` and accepts up to four unique comma-separated values from `1,2,4,8`. Rust currently rejects everything except N=1 before uploading. `bench_repetitions` defaults to `3` and accepts integers from `1` through `3`. The trusted job validates both before deployment. Each measurement uploads 1 GiB, for at most 12 GiB before retries. The default uploads 3 GiB. `KOIDRIVE_BENCH_MIB` reduces the payload for local runs only.
+Choose `bench` as shown above to deploy, claim, and run the Rust release test `upload_benchmark` in target `upload_bench`. `bench_ns` defaults to `1`. This build accepts only N=1; the trusted job rejects unsupported values before deployment. The concurrency follow-up will enable the four-value sweep of `1,2,4,8`. `bench_repetitions` defaults to `3` and accepts integers from `1` through `3`. Each measurement uploads 1 GiB, so the default uploads 3 GiB before retries. The future four-value sweep is bounded at 12 GiB. `KOIDRIVE_BENCH_MIB` reduces the payload for local runs only.
 
 Each measurement keeps its fresh payload in memory as 256 chunks of 4 MiB and uses a fresh space. The order of N values rotates between repetitions. Generation, initial hashing, space creation, session setup, and commit happen outside the timer. `Transfer::upload`, including hash validation, upload planning, PUTs, and retry waits, runs inside it. MB/s uses decimal megabytes. Upload timing includes Worker and R2 work and cannot isolate R2 latency.
 

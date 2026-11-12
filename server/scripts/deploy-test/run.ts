@@ -353,12 +353,11 @@ async function emptyAndDeleteBucket(account: Account, name: string): Promise<Sto
       storage.exportBytes += object.size;
     }
   }
+  let objects = first;
   if (first.length > 1000) {
     await emptyBucket(account, name);
-    await deleteBucket(account, name);
-    return storage;
+    objects = (await listObjects(account, name)) ?? [];
   }
-  let objects = first;
   for (let attempt = 1; ; attempt++) {
     for (let i = 0; i < objects.length; i += 8) await Promise.all(objects.slice(i, i + 8).map((object) => deleteObject(account, name, object.key)));
     try {

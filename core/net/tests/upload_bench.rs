@@ -370,6 +370,7 @@ async fn upload_benchmark() {
         .unwrap();
         let history = connected(&mut events).await.history_id;
         let transfer = Transfer::new(&api);
+        // When adding the gate here, update Config::parse and SUPPORTED_NS in server/scripts/deploy-test/bench.ts together.
         assert_eq!(
             n, 1,
             "set Transfer::gate = UploadGate::new(n) here when the concurrency API is available"

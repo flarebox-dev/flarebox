@@ -21,7 +21,7 @@ on:
         type: string
         required: false
       bench_ns:
-        description: "bench only: comma-separated unique concurrency values from 1,2,4,8, at most four. Rust currently supports only 1."
+        description: "bench only: comma-separated supported concurrency values. This build accepts only 1; other values fail before deployment."
         type: string
         default: '1'
       bench_repetitions:

@@ -61,10 +61,19 @@ function run({ command, env = {} }: { command?: string; env?: NodeJS.ProcessEnv 
 }
 
 describe("benchmark input validation before deployment", () => {
-  it.each(["1", "2", "4", "8", "1,2,4,8", "8,1"])("accepts the supported workflow list %s without state or cargo", async (ns) => {
+  it.each(["1"])("accepts the supported workflow list %s without state or cargo", async (ns) => {
     rmSync(join(work, "state.json"));
     const result = await run({ command: "validate", env: { KOIDRIVE_BENCH_NS: ns, KOIDRIVE_BENCH_REPETITIONS: "3" } });
     expect(result).toEqual({ status: 0, output: "" });
+    expect(existsSync(join(work, "cargo.json"))).toBe(false);
+  });
+
+  it.each(["2", "4", "8", "1,2,4,8", "8,1"])("refuses unsupported list %s before deployment without state or cargo", async (ns) => {
+    rmSync(join(work, "state.json"));
+    fakeCargo();
+    const result = await run({ command: "validate", env: { KOIDRIVE_BENCH_NS: ns } });
+    expect(result.status).toBe(1);
+    expect(result.output).toContain("supports only 1 on this build");
     expect(existsSync(join(work, "cargo.json"))).toBe(false);
   });
 
@@ -101,11 +110,13 @@ describe("Rust benchmark child", () => {
     expect(JSON.parse(readFileSync(join(work, "state.json"), "utf8")).stats).toEqual({ requests: 2, bytesUp: 3, bytesDown: 4 });
   });
 
-  it("passes future concurrency choices through so Rust can reject unsupported modes", async () => {
-    fakeCargo(1);
+  it("refuses unsupported concurrency without reading state or launching cargo", async () => {
+    fakeCargo();
+    writeFileSync(join(work, "state.json"), "invalid private state");
     const result = await run({ env: { KOIDRIVE_BENCH_NS: "1,2,4,8", KOIDRIVE_BENCH_REPETITIONS: "1" } });
     expect(result.status).toBe(1);
-    expect(JSON.parse(readFileSync(join(work, "cargo.json"), "utf8")).env).toMatchObject({ KOIDRIVE_BENCH_NS: "1,2,4,8", KOIDRIVE_BENCH_REPETITIONS: "1" });
+    expect(result.output).toContain("supports only 1 on this build");
+    expect(existsSync(join(work, "cargo.json"))).toBe(false);
   });
 
   it("reports cargo failure without credentials", async () => {

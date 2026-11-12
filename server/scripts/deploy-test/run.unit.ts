@@ -135,13 +135,13 @@ describe("teardown", () => {
     const { status, output } = await runTs("teardown");
     expect({ status, errors: output.includes("::error::") }).toEqual({ status: 0, errors: false });
     expect(mock.buckets.has(NAME)).toBe(false);
-    expect(mock.requests.filter((request) => request.startsWith("GET ") && request.endsWith("/objects"))).toHaveLength(4);
+    expect(mock.requests.filter((request) => request.startsWith("GET ") && request.endsWith("/objects"))).toHaveLength(5);
     expect(mock.deletes().filter((request) => request.includes("/objects/"))).toEqual([]);
     expect(mock.bucketJobBodies).toEqual([{ jobType: "prefixDelete", prefix: "" }]);
     expect(mock.requests.filter((request) => request.includes("/jobs/"))).toHaveLength(1);
-    expect(mock.requests).toHaveLength(9);
+    expect(mock.requests).toHaveLength(10);
     expect(output).toContain("3072 objects");
-    console.info("3072-object teardown mock: " + (performance.now() - started).toFixed(0) + " ms, " + mock.requests.length + " API requests, four listing pages, one job and one poll, no network retries or analytics wait");
+    console.info("3072-object teardown mock: " + (performance.now() - started).toFixed(0) + " ms, " + mock.requests.length + " API requests, four initial listing pages, one fresh listing, one job and one poll, no network retries or analytics wait");
   });
 
   it("accepts a prefix-delete job that completes synchronously", async () => {
@@ -150,6 +150,22 @@ describe("teardown", () => {
     expect((await runTs("teardown")).status).toBe(0);
     expect(mock.bucketJobBodies).toHaveLength(1);
     expect(mock.requests.filter((request) => request.includes("/jobs/"))).toEqual([]);
+    expect(mock.buckets.has(NAME)).toBe(false);
+  });
+
+  it("retries deleting the bucket when it still appears nonempty after the emptying job", async () => {
+    const bucket = mock.addBucket(NAME, undefined, Array.from({ length: 1001 }, (_, i) => "chunk-" + i));
+    writeState({ owned: { bucketCreationDate: bucket.creationDate } });
+    mock.bucketDeleteFailures = 1;
+    const leftover = "chunk-0";
+    mock.bucketJobLeftovers = [leftover];
+    const { status, output } = await runTs("teardown");
+    expect({ status, errors: output.includes("::error::") }).toEqual({ status: 0, errors: false });
+    expect(mock.bucketJobBodies).toEqual([{ jobType: "prefixDelete", prefix: "" }]);
+    expect(mock.deletes()).toHaveLength(3);
+    expect(mock.deletes()[0]).toContain("/objects/" + leftover);
+    expect(mock.deletes().slice(1).every((request) => request.endsWith("/r2/buckets/" + NAME))).toBe(true);
+    expect(mock.bucketDeleteFailures).toBe(0);
     expect(mock.buckets.has(NAME)).toBe(false);
   });
 
