@@ -330,40 +330,41 @@ impl FsObserver {
         }
     }
 
-    /// Forgets or moves the unread files that `change` replaces: a new change to a path is read afresh, and a rename
+    /// Forgets or moves the unread files that `changes` replace: a new change to a path is read afresh, and a rename
     /// carries the files under it along unless it moves them into an excluded path.
-    fn supersede(&mut self, change: &Change) {
-        let take = |unread: &mut BTreeMap<PathBuf, Retry>, under: &Path| {
-            let paths: Vec<PathBuf> = unread
-                .range(under.to_path_buf()..)
-                .take_while(|(path, _)| path.starts_with(under))
-                .map(|(path, _)| path.clone())
-                .collect();
-            paths
-                .into_iter()
-                .map(|path| {
-                    let retry = unread.remove(&path).expect("listed above");
-                    (path, retry)
-                })
-                .collect::<Vec<_>>()
-        };
-        match change {
-            Change::Created { path, .. } | Change::Modified { path } => {
-                self.unread.remove(path);
-            }
-            Change::Removed { path, .. } | Change::Ignored { from: path, .. } => {
-                take(&mut self.unread, path);
-            }
-            Change::Renamed { from, to, .. } => {
-                for (path, retry) in take(&mut self.unread, from) {
-                    let rest = path.strip_prefix(from).expect("taken under from");
-                    let moved = if rest.as_os_str().is_empty() {
-                        to.clone()
-                    } else {
-                        to.join(rest)
-                    };
-                    self.unread.insert(moved, retry);
+    fn supersede(&mut self, changes: &[Change]) {
+        let mut moves: BTreeMap<&Path, Option<&Path>> = BTreeMap::new();
+        for change in changes {
+            match change {
+                Change::Renamed { from, to, .. } => {
+                    moves.insert(from, Some(to));
                 }
+                Change::Removed { path, .. } | Change::Ignored { from: path, .. } => {
+                    moves.insert(path, None);
+                }
+                Change::Created { .. } | Change::Modified { .. } => {}
+            }
+        }
+        for (path, retry) in std::mem::take(&mut self.unread) {
+            let Some((from, to)) = path
+                .ancestors()
+                .find_map(|above| moves.get_key_value(above))
+            else {
+                self.unread.insert(path, retry);
+                continue;
+            };
+            let Some(to) = to else { continue };
+            let rest = path.strip_prefix(from).expect("an ancestor of the path");
+            let moved = if rest.as_os_str().is_empty() {
+                to.to_path_buf()
+            } else {
+                to.join(rest)
+            };
+            self.unread.insert(moved, retry);
+        }
+        for change in changes {
+            if let Change::Created { path, .. } | Change::Modified { path } = change {
+                self.unread.remove(path);
             }
         }
     }
@@ -485,9 +486,7 @@ impl Observer for FsObserver {
             ..Reads::default()
         };
         let observed = !poll.changes.is_empty();
-        for change in &poll.changes {
-            self.supersede(change);
-        }
+        self.supersede(&poll.changes);
         let mut retried = Vec::new();
         self.retry(now, &mut retried, &mut reads);
         for change in poll.changes {
@@ -1129,6 +1128,89 @@ mod tests {
             .unwrap_or_else(|| panic!("no content in {seen:?}"));
         assert_eq!(content.size, 7);
         assert!(observer.unread.is_empty());
+    }
+
+    fn unread_file_read_at(dirs: &[&str], locked: &str, moves: &[(&str, &str)], read_at: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = marked();
+        for folder in dirs {
+            fs::create_dir_all(dir.path().join(folder)).unwrap();
+            fs::write(dir.path().join(folder).join("other"), b"readable").unwrap();
+        }
+        let file = dir.path().join(locked);
+        fs::write(&file, b"content").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&file).is_ok() {
+            assert!(rustix::process::geteuid().is_root());
+            eprintln!("SKIPPED: running as root, so permissions do not block reads");
+            return;
+        }
+        let mut observer = observer(dir.path());
+        observe_until(&mut observer, |seen| seen.len() > dirs.len() * 2);
+        assert_eq!(
+            observer.unread.keys().collect::<Vec<_>>(),
+            [Path::new(locked)]
+        );
+
+        for (from, to) in moves {
+            match to {
+                &"" => fs::remove_dir_all(dir.path().join(from)).unwrap(),
+                to => fs::rename(dir.path().join(from), dir.path().join(to)).unwrap(),
+            }
+        }
+        observe_until(&mut observer, |seen| {
+            seen.iter()
+                .any(|change| matches!(change, Observed::Renamed { .. }))
+        });
+        assert_eq!(
+            observer.unread.keys().collect::<Vec<_>>(),
+            [Path::new(read_at)]
+        );
+        fs::set_permissions(dir.path().join(read_at), fs::Permissions::from_mode(0o600)).unwrap();
+        let (seen, _) = observe_until(&mut observer, |seen| {
+            seen.iter()
+                .any(|change| matches!(change, Observed::Modified { .. }))
+        });
+        let read: Vec<_> = (seen.iter())
+            .filter_map(|change| match change {
+                Observed::Modified { path, content, .. } => {
+                    Some((path.clone(), content.as_ref().map(|c| c.size)))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(read, [(PathBuf::from(read_at), Some(7))]);
+    }
+
+    #[test]
+    fn an_unread_file_in_a_folder_swapped_through_a_third_name_is_read_at_its_new_path() {
+        unread_file_read_at(
+            &["a", "b"],
+            "a/locked",
+            &[("a", "t"), ("b", "a"), ("t", "b")],
+            "b/locked",
+        );
+    }
+
+    #[test]
+    fn an_unread_file_renamed_inside_a_renamed_folder_is_read_at_its_new_path() {
+        unread_file_read_at(
+            &["a"],
+            "a/locked",
+            &[("a", "b"), ("b/locked", "b/moved")],
+            "b/moved",
+        );
+    }
+
+    #[test]
+    fn an_unread_file_moved_out_of_a_removed_folder_is_read_at_its_new_path() {
+        unread_file_read_at(
+            &["a", "c"],
+            "a/locked",
+            &[("a/locked", "c/locked"), ("a", "")],
+            "c/locked",
+        );
     }
 
     #[test]

@@ -6996,3 +6996,42 @@ fn an_edit_of_the_copy_while_the_original_takes_its_content_is_asked_about_again
     assert_eq!(files(&site_b.root), kept);
     assert_eq!(shown(&site_b).len(), 1);
 }
+
+#[test]
+fn a_file_unreadable_until_its_folder_swapped_names_reaches_the_other_device() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site_a.root.join("a")).unwrap();
+    fs::create_dir(site_a.root.join("b")).unwrap();
+    a.create(&mut remote, &site_a.root.join("a/one"), b"one");
+    a.create(&mut remote, &site_a.root.join("b/two"), b"two");
+    let (site, mut b) = linked(&mut remote, "b");
+    b.settle();
+    let locked = site.root.join("a/locked");
+    fs::write(&locked, b"locked").unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&locked).is_ok() {
+        assert!(rustix::process::geteuid().is_root());
+        eprintln!("SKIPPED: running as root, so permissions do not block reads");
+        return;
+    }
+    for _ in 0..8 {
+        b.scan(Duration::from_millis(150));
+        b.run(&mut remote);
+    }
+    for (from, to) in [("a", "t"), ("b", "a"), ("t", "b")] {
+        fs::rename(site.root.join(from), site.root.join(to)).unwrap();
+    }
+    fs::set_permissions(
+        site.root.join("b/locked"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site, &mut b));
+    let moved = [("a/two", "two"), ("b/locked", "locked"), ("b/one", "one")]
+        .map(|(path, text)| (path.to_owned(), text.to_owned()));
+    assert_eq!(files(&site.root), moved);
+    assert_eq!(files(&site_a.root), moved);
+}
