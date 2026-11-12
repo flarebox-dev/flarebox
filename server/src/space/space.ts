@@ -53,7 +53,8 @@ import {
   VersionChunksSchema,
   VersionListSchema,
 } from "../gen/koidrive/v1/rpc_pb";
-import type { AccountDO, SessionCheck } from "../account-do";
+import type { SessionCheck } from "../account/account";
+import type { AccountDO } from "../account-do";
 import { type Identity, verifyAccessToken } from "../auth";
 import { type ChunkObject, sha256, signChunkGrant, verifyChunkGrant } from "../crypto";
 import type { Database, ObjectState, ObjectStore, Socket, Sql } from "../host";
