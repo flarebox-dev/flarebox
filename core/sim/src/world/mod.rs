@@ -377,6 +377,7 @@ struct Exposure {
 struct Backup {
     space: SpaceDo,
     held: Held,
+    in_history: Held,
 }
 
 fn note(seen: &mut BTreeMap<&'static str, u64>, what: &'static str) {
@@ -402,6 +403,7 @@ pub struct World {
     published: BTreeSet<i64>,
     /// What every node of the server, live or trashed, has held at some time.
     held: Held,
+    in_history: Held,
     /// The first change a commit made that no user asked for.
     unasked: Option<String>,
     /// The writes that a download left on a disk in a file the engine then took for a new one. A
@@ -466,6 +468,7 @@ impl World {
             writers: BTreeMap::new(),
             published: BTreeSet::new(),
             held: Held::new(),
+            in_history: Held::new(),
             unasked: None,
             copied: BTreeSet::new(),
             backup: None,
@@ -555,6 +558,7 @@ impl World {
                 self.backup = Some(Backup {
                     space: self.space.clone(),
                     held: self.held.clone(),
+                    in_history: self.in_history.clone(),
                 });
             }
             Step::Restore => self.restore(),
@@ -697,23 +701,18 @@ impl World {
         };
         note(&mut self.seen, "server rewound");
         let taken: Vec<i64> = (self.writers.keys())
-            .filter(|write| stored(&self.held, **write) && !stored(&backup.held, **write))
+            .filter(|write| {
+                stored(&self.in_history, **write) && !stored(&backup.in_history, **write)
+            })
             .copied()
             .collect();
         self.space.rewind(&backup.space, NOW);
+        self.in_history = backup.in_history.clone();
         self.rewound
-            .retain(|write, _| !stored(&backup.held, *write));
+            .retain(|write, _| !stored(&backup.in_history, *write));
         for write in taken {
             let holders: BTreeSet<usize> = (self.devices.iter().enumerate())
-                .filter(|(_, device)| {
-                    let remote = device.engine.trees.remote();
-                    device.disk.shows(write)
-                        && (remote.iter()).any(|(_, node)| {
-                            !node.trashed
-                                && (node.shape.content.as_ref())
-                                    .is_some_and(|c| c.mtime_ns == write)
-                        })
-                })
+                .filter(|(_, device)| device.disk.shows(write))
                 .map(|(d, _)| d)
                 .collect();
             if !holders.is_empty() {
@@ -780,6 +779,7 @@ impl World {
         let before = shapes(&self.space);
         let held_before = writes(&self.space);
         self.space.restore(&backup.space);
+        self.in_history = backup.in_history.clone();
         let after = shapes(&self.space);
         let held_after = writes(&self.space);
         for (id, (.., digest)) in &after {
@@ -1060,8 +1060,10 @@ impl World {
                             &mut self.seen,
                             "restart takes a file of the user for the download",
                         );
-                        let writes = self.held.entry(record.node.clone()).or_default();
-                        writes.insert(found.mtime_ns, found.manifest_digest.clone());
+                        for held in [&mut self.held, &mut self.in_history] {
+                            let writes = held.entry(record.node.clone()).or_default();
+                            writes.insert(found.mtime_ns, found.manifest_digest.clone());
+                        }
                         self.published.insert(found.mtime_ns);
                     }
                     note(
@@ -1507,8 +1509,13 @@ impl World {
                             self.published.extend(after.into_keys());
                             for node in self.space.nodes() {
                                 if let Some(content) = node.current.and_then(|v| v.content) {
-                                    let writes = self.held.entry(node.node_id).or_default();
-                                    writes.insert(content.mtime_ns, content.manifest_digest);
+                                    for held in [&mut self.held, &mut self.in_history] {
+                                        let writes = held.entry(node.node_id.clone()).or_default();
+                                        writes.insert(
+                                            content.mtime_ns,
+                                            content.manifest_digest.clone(),
+                                        );
+                                    }
                                 }
                             }
                             note(&mut self.seen, "commit applied");
@@ -1779,7 +1786,8 @@ impl World {
         let dropped = (self.rewound.iter())
             .flat_map(|(write, holders)| holders.iter().map(move |d| (*write, *d)))
             .find(|(write, d)| {
-                !self.removed[*d].contains(write) && !self.devices[*d].disk.holds(*write)
+                let disk = &self.devices[*d].disk;
+                !self.removed[*d].contains(write) && !disk.holds(*write) && !disk.binned(*write)
             });
         if let Some((write, d)) = dropped {
             return Err(Failure::Broken(format!(

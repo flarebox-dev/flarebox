@@ -95,6 +95,7 @@ pub struct Disk {
     pub(super) quarantine: Option<Entry>,
     /// The effects whose displaced entry is in the local trash.
     trash: BTreeSet<String>,
+    binned: BTreeSet<i64>,
     marker: u64,
 }
 
@@ -155,6 +156,10 @@ impl Disk {
             current = &self.entries[ino].place;
         }
         false
+    }
+
+    pub fn binned(&self, write: i64) -> bool {
+        self.binned.contains(&write)
     }
 
     pub fn shows(&self, write: i64) -> bool {
@@ -240,6 +245,8 @@ impl Disk {
         if until == Cut::Done && outcome.is_ok() && removal {
             self.trash.insert(record.effect_id.clone());
         }
+        self.binned
+            .extend(trashed.as_ref().map(|content| content.mtime_ns));
         Some(Applied { outcome, trashed })
     }
 
@@ -348,6 +355,8 @@ impl Disk {
             }
             _ => Ok(None),
         };
+        self.binned
+            .extend(entry.content.as_ref().map(|content| content.mtime_ns));
         Applied {
             outcome,
             trashed: entry.content,

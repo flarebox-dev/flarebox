@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use koidrive_proto::v1::{Commit, NodeStatus, error};
-use koidrive_sim::world::{Action, NAMES, Outcome, Reply, Step, World};
+use koidrive_sim::world::{Action, Failure, NAMES, Outcome, Reply, Step, World};
 
 fn user(kind: u8, target: usize, parent: usize, name: &str) -> Step {
     let name = NAMES.iter().position(|other| *other == name).unwrap();
@@ -354,6 +354,32 @@ fn rewound_write_only_one_disk_holds() {
 }
 
 #[test]
+fn rewound_write_whose_delete_this_device_has_not_applied() {
+    let mut world = synced(2, &[vec![(0, Step::Backup), (0, file("a"))]]);
+    world
+        .run(
+            1,
+            &[
+                (1, delete(0)),
+                (1, SCAN),
+                (1, COMMIT),
+                (1, COMMIT),
+                (1, DELIVER),
+                (0, DELIVER),
+                (0, DELIVER),
+                (0, DELIVER),
+                (0, DELIVER),
+            ],
+        )
+        .unwrap();
+    assert!(world.devices[0].engine.effects.in_flight().is_none());
+    assert!(world.devices[0].disk.holds(1));
+    world.run(1, &[(0, Step::Rewind)]).unwrap();
+    world.phase(2, &[]).unwrap();
+    assert!(world.devices[0].disk.holds(1));
+}
+
+#[test]
 fn rewound_write_another_device_overwrote() {
     let mut world = synced(2, &[vec![(0, Step::Backup), (0, file("a"))]]);
     world
@@ -452,4 +478,48 @@ fn commit_refused_after_store_rollback() {
         "{:?}",
         world.seen
     );
+}
+
+fn erase_disk(world: &mut World, d: usize) {
+    let inos: Vec<u64> = world.devices[d].disk.entries().keys().copied().collect();
+    for ino in inos {
+        world.devices[d].disk.delete(ino);
+    }
+}
+
+#[test]
+fn repeated_rewind_keeps_the_write_obligation() {
+    let mut world = synced(2, &[vec![(0, Step::Backup), (0, file("a"))]]);
+    world.phase(1, &[(0, Step::Rewind)]).unwrap();
+    world
+        .run(2, &[(0, Step::Backup), (0, Step::Rewind)])
+        .unwrap();
+    erase_disk(&mut world, 0);
+    erase_disk(&mut world, 1);
+    assert!(matches!(world.phase(2, &[]), Err(Failure::Broken(_))));
+}
+
+#[test]
+fn accepted_write_not_yet_in_the_remote_tree_is_required() {
+    let mut world = synced(1, &[]);
+    world
+        .run(
+            0,
+            &[
+                (0, Step::Backup),
+                (0, file("a")),
+                (0, SCAN),
+                (0, COMMIT),
+                (0, COMMIT),
+            ],
+        )
+        .unwrap();
+    assert_eq!(world.space().head_seq(), 1);
+    assert_eq!(world.devices[0].engine.cursor.seq, 0);
+    world
+        .run(1, &[(0, Step::Rewind), (0, Step::Connect)])
+        .unwrap();
+    recovering(&world, 0);
+    erase_disk(&mut world, 0);
+    assert!(matches!(world.phase(1, &[]), Err(Failure::Broken(_))));
 }
