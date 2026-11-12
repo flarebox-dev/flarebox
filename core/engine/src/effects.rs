@@ -211,11 +211,11 @@ impl Effects {
     /// into the node's own subtree. A directory is removed only once it is empty. When no such
     /// effect applies, a node that blocks one is parked, if it is a candidate itself or its S
     /// update waits ([`Trees::waiting`]), since the commit layer does not plan it either: the entry
-    /// holding a name, or a directory that would move into its own subtree, when an effect moves a
-    /// node between the two out of it. Otherwise the directory waits where it is for the commit
-    /// layer. A blocker that already sits where R has it is not parked, since its own effect would
-    /// move it straight back and take the name again. A node whose park failed gets no effect until
-    /// L changes: the parked directory always has room, so the park failed on the entry itself, and
+    /// holding a name. A directory that would move into its own subtree is not parked: it waits
+    /// where it is until the effects or the commit layer move the folder in between out of it. A
+    /// blocker that already sits where R has it is not parked, since its own effect would move it
+    /// straight back and take the name again. A node whose park failed gets no effect until L
+    /// changes: the parked directory always has room, so the park failed on the entry itself, and
     /// the node's own effect would fail on it too, taking turns with the park for as long as L
     /// stays as it is. A rename that changes only case or normalization goes through the parked
     /// directory too.
@@ -863,33 +863,9 @@ impl<'a> View<'a> {
             _ => return Some(Step::Blocked(None)),
         }
         if self.inside(parent, id) {
-            return Some(Step::Blocked(
-                self.parking_frees(parent, id).then(|| id.to_owned()),
-            ));
+            return Some(Step::Blocked(None));
         }
         None
-    }
-
-    /// True when parking `id` lets it move into `inner`, which it holds on disk: an effect moves a
-    /// node on the way up from `inner` to `id` out of it, and no excluded node, which no effect
-    /// moves, is on that way. Otherwise `id` waits for the commit layer to move `inner` out.
-    fn parking_frees(&self, inner: &str, id: &str) -> bool {
-        let mut current = inner;
-        let mut moved = false;
-        for _ in 0..=self.trees.local().len() {
-            if current == id {
-                return moved;
-            }
-            if self.trees.excluded(current) {
-                return false;
-            }
-            moved |= candidate(self.trees, current) || self.trees.waiting().contains_key(current);
-            match self.trees.local().get(current) {
-                Some(node) => current = &node.shape.parent,
-                None => return false,
-            }
-        }
-        false
     }
 
     /// The excluded node that keeps `id` from its place, if one does: the name it moves to is held
