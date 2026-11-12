@@ -1284,6 +1284,12 @@ fn diff(old: &BTreeMap<PathBuf, Entry>, new: &BTreeMap<PathBuf, Entry>) -> Vec<C
                 && ids_after.contains(&(before.id, before.kind)))
             && !(after.kind == EntryKind::Dir
                 && after.id != before.id
+                && dirs.contains(&before.id)
+                && !(old.range(path.to_path_buf()..).skip(1))
+                    .take_while(|(inside, _)| inside.starts_with(path))
+                    .any(|(inside, entry)| new.get(inside) == Some(entry)))
+            && !(after.kind == EntryKind::Dir
+                && after.id != before.id
                 && moved.contains(&after.id)
                 && (dirs.contains(&before.id)
                     || !old
