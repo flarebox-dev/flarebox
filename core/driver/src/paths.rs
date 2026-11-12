@@ -79,7 +79,10 @@ impl Paths {
     pub fn socket(&self) -> PathBuf {
         match self.runtime_dir == self.state_dir {
             true => self.runtime_dir.join("daemon.sock"),
-            false => (self.runtime_dir).join(format!("daemon-{}.sock", self.profile_key())),
+            false => {
+                let socket = format!("daemon-{}.sock", self.profile_key());
+                self.runtime_dir.join(socket)
+            }
         }
     }
 
