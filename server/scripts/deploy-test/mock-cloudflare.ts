@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import type { Socket } from "node:net";
 
 export interface MockWorker {
   id: string;
@@ -28,15 +26,20 @@ export class MockCloudflare {
   bucketJobLeftovers: string[] = [];
   readonly bucketJobBodies: unknown[] = [];
   readonly claimCode = "ZQ7K-M2XR-9WPD";
-  tailDropsFirst = 0;
+  readonly logs: { script: string; timestamp: number; message?: string; path?: string; visibleFrom?: number }[] = [];
+  readonly queryDryFlags: unknown[] = [];
+  workerName = "";
+  filterKeys = ["$metadata.service", "$workers.scriptName"];
+  rejectedKeys: string[] = [];
+  codeLagQueries = 0;
+  observabilityStatus = 200;
+  logQueries = 0;
   setupRequests = 0;
   url = "";
   private server: Server | undefined;
-  private readonly tails = new Set<Socket>();
 
   async start(): Promise<string> {
     this.server = createServer((request, response) => this.handle(request, response));
-    this.server.on("upgrade", (request: IncomingMessage, socket: Socket) => this.upgrade(request, socket));
     await new Promise<void>((resolve) => this.server!.listen(0, "127.0.0.1", resolve));
     const address = this.server.address();
     this.url = "http://127.0.0.1:" + (typeof address === "object" && address ? address.port : 0);
@@ -44,7 +47,6 @@ export class MockCloudflare {
   }
 
   async stop(): Promise<void> {
-    for (const socket of this.tails) socket.destroy();
     this.server?.closeAllConnections();
     await new Promise<void>((resolve) => this.server?.close(() => resolve()) ?? resolve());
   }
@@ -63,40 +65,7 @@ export class MockCloudflare {
   }
 
   deletes(): string[] {
-    return this.requests.filter((request) => request.startsWith("DELETE ") && !request.includes("/tails/"));
-  }
-
-  private upgrade(request: IncomingMessage, socket: Socket): void {
-    const key = String(request.headers["sec-websocket-key"] ?? "");
-    const accept = createHash("sha1").update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
-    socket.write(
-      "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\nSec-WebSocket-Protocol: trace-v1\r\n\r\n",
-    );
-    socket.on("data", () => {});
-    socket.on("error", () => {});
-    socket.on("close", () => this.tails.delete(socket));
-    this.tails.add(socket);
-  }
-
-  private pushEvent(url: string, messages: string[]): void {
-    if (this.tailDropsFirst > 0) {
-      this.tailDropsFirst--;
-      return;
-    }
-    const event = JSON.stringify({
-      outcome: "ok",
-      scriptName: "mock",
-      eventTimestamp: Date.now(),
-      event: { request: { url, method: "GET", headers: {} } },
-      logs: messages.map((message) => ({ message: [message], level: "log", timestamp: Date.now() })),
-      exceptions: [],
-    });
-    const payload = Buffer.from(event);
-    const header =
-      payload.length < 126
-        ? Buffer.from([0x81, payload.length])
-        : Buffer.from([0x81, 126, payload.length >> 8, payload.length & 0xff]);
-    for (const socket of this.tails) socket.write(Buffer.concat([header, payload]));
+    return this.requests.filter((request) => request.startsWith("DELETE "));
   }
 
   private handle(request: IncomingMessage, response: ServerResponse): void {
@@ -114,12 +83,13 @@ export class MockCloudflare {
       let match: RegExpExecArray | null;
 
       if (path === "/v1/server") {
-        this.pushEvent(this.url + "/v1/server", []);
         return send(200, { serverVersion: "0.0.0", claimed: false });
       }
       if (path === "/setup") {
         this.setupRequests++;
-        this.pushEvent(this.url + "/setup", ["Koidrive claim code (valid for 1 hour): " + this.claimCode]);
+        if (this.setupRequests === 1) {
+          this.logs.push({ script: this.workerName, message: "Koidrive claim code (valid for 1 hour): " + this.claimCode, path, timestamp: Date.now(), visibleFrom: this.logQueries + this.codeLagQueries });
+        }
         response.writeHead(200, { "Content-Type": "text/plain" });
         response.end("A one-time claim code, valid for one hour, is in this Worker's logs.\n");
         return;
@@ -130,6 +100,10 @@ export class MockCloudflare {
         if (!worker) return send(200, this.addWorker(match[1]!, undefined, tag));
         worker.versions.unshift({ id: crypto.randomUUID(), tag });
         return send(200, worker);
+      }
+      if (path.startsWith("/deploy-test-probe-")) {
+        this.logs.push({ script: this.workerName, path, timestamp: Date.now() });
+        return send(404, { code: "NOT_FOUND", message: "not found" });
       }
       if (path === "/v1/claim") {
         const claimed = JSON.parse(body) as { code?: string };
@@ -162,10 +136,25 @@ export class MockCloudflare {
         if (!version) return missing();
         return ok({ id: version.id, annotations: { "workers/triggered_by": "upload", ...(version.tag ? { "workers/tag": version.tag } : {}) } });
       }
-      if ((match = /^\/workers\/scripts\/([^/]+)\/tails$/.exec(api)) && method === "POST") {
-        return ok({ id: "tail-1", url: this.url.replace("http", "ws") + "/tail", expires_at: new Date(Date.now() + 3_600_000).toISOString() });
+      if (api === "/workers/observability/telemetry/query" && method === "POST") {
+        if (this.observabilityStatus !== 200) return send(this.observabilityStatus, { success: false, errors: [{ code: 10000, message: "Authentication error" }], messages: [], result: null });
+        const { timeframe, parameters, dry } = JSON.parse(body) as { timeframe: { from: number; to: number }; parameters: { filters: { key: string; operation: string; value: string }[] }; dry?: unknown };
+        this.queryDryFlags.push(dry);
+        if (parameters.filters.some((candidate) => this.rejectedKeys.includes(candidate.key))) {
+          return send(400, { success: false, errors: [{ code: 10001, message: "unknown key" }], messages: [], result: null });
+        }
+        const filter = parameters.filters.find((candidate) => this.filterKeys.includes(candidate.key) && candidate.operation === "eq");
+        const index = this.logQueries++;
+        const events = this.logs
+          .filter((log) => filter !== undefined && log.script === filter.value && (log.visibleFrom ?? 0) <= index && log.timestamp >= timeframe.from && log.timestamp <= timeframe.to)
+          .map((log) => ({
+            timestamp: log.timestamp,
+            $metadata: { service: log.script, level: "log", ...(log.message ? { message: log.message } : {}) },
+            $workers: { scriptName: log.script, event: { request: { url: this.url + (log.path ?? "/"), method: "GET" } } },
+            ...(log.message ? { source: { message: log.message } } : {}),
+          }));
+        return ok({ events: { events } });
       }
-      if (/^\/workers\/scripts\/[^/]+\/tails\/[^/]+$/.test(api) && method === "DELETE") return ok(null);
       if (api === "/workers/durable_objects/namespaces" && method === "GET") {
         return send(200, { success: true, errors: [], messages: [], result: this.namespaces, result_info: { page: 1, total_pages: 1 } });
       }

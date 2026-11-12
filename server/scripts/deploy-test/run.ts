@@ -2,12 +2,15 @@
 
 import { execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { appendFileSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { appendFileSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   type Account,
+  ApiError,
+  type Deadline,
+  DeadlineError,
   LISTING_MS,
   newestDeployment,
   createBucket,
@@ -23,6 +26,9 @@ import {
   namespacesOf,
   requireAccount,
   serves,
+  WORKER_KEYS,
+  workerEvents,
+  type WorkerKey,
   workerTag,
 } from "./cloudflare.ts";
 import { readState, type State, testName, writeState } from "./state.ts";
@@ -30,16 +36,28 @@ import { readState, type State, testName, writeState } from "./state.ts";
 const INSTALL_MS = 5 * 60_000;
 const DEPLOY_MS = 5 * 60_000;
 const SERVING_MS = 3 * 60_000;
-const TAIL_MS = 60_000;
+const CLAIM_LOG_MS = 4 * 60_000;
+const CLAIM_LOG_EVERY_MS = 5_000;
+const CLOCK_SKEW_MS = 60_000;
+const CODE_LIFETIME_MS = 60 * 60_000;
+const DEPLOY_ATTEMPTS = 3;
+const DEPLOY_RETRY_MS = 10_000;
 const PROPAGATION_MS = 15_000;
 /** The first commit whose server/ deploys on its own (#38); an upgrade cannot start earlier. */
 const FIRST_DEPLOYABLE = "8c9bf4a";
-const CLAIM_LOG_LINE = "Koidrive claim code";
 const CLAIM_CODE = /Koidrive claim code[^:]*: ([A-Z0-9-]+)/;
 
 const repo = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 
 class Failed extends Error {}
+
+class Exited extends Failed {
+  readonly output: string;
+  constructor(message: string, output: string) {
+    super(message);
+    this.output = output;
+  }
+}
 
 function fail(message: string): never {
   throw new Failed(message);
@@ -92,7 +110,7 @@ function run(command: string, args: string[], cwd: string, timeoutMs: number, en
     child.on("close", (code) => {
       clearTimeout(timer);
       if (code === 0) resolve(output);
-      else reject(new Failed(command + " " + args.join(" ") + " exited with " + code));
+      else reject(new Exited(command + " " + args.join(" ") + " exited with " + code, output));
     });
   });
 }
@@ -198,7 +216,19 @@ async function deploy(account: Account, ref: string): Promise<void> {
     state.owned.workerTag = randomBytes(8).toString("hex");
     writeState(state);
   }
-  const deployed = await run("pnpm", ["run", "deploy", "--tag", state.owned.workerTag!], dir, DEPLOY_MS, process.env);
+  let deployed: string;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      deployed = await run("pnpm", ["run", "deploy", "--tag", state.owned.workerTag!], dir, DEPLOY_MS, process.env);
+      break;
+    } catch (error) {
+      const unlisted = error instanceof Exited && error.output.includes("Uploaded " + state.name) && error.output.includes("[code: 10007]");
+      if (!unlisted || attempt >= DEPLOY_ATTEMPTS) throw error;
+      const waitMs = DEPLOY_RETRY_MS * 3 ** (attempt - 1);
+      console.log("Wrangler uploaded " + state.name + ", but the API did not list the Worker yet (code 10007); deploying again in " + waitMs / 1000 + " s");
+      await sleep(waitMs);
+    }
+  }
   const url = /https:\/\/[a-z0-9.-]+\.workers\.dev/.exec(deployed)?.[0];
   if (!url) fail("wrangler deploy printed no workers.dev address; the account needs a workers.dev subdomain (docs/deploy-test.md)");
   const versionId = /Current Version ID: ([0-9a-f-]{36})/.exec(deployed)?.[1] ?? fail("wrangler deploy printed no version ID");
@@ -220,101 +250,72 @@ async function deploy(account: Account, ref: string): Promise<void> {
   console.log(url + " serves Koidrive " + info.serverVersion + (info.claimed ? ", claimed" : ", not claimed yet"));
 }
 
-async function until<T>(check: () => T | undefined, what: string, timeoutMs: number): Promise<T> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const value = check();
-    if (value !== undefined) return value;
-    if (Date.now() > deadline) fail("timed out after " + timeoutMs / 1000 + " s waiting for " + what);
-    await sleep(500);
-  }
-}
-
-function filesWithClaimCode(roots: string[]): string[] {
-  const found: string[] = [];
-  const visit = (path: string) => {
-    let entries;
+async function provenKey(account: Account, name: string, fromMs: number, marker: string, deadline: Deadline): Promise<{ key: WorkerKey; timestamp: unknown } | undefined> {
+  for (const key of WORKER_KEYS) {
+    let events: { timestamp: unknown; text: string }[];
     try {
-      entries = readdirSync(path, { withFileTypes: true });
-    } catch {
-      return;
+      events = await workerEvents(account, key, name, fromMs, deadline);
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 400) continue;
+      throw error;
     }
-    for (const entry of entries) {
-      const child = join(path, entry.name);
-      if (entry.isDirectory() && entry.name !== "node_modules") visit(child);
-      else if (entry.isFile() && statSync(child).size < 64 * 1024 * 1024 && readFileSync(child).includes(CLAIM_LOG_LINE)) found.push(child);
-    }
-  };
-  for (const root of roots) visit(root);
-  return found;
+    const probe = events.find((event) => event.text.includes(marker));
+    if (probe) return { key, timestamp: probe.timestamp };
+  }
+  return undefined;
 }
 
-function wranglerDirs(): string[] {
-  const home = homedir();
-  return [join(home, ".wrangler"), join(process.env.XDG_CONFIG_HOME || join(home, ".config"), ".wrangler"), join(home, "Library", "Preferences", ".wrangler")];
+async function claimCode(account: Account, key: WorkerKey, name: string, fromMs: number, deadline: Deadline): Promise<string | undefined> {
+  const live = Date.now() - CODE_LIFETIME_MS;
+  const codes = (await workerEvents(account, key, name, fromMs, deadline))
+    .map((event) => ({ atMs: typeof event.timestamp === "number" ? event.timestamp : Infinity, code: CLAIM_CODE.exec(event.text)?.[1] }))
+    .filter((event) => event.code !== undefined && event.atMs > live);
+  return codes.sort((a, b) => b.atMs - a.atMs)[0]?.code;
 }
 
-/** A tail can connect before it receives the Worker's events. */
-async function claim(): Promise<void> {
+async function claim(account: Account): Promise<void> {
   const state = readState();
-  const deployment = state.deployments.at(-1) ?? fail("nothing is deployed yet");
+  const first = state.deployments[0] ?? fail("nothing is deployed yet");
   const url = state.url!;
-  const logDir = mkdtempSync(join(tmpdir(), "koidrive-wrangler-logs-"));
-  const tail = spawn(join(deployment.dir, "node_modules", ".bin", "wrangler"), ["tail", state.name, "--format", "pretty"], {
-    cwd: deployment.dir,
-    env: { ...process.env, WRANGLER_SEND_METRICS: "false", WRANGLER_WRITE_LOGS: "false", WRANGLER_LOG_PATH: logDir },
-    detached: true,
-  });
-  let log = "";
-  let code = "";
-  let exited: number | null | undefined;
-  const closed = new Promise<void>((resolve) => tail.on("close", () => resolve()));
-  tail.stdout.on("data", (chunk: Buffer) => (log += chunk));
-  tail.stderr.on("data", (chunk: Buffer) => (log += chunk));
-  tail.on("close", (status) => (exited = status));
-  const redacted = (text: string) => (code ? text.replaceAll(code, "<claim code>") : text).replace(/\b[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}\b/g, "<claim code>");
+  const fromMs = first.atMs - CLOCK_SKEW_MS;
+  const marker = "/deploy-test-probe-" + randomBytes(8).toString("hex");
+  await fetch(url + marker, { signal: AbortSignal.timeout(15_000) }).then((response) => response.body?.cancel(), () => undefined);
+  const probe = { atMs: Date.now() + CLAIM_LOG_MS, what: "no query of this Worker's logs showed its request to " + marker + " within " + CLAIM_LOG_MS / 1000 + " s" };
+  let proven: { key: WorkerKey; timestamp: unknown } | undefined;
   try {
-    await until(() => (log.includes("Connected to") ? true : exited !== undefined ? fail("wrangler tail exited with " + exited) : undefined), "wrangler tail to connect", TAIL_MS);
-    const deadline = Date.now() + TAIL_MS;
-    while (!log.includes("/v1/server")) {
-      if (exited !== undefined) fail("wrangler tail exited with " + exited);
-      if (Date.now() > deadline) {
-        fail("wrangler tail showed none of this Worker's requests to /v1/server within " + TAIL_MS / 1000 + " s, so /setup was not opened and no claim code was spent; run the claim again");
-      }
-      await fetch(url + "/v1/server", { signal: AbortSignal.timeout(10_000) }).then((response) => response.body?.cancel(), () => undefined);
-      await sleep(2000);
+    while (!(proven = await provenKey(account, state.name, fromMs, marker, probe))) {
+      if (Date.now() > probe.atMs) throw new DeadlineError(probe.what);
+      await sleep(CLAIM_LOG_EVERY_MS);
     }
-    console.log("wrangler tail shows this Worker's requests, so it will see the claim code");
-    const setup = await fetch(url + "/setup", { signal: AbortSignal.timeout(15_000) });
-    const page = await setup.text();
-    if (!setup.ok || !page.includes("claim code")) fail("/setup did not issue a claim code (HTTP " + setup.status + "): " + page.slice(0, 200));
-    code = await until(() => CLAIM_CODE.exec(log)?.[1], "the claim code in the Worker's log", TAIL_MS);
-    console.log("Read the claim code from the Worker's log through wrangler tail");
-    const response = await fetch(url + "/v1/claim", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({ code, userName: "Deploy test owner", deviceName: "deploy-test owner", platform: "linux" }),
-      signal: AbortSignal.timeout(15_000),
-    });
-    const body = (await response.json()) as { userId?: string; deviceId?: string; refreshCredential?: string; message?: string };
-    if (!response.ok || !body.userId || !body.deviceId || !body.refreshCredential) fail("the claim failed with HTTP " + response.status + ": " + redacted(body.message ?? "no message"));
-    state.owner = { userId: body.userId, deviceId: body.deviceId, refreshCredential: body.refreshCredential };
-    writeState(state);
-    console.log("Claimed " + url + ": owner " + body.userId + ", first device " + body.deviceId);
   } catch (error) {
-    console.error("wrangler tail output (claim codes redacted):\n" + redacted(log));
-    throw error;
-  } finally {
-    try {
-      process.kill(-tail.pid!, "SIGTERM");
-    } catch {}
-    await Promise.race([closed, sleep(10_000)]);
-    const holders = filesWithClaimCode([logDir, join(deployment.dir, ".wrangler"), ...wranglerDirs()]);
-    for (const holder of holders) rmSync(holder, { force: true });
-    rmSync(logDir, { recursive: true, force: true });
-    if (holders.length > 0) fail("Wrangler wrote the claim code's log line to " + holders.join(", ") + "; those files were deleted");
-    console.log("No file in Wrangler's directories or the deployed copy holds the claim code");
+    if (!(error instanceof ApiError)) throw error;
+    fail(error.message + ", so /setup was not opened and no claim code was spent");
   }
+  const { key } = proven;
+  console.log("Workers Logs shows this Worker's request to " + marker + " when filtered on " + key + ", with event timestamp " + JSON.stringify(proven.timestamp) + " (Date.now() " + Date.now() + ")");
+  const setup = await fetch(url + "/setup", { signal: AbortSignal.timeout(15_000) });
+  const page = await setup.text();
+  if (!setup.ok || !page.includes("claim code")) fail("/setup did not issue a claim code (HTTP " + setup.status + "): " + page.slice(0, 200));
+  const wait = { atMs: Date.now() + CLAIM_LOG_MS, what: "the claim code did not appear in this Worker's logs within " + CLAIM_LOG_MS / 1000 + " s" };
+  let code: string | undefined;
+  while (!(code = await claimCode(account, key, state.name, fromMs, wait))) {
+    if (Date.now() > wait.atMs) fail(wait.what);
+    await sleep(CLAIM_LOG_EVERY_MS);
+  }
+  console.log("Read the claim code from this Worker's logs");
+  const response = await fetch(url + "/v1/claim", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ code, userName: "Deploy test owner", deviceName: "deploy-test owner", platform: "linux" }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  const body = (await response.json()) as { userId?: string; deviceId?: string; refreshCredential?: string; message?: string };
+  if (!response.ok || !body.userId || !body.deviceId || !body.refreshCredential) {
+    fail("the claim failed with HTTP " + response.status + ": " + (body.message ?? "no message").replaceAll(code, "<claim code>"));
+  }
+  state.owner = { userId: body.userId, deviceId: body.deviceId, refreshCredential: body.refreshCredential };
+  writeState(state);
+  console.log("Claimed " + url + ": owner " + body.userId + ", first device " + body.deviceId);
 }
 
 interface Storage {
@@ -501,7 +502,7 @@ const [command, arg = ""] = process.argv.slice(2);
 try {
   if (command === "upgrade-from") upgradeFrom(arg);
   else if (command === "deploy") await deploy(requireAccount(), arg || "HEAD");
-  else if (command === "claim") await claim();
+  else if (command === "claim") await claim(requireAccount());
   else if (command === "teardown") await teardown(requireAccount());
   else fail("usage: run.ts upgrade-from [<ref>] | deploy <ref> | claim | teardown");
 } catch (error) {

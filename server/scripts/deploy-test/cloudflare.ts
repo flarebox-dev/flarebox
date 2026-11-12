@@ -34,7 +34,7 @@ export class DeadlineError extends ApiError {
   }
 }
 
-interface Deadline {
+export interface Deadline {
   atMs: number;
   what: string;
 }
@@ -246,6 +246,23 @@ export async function namespacesOf(account: Account, script: string): Promise<Na
     found.push(...(listed.result ?? []).filter((namespace) => namespace.script === script));
     if (!listed.result_info?.total_pages || page >= listed.result_info.total_pages) return found;
   }
+}
+
+export const WORKER_KEYS = ["$metadata.service", "$workers.scriptName"] as const;
+export type WorkerKey = (typeof WORKER_KEYS)[number];
+
+export async function workerEvents(account: Account, key: WorkerKey, name: string, fromMs: number, deadline: Deadline): Promise<{ timestamp: unknown; text: string }[]> {
+  const query = {
+    queryId: "deploy-test-" + name,
+    view: "events",
+    dry: true,
+    limit: 2000,
+    parameters: { filters: [{ key, operation: "eq", type: "string", value: name }] },
+    timeframe: { from: fromMs, to: Date.now() },
+  };
+  const response = await call<{ events?: { events?: Record<string, Record<string, unknown> | undefined>[] } }>(account, "POST", `/accounts/${account.id}/workers/observability/telemetry/query`, query, deadline);
+  const [group, field] = key.split(".") as [string, string];
+  return (response.result?.events?.events ?? []).filter((event) => event[group]?.[field] === name).map((event) => ({ timestamp: event.timestamp, text: JSON.stringify(event) }));
 }
 
 export interface Deployment {
