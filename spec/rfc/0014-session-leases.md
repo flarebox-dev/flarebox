@@ -10,7 +10,9 @@ This RFC lets the Space DO reuse an answer for a few seconds. A revocation and a
 
 Each answer of the Account DO to a session check carries `lease_ms`. The Space DO may use the answer for every request and message of that principal until `lease_ms` has passed, counted from the moment it sent the check. It then asks again. `lease_ms` is 5 seconds, or the time left until the principal's credential expires (RFC 0006 §7) if that is shorter. So an expired principal is refused at its expiry, as before.
 
-The Space DO keeps leases in memory only. A Space DO that restarts, for any reason, has none and asks the Account DO again. A revocation the space recorded (`revoked_devices`, RFC 0009 §2) comes before any lease. While the Space DO waits for an answer it takes no other event, and it stores the lease before the next event runs. So an answer can't land after a revocation notice or a rewind admission that reached the space later.
+The Space DO keeps leases in memory only. A Space DO that restarts, for any reason, has none and asks the Account DO again. A revocation the space recorded (`revoked_devices`, RFC 0009 §2) comes before any lease.
+
+When a principal has no running lease, the Space DO takes no other event while it waits for the answer, and it stores the lease before the next event runs. When a lease is past half of its `lease_ms`, the Space DO may renew it while it goes on taking events. One check covers every principal whose lease is past half, and the Space DO has at most one such check in flight. A renewed lease also counts from the moment its check was sent. The Space DO stores a renewal's answer only if it dropped no leases (§3) between sending that check and receiving the answer. For each principal, it keeps the answer to the check sent last. So an answer that predates a rewind admission is never stored after the admission, and a recorded revocation still comes before every lease.
 
 The Worker still reads the principal's current row before it serves any authenticated route. Leases apply only inside the Space DO.
 
@@ -24,7 +26,7 @@ The bound of RFC 0009 §2 is unchanged. No access token, refresh credential or s
 
 A lease also carries whether the space is closed (RFC 0003 §4). The Space DO's rewind marker can't replace that check. Before preparing writes the marker, the space has none. After the restore, the restored database predates the marker and still holds the old history until completion runs.
 
-So admission closes the space for leases first. The Account DO answers every check of the space as closed from just before it asks the Space DO for the admission data (RFC 0003 §3, step 1). The Space DO drops all of its leases when it answers that call. Any lease the Space DO takes after that call says closed. By §1, an answer from before the closure was leased before that call and has been dropped. So every request that starts after admission sees the space closed, as RFC 0003 §4 requires.
+So admission closes the space for leases first. The Account DO answers every check of the space as closed from just before it asks the Space DO for the admission data (RFC 0003 §3, step 1). The Space DO drops all of its leases when it answers that call. Any lease the Space DO takes after that call says closed. By §1, an answer to a check sent before that call was either stored before the call, and the call drops it, or arrives after the call, and the Space DO discards it. So every request that starts after admission sees the space closed, as RFC 0003 §4 requires.
 
 Two effects are new:
 
