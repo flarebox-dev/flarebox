@@ -1209,7 +1209,6 @@ fn find_ignored(
             Change::Created { .. } | Change::Modified { .. } => {}
         }
     }
-    changes.retain(|change| !matches!(change, Change::Renamed { from, to, .. } if from == to));
 }
 
 fn unaside(path: &Path) -> PathBuf {
@@ -1228,6 +1227,7 @@ fn hold_back(
     rules: &mut Pending<'_>,
     root: BorrowedFd<'_>,
 ) {
+    let first = rules.first_scan();
     let replaced: BTreeSet<PathBuf> = (changes.iter())
         .filter_map(|change| match change {
             Change::Modified { path }
@@ -1285,7 +1285,11 @@ fn hold_back(
         .chain(&replaced)
         .map(|path| key(path))
         .collect();
-    let undecided = rules.search(root, &mut wanted, &fresh, true);
+    let seeded: Vec<&PathBuf> = (replaced.iter())
+        .filter(|path| first && !present.contains(&key(path)))
+        .collect();
+    wanted.extend(seeded.iter().map(|path| (key(path), None)));
+    let undecided = rules.search(root, &mut wanted, &fresh, seeded.is_empty());
     let relocated = |path: &Path| {
         unaside(
             &(path.ancestors().skip(1))

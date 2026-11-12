@@ -82,6 +82,7 @@ struct Search {
     pending: HashMap<Key, u64>,
     decided: HashMap<Key, Option<PathBuf>>,
     held: BTreeMap<PathBuf, Entry>,
+    scanned: bool,
 }
 
 impl Search {
@@ -442,6 +443,10 @@ impl<'r> Pending<'r> {
 
     pub(crate) fn held(&self) -> impl Iterator<Item = &PathBuf> {
         self.rules.search.held.keys()
+    }
+
+    pub(crate) fn first_scan(&mut self) -> bool {
+        !std::mem::replace(&mut self.rules.search.scanned, true)
     }
 
     /// Drops the rules of every folder for which `is_folder` is false, and
