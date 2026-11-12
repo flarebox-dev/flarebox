@@ -1032,7 +1032,7 @@ impl Engine {
                 self.remove(&holder, moving, false, touched, gone);
             }
         }
-        let left = (self.trees.ignored_local().contains(&id))
+        let left = (self.trees.recorded_local(&id))
             .then(|| {
                 self.trees
                     .local()
