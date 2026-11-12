@@ -50,8 +50,9 @@ On top of that, reports hold:
 - The steps of `koi setup` and `koi server ...` (log in, R2, bucket, Worker upload, serving, claim, pairing), `koi server upgrade` and `koi server delete`: whether each one succeeded and roughly how long it took.
 - Where Koidrive panicked: the source file and line in Koidrive's own code. Never the panic's message.
 - Exact daily totals from the daemon: commits sent and received, bytes of file content uploaded and downloaded, and the day's highest number of linked spaces and of the files and folders they hold, trash included. Only totals over all your spaces, never a count per space or per file.
+- How many times each kind of error happened in a day: why a folder stopped syncing, how an upload or download failed, the code of a server refusal, which kind of question a folder asked, and why the daemon could not start. Never the error's message.
 
-Later versions add sync timings and error types to this page as they add them to the reports.
+Later versions add sync timings to this page as they add them to the reports.
 
 ## What a report never holds
 

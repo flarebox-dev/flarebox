@@ -59,6 +59,24 @@ fn a_command_run_with_reports_on_is_counted_by_name_only() {
 }
 
 #[test]
+fn a_daemon_that_cannot_start_is_counted_by_why() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::tempdir().unwrap();
+    stdout(&koi(home.path(), &["telemetry", "on"], &[]));
+    let runtime = home.path().join("run/koidrive");
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let daemon = koi(home.path(), &["_daemon"], &[]);
+    assert!(!daemon.status.success());
+    let preview = stdout(&koi(home.path(), &["telemetry", "preview"], &[]));
+    let body: serde_json::Value = serde_json::from_str(&preview).unwrap();
+    let report = &body["batch"][0]["properties"];
+    assert_eq!(report["c.daemon_start_failed.socket"], 1, "{preview}");
+    assert!(!preview.contains("koidrive/daemon.sock"), "{preview}");
+}
+
+#[test]
 fn off_deletes_the_id_and_what_waits_and_stays_off() {
     let home = tempfile::tempdir().unwrap();
     stdout(&koi(home.path(), &["telemetry", "on"], &[]));

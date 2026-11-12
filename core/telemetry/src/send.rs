@@ -266,7 +266,8 @@ mod tests {
     use super::*;
     use crate::recorder::Recorder;
     use crate::schema::{
-        Client, Command, Counter, Event, Level, Outcome, SetupFlow, SetupStep, SourceFile, Synced,
+        Client, Command, Counter, Event, Failure, Halted, Level, Outcome, Refusal, SetupFlow,
+        SetupStep, SourceFile, Synced,
     };
 
     fn environment() -> Environment {
@@ -278,6 +279,16 @@ mod tests {
         let recorder = Recorder::on();
         recorder.count_on(day, Counter::Command(Command::Setup), 2);
         recorder.count_on(day, Counter::Sync(Synced::BytesUploaded), 5_000_000);
+        recorder.count_on(
+            day,
+            Counter::Failure(Failure::Halted(Halted::StoreBehind)),
+            1,
+        );
+        recorder.count_on(
+            day,
+            Counter::Failure(Failure::Refused(Refusal::QuotaExceeded)),
+            3,
+        );
         recorder.level_on(day, Level::Nodes, 1_500);
         recorder.level_on(day, Level::Nodes, 900);
         recorder.event(Event::SetupStep {
@@ -329,6 +340,8 @@ mod tests {
         assert_eq!(events[0]["properties"]["c.command.setup"], 2);
         assert_eq!(events[0]["properties"]["c.sync.bytes_uploaded"], 5_000_000);
         assert_eq!(events[0]["properties"]["l.sync.nodes"], 1_500);
+        assert_eq!(events[0]["properties"]["c.halted.store_behind"], 1);
+        assert_eq!(events[0]["properties"]["c.refused.quota_exceeded"], 3);
         assert_eq!(events[1]["properties"]["cloudflare_code"], 10042);
         assert_eq!(events[2]["properties"]["file"], SourceFile::EXTERNAL);
     }
@@ -383,6 +396,8 @@ mod tests {
         report["counters"]["/home/fixture/private"] = json!({ "confidential.txt": 1 });
         report["counters"]["command"]["Alice Notes"] = json!(1);
         report["counters"]["sync"]["Alice Notes"] = json!(1);
+        report["counters"]["halted"]["Alice Notes"] = json!(1);
+        report["counters"]["refused"]["/home/fixture/private"] = json!(1);
         report["levels"]["/home/fixture/private"] = json!({ "confidential.txt": 1 });
         report["levels"]["sync"]["Alice Notes"] = json!(1);
         report["histograms"]["/home/fixture"] = json!({
@@ -406,6 +421,7 @@ mod tests {
         }
         assert!(request.contains("c.command.setup"));
         assert!(request.contains("l.sync.nodes"));
+        assert!(request.contains("c.halted.store_behind"));
     }
 
     /// A batch that was not accepted goes again with the same uuids, so PostHog keeps one copy if both arrived.

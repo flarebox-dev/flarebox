@@ -3,13 +3,14 @@
 //! The CLI's side of telemetry (docs/guide/telemetry.md): the question in `koi setup`, `koi telemetry ...`, the
 //! command and setup-step events of one run, and the daemon's loop that moves the sums to disk and sends them.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use koidrive_driver::{Driver, Paths, Status, Volume};
 use koidrive_telemetry::schema::{
-    self, Client, Counter, Level, Outcome, SetupFlow, SetupStep, Synced, magnitude,
+    self, Client, Counter, Failure, Level, Outcome, SetupFlow, SetupStep, Synced, magnitude,
 };
 use koidrive_telemetry::{
     Environment, Event, InstallId, Mode, Recorder, Sent, Source, Store, Uploader,
@@ -133,8 +134,9 @@ fn flow() -> Option<SetupFlow> {
 async fn question() -> Option<bool> {
     println!("Send anonymous usage reports to the Koidrive project?");
     println!("Reports hold which commands ran, where setup failed, crash locations, daily sync");
-    println!("totals, and your OS and Koidrive version. They never hold file names, paths,");
-    println!("contents, your server address or your account.");
+    println!("totals, daily counts of each kind of error, and your OS and Koidrive version.");
+    println!("They never hold file names, paths, contents, error messages, your server address");
+    println!("or your account.");
     println!("See a report: koi telemetry preview. Turn off: koi telemetry off.");
     loop {
         let answer = crate::setup::prompt("Send reports? [Y/n] ").await.ok()?;
@@ -241,6 +243,7 @@ async fn send(store: &Store, client: Client) -> Option<Sent> {
 pub async fn run_daemon(stop: tokio::sync::oneshot::Receiver<()>, driver: Driver) {
     let Some(run) = RUN.get() else { return };
     let mut last = Volume::default();
+    let mut failed = BTreeMap::new();
     let tick = || {
         record_sync(
             &run.recorder,
@@ -248,6 +251,7 @@ pub async fn run_daemon(stop: tokio::sync::oneshot::Receiver<()>, driver: Driver
             koidrive_driver::volume(),
             &driver.status(),
         );
+        record_failures(&run.recorder, &mut failed, koidrive_driver::failures());
         flush();
     };
     every(TICK, stop, tick, || send(&run.store, Client::CliDaemon)).await;
@@ -292,6 +296,28 @@ fn record_sync(recorder: &Recorder, last: &mut Volume, now: Volume, status: &Sta
     recorder.level(Level::Nodes, nodes);
 }
 
+/// Adds the failures counted between `last` and `now`.
+fn record_failures(
+    recorder: &Recorder,
+    last: &mut BTreeMap<Failure, u64>,
+    now: BTreeMap<Failure, u64>,
+) {
+    for (&failure, &count) in &now {
+        let added = count.saturating_sub(last.get(&failure).copied().unwrap_or(0));
+        if added > 0 {
+            recorder.count(Counter::Failure(failure), added);
+        }
+    }
+    *last = now;
+}
+
+/// Counts a failure of this run outside the driver, such as a daemon that cannot start.
+pub fn failed(failure: Failure) {
+    if let Some(run) = RUN.get() {
+        run.recorder.count(Counter::Failure(failure), 1);
+    }
+}
+
 /// Runs `tick` and then `work` every `period` until `stop` fires, and `tick` once more then. A `work` still running
 /// when `stop` fires is dropped, so stopping never waits on it.
 async fn every<W: Future>(
@@ -319,6 +345,29 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn the_daemon_records_the_failures_counted_since_its_last_tick() {
+        use koidrive_telemetry::schema::{Asked, Halted};
+
+        let recorder = Recorder::on();
+        let halted = Failure::Halted(Halted::StoreBehind);
+        let asked = Failure::Asked(Asked::Conflict);
+        let mut last = BTreeMap::from([(halted, 2)]);
+        let now = BTreeMap::from([(halted, 3), (asked, 4)]);
+        record_failures(&recorder, &mut last, now.clone());
+        record_failures(&recorder, &mut last, now.clone());
+        assert_eq!(last, now);
+        let day = recorder.take().days.into_values().next().unwrap();
+        let report = serde_json::to_value(day).unwrap();
+        assert_eq!(
+            report["counters"],
+            serde_json::json!({
+                "asked": { "conflict": 4 },
+                "halted": { "store_behind": 1 },
+            })
+        );
+    }
 
     #[test]
     fn the_daemon_records_what_was_synced_since_its_last_tick() {
