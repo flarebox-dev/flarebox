@@ -168,7 +168,7 @@ a:hover {
   background: var(--color-rule-2);
 }
 
-/* Ledge: the field above, the head resting at the base of the screen. Flarebox has no field, so it takes the bare
+/* Ledge: the field above, the head resting at the base of the screen. Koidrive has no field, so it takes the bare
    form, where the head alone sits in the middle of the screen. */
 /* The bottom padding repeats the nav's 72px, so the head centres on the screen, not on the space under the nav. */
 .hero {

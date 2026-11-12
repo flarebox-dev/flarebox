@@ -45,7 +45,6 @@ The spacing scale, the type scale, the easings and the durations live in `tokens
 - `favicon.svg` is the supplied app-icon SVG; `favicon.ico` holds 16 and 32px renders of it. `apple-touch-icon.png` and the manifest's 192 and 512px icons also render that SVG, without redrawing the fish.
 - `og.png` is a 1200 by 630 image with the transparent icon and outlined wordmark on the dark paper. The page names it in the Open Graph and Twitter card metadata. Both name it by its absolute URL, https://koidrive.com/og.png, because Open Graph requires one.
 - `logo/draw.py /path/to/outfit-latin-600-normal.woff2` draws the wordmark from an external Outfit 600 Latin WOFF2 file from @fontsource/outfit 5.3.0 and generates the cropped nav SVG. The source font stays outside the repository. The script needs fonttools and brotli. `logo/icons.mjs` renders the supplied app icons and OG image using sharp. Install these tools outside the repository.
-- The GitHub links still name flarebox-dev/flarebox. This page changes the landing-page identity, not the repository name.
 - Don't reuse CoreAV's wordmark setting, its AV monogram or its icons.
 
 ## Controls
