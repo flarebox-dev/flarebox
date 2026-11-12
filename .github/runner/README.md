@@ -1,6 +1,6 @@
 # Self-hosted Mac runners
 
-The merge queue, pushes to `main` and pull requests from branches of `koidrive/koidrive` run their macOS jobs on the project's Mac. Four runners (label `flarebox-mini`) run there as the user `ghrunner`, in `/Users/ghrunner/runner-1` to `runner-4`. Pull requests from forks run their macOS jobs on GitHub-hosted runners.
+The project's Mac hosts four runners (label `flarebox-mini`), which run as the user `ghrunner` in `/Users/ghrunner/runner-1` to `runner-4`. The merge queue and pushes to `main` run their macOS jobs there. For a pull request from a branch of `koidrive/koidrive`, the `pick-macos` job of CI sends each macOS job to an idle runner there or to a GitHub-hosted runner. Pull requests from forks always run their macOS jobs on GitHub-hosted runners.
 
 ## Trust rule
 
