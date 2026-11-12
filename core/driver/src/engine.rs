@@ -2739,13 +2739,14 @@ mod tests {
         }
     }
 
-    /// Makes `mkdir`, `write` and `mv` edits on the disk under `root`.
+    /// Makes `mkdir`, `write`, `mv` and `rmdir` edits on the disk under `root`.
     fn run(root: &Path, edits: &[&str]) {
         for edit in edits {
             match edit.split(' ').collect::<Vec<_>>()[..] {
                 ["mkdir", path] => fs::create_dir(root.join(path)).unwrap(),
                 ["write", path] => fs::write(root.join(path), path).unwrap(),
                 ["mv", from, to] => fs::rename(root.join(from), root.join(to)).unwrap(),
+                ["rmdir", path] => fs::remove_dir(root.join(path)).unwrap(),
                 _ => panic!("{edit}"),
             }
         }
@@ -2777,6 +2778,16 @@ mod tests {
         replay(&[
             &["mkdir d", "mkdir d/s"],
             &["mv d d.old", "mkdir d", "mv d.old/s d/s", "write d/s/n"],
+        ]);
+    }
+
+    /// A folder moved away and made again at its path, with a new folder made below it where the moved one held a folder
+    /// of that name, which is then removed: the new folder below is a new node, and the old one leaves L.
+    #[test]
+    fn a_new_folder_below_a_folder_made_again_at_its_path_is_in_l() {
+        replay(&[
+            &["mkdir a", "mkdir a/s"],
+            &["mv a b", "mkdir a", "mkdir a/s", "rmdir b/s"],
         ]);
     }
 

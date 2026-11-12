@@ -943,6 +943,33 @@ fn a_folder_moved_away_and_made_again_at_its_path_is_renamed_and_created() {
     }
 }
 
+/// A folder moved away and made again at its path, with a new folder made at
+/// the path of one it held, which is then removed from the moved folder: the
+/// new folder below is a creation too, and the one it replaced is removed.
+/// Otherwise the old folder's node would move along to a path the disk does
+/// not hold, and the new one would never be reported.
+#[test]
+fn a_new_folder_below_a_folder_made_again_at_its_path_is_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("a/s")).unwrap();
+    let mut snapshot = Snapshot::scan(root).unwrap();
+    fs::rename(root.join("a"), root.join("b")).unwrap();
+    fs::create_dir_all(root.join("a/s")).unwrap();
+    fs::remove_dir(root.join("b/s")).unwrap();
+    let changes = snapshot.rescan(root, [PathBuf::new()]).unwrap().changes;
+    assert_eq!(
+        changes,
+        [
+            removed("a/s", Dir),
+            renamed("a", "b", Dir),
+            created("a", Dir),
+            created("a/s", Dir)
+        ]
+    );
+    assert_eq!(snapshot, Snapshot::scan(root).unwrap());
+}
+
 /// A folder whose device number changed, as after a remount, may report any
 /// inode number, so its identity cannot be compared and it is not reported as
 /// replaced.
