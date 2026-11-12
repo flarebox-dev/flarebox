@@ -201,6 +201,18 @@ export async function activeVersion(account: Account, name: string): Promise<str
 }
 
 /** A GraphQL Analytics API query; throws with the API's error messages. */
+export interface Subscription {
+  id: string;
+  price?: number;
+  state?: string;
+  rate_plan?: { id?: string; public_name?: string };
+}
+
+/** The account's subscriptions. Needs a billing permission that the deploy-test token lacks (docs/load-test.md). */
+export async function subscriptions(account: Account): Promise<Subscription[]> {
+  return (await call<Subscription[]>(account, "GET", `/accounts/${account.id}/subscriptions`)).result ?? [];
+}
+
 export async function graphql<T>(account: Account, query: string, variables: Record<string, unknown>): Promise<T> {
   const response = await call<never>(account, "POST", "/graphql", { query, variables });
   const body = response as unknown as { data?: T; errors?: { message: string }[] | null };

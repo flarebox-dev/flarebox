@@ -1,0 +1,192 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# Deploys server/ to the deploy test's Cloudflare account under a throwaway name, claims it, commits to it from up to 400
+# paired devices in steps of rising load, reads what its Durable Objects did from the Analytics API, and deletes
+# everything again (docs/load-test.md). Manual only, like the Deploy test: it uses the same protected deploy-test
+# environment and the scripts in server/scripts/deploy-test. Every run spends some of the account's Workers Paid usage,
+# so it stops before deploying unless the account is on Workers Paid, and stops committing at a rows-written budget.
+
+name: Load test
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "s1: writers in one space (1, 5, 10, 25, 50, 100, 200). s4: spaces with 25 writers each (1, 4, 16)."
+        type: choice
+        options: [s1, s4]
+        default: s1
+      steps:
+        description: "Optional: the steps to run instead, rising and separated by commas (s1: writers, s4: spaces)."
+        type: string
+        required: false
+      warmup_seconds:
+        description: "Seconds of load before each step measures, at most 600."
+        type: string
+        default: "120"
+      measure_seconds:
+        description: "Seconds each step measures, at most 1800."
+        type: string
+        default: "480"
+      max_rows_written:
+        description: "Stop committing before the run writes more Durable Object rows than this."
+        type: string
+        default: "40000000"
+      workers_paid:
+        description: "confirmed: you checked that the account is on Workers Paid. It overrides the subscriptions check, whether the token can read the subscriptions or not."
+        type: choice
+        options: [unconfirmed, confirmed]
+        default: unconfirmed
+
+permissions:
+  contents: read
+
+concurrency:
+  group: load-test
+  cancel-in-progress: false
+
+jobs:
+  trusted:
+    name: load test (main and protected environment)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Refuse unless the run is for a commit on main of koidrive/koidrive
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REF: ${{ github.ref }}
+        run: |
+          if [ "$REPOSITORY" != koidrive/koidrive ]; then
+            echo "::error::The load test runs only in koidrive/koidrive, not in $REPOSITORY."
+            exit 1
+          fi
+          if [ "$REF" != refs/heads/main ]; then
+            echo "::error::The load test must start from main, not $REF. Choose main under 'Use workflow from'."
+            exit 1
+          fi
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          commit="$(git rev-parse HEAD)"
+          if ! git merge-base --is-ancestor "$commit" origin/main; then
+            echo "::error::$REF points to $commit, which is not on main. The load test runs only commits that were merged to main."
+            exit 1
+          fi
+          echo "$REF ($commit) is on main of $REPOSITORY."
+      - name: Refuse unless the deploy-test environment is protected
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          refuse() {
+            echo "::error::$1 Set up the deploy-test environment as docs/deploy-test.md describes before running the load test."
+            exit 1
+          }
+          environment="$(gh api "repos/$REPOSITORY/environments/deploy-test")" || refuse "The deploy-test environment does not exist or cannot be read."
+          reviewers="$(jq -r '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]?.reviewer.login] | join(" ")' <<<"$environment")"
+          [ "$reviewers" = gunwooterry ] || refuse "The deploy-test environment's required reviewers must be gunwooterry alone, because any one listed reviewer can approve a run (required reviewers: ${reviewers:-none})."
+          [ "$(jq -r '.can_admins_bypass' <<<"$environment")" != true ] || refuse "Administrators can bypass the deploy-test environment's protection rules."
+          [ "$(jq -r '.deployment_branch_policy.custom_branch_policies // false' <<<"$environment")" = true ] || refuse "The deploy-test environment does not limit deployments to selected branches."
+          policies="$(gh api "repos/$REPOSITORY/environments/deploy-test/deployment-branch-policies" --jq '[.branch_policies[] | (.type // "branch") + ":" + .name] | sort | join(",")')" || refuse "The deploy-test environment's branch policies cannot be read."
+          [ "$policies" = "branch:main" ] || refuse "The deploy-test environment must allow the main branch only, but allows: ${policies:-nothing}."
+          echo "The deploy-test environment lists gunwooterry as its only required reviewer, allows main only, and does not report administrator bypass as allowed."
+
+  load-test:
+    name: load test (${{ inputs.scenario }})
+    needs: trusted
+    runs-on: ubuntu-latest
+    environment: deploy-test
+    timeout-minutes: 300
+    permissions:
+      contents: read
+    env:
+      KOIDRIVE_TEST_NAME: koidrive-test-${{ github.run_id }}-${{ github.run_attempt }}
+      WRANGLER_SEND_METRICS: "false"
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - name: Check the Cloudflare secrets
+        id: secrets
+        working-directory: .
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          missing=""
+          [ -n "$CLOUDFLARE_API_TOKEN" ] || missing="$missing CLOUDFLARE_API_TOKEN"
+          [ -n "$CLOUDFLARE_ACCOUNT_ID" ] || missing="$missing CLOUDFLARE_ACCOUNT_ID"
+          if [ -n "$missing" ]; then
+            echo "::error::The load test needs the environment secrets$missing in the deploy-test environment. docs/deploy-test.md lists what each holds and the token's permissions. Nothing was deployed."
+            exit 1
+          fi
+          echo "Both secrets are set. This run deploys and then deletes the Worker and R2 bucket $KOIDRIVE_TEST_NAME."
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: server/package.json
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: server/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+
+      - name: Refuse unless the account is on Workers Paid
+        timeout-minutes: 5
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WORKERS_PAID: ${{ inputs.workers_paid }}
+        run: node scripts/deploy-test/workers-plan.ts
+
+      - name: Deploy this commit
+        timeout-minutes: 15
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node scripts/deploy-test/run.ts deploy "$GITHUB_SHA"
+
+      - name: Claim it with the code from its own log
+        timeout-minutes: 5
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node scripts/deploy-test/run.ts claim
+
+      - name: Run scenario ${{ inputs.scenario }}
+        timeout-minutes: 240
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          LOAD_SCENARIO: ${{ inputs.scenario }}
+          LOAD_STEPS: ${{ inputs.steps }}
+          LOAD_WARMUP_SECONDS: ${{ inputs.warmup_seconds }}
+          LOAD_MEASURE_SECONDS: ${{ inputs.measure_seconds }}
+          LOAD_MAX_ROWS_WRITTEN: ${{ inputs.max_rows_written }}
+        run: pnpm exec vitest run --config scripts/deploy-test/vitest.config.ts --reporter=verbose load.ts
+
+      - name: Upload the results
+        if: always() && steps.secrets.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: load-results-${{ inputs.scenario }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/load-results.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Tear down the Worker, its Durable Objects and the R2 bucket
+        if: always() && steps.secrets.outcome == 'success'
+        timeout-minutes: 10
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node scripts/deploy-test/run.ts teardown
