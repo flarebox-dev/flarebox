@@ -1701,6 +1701,39 @@ fn a_file_that_changes_while_it_is_uploaded_is_committed_with_its_new_bytes() {
 }
 
 #[test]
+fn a_chunk_sent_again_after_a_refused_ticket_counts_its_bytes_once() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    for i in 0..3 {
+        fs::write(site.root.join(format!("{i}.txt")), format!("file {i}")).unwrap();
+    }
+    a.scan_until(|a| !a.work.is_empty());
+    let Some(Work::Upload(upload)) = a.work.pop_front() else {
+        panic!("the content is uploaded first");
+    };
+    let distinct: BTreeMap<_, _> = (upload.chunks.iter())
+        .map(|chunk| (chunk.hash.clone(), u64::from(chunk.size)))
+        .collect();
+    assert_eq!(distinct.len(), 3);
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (result, seen) = runtime.block_on(async {
+        let (relay, seen) = crate::scripted::relay_refusing(1, 1).await;
+        let (session, _events, api) = crate::scripted::session(relay).await;
+        let transfer = Transfer::new(&api);
+        (upload_counted(&session, &transfer, upload).await, seen)
+    });
+    let (receipts, bytes) = result.unwrap();
+    assert_eq!(receipts.len(), 3);
+    assert_eq!(
+        seen.lock().unwrap().hashes.len(),
+        4,
+        "the refused chunk is sent again"
+    );
+    assert_eq!(bytes, distinct.values().sum::<u64>());
+}
+
+#[test]
 fn with_four_uploads_at_once_a_file_that_changed_after_it_was_chunked_abandons_the_commit() {
     let mut remote = Remote::new();
     let (site, mut a) = linked(&mut remote, "a");

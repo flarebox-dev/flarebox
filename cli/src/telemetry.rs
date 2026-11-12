@@ -132,9 +132,9 @@ fn flow() -> Option<SetupFlow> {
 /// The question, until it gets an answer: Enter or y is yes, n is no. None when stdin closes.
 async fn question() -> Option<bool> {
     println!("Send anonymous usage reports to the Koidrive project?");
-    println!("Reports hold which commands ran, where setup failed, crash locations, and your OS");
-    println!("and Koidrive version. They never hold file names, paths, contents, your server");
-    println!("address or your account.");
+    println!("Reports hold which commands ran, where setup failed, crash locations, daily sync");
+    println!("totals, and your OS and Koidrive version. They never hold file names, paths,");
+    println!("contents, your server address or your account.");
     println!("See a report: koi telemetry preview. Turn off: koi telemetry off.");
     loop {
         let answer = crate::setup::prompt("Send reports? [Y/n] ").await.ok()?;
@@ -240,7 +240,7 @@ async fn send(store: &Store, client: Client) -> Option<Sent> {
 /// run sends them. It reads the choice again each time, so `koi telemetry off` stops it without a restart.
 pub async fn run_daemon(stop: tokio::sync::oneshot::Receiver<()>, driver: Driver) {
     let Some(run) = RUN.get() else { return };
-    let mut last = koidrive_driver::volume();
+    let mut last = Volume::default();
     let tick = || {
         record_sync(
             &run.recorder,
@@ -280,6 +280,9 @@ fn record_sync(recorder: &Recorder, last: &mut Volume, now: Volume, status: &Sta
         }
     }
     *last = now;
+    if status.folders.is_empty() {
+        return;
+    }
     recorder.level(Level::Spaces, status.folders.len() as u64);
     let nodes = status
         .folders

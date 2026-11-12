@@ -37,6 +37,14 @@ pub(crate) struct Seen {
 /// A relay that holds each upload until `expected` uploads are open at once, or for at most [`HOLD_LIMIT`], then
 /// for [`SETTLE`] more, and answers it with a receipt. The ticket of an upload is its chunk's hash in hex.
 pub(crate) async fn relay(expected: usize) -> (SocketAddr, Arc<Mutex<Seen>>) {
+    relay_refusing(expected, 0).await
+}
+
+/// [`relay`], answering its first `refused` uploads with 403, as for an expired ticket.
+pub(crate) async fn relay_refusing(
+    expected: usize,
+    refused: usize,
+) -> (SocketAddr, Arc<Mutex<Seen>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let seen = Arc::new(Mutex::new(Seen::default()));
@@ -51,12 +59,21 @@ pub(crate) async fn relay(expected: usize) -> (SocketAddr, Arc<Mutex<Seen>>) {
                     return;
                 };
                 let hash = unhex(&ticket);
+                let mut arrived = 0;
                 open.send_modify(|open| {
                     *open += 1;
                     let mut seen = seen.lock().unwrap();
                     seen.hashes.push(hash.clone());
+                    arrived = seen.hashes.len();
                     seen.peak = seen.peak.max(*open);
                 });
+                if arrived <= refused {
+                    open.send_modify(|open| *open -= 1);
+                    let head =
+                        "HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    return;
+                }
                 let mut enough = open.subscribe();
                 let _ = tokio::time::timeout(HOLD_LIMIT, enough.wait_for(|open| *open >= expected))
                     .await;

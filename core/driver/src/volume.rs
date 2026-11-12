@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! How much this process synced since it started: commits sent and received, and content bytes uploaded and
-//! downloaded. The counts only grow. Usage reports read them and keep each day's total as a magnitude.
+//! How much this process synced since it started, from zero: commits sent and received, and content bytes uploaded and
+//! downloaded. The counts only grow. Usage reports read them and send each day's total.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -15,9 +15,10 @@ static BYTES_DOWNLOADED: AtomicU64 = AtomicU64::new(0);
 pub struct Volume {
     /// Commits of this device the server accepted.
     pub commits_sent: u64,
-    /// Commits of the server's log that reached this device.
+    /// Commit records of the server's log that reached this device. The result of this device's own commit counts
+    /// under `commits_sent` instead.
     pub commits_received: u64,
-    /// Chunk bytes read for upload: the content the server did not hold yet.
+    /// Chunk bytes of uploads that stored every chunk the server lacked, each distinct chunk once.
     pub bytes_uploaded: u64,
     /// Chunk bytes downloaded and checked against their hash.
     pub bytes_downloaded: u64,
@@ -40,8 +41,8 @@ pub(crate) fn commits_received(count: usize) {
     COMMITS_RECEIVED.fetch_add(count as u64, Ordering::Relaxed);
 }
 
-pub(crate) fn uploaded(bytes: usize) {
-    BYTES_UPLOADED.fetch_add(bytes as u64, Ordering::Relaxed);
+pub(crate) fn uploaded(bytes: u64) {
+    BYTES_UPLOADED.fetch_add(bytes, Ordering::Relaxed);
 }
 
 pub(crate) fn downloaded(bytes: usize) {

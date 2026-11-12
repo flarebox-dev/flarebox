@@ -1075,7 +1075,6 @@ impl Folder {
 
     /// Commits of the log. A gap subscribes again from the last commit applied.
     fn changes(&mut self, records: &[CommitRecord], work: &mut Vec<Work>) -> Result<(), Stop> {
-        crate::volume::commits_received(records.len());
         let (applied, since) = match &mut self.stream {
             Stream::Connecting | Stream::Listing { .. } => return Ok(()),
             Stream::Replaying(staging) => (
@@ -1091,6 +1090,7 @@ impl Folder {
                 (applied, resume(&cursor.history_id, &cursor.base()))
             }
         };
+        crate::volume::commits_received(records.len());
         if applied == Applied::Gap {
             tracing::warn!(
                 space_id = self.link.space_id,
@@ -2007,24 +2007,43 @@ async fn stage_effect(
     (pending, staged)
 }
 
-/// Uploads the chunks of `upload` the server lacks. Each is read on a thread that may block.
+/// Uploads the chunks of `upload` the server lacks, and counts their bytes in [`crate::volume`] once all are stored.
 async fn upload_chunks(
     session: &Session,
     transfer: &Transfer,
     upload: Upload,
 ) -> Result<Vec<UploadReceipt>, ChunkError> {
+    let (receipts, bytes) = upload_counted(session, transfer, upload).await?;
+    crate::volume::uploaded(bytes);
+    Ok(receipts)
+}
+
+/// Uploads the chunks of `upload` the server lacks, each read on a thread that may block, and returns their receipts
+/// with the bytes of the distinct chunks it read. A chunk read again, after a refused ticket or a failed attempt,
+/// counts once.
+async fn upload_counted(
+    session: &Session,
+    transfer: &Transfer,
+    upload: Upload,
+) -> Result<(Vec<UploadReceipt>, u64), ChunkError> {
     let upload = Arc::new(upload);
+    let sizes = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
     let read = |chunk: &ChunkRef| {
-        let (upload, chunk) = (upload.clone(), chunk.clone());
+        let (upload, chunk, sizes) = (upload.clone(), chunk.clone(), sizes.clone());
         async move {
+            let hash = chunk.hash.clone();
             let bytes = tokio::task::spawn_blocking(move || upload.read(&chunk))
                 .await
                 .map_err(io::Error::other)??;
-            crate::volume::uploaded(bytes.len());
+            if let Ok(mut sizes) = sizes.lock() {
+                sizes.insert(hash, bytes.len() as u64);
+            }
             Ok(bytes)
         }
     };
-    transfer.upload(session, &upload.chunks, read).await
+    let receipts = transfer.upload(session, &upload.chunks, read).await?;
+    let bytes = sizes.lock().map(|sizes| sizes.values().sum()).unwrap_or(0);
+    Ok((receipts, bytes))
 }
 
 #[cfg(test)]

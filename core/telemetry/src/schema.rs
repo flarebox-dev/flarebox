@@ -269,7 +269,7 @@ impl Counter {
 pub enum Synced {
     /// Commits of this device the server accepted.
     CommitsSent,
-    /// Commits of the server's log that reached this device.
+    /// Commit records of the server's log that reached this device, apart from results of its own commits.
     CommitsReceived,
     /// File content uploaded, in bytes: the chunks the server did not hold yet.
     BytesUploaded,
