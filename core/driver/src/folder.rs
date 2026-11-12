@@ -682,6 +682,7 @@ impl Folder {
         };
         match result {
             Ok(result) => {
+                crate::volume::commit_sent();
                 self.failures = 0;
                 self.commit_ended();
                 self.result(&commit.commit_id, result)?;
@@ -1089,6 +1090,7 @@ impl Folder {
                 (applied, resume(&cursor.history_id, &cursor.base()))
             }
         };
+        crate::volume::commits_received(records.len());
         if applied == Applied::Gap {
             tracing::warn!(
                 space_id = self.link.space_id,
@@ -2005,11 +2007,22 @@ async fn stage_effect(
     (pending, staged)
 }
 
-/// Uploads the chunks of `upload` the server lacks. Each is read on a thread that may block.
+/// Uploads the chunks of `upload` the server lacks, and adds the bytes of each to [`crate::volume`] once it is stored.
 async fn upload_chunks(
     session: &Session,
     transfer: &Transfer,
     upload: Upload,
+) -> Result<Vec<UploadReceipt>, ChunkError> {
+    upload_counted(session, transfer, upload, crate::volume::uploaded).await
+}
+
+/// Uploads the chunks of `upload` the server lacks, each read on a thread that may block, and passes the size of each
+/// to `stored` once it is stored.
+async fn upload_counted(
+    session: &Session,
+    transfer: &Transfer,
+    upload: Upload,
+    mut stored: impl FnMut(u64),
 ) -> Result<Vec<UploadReceipt>, ChunkError> {
     let upload = Arc::new(upload);
     let read = |chunk: &ChunkRef| {
@@ -2020,7 +2033,8 @@ async fn upload_chunks(
                 .map_err(io::Error::other)?
         }
     };
-    transfer.upload(session, &upload.chunks, read).await
+    let stored = |chunk: &ChunkRef| stored(u64::from(chunk.size));
+    (transfer.upload_observed(session, &upload.chunks, read, stored)).await
 }
 
 #[cfg(test)]

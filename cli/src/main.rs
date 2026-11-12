@@ -716,7 +716,7 @@ async fn daemon(paths: Paths, json: bool) -> Result<Done, CliError> {
     let server = tokio::spawn(ipc::serve(listener, driver.clone()));
     let notifications = tokio::spawn(notifications);
     let (stop_telemetry, telemetry_stopped) = tokio::sync::oneshot::channel();
-    let telemetry = tokio::spawn(telemetry::run_daemon(telemetry_stopped));
+    let telemetry = tokio::spawn(telemetry::run_daemon(telemetry_stopped, driver.clone()));
     let watch = driver.watch();
     let folders = driver.status().folders;
     tracing::info!(

@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use crate::schema::{Counter, DailyReport, Event, Histogram, Measure};
+use crate::schema::{Counter, DailyReport, Event, Histogram, Level, Measure};
 
 /// A cheap handle that code passes around to record. One made with [`Recorder::off`] records nothing and costs one
 /// branch per call. Recording takes a short lock on the sums and does no I/O.
@@ -39,6 +39,11 @@ impl Recorder {
 
     pub fn measure(&self, measure: Measure, value: u64) {
         self.measure_on(crate::today(), measure, value);
+    }
+
+    /// Keeps `value` when it is the highest reading of `level` today.
+    pub fn level(&self, level: Level, value: u64) {
+        self.level_on(crate::today(), level, value);
     }
 
     /// Keeps an event, unless [`Event::PER_KIND_PER_DAY`] of its kind are already held for its day.
@@ -100,6 +105,23 @@ impl Recorder {
                 .entry(label.to_owned())
                 .or_default();
             *sum = sum.saturating_add(by);
+        });
+    }
+
+    pub(crate) fn level_on(&self, day: u32, level: Level, value: u64) {
+        let (metric, label) = level.key();
+        self.with(|pending| {
+            let report = pending.days.entry(day).or_insert_with(|| DailyReport {
+                day,
+                ..DailyReport::default()
+            });
+            let highest = report
+                .levels
+                .entry(metric.to_owned())
+                .or_default()
+                .entry(label.to_owned())
+                .or_default();
+            *highest = (*highest).max(value);
         });
     }
 
