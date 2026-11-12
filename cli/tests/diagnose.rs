@@ -53,6 +53,11 @@ fn diagnose_writes_a_file_without_the_profiles_paths_names_server_or_token() {
             folder.display()
         );
         fs::write(&log, line).unwrap();
+        fs::write(
+            format!("{}.1", log.display()),
+            "2026-11-12T06:29:22.000001Z  INFO koidrive_cli: the daemon is running\n",
+        )
+        .unwrap();
     }
     let cwd = tempfile::tempdir().unwrap();
     let output = koi(home.path())
@@ -88,6 +93,39 @@ fn diagnose_writes_a_file_without_the_profiles_paths_names_server_or_token() {
     if cfg!(target_os = "macos") {
         assert!(text.contains("sync of a folder halted"), "{text}");
         assert!(text.contains(": Permission denied (os error 13)"), "{text}");
+        assert!(text.contains("the daemon is running"), "{text}");
+    }
+}
+
+#[test]
+fn each_run_writes_its_own_file_that_only_its_owner_can_read() {
+    let home = paired_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let paths: Vec<String> = (0..3)
+        .map(|_| {
+            let output = koi(home.path())
+                .arg("diagnose")
+                .current_dir(cwd.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .trim_end()
+                .to_owned()
+        })
+        .collect();
+    let mut unique = paths.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 3, "{paths:?}");
+    for path in paths {
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{path}");
     }
 }
 

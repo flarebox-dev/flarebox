@@ -2,10 +2,11 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{ErrorKind, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use koidrive_driver::{Credential, Paths};
 use serde_json::{Value, json};
@@ -17,6 +18,10 @@ use crate::service;
 const ISSUES: &str = "https://github.com/koidrive/koidrive/issues";
 
 const LOG_LINES: usize = 200;
+
+const STATUS_WAIT: Duration = Duration::from_secs(10);
+
+const SIGNALS: [&str; 2] = ["\"SIGTERM\"", "\"SIGINT\""];
 
 const NAMED: [(&str, &str); 6] = [
     ("path", "folder"),
@@ -50,23 +55,53 @@ const OURS: [&str; 4] = [
 pub async fn run(paths: &Paths) -> Result<Done, CliError> {
     let mut redactor = Redactor::default();
     know_profile(&mut redactor, paths);
-    let status = match crate::status(paths, false).await {
-        Ok(done) => done.data,
-        Err(error) => json!({
-            "error": error.message,
-            "service": service::inspect(paths, false).await,
-        }),
+    let status = match tokio::time::timeout(STATUS_WAIT, crate::status(paths, false)).await {
+        Ok(Ok(done)) => {
+            let mut status = done.data;
+            if let Value::Object(fields) = &mut status
+                && !done.decisions.is_empty()
+            {
+                fields.insert("decisions".to_owned(), json!(done.decisions));
+            }
+            status
+        }
+        failed => {
+            let error = match failed {
+                Ok(Err(error)) => error.message,
+                _ => format!(
+                    "the daemon did not answer within {} seconds",
+                    STATUS_WAIT.as_secs()
+                ),
+            };
+            json!({
+                "error": error,
+                "service": service::inspect(paths, false).await,
+            })
+        }
     };
     let text = bundle(&mut redactor, &system(), &status, &daemon_log(paths));
     let seconds = (SystemTime::now().duration_since(UNIX_EPOCH)).map_or(0, |since| since.as_secs());
     let dir = std::env::current_dir()
         .map_err(|error| format!("cannot find the current directory: {error}"))?;
-    let path = dir.join(format!("koi-diagnostics-{seconds}.txt"));
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .and_then(|mut file| file.write_all(text.as_bytes()))
+    let mut attempt = 1;
+    let (path, mut file) = loop {
+        let suffix = match attempt {
+            1 => String::new(),
+            _ => format!("-{attempt}"),
+        };
+        let path = dir.join(format!("koi-diagnostics-{seconds}{suffix}.txt"));
+        let opened = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path);
+        match opened {
+            Ok(file) => break (path, file),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => attempt += 1,
+            Err(error) => return Err(format!("cannot write {}: {error}", path.display()).into()),
+        }
+    };
+    file.write_all(text.as_bytes())
         .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
     Ok(Done {
         note: format!("To report a problem, attach this file to an issue at {ISSUES}\n"),
@@ -159,10 +194,16 @@ fn daemon_log(paths: &Paths) -> Result<String, String> {
     if cfg!(target_os = "macos") {
         let path = service.log_file();
         let log = fs::read(&path).map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => "the service has not written a log".to_owned(),
+            ErrorKind::NotFound => "the service has not written a log".to_owned(),
             _ => format!("cannot read {}: {error}", path.display()),
         })?;
-        return Ok(String::from_utf8_lossy(&log).into_owned());
+        let log = String::from_utf8_lossy(&log).into_owned();
+        if log.lines().count() < LOG_LINES
+            && let Ok(older) = fs::read(crate::logfile::previous(&path))
+        {
+            return Ok(String::from_utf8_lossy(&older).into_owned() + &log);
+        }
+        return Ok(log);
     }
     let lines = LOG_LINES.to_string();
     let unit = service.unit_name();
@@ -268,7 +309,7 @@ impl Redactor {
             let end = starts.get(index + 1).map_or(rest.len(), |next| next - 1);
             let (key, value) = rest[*start..end].split_once('=').unwrap_or_default();
             let value = match key {
-                "signal" => value.to_owned(),
+                "signal" if SIGNALS.contains(&value) => value.to_owned(),
                 _ if KEPT.contains(&key) => self.text(value),
                 _ => "<redacted>".to_owned(),
             };
@@ -344,6 +385,10 @@ fn closing_quote(text: &str) -> Option<usize> {
 
 fn log_parts(line: &str) -> Option<(&str, &str, &str, &str)> {
     let (time, rest) = line.split_once(' ')?;
+    let time_shape = |c: char| c.is_ascii_digit() || "-:.TZ+".contains(c);
+    if time.is_empty() || !time.chars().all(time_shape) {
+        return None;
+    }
     let (level, rest) = rest.trim_start().split_once(' ')?;
     let (target, rest) = rest.trim_start().split_once(": ")?;
     let target_shape =
@@ -719,6 +764,22 @@ thread 'tokio-runtime-worker' panicked at /Users/ada/Secret Plans/ledger.rs:1:1:
             redactor.log_line(&line("Jiyeon contract v2=final path=draft")),
             "2026-11-12T06:29:23.000001Z WARN koidrive_driver::folder: sync of a folder halted space_id=s1 reason=the folder: \"<name-2>\" is missing"
         );
+    }
+
+    #[test]
+    fn a_signal_field_keeps_only_a_signal_name() {
+        let mut redactor = Redactor::default();
+        let line = "2026-11-12T06:29:23.000001Z  WARN koidrive_driver::folder: sync of a folder halted space_id=s1 reason=the folder: /x/report signal=HIV-result.txt: Permission denied";
+        let out = redactor.log_line(line);
+        assert!(!out.contains("HIV") && !out.contains("result"), "{out}");
+        assert!(out.ends_with(" signal=<redacted>"), "{out}");
+    }
+
+    #[test]
+    fn a_line_that_does_not_start_with_a_time_is_left_out() {
+        let mut redactor = Redactor::default();
+        let line = "/Users/ada/Secret INFO koidrive_cli: the daemon is running";
+        assert_eq!(redactor.log_line(line), "<redacted>");
     }
 
     #[test]
