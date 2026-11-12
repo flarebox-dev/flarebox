@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: Apache-2.0
+
+name: Installer
+
+# Cloudflare Pages deploys main to koidrive.com (build command "sh scripts/site-build.sh").
+# After each deploy, this checks that https://koidrive.com/install.sh serves main's install.sh.
+# A pull request that changes this workflow runs the same check against the live site.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - "install.sh"
+      - "scripts/site-build.sh"
+  pull_request:
+    paths:
+      - ".github/workflows/installer.yml"
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: installer-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  production:
+    name: koidrive.com
+    if: github.event_name != 'merge_group'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      checks: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      URL: https://koidrive.com/install.sh
+    steps:
+      - name: Wait for the Cloudflare Pages deployment of this commit
+        if: github.event_name == 'push'
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          for attempt in $(seq 1 60); do
+            runs="$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
+              --jq '[.check_runs[] | select(.app.slug == "cloudflare-workers-and-pages")]')"
+            if [ "$(jq 'length' <<<"$runs")" -ge 1 ] && [ "$(jq -r 'all(.status == "completed")' <<<"$runs")" = true ]; then
+              if [ "$(jq -r 'all(.conclusion == "success")' <<<"$runs")" != true ]; then
+                echo "::error::The Cloudflare Pages build of $SHA did not succeed: $(jq -r '.[].details_url' <<<"$runs")"
+                exit 1
+              fi
+              echo "Cloudflare Pages deployed $SHA."
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::No completed Cloudflare Pages check run for $SHA after 15 minutes. Check the project's build watch paths."
+          exit 1
+      - name: Check that koidrive.com serves main's install.sh
+        run: |
+          served="$RUNNER_TEMP/served-install.sh" headers="$RUNNER_TEMP/served-install.headers" expected="$RUNNER_TEMP/main-install.sh"
+          main=
+          for attempt in $(seq 1 36); do
+            latest="$(gh api "repos/$REPO/commits/main" --jq .sha)"
+            if [ "$latest" != "$main" ]; then
+              main=$latest
+              gh api -H "Accept: application/vnd.github.raw" "repos/$REPO/contents/install.sh?ref=$main" >"$expected"
+            fi
+            status="$(curl --silent --show-error --max-time 20 --dump-header "$headers" --output "$served" --write-out '%{http_code}' "$URL")" || status=000
+            [ "$status" != 200 ] || cmp -s "$expected" "$served" || status="200 with other bytes"
+            [ "$status" != 200 ] || break
+            [ "$attempt" -lt 36 ] || { echo "::error::$URL returned HTTP $status, not 200 with install.sh at $main, after 36 attempts."; exit 1; }
+            sleep 10
+          done
+          type="$(tr -d '\r' <"$headers" | awk 'tolower($1) == "content-type:" { $1 = ""; sub(/^ /, ""); print }' | tail -n 1)"
+          media="$(printf '%s' "${type%%;*}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
+          if [ "$media" != text/plain ]; then
+            echo "::error::$URL is served as '$type', not text/plain. Check site/_headers."
+            exit 1
+          fi
+          echo "$URL matches install.sh at $main ($(wc -c <"$expected") bytes, sha256 $(sha256sum "$expected" | cut -d' ' -f1)) and is served as $type."
+          tr -d '\r' <"$headers" | grep -i '^cache-control:' || true

@@ -101,7 +101,7 @@ You need a Cloudflare account with R2 turned on, and a Mac or a Linux machine.
 1. **Install the `koi` command.**
 
    ```sh
-   curl -fsSL https://raw.githubusercontent.com/koidrive/koidrive/main/install.sh | sh
+   curl -fsSL https://koidrive.com/install.sh | sh
    ```
 
    Downloads start with the first release. Until then, [build from source](docs/guide/install.md#build-from-source).
