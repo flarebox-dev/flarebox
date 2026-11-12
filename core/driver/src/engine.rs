@@ -2203,6 +2203,79 @@ mod tests {
         Some((id, node.identity, size))
     }
 
+    #[test]
+    fn a_file_removed_from_a_folder_renamed_while_the_search_runs_leaves_l() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("space");
+        fs::create_dir_all(root.join("d")).unwrap();
+        fs::write(root.join(koidrive_fs::RULES_FILE), "ig/\n").unwrap();
+        for n in 0..30 {
+            fs::create_dir_all(root.join(format!("ig/{n:02}"))).unwrap();
+            for m in 0..10 {
+                fs::write(root.join(format!("ig/{n:02}/{m}.txt")), "x").unwrap();
+            }
+        }
+        fs::write(root.join("d/x.txt"), "x").unwrap();
+        fs::write(root.join("d/y.txt"), "y").unwrap();
+        let device: std::sync::Arc<dyn crate::ignore::Matcher> =
+            std::sync::Arc::new(crate::ignore::Unfiltered);
+        let mut rules = crate::ignore::scan_rules(&device).with_search_budget(100);
+        let mut snapshot = Snapshot::default();
+        let (_dir, mut engine) = mapper();
+        let mut step = |snapshot: &mut Snapshot, engine: &mut Engine| {
+            let rescan = snapshot
+                .rescan_with_rules(&root, [PathBuf::new()], &mut rules)
+                .unwrap();
+            let entry = |path: &Path| snapshot.entries[path];
+            let batch: Vec<Observed> = (rescan.changes.into_iter())
+                .map(|change| match change {
+                    Change::Created { path, kind } => Observed::Created {
+                        content: (kind == EntryKind::File).then(|| bytes(entry(&path).size)),
+                        id: entry(&path).id,
+                        linked: false,
+                        path,
+                        kind,
+                    },
+                    Change::Modified { path } => Observed::Modified {
+                        content: Some(bytes(entry(&path).size)),
+                        id: entry(&path).id,
+                        linked: false,
+                        path,
+                    },
+                    Change::Renamed { from, to, kind } => Observed::Renamed {
+                        id: entry(&to).id,
+                        linked: false,
+                        from,
+                        to,
+                        kind,
+                    },
+                    Change::Ignored { from, to, kind, id } => Observed::Renamed {
+                        from,
+                        to,
+                        kind,
+                        id,
+                        linked: false,
+                    },
+                    Change::Removed { path, kind } => Observed::Removed { path, kind },
+                })
+                .collect();
+            engine.observe(&batch, 0);
+            rescan.unsettled
+        };
+        step(&mut snapshot, &mut engine);
+        fs::remove_file(root.join("d/x.txt")).unwrap();
+        fs::rename(root.join("d"), root.join("e")).unwrap();
+        let mut rescans = 0;
+        while !step(&mut snapshot, &mut engine).is_empty() {
+            rescans += 1;
+            assert!(rescans < 30, "the search never ended");
+        }
+
+        assert!(rescans > 0);
+        assert!(holding(&engine, "e/x.txt").is_none());
+        assert!(holding(&engine, "e/y.txt").is_some());
+    }
+
     /// The scan reports a folder removed and entries renamed out of it in one batch, as it can for `rm -r b && mv a
     /// b` (GUN-353). The entries keep their nodes, with what L holds below them, and only the folder leaves L.
     #[test]
