@@ -5,9 +5,10 @@ use std::collections::{BTreeSet, HashMap};
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::names::MAX_NAME_BYTES;
 use koidrive_proto::v1::{
-    ChunkRef, Commit, Content, CreateDir, CreateFile, Delete, Error, ListVersions, Move, NodeKind,
-    NodeState, NodeStatus, Op, PrepareUpload, Restore, RpcRequest, UpdateContent, UploadReceipt,
-    VersionInfo, chunk_plan, error, op, op_result, rpc_request, rpc_response,
+    ChangeRecord, ChunkRef, Commit, CommitResult, Content, CreateDir, CreateFile, Delete, Error,
+    ListVersions, Move, NodeKind, NodeState, NodeStatus, Op, OpResult, PrepareUpload, Restore,
+    RpcRequest, UpdateContent, UploadReceipt, VersionInfo, change_record, chunk_plan, error, op,
+    op_result, rpc_request, rpc_response,
 };
 use koidrive_sim::space::{Role, Session, SpaceDo, node_states};
 use serde_json::{Map, Value, json};
@@ -178,16 +179,12 @@ fn sequence(doc: &Value, seed: u64) -> Result<Value, String> {
         let (expect, changed) = run.recorded("main", &result)?;
         step["expect"] = expect;
         steps.push(step);
-        for symbol in &changed {
-            if symbol != "root" && !nodes.contains(symbol) {
-                nodes.push(symbol.clone());
+        for symbol in changed {
+            if symbol != "root" && !nodes.contains(&symbol) {
+                nodes.push(symbol);
             }
         }
-        let entries = changed
-            .iter()
-            .map(|symbol| run.recorded_node("main", symbol))
-            .collect::<Result<Vec<_>, _>>()?;
-        steps.push(json!({ "head": run.space("main")?.head_seq(), "nodes": entries }));
+        steps.push(json!({ "head": run.space("main")?.head_seq() }));
     }
     let root = run.space("main")?.space_id().to_owned();
     let mut live = Vec::new();
@@ -517,6 +514,35 @@ fn opt_list<'a>(value: &'a Value, field: &str) -> Result<Option<&'a Vec<Value>>,
 fn req<T>(found: Result<Option<T>, String>, field: &str) -> Result<T, String> {
     found?.ok_or_else(|| format!("missing field {field}"))
 }
+
+fn every(value: &Value, fields: &[&str]) -> Outcome {
+    match fields.iter().find(|field| value.get(**field).is_none()) {
+        Some(field) => Err(format!("missing field {field}")),
+        None => Ok(()),
+    }
+}
+
+const NODE_FIELDS: &[&str] = &[
+    "node",
+    "parent",
+    "name",
+    "kind",
+    "status",
+    "content_rev",
+    "meta_rev",
+    "trash_group",
+    "current",
+];
+
+const CURRENT_FIELDS: &[&str] = &[
+    "version",
+    "seq",
+    "content",
+    "chunks_inline",
+    "device",
+    "user",
+    "created_at_ms",
+];
 
 fn strings<'a>(list: &'a [Value], what: &str) -> Result<Vec<&'a str>, String> {
     list.iter()
@@ -1126,7 +1152,7 @@ impl Run {
         let expect = expectation(
             step,
             &["missing", "missing_some"],
-            &["seq", "results", "changed"],
+            &["seq", "results", "changed", "response"],
         )?;
         let result = self.send(space, at_ms, step)?;
         self.check_commit(space, expect, result)
@@ -1254,64 +1280,139 @@ impl Run {
     ) -> Result<(Value, Vec<String>), String> {
         let result = match result {
             rpc_response::Result::Commit(result) => result,
-            rpc_response::Result::Error(e) => {
-                return Ok((json!({ "error": error_name(e.code) }), Vec::new()));
-            }
-            other => return Err(format!("unexpected response {other:?}")),
+            other => return Err(format!("a generated commit got {other:?}")),
         };
-        let mut results = Vec::new();
-        for got in &result.results {
-            results.push(json!({
-                "code": result_code(got.code),
-                "node": self.symbol(space, &got.node_id, "copy")?,
-                "name": got.name,
-                "reason": got.reject_reason,
+        let CommitResult {
+            seq,
+            results,
+            changes,
+            committed_at_ms,
+        } = result;
+        let mut listed = Vec::new();
+        for got in results {
+            let OpResult {
+                code,
+                node_id,
+                name,
+                reject_reason,
+            } = got;
+            listed.push(json!({
+                "code": result_code(*code),
+                "node": self.symbol(space, node_id, "copy")?,
+                "name": name,
+                "reason": reject_reason,
             }));
         }
-        let root = self.space(space)?.space_id().to_owned();
         let mut changed = Vec::new();
-        for node in node_states(&result.changes) {
-            if node.node_id != root && !self.values.contains_key(&node.node_id) {
+        let mut states = Vec::new();
+        for change in changes {
+            let Some(change_record::Change::Node(node)) = &change.change else {
+                return Err(format!("a generated commit returned {change:?}"));
+            };
+            if self.space(space)?.space_id() != node.node_id
+                && !self.values.contains_key(&node.node_id)
+            {
                 return Err(format!(
                     "changed node {} is named by no result",
                     node.node_id
                 ));
             }
-            changed.push(self.symbol(space, &node.node_id, "copy")?);
+            let state = self.recorded_state(space, node)?;
+            changed.push(state["node"].as_str().unwrap_or_default().to_owned());
+            states.push(json!({ "node": state }));
         }
-        let expect = json!({ "seq": result.seq, "results": results, "changed": changed });
-        Ok((expect, changed))
+        let response = json!({
+            "seq": seq,
+            "committed_at_ms": committed_at_ms,
+            "results": listed,
+            "changes": states,
+        });
+        Ok((json!({ "response": response }), changed))
     }
 
     fn recorded_node(&mut self, space: &str, symbol: &str) -> Result<Value, String> {
         let id = self.known(space, symbol)?;
-        let Some(node) = self.space(space)?.node(&id) else {
-            return Ok(json!({ "node": symbol, "absent": true }));
-        };
-        let trash_group = if node.trash_group.is_empty() {
+        match self.space(space)?.node(&id) {
+            None => Ok(json!({ "node": symbol, "absent": true })),
+            Some(node) => self.recorded_state(space, &node),
+        }
+    }
+
+    fn recorded_state(&mut self, space: &str, node: &NodeState) -> Result<Value, String> {
+        let NodeState {
+            node_id,
+            parent_id,
+            name,
+            kind,
+            status,
+            content_rev,
+            meta_rev,
+            trash_group,
+            current,
+        } = node;
+        let trash_group = if trash_group.is_empty() {
             Value::Null
         } else {
-            self.symbol(space, &node.trash_group, "group")?.into()
+            self.symbol(space, trash_group, "group")?.into()
         };
-        let mut entry = json!({
-            "node": symbol,
-            "parent": self.symbol(space, &node.parent_id, "copy")?,
-            "name": node.name,
-            "kind": kind_name(node.kind),
-            "status": status_name(node.status),
-            "content_rev": node.content_rev,
-            "meta_rev": node.meta_rev,
+        let current = match current {
+            None => Value::Null,
+            Some(version) => self.recorded_current(space, version)?,
+        };
+        Ok(json!({
+            "node": self.symbol(space, node_id, "copy")?,
+            "parent": self.symbol(space, parent_id, "copy")?,
+            "name": name,
+            "kind": kind_name(*kind),
+            "status": status_name(*status),
+            "content_rev": content_rev,
+            "meta_rev": meta_rev,
             "trash_group": trash_group,
-        });
-        if let Some(content) = node.current.as_ref().and_then(|v| v.content.as_ref()) {
-            let (symbol, _) = self
-                .contents
-                .iter()
-                .find(|(_, c)| c.manifest_digest == content.manifest_digest)
-                .ok_or_else(|| format!("{symbol} holds a content no scenario lists"))?;
-            entry["content"] = symbol.clone().into();
-        }
-        Ok(entry)
+            "current": current,
+        }))
+    }
+
+    fn recorded_current(&mut self, space: &str, version: &VersionInfo) -> Result<Value, String> {
+        let VersionInfo {
+            version_id,
+            seq,
+            content,
+            device_id,
+            user_id,
+            created_at_ms,
+        } = version;
+        let mut devices: Vec<(&String, &Session)> = self.devices.iter().collect();
+        devices.sort_by_key(|(symbol, _)| *symbol);
+        let device = devices
+            .iter()
+            .find(|(_, s)| s.device_id == *device_id)
+            .map(|(symbol, _)| symbol.to_string())
+            .ok_or_else(|| format!("device {device_id} is no scenario device"))?;
+        let user = devices
+            .iter()
+            .find(|(_, s)| s.user_id == *user_id)
+            .map(|(symbol, _)| symbol.to_string())
+            .ok_or_else(|| format!("user {user_id} is no scenario device's user"))?;
+        let (content, inline) = match content {
+            None => (Value::Null, false),
+            Some(content) => {
+                let (symbol, _) = self
+                    .contents
+                    .iter()
+                    .find(|(_, c)| c.manifest_digest == content.manifest_digest)
+                    .ok_or("a version holds a content no scenario lists")?;
+                (symbol.clone().into(), !content.chunks.is_empty())
+            }
+        };
+        Ok(json!({
+            "version": self.symbol(space, version_id, "version")?,
+            "seq": seq,
+            "content": content,
+            "chunks_inline": inline,
+            "device": device,
+            "user": user,
+            "created_at_ms": created_at_ms,
+        }))
     }
 
     fn check_commit(
@@ -1371,6 +1472,10 @@ impl Run {
                 e.message
             )),
             (rpc_response::Result::Commit(result), None) => {
+                if let Some(response) = expect.get("response") {
+                    keys(expect, "a full expect", &["response"])?;
+                    return self.check_response(space, response, &result);
+                }
                 if let Some(seq) = opt_u64(expect, "seq")?
                     && result.seq != seq
                 {
@@ -1385,7 +1490,7 @@ impl Run {
                         ));
                     }
                     for (i, (want, got)) in expected.iter().zip(&result.results).enumerate() {
-                        self.check_result(space, want, got)
+                        self.check_result(space, want, got, false)
                             .map_err(|e| format!("result {}: {e}", i + 1))?;
                     }
                 }
@@ -1409,33 +1514,102 @@ impl Run {
         }
     }
 
+    fn check_response(&mut self, space: &str, want: &Value, got: &CommitResult) -> Outcome {
+        const FIELDS: &[&str] = &["seq", "committed_at_ms", "results", "changes"];
+        keys(want, "response", FIELDS)?;
+        every(want, FIELDS)?;
+        let CommitResult {
+            seq,
+            results,
+            changes,
+            committed_at_ms,
+        } = got;
+        let want_seq = req(opt_u64(want, "seq"), "seq")?;
+        if *seq != want_seq {
+            return Err(format!("seq {seq}, expected {want_seq}"));
+        }
+        let at = req(opt_i64(want, "committed_at_ms"), "committed_at_ms")?;
+        if *committed_at_ms != at {
+            return Err(format!("committed_at_ms {committed_at_ms}, expected {at}"));
+        }
+        let want_results = req(opt_list(want, "results"), "results")?;
+        if want_results.len() != results.len() {
+            return Err(format!(
+                "{} results, expected {}",
+                results.len(),
+                want_results.len()
+            ));
+        }
+        for (i, (want, got)) in want_results.iter().zip(results).enumerate() {
+            self.check_result(space, want, got, true)
+                .map_err(|e| format!("result {}: {e}", i + 1))?;
+        }
+        let want_changes = req(opt_list(want, "changes"), "changes")?;
+        if want_changes.len() != changes.len() {
+            return Err(format!(
+                "{} changes, expected {}",
+                changes.len(),
+                want_changes.len()
+            ));
+        }
+        for (i, (want, got)) in want_changes.iter().zip(changes).enumerate() {
+            self.check_change(space, want, got)
+                .map_err(|e| format!("change {}: {e}", i + 1))?;
+        }
+        Ok(())
+    }
+
+    fn check_change(&mut self, space: &str, want: &Value, got: &ChangeRecord) -> Outcome {
+        keys(want, "a change", &["node"])?;
+        let ChangeRecord { change } = got;
+        let found = match change {
+            Some(change_record::Change::Node(node)) => {
+                let want = want.get("node").ok_or("missing field node")?;
+                return self.check_node_state(space, want, node, true);
+            }
+            Some(change_record::Change::Purged(_)) => "a purge",
+            Some(change_record::Change::Space(_)) => "a space update",
+            Some(change_record::Change::Member(_)) => "a member update",
+            None => "an empty change",
+        };
+        Err(format!("{found}, expected a node"))
+    }
+
     fn check_result(
         &mut self,
         space: &str,
         want: &Value,
-        got: &koidrive_proto::v1::OpResult,
+        got: &OpResult,
+        complete: bool,
     ) -> Outcome {
-        keys(want, "a result", &["code", "node", "name", "reason"])?;
-        let code = result_code(got.code);
+        const FIELDS: &[&str] = &["code", "node", "name", "reason"];
+        keys(want, "a result", FIELDS)?;
+        if complete {
+            every(want, FIELDS)?;
+        }
+        let OpResult {
+            code,
+            node_id,
+            name,
+            reject_reason,
+        } = got;
+        let code = result_code(*code);
         let want_code = req(opt_str(want, "code"), "code")?;
         if code != want_code {
-            return Err(format!(
-                "{code} {:?}, expected {want_code}",
-                got.reject_reason
-            ));
+            return Err(format!("{code} {reject_reason:?}, expected {want_code}"));
         }
-        if let Some(name) = opt_str(want, "name")?
-            && got.name != name
+        if let Some(want_name) = opt_str(want, "name")?
+            && name != want_name
         {
-            return Err(format!("name {:?}, expected {name:?}", got.name));
+            return Err(format!("name {name:?}, expected {want_name:?}"));
         }
         if let Some(reason) = opt_str(want, "reason")?
-            && got.reject_reason != reason
+            && reject_reason != reason
         {
-            return Err(format!("reason {:?}, expected {reason}", got.reject_reason));
+            return Err(format!("reason {reject_reason:?}, expected {reason}"));
         }
         if let Some(node) = opt_str(want, "node")? {
-            self.expect_id(space, node, &got.node_id)?;
+            self.expect_id(space, node, node_id)?;
         }
         Ok(())
     }
@@ -1604,22 +1778,6 @@ impl Run {
     }
 
     fn check_node(&mut self, space: &str, want: &Value) -> Outcome {
-        keys(
-            want,
-            "a node",
-            &[
-                "node",
-                "absent",
-                "parent",
-                "name",
-                "kind",
-                "status",
-                "content_rev",
-                "meta_rev",
-                "trash_group",
-                "content",
-            ],
-        )?;
         let symbol = req(opt_str(want, "node"), "node")?;
         let id = self.known(space, symbol)?;
         let got: Option<NodeState> = self.space(space)?.node(&id);
@@ -1634,61 +1792,193 @@ impl Run {
             };
         }
         let got = got.ok_or_else(|| format!("{symbol} does not exist"))?;
+        self.check_node_state(space, want, &got, want.get("current").is_some())
+    }
+
+    fn check_node_state(
+        &mut self,
+        space: &str,
+        want: &Value,
+        got: &NodeState,
+        complete: bool,
+    ) -> Outcome {
+        if complete {
+            keys(want, "a node", NODE_FIELDS)?;
+            every(want, NODE_FIELDS)?;
+        } else {
+            keys(
+                want,
+                "a node",
+                &[NODE_FIELDS, &["absent", "content"]].concat(),
+            )?;
+        }
+        let NodeState {
+            node_id,
+            parent_id,
+            name,
+            kind,
+            status,
+            content_rev,
+            meta_rev,
+            trash_group,
+            current,
+        } = got;
+        let symbol = req(opt_str(want, "node"), "node")?;
+        self.expect_id(space, symbol, node_id)
+            .map_err(|e| format!("node: {e}"))?;
         let differs = |field: &str, got: &dyn std::fmt::Debug| {
             format!("{symbol}.{field} is {got:?}, expected {}", want[field])
         };
         if let Some(parent) = opt_str(want, "parent")? {
-            self.expect_id(space, parent, &got.parent_id)
+            self.expect_id(space, parent, parent_id)
                 .map_err(|e| format!("{symbol}.parent: {e}"))?;
         }
-        if let Some(name) = opt_str(want, "name")?
-            && got.name != name
+        if let Some(want_name) = opt_str(want, "name")?
+            && name != want_name
         {
-            return Err(differs("name", &got.name));
+            return Err(differs("name", name));
         }
-        if let Some(kind) = opt_str(want, "kind")? {
-            let name = kind_name(got.kind);
-            if name != kind {
-                return Err(differs("kind", &name));
-            }
+        if let Some(want_kind) = opt_str(want, "kind")?
+            && kind_name(*kind) != want_kind
+        {
+            return Err(differs("kind", &kind_name(*kind)));
         }
-        if let Some(status) = opt_str(want, "status")? {
-            let name = status_name(got.status);
-            if name != status {
-                return Err(differs("status", &name));
-            }
+        if let Some(want_status) = opt_str(want, "status")?
+            && status_name(*status) != want_status
+        {
+            return Err(differs("status", &status_name(*status)));
         }
         if let Some(rev) = opt_u64(want, "content_rev")?
-            && got.content_rev != rev
+            && *content_rev != rev
         {
-            return Err(differs("content_rev", &got.content_rev));
+            return Err(differs("content_rev", content_rev));
         }
         if let Some(rev) = opt_u64(want, "meta_rev")?
-            && got.meta_rev != rev
+            && *meta_rev != rev
         {
-            return Err(differs("meta_rev", &got.meta_rev));
+            return Err(differs("meta_rev", meta_rev));
         }
         match want.get("trash_group") {
             None => {}
             Some(Value::Null) => {
-                if !got.trash_group.is_empty() {
-                    return Err(differs("trash_group", &got.trash_group));
+                if !trash_group.is_empty() {
+                    return Err(differs("trash_group", trash_group));
                 }
             }
             Some(Value::String(group)) => self
-                .expect_id(space, group, &got.trash_group)
+                .expect_id(space, group, trash_group)
                 .map_err(|e| format!("{symbol}.trash_group: {e}"))?,
             Some(other) => {
                 return Err(format!("trash_group must be a string or null, got {other}"));
             }
         }
         if let Some(content) = opt_str(want, "content")? {
-            self.check_content(
-                got.current.as_ref().and_then(|v| v.content.as_ref()),
-                content,
-            )
-            .map_err(|e| format!("{symbol}: {e}"))?;
+            self.check_content(current.as_ref().and_then(|v| v.content.as_ref()), content)
+                .map_err(|e| format!("{symbol}: {e}"))?;
         }
-        Ok(())
+        match (want.get("current"), current) {
+            (None, _) | (Some(Value::Null), None) => Ok(()),
+            (Some(Value::Null), Some(_)) => {
+                Err(format!("{symbol} has a current version, expected none"))
+            }
+            (Some(_), None) => Err(format!("{symbol} has no current version, expected one")),
+            (Some(want), Some(got)) => self
+                .check_current(space, want, got)
+                .map_err(|e| format!("{symbol}.current: {e}")),
+        }
+    }
+
+    fn check_current(&mut self, space: &str, want: &Value, got: &VersionInfo) -> Outcome {
+        keys(want, "a current version", CURRENT_FIELDS)?;
+        every(want, CURRENT_FIELDS)?;
+        let VersionInfo {
+            version_id,
+            seq,
+            content,
+            device_id,
+            user_id,
+            created_at_ms,
+        } = got;
+        self.expect_id(space, req(opt_str(want, "version"), "version")?, version_id)
+            .map_err(|e| format!("version: {e}"))?;
+        let want_seq = req(opt_u64(want, "seq"), "seq")?;
+        if *seq != want_seq {
+            return Err(format!("seq {seq}, expected {want_seq}"));
+        }
+        let at = req(opt_i64(want, "created_at_ms"), "created_at_ms")?;
+        if *created_at_ms != at {
+            return Err(format!("created_at_ms {created_at_ms}, expected {at}"));
+        }
+        let device = self.session_of(req(opt_str(want, "device"), "device")?)?;
+        if *device_id != device.device_id {
+            return Err(format!(
+                "device_id {device_id}, expected {}'s",
+                device.device_name
+            ));
+        }
+        let user = self.session_of(req(opt_str(want, "user"), "user")?)?;
+        if *user_id != user.user_id {
+            return Err(format!("user_id {user_id}, expected {}", user.user_id));
+        }
+        let inline = req(opt_bool(want, "chunks_inline"), "chunks_inline")?;
+        match (&want["content"], content) {
+            (Value::Null, None) => Ok(()),
+            (Value::String(symbol), Some(got)) => self.check_full_content(got, symbol, inline),
+            (Value::Null, Some(_)) => Err("a content, expected none".into()),
+            (want, None) => Err(format!("no content, expected {want}")),
+            (other, Some(_)) => Err(format!("content must be a string or null, got {other}")),
+        }
+    }
+
+    fn session_of(&self, symbol: &str) -> Result<Session, String> {
+        self.devices
+            .get(symbol)
+            .cloned()
+            .ok_or_else(|| format!("unknown device {symbol}"))
+    }
+
+    fn check_full_content(&self, got: &Content, symbol: &str, inline: bool) -> Outcome {
+        let want = self.content(symbol)?;
+        let Content {
+            size,
+            mtime_ns,
+            executable,
+            chunks,
+            chunk_count,
+            manifest_digest,
+            chunker,
+        } = got;
+        let listed: &[ChunkRef] = if inline { &want.chunks } else { &[] };
+        let same_chunks = chunks.len() == listed.len()
+            && chunks.iter().zip(listed).all(|(got, want)| {
+                let ChunkRef {
+                    hash,
+                    size,
+                    encoding,
+                } = got;
+                *hash == want.hash && *size == want.size && *encoding == want.encoding
+            });
+        let fields = [
+            ("size", *size == want.size),
+            ("mtime_ns", *mtime_ns == want.mtime_ns),
+            ("executable", *executable == want.executable),
+            ("chunks", same_chunks),
+            ("chunk_count", *chunk_count == want.chunk_count),
+            ("manifest_digest", *manifest_digest == want.manifest_digest),
+            ("chunker", *chunker == want.chunker),
+        ];
+        let differ: Vec<&str> = fields
+            .iter()
+            .filter(|(_, same)| !same)
+            .map(|(field, _)| *field)
+            .collect();
+        if differ.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "content differs from {symbol} in {}",
+                differ.join(", ")
+            ))
+        }
     }
 }
