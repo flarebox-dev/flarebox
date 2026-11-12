@@ -22,6 +22,7 @@ import {
   deleteBucket,
   deleteObject,
   deleteWorker,
+  emptyBucket,
   getBucket,
   getWorker,
   graphql,
@@ -351,6 +352,11 @@ async function emptyAndDeleteBucket(account: Account, name: string): Promise<Sto
       storage.exportObjects++;
       storage.exportBytes += object.size;
     }
+  }
+  if (first.length > 1000) {
+    await emptyBucket(account, name);
+    await deleteBucket(account, name);
+    return storage;
   }
   let objects = first;
   for (let attempt = 1; ; attempt++) {

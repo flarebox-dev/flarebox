@@ -32,6 +32,9 @@ export class MockCloudflare {
   claimStatus = 200;
   /** The status of listing a Worker's versions. */
   versionsStatus = 200;
+  bucketJobStatuses: string[] = ["COMPLETED"];
+  bucketJobCreateStatus = 200;
+  readonly bucketJobBodies: unknown[] = [];
   readonly claimCode = "ZQ7K-M2XR-9WPD";
   url = "";
   private server: Server | undefined;
@@ -186,7 +189,22 @@ export class MockCloudflare {
       if ((match = /^\/r2\/buckets\/([^/]+)\/objects$/.exec(api)) && method === "GET") {
         const bucket = this.buckets.get(match[1]!);
         if (!bucket) return missing();
-        return send(200, { success: true, errors: [], messages: [], result: [...bucket.objects].map(([key, size]) => ({ key, size })), result_info: { is_truncated: false } });
+        const cursor = Number(new URL(request.url ?? "/", this.url).searchParams.get("cursor") ?? "0");
+        const objects = [...bucket.objects].map(([key, size]) => ({ key, size }));
+        const next = cursor + 1000;
+        return send(200, { success: true, errors: [], messages: [], result: objects.slice(cursor, next), result_info: { is_truncated: next < objects.length, cursor: next < objects.length ? String(next) : "" } });
+      }
+      if ((match = /^\/r2\/buckets\/([^/]+)\/jobs(?:\/empty-1)?$/.exec(api)) && (method === "POST" || method === "GET")) {
+        const bucket = this.buckets.get(match[1]!);
+        if (!bucket) return missing();
+        if (method === "POST") {
+          this.bucketJobBodies.push(JSON.parse(body));
+          if (this.bucketJobCreateStatus !== 200) return send(this.bucketJobCreateStatus, { success: false, errors: [{ code: 10001, message: "job creation failed" }] });
+        }
+        const status = this.bucketJobStatuses.length > 1 ? this.bucketJobStatuses.shift() : this.bucketJobStatuses[0];
+        const deletedObjects = status === "COMPLETED" ? bucket.objects.size : 0;
+        if (status === "COMPLETED") bucket.objects.clear();
+        return ok({ id: "empty-1", jobType: "prefixDelete", status, prefixDelete: { prefix: "", deletedObjects }, startTime: new Date().toISOString() });
       }
       if ((match = /^\/r2\/buckets\/([^/]+)\/objects\/(.+)$/.exec(api)) && method === "DELETE") {
         const bucket = this.buckets.get(match[1]!);
