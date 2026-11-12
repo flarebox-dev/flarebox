@@ -2591,7 +2591,8 @@ fn a_folder_replaced_on_the_path_of_a_paused_search_keeps_the_move() {
         let id = snapshot.entries[Path::new("f.txt")].id;
         fs::rename(root.join("f.txt"), root.join("ig/p/f.txt")).unwrap();
         let mut paths = whole().to_vec();
-        for rescan in 1..1000 {
+        for rescan in 1.. {
+            assert!(rescan < 1000, "budget {budget}: the search never ended");
             let result = snapshot.rescan_with_rules(root, paths, &mut rules).unwrap();
             if !result.changes.is_empty() {
                 assert_eq!(
@@ -2638,7 +2639,8 @@ fn a_deep_folder_renamed_while_a_search_is_paused_is_followed() {
         )
         .unwrap();
         let mut paths = whole().to_vec();
-        for rescan in 1..10_000 {
+        for rescan in 1.. {
+            assert!(rescan < 10_000, "budget {budget}: the search never ended");
             let result = snapshot.rescan_with_rules(root, paths, &mut rules).unwrap();
             if !result.changes.is_empty() {
                 assert_eq!(
@@ -2675,7 +2677,8 @@ fn a_scanned_folder_replaced_above_a_paused_search_keeps_the_move() {
         let mut rules = rules().with_search_budget(budget);
         let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
         fs::rename(root.join("f.txt"), root.join("proj/ig/p/f.txt")).unwrap();
-        for rescan in 1..1000 {
+        for rescan in 1.. {
+            assert!(rescan < 1000, "budget {budget}: the search never ended");
             let changes = snapshot
                 .rescan_with_rules(root, whole(), &mut rules)
                 .unwrap()

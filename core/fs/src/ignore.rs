@@ -462,10 +462,12 @@ impl<'r> Pending<'r> {
                         (dir.clone(), name)
                     }
                     None => {
-                        if walk.reach.is_none()
-                            && let Some((dir, id)) = walk.later.pop()
-                        {
-                            walk.reach = (root.try_clone_to_owned().ok()).map(|fd| Reach {
+                        if walk.reach.is_none() && !walk.later.is_empty() {
+                            let Ok(fd) = root.try_clone_to_owned() else {
+                                (left, looked) = (0, true);
+                                break;
+                            };
+                            walk.reach = (walk.later.pop()).map(|(dir, id)| Reach {
                                 dir,
                                 expect: vec![id],
                                 seen: Vec::new(),
@@ -519,7 +521,7 @@ impl<'r> Pending<'r> {
                             if confirm {
                                 continue;
                             }
-                            let Ok(entries) = Dir::read_from(&fd) else {
+                            let Ok(entries) = Dir::new(fd) else {
                                 continue;
                             };
                             seen.pop();
@@ -533,10 +535,12 @@ impl<'r> Pending<'r> {
                             continue;
                         }
                         let Some(listing) = walk.listings.last_mut() else {
-                            if walk.later.is_empty()
-                                && let Some((dir, expect)) = walk.bases.pop()
-                            {
-                                walk.reach = (root.try_clone_to_owned().ok()).map(|fd| Reach {
+                            if walk.later.is_empty() && !walk.bases.is_empty() {
+                                let Ok(fd) = root.try_clone_to_owned() else {
+                                    (left, looked) = (0, true);
+                                    break;
+                                };
+                                walk.reach = (walk.bases.pop()).map(|(dir, expect)| Reach {
                                     dir,
                                     expect,
                                     seen: Vec::new(),
@@ -607,7 +611,7 @@ impl<'r> Pending<'r> {
                 let Ok(sub) = open_dir_at(parent, &name) else {
                     continue;
                 };
-                let Ok(entries) = Dir::read_from(&sub) else {
+                let Ok(entries) = Dir::new(sub) else {
                     continue;
                 };
                 if walk.folders.is_empty() {
