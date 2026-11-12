@@ -1442,3 +1442,44 @@ fn a_write_a_restore_exposed_stays_on_the_disks_through_a_second_restore() {
     .unwrap();
     assert!(world.devices.iter().all(|device| device.disk.holds(2)));
 }
+
+#[test]
+fn a_lost_file_another_device_creates_again_renames_and_deletes_stays_deleted() {
+    let lost = vec![
+        (0, RESTORE),
+        (0, Step::Connect),
+        (1, Step::Connect),
+        (0, DELIVER),
+        (1, DELIVER),
+        (1, SCAN),
+        (1, COMMIT),
+        (0, SCAN),
+        (0, COMMIT),
+        (0, COMMIT),
+        (0, DELIVER),
+        (0, DELIVER),
+        (0, rename(0, 0, "b")),
+        (0, SCAN),
+        (0, COMMIT),
+        (0, COMMIT),
+        (0, DELIVER),
+        (0, DELIVER),
+        (0, delete(0)),
+        (0, SCAN),
+        (0, COMMIT),
+        (0, COMMIT),
+        (0, DELIVER),
+        (0, DELIVER),
+        (1, COMMIT),
+        (1, DELIVER),
+        (1, DELIVER),
+        (1, DELIVER),
+    ];
+    let world = converge(2, &[Vec::new(), vec![(0, BACKUP), (0, file("a"))], lost]).unwrap();
+    assert!(
+        world
+            .devices
+            .iter()
+            .all(|device| device.disk.entries().is_empty())
+    );
+}
