@@ -3,6 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use koidrive_engine::names::{conflict_name, is_reserved_at_root, name_key, normalize_name};
+use koidrive_engine::tree::same_content;
 use koidrive_proto::v1::{
     ChangeRecord, ChunkRef, Content, CreateDir, CreateFile, Delete, Error, Move, NodeKind,
     NodeStatus, Op, OpResult, Restore, change_record, error, op, op_result,
@@ -457,6 +458,12 @@ impl<'a> Applier<'a> {
         };
         if found.kind != NodeKind::File {
             return Ok(rejected("NOT_FILE"));
+        }
+        let current = (found.cur_version_id.as_ref()).map(|id| &self.st.versions[id].content);
+        if self.unseen_content(&found)
+            && current.is_some_and(|current| same_content(current, content))
+        {
+            return Ok(applied(false, &found.name));
         }
         let (node, renamed) = self.revive_target(found);
         let parent_id = node.parent_id.clone().expect("a file has a parent");

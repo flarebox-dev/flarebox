@@ -16,7 +16,7 @@ import {
 import { type ChangeRecord, ChangeRecordSchema, type ChunkRef, type Content } from "../gen/koidrive/v1/model_pb";
 import { Error_Code } from "../gen/koidrive/v1/rpc_pb";
 import type { Sql } from "../host";
-import { uuidv7 } from "../ids";
+import { toHex, uuidv7 } from "../ids";
 import type { OpEffect } from "../policy";
 import { conflictName, isReservedAtRoot, nameKey, normalizeName } from "./names";
 import { NodeKindValue, NodeStatusValue } from "./schema";
@@ -179,6 +179,16 @@ export class CommitApplier {
 
   private get dev(): string {
     return this.ctx.committer.deviceId;
+  }
+
+  private holds(node: NodeRow, content: Content): boolean {
+    const current = node.cur_version_id ? getVersion(this.sql, node.cur_version_id) : undefined;
+    return (
+      current !== undefined &&
+      BigInt(current.size) === content.size &&
+      (current.executable === 1) === content.executable &&
+      toHex(new Uint8Array(current.manifest_digest)) === toHex(content.manifestDigest)
+    );
   }
 
   private unseenContent(node: NodeRow): boolean {
@@ -395,6 +405,7 @@ export class CommitApplier {
     const found = this.node(nodeId);
     if (!found) return rejected("NOT_FOUND");
     if (found.kind !== NodeKindValue.FILE) return rejected("NOT_FILE");
+    if (this.unseenContent(found) && this.holds(found, content)) return result(OpResult_Code.APPLIED, "", found.name);
     const { node, renamed } = this.reviveTarget(found);
     if (this.unseenContent(node)) {
       const copyId = uuidv7(this.ctx.nowMs);
