@@ -488,6 +488,8 @@ fn a_help_or_version_flag_before_a_subcommand_reports_the_command_it_belongs_to(
     for (args, command, field) in [
         (&["--version", "space", "list"][..], "", "version"),
         (&["-V", "folder", "link"], "", "version"),
+        (&["-Vh", "space", "list"], "", "version"),
+        (&["-hV", "space", "list"], "", "help"),
         (&["-h", "space", "list"], "", "help"),
         (&["space", "--help", "list"], "space", "help"),
     ] {

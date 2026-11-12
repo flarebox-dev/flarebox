@@ -81,6 +81,9 @@ pub fn envelope(command: &str) -> Option<Value> {
         _ => Map::new(),
     };
     defs.extend(generator.take_definitions(true));
+    if let Some(line) = defs.get_mut("DaemonLine") {
+        line["properties"]["schema_version"] = json!({ "const": SCHEMA_VERSION });
+    }
     let Some(line) = line else {
         root["$defs"] = Value::Object(defs);
         return Some(root);
@@ -201,5 +204,8 @@ mod tests {
         assert!(lines.is_valid(&stopping), "{stopping:#}");
         stopping["signal"] = json!("SIGHUP");
         assert!(!lines.is_valid(&stopping));
+        let mut stopped = line(crate::report::Lifecycle::Stopped);
+        stopped["schema_version"] = json!(2);
+        assert!(!lines.is_valid(&stopped));
     }
 }

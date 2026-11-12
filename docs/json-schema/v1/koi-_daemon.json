@@ -184,9 +184,7 @@
       ],
       "properties": {
         "schema_version": {
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
+          "const": 1
         }
       },
       "required": [

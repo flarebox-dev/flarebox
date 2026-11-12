@@ -28,7 +28,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::error::ErrorKind;
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use koidrive_driver::{
     Answer, Credential, Driver, DriverError, FolderState, FolderStatus, Limit, MAX_DELETIONS,
     Paths, Question, QuestionKind, RecoveryGroup, Status,
@@ -691,9 +691,10 @@ fn json_requested(args: &[OsString]) -> bool {
 /// The subcommand path the arguments name, such as `folder link`: each argument that names a subcommand of the one before.
 fn command_path(args: &[OsString]) -> String {
     let mut command = Cli::command();
+    command.build();
     let mut path = Vec::new();
     for arg in args.iter().skip(1).filter_map(|arg| arg.to_str()) {
-        if matches!(arg, "-h" | "--help" | "-V" | "--version" | "--") {
+        if arg == "--" || shows_and_exits(&command, arg) {
             break;
         }
         if arg.starts_with('-') {
@@ -706,6 +707,40 @@ fn command_path(args: &[OsString]) -> String {
         command = sub;
     }
     path.join(" ")
+}
+
+fn shows_and_exits(command: &clap::Command, arg: &str) -> bool {
+    let exits = |found: Option<&clap::Arg>| {
+        found.is_some_and(|found| {
+            matches!(
+                found.get_action(),
+                ArgAction::Help | ArgAction::HelpShort | ArgAction::HelpLong | ArgAction::Version
+            )
+        })
+    };
+    if let Some(long) = arg.strip_prefix("--") {
+        let name = long.split('=').next().unwrap_or(long);
+        return exits(
+            command
+                .get_arguments()
+                .find(|found| found.get_long() == Some(name)),
+        );
+    }
+    let Some(shorts) = arg.strip_prefix('-') else {
+        return false;
+    };
+    for short in shorts.chars() {
+        let found = command
+            .get_arguments()
+            .find(|found| found.get_short() == Some(short));
+        if exits(found) {
+            return true;
+        }
+        if found.is_none_or(|found| found.get_action().takes_values()) {
+            return false;
+        }
+    }
+    false
 }
 
 /// Logs go to stderr: structured key-value text by default, one JSON object per line with `--log-format json`. The
@@ -2354,6 +2389,12 @@ mod tests {
             "space"
         );
         assert_eq!(command_path(&args(&["koi", "--", "status"])), "");
+        assert_eq!(command_path(&args(&["koi", "-Vh", "space", "list"])), "");
+        assert_eq!(command_path(&args(&["koi", "-hV", "folder", "link"])), "");
+        assert_eq!(
+            command_path(&args(&["koi", "space", "-V", "list"])),
+            "space list"
+        );
         assert!(json_requested(&args(&["koi", "linky", "--json"])));
         assert!(json_requested(&args(&["koi", "status", "--json=2"])));
         assert!(!json_requested(&args(&["koi", "status"])));
