@@ -7,6 +7,8 @@ use std::process::{Command, Output, Stdio};
 
 use serde_json::Value;
 
+mod schema;
+
 struct Profile {
     home: tempfile::TempDir,
 }
@@ -46,7 +48,7 @@ impl Profile {
                 String::from_utf8_lossy(&output.stdout)
             )
         });
-        assert_eq!(envelope["schema_version"], 1, "{envelope:#}");
+        schema::check(&envelope);
         for field in [
             "command",
             "outcome",
@@ -440,6 +442,7 @@ fn ctrl_c_ends_a_command_with_an_interrupted_error_and_exit_130() {
         let stderr = String::from_utf8(output.stderr).unwrap();
         if json {
             let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+            schema::check(&envelope);
             assert_eq!(envelope["command"], "join", "{envelope:#}");
             assert_eq!(envelope["outcome"], "error", "{envelope:#}");
             assert_eq!(envelope["error"]["code"], "interrupted", "{envelope:#}");
@@ -482,6 +485,96 @@ fn ctrl_c_during_setup_under_json_prints_the_interrupted_envelope() {
 
     assert_eq!(output.status.code(), Some(130), "{output:?}");
     let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    schema::check(&envelope);
     assert_eq!(envelope["command"], "setup", "{envelope:#}");
     assert_eq!(envelope["error"]["code"], "interrupted", "{envelope:#}");
+}
+
+#[test]
+fn a_help_or_version_flag_before_a_subcommand_reports_the_command_it_belongs_to() {
+    let profile = Profile::new();
+    for (args, command, field) in [
+        (&["--version", "space", "list"][..], "", "version"),
+        (&["-V", "folder", "link"], "", "version"),
+        (&["-Vh", "space", "list"], "", "version"),
+        (&["-hV", "space", "list"], "", "help"),
+        (&["-h", "space", "list"], "", "help"),
+        (&["space", "--help", "list"], "space", "help"),
+    ] {
+        let (code, envelope) = profile.json(&[&["--json"], args].concat());
+        assert_eq!(code, 0, "{args:?} {envelope:#}");
+        assert_eq!(envelope["command"], command, "{args:?} {envelope:#}");
+        assert!(envelope["data"][field].is_string(), "{args:?} {envelope:#}");
+        schema::check(&envelope);
+    }
+}
+
+#[test]
+fn help_named_after_a_group_is_the_help_of_the_commands_after_it() {
+    let profile = Profile::new();
+    for (args, command, shown) in [
+        (
+            &["space", "help"][..],
+            "help space",
+            &["space", "--help"][..],
+        ),
+        (
+            &["space", "help", "list"],
+            "help space list",
+            &["space", "list", "--help"],
+        ),
+        (
+            &["folder", "help", "-h"],
+            "help folder",
+            &["folder", "--help"],
+        ),
+        (&["help", "space"], "help space", &["space", "--help"]),
+    ] {
+        let (code, envelope) = profile.json(&[args, &["--json"]].concat());
+        assert_eq!(code, 0, "{args:?} {envelope:#}");
+        assert_eq!(envelope["command"], command, "{args:?} {envelope:#}");
+        let (_, expected) = profile.json(&[shown, &["--json"]].concat());
+        assert_eq!(
+            envelope["data"]["help"], expected["data"]["help"],
+            "{args:?}"
+        );
+    }
+    let (code, envelope) = profile.json(&["folder", "link", "help", "--json"]);
+    assert_eq!(code, 2, "{envelope:#}");
+    assert_eq!(envelope["command"], "folder link", "{envelope:#}");
+    for (args, field) in [
+        (&["--version", "space", "help"][..], "version"),
+        (&["--help", "space", "help"], "help"),
+    ] {
+        let (code, envelope) = profile.json(&[args, &["--json"]].concat());
+        assert_eq!(code, 0, "{args:?} {envelope:#}");
+        assert_eq!(envelope["command"], "", "{args:?} {envelope:#}");
+        assert!(envelope["data"][field].is_string(), "{args:?} {envelope:#}");
+    }
+    let (code, envelope) = profile.json(&["space", "--bogus", "help", "--json"]);
+    assert_eq!(code, 2, "{envelope:#}");
+    assert_eq!(envelope["error"]["code"], "usage", "{envelope:#}");
+}
+
+#[test]
+fn every_command_prints_its_help_as_an_envelope_its_schema_takes() {
+    let profile = Profile::new();
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/json-schema/v1");
+    let mut commands = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let schema: Value =
+            serde_json::from_slice(&std::fs::read(entry.unwrap().path()).unwrap()).unwrap();
+        if let Some(command) = schema["properties"]["command"]["const"].as_str() {
+            commands.push(command.to_owned());
+        }
+    }
+    assert!(commands.len() > 30, "{commands:?}");
+    for command in commands {
+        let mut args: Vec<&str> = command.split_whitespace().collect();
+        args.extend(["--help", "--json"]);
+        let (code, envelope) = profile.json(&args);
+        assert_eq!(code, 0, "{envelope:#}");
+        assert_eq!(envelope["command"], command.as_str(), "{envelope:#}");
+        assert!(envelope["data"]["help"].is_string(), "{envelope:#}");
+    }
 }

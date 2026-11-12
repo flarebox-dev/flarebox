@@ -8,12 +8,13 @@ use koidrive_cloudflare::{ApiError as CloudflareError, OauthError};
 use koidrive_driver::{ConfigError, DriverError, PathsError, SET_UP_AGAIN};
 use koidrive_net::{ApiError, Resend, ServerError};
 use koidrive_proto::v1::{Error as ProtoError, error::Code as ServerCode};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::report::{Done, Next};
 
 /// What kind of failure an error is. Each code has one exit status.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Code {
     /// No more specific code applies.

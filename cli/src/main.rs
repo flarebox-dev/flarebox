@@ -15,6 +15,8 @@ mod notify;
 mod pairing;
 mod report;
 mod request;
+#[cfg(test)]
+mod schema;
 mod service;
 mod setup;
 mod telemetry;
@@ -26,7 +28,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::error::ErrorKind;
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use koidrive_driver::{
     Answer, Credential, Driver, DriverError, FolderState, FolderStatus, Limit, MAX_DELETIONS,
     Paths, Question, QuestionKind, RecoveryGroup, Status,
@@ -44,9 +46,9 @@ use koidrive_telemetry::schema::{DaemonStart, Failure, SetupStep};
 use crate::error::{CliError, Code};
 use crate::ipc::{Request, Response};
 use crate::report::{
-    AccountData, AnsweredData, Decision, DeviceData, DevicesData, Done, Envelope, FolderData,
-    HelpData, InvitationData, Lifecycle, RefusedSpace, RevokedData, SpaceData, SpacesData,
-    StatusData, UnlinkedData, UsageData, UsagesData, VersionInfoData,
+    AccountData, AnsweredData, Decision, DeviceData, DevicesData, Done, Empty, Envelope,
+    FolderData, HelpData, InvitationData, Lifecycle, RefusedSpace, RevokedData, SpaceData,
+    SpacesData, StatusData, UnlinkedData, UsageData, UsagesData, VersionInfoData, WithService,
 };
 use crate::request::{Begun, Key, RequestId};
 
@@ -471,13 +473,15 @@ async fn run(paths: Paths, command: Command, json: bool) -> Result<Done, CliErro
             return Err(CliError::new(Code::Failed, text.trim_end()));
         }
         done.text.push_str(&text);
-        if done.data.is_null() {
-            done.data = Value::Object(serde_json::Map::new());
-        }
-        if let Value::Object(data) = &mut done.data {
-            let report = serde_json::to_value(&report).expect("the CLI's own types serialize");
-            data.insert("service".to_owned(), report);
-        }
+        let data = match done.data.take() {
+            Value::Null => Value::Object(serde_json::Map::new()),
+            data => data,
+        };
+        done.data = serde_json::to_value(WithService {
+            data,
+            service: report,
+        })
+        .expect("the CLI's own types serialize");
     }
     Ok(done)
 }
@@ -531,7 +535,7 @@ async fn execute(paths: Paths, command: Command, json: bool) -> Result<Done, Cli
         Command::Folder { action } => folder(&paths, action).await,
         Command::Service {
             action: ServiceAction::Start,
-        } => Ok(Done::ok(serde_json::Map::new(), "")),
+        } => Ok(Done::ok(Empty {}, "")),
         Command::Device { action } => device(paths, action).await,
         Command::History { action } => history::run(&paths, action).await,
         Command::Telemetry { action } => telemetry::command(&paths, action),
@@ -657,11 +661,23 @@ fn help_of(path: &str) -> Option<String> {
 /// The command names after `help` when `help` is the first command named, as in `koi help folder --json`.
 /// Clap's own `help` reads every argument as a command name, `--json` included.
 fn help_names(args: &[OsString]) -> Option<Vec<&str>> {
-    let mut names = (args.iter().skip(1))
-        .take_while(|arg| *arg != "--")
-        .filter_map(|arg| arg.to_str())
-        .filter(|arg| !arg.starts_with('-'));
-    (names.next() == Some("help")).then(|| names.collect())
+    let mut words = (args.iter().skip(1)).take_while(|arg| *arg != "--");
+    let mut command = Cli::command();
+    let mut path = Vec::new();
+    while let Some(word) = words.next() {
+        let word = word.to_str()?;
+        if word == "--json" || word.starts_with("--json=") {
+            continue;
+        }
+        if word == "help" && command.has_subcommands() {
+            let names = words.filter_map(|arg| arg.to_str());
+            path.extend(names.filter(|arg| !arg.starts_with('-')));
+            return Some(path);
+        }
+        command = command.find_subcommand(word)?.clone();
+        path.push(word);
+    }
+    None
 }
 
 fn help_done(help: String) -> Done {
@@ -687,18 +703,57 @@ fn json_requested(args: &[OsString]) -> bool {
 /// The subcommand path the arguments name, such as `folder link`: each argument that names a subcommand of the one before.
 fn command_path(args: &[OsString]) -> String {
     let mut command = Cli::command();
+    command.build();
     let mut path = Vec::new();
     for arg in args.iter().skip(1).filter_map(|arg| arg.to_str()) {
+        if arg == "--" || shows_and_exits(&command, arg) {
+            break;
+        }
         if arg.starts_with('-') {
             continue;
         }
-        let Some(sub) = command.find_subcommand(arg).cloned() else {
+        let found = command.find_subcommand(arg);
+        let Some(sub) = found.filter(|sub| sub.get_name() != "help").cloned() else {
             break;
         };
         path.push(sub.get_name().to_owned());
         command = sub;
     }
     path.join(" ")
+}
+
+fn shows_and_exits(command: &clap::Command, arg: &str) -> bool {
+    let exits = |found: Option<&clap::Arg>| {
+        found.is_some_and(|found| {
+            matches!(
+                found.get_action(),
+                ArgAction::Help | ArgAction::HelpShort | ArgAction::HelpLong | ArgAction::Version
+            )
+        })
+    };
+    if let Some(long) = arg.strip_prefix("--") {
+        let name = long.split('=').next().unwrap_or(long);
+        return exits(
+            command
+                .get_arguments()
+                .find(|found| found.get_long() == Some(name)),
+        );
+    }
+    let Some(shorts) = arg.strip_prefix('-') else {
+        return false;
+    };
+    for short in shorts.chars() {
+        let found = command
+            .get_arguments()
+            .find(|found| found.get_short() == Some(short));
+        if exits(found) {
+            return true;
+        }
+        if found.is_none_or(|found| found.get_action().takes_values()) {
+            return false;
+        }
+    }
+    false
 }
 
 /// Logs go to stderr: structured key-value text by default, one JSON object per line with `--log-format json`. The
@@ -778,11 +833,11 @@ async fn daemon(paths: Paths, json: bool) -> Result<Done, CliError> {
         folders: folders.len(),
     });
     let states = json.then(|| tokio::spawn(folder_states(driver.clone(), watch, folders)));
-    let signal = tokio::select! {
-        _ = terminate.recv() => "SIGTERM",
-        _ = interrupt.recv() => "SIGINT",
+    let (signal, name) = tokio::select! {
+        _ = terminate.recv() => (report::Signal::Term, "SIGTERM"),
+        _ = interrupt.recv() => (report::Signal::Int, "SIGINT"),
     };
-    tracing::info!(signal, "stopping the daemon");
+    tracing::info!(signal = name, "stopping the daemon");
     if let Some(states) = states {
         states.abort();
         let _ = states.await;
@@ -2341,6 +2396,22 @@ mod tests {
         assert_eq!(command_path(&args(&["koi", "history"])), "history");
         assert_eq!(command_path(&args(&["koi", "nonsense", "x"])), "");
         assert_eq!(command_path(&args(&["koi"])), "");
+        assert_eq!(command_path(&args(&["koi", "-V", "space", "list"])), "");
+        assert_eq!(
+            command_path(&args(&["koi", "space", "--help", "list"])),
+            "space"
+        );
+        assert_eq!(command_path(&args(&["koi", "--", "status"])), "");
+        assert_eq!(
+            command_path(&args(&["koi", "space", "--bogus", "help"])),
+            "space"
+        );
+        assert_eq!(command_path(&args(&["koi", "-Vh", "space", "list"])), "");
+        assert_eq!(command_path(&args(&["koi", "-hV", "folder", "link"])), "");
+        assert_eq!(
+            command_path(&args(&["koi", "space", "-V", "list"])),
+            "space list"
+        );
         assert!(json_requested(&args(&["koi", "linky", "--json"])));
         assert!(json_requested(&args(&["koi", "status", "--json=2"])));
         assert!(!json_requested(&args(&["koi", "status"])));

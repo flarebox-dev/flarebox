@@ -23,8 +23,8 @@ use koidrive_proto::v1::{
 use crate::error::CliError;
 use crate::ipc::{self, Request, Response};
 use crate::report::{
-    Done, Outcome, RequestData, RequestsData, RestoreAskedData, TrashData, TrashEntry, VersionData,
-    VersionsData,
+    Done, NodeType, Outcome, RequestData, RequestsData, RestoreAskedData, TrashData, TrashEntry,
+    VersionData, VersionsData,
 };
 use crate::request::{self, Key, RequestId};
 use crate::{ago, now_ms, printable, signed_in, size, unexpected};
@@ -704,11 +704,11 @@ fn content_size(version: Option<&VersionInfo>) -> u64 {
         .map_or(0, |content| content.size)
 }
 
-fn kind(node: &NodeState) -> &'static str {
+fn kind(node: &NodeState) -> NodeType {
     match node.kind() {
-        NodeKind::Dir => "folder",
-        NodeKind::Symlink => "symlink",
-        _ => "file",
+        NodeKind::Dir => NodeType::Folder,
+        NodeKind::Symlink => NodeType::Symlink,
+        _ => NodeType::File,
     }
 }
 

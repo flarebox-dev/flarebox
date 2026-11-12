@@ -12,7 +12,7 @@ use koidrive_driver::{Credential, Paths};
 use serde_json::{Value, json};
 
 use crate::error::CliError;
-use crate::report::{Decision, Done};
+use crate::report::{Decision, DiagnosticsData, Done};
 use crate::service;
 
 const ISSUES: &str = "https://github.com/koidrive/koidrive/issues";
@@ -108,7 +108,10 @@ pub async fn run(paths: &Paths) -> Result<Done, CliError> {
         .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
     Ok(Done {
         note: format!("To report a problem, attach this file to an issue at {ISSUES}\n"),
-        ..Done::ok(json!({ "path": path }), format!("{}\n", path.display()))
+        ..Done::ok(
+            DiagnosticsData { path: path.clone() },
+            format!("{}\n", path.display()),
+        )
     })
 }
 
@@ -831,7 +834,7 @@ thread 'tokio-runtime-worker' panicked at /Users/ada/Secret Plans/ledger.rs:1:1:
         let decision = Decision {
             id: "q1".to_owned(),
             space_id: "s1".to_owned(),
-            kind: "conflict",
+            kind: crate::report::DecisionKind::Conflict,
             group: None,
             asked_at_ms: 1,
             requires_choice: true,

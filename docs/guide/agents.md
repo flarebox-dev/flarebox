@@ -40,6 +40,8 @@ Without `--json`, a command whose result is one value prints only that value on 
 
 A failed command can still carry `data`. For example, `koi space usage` returns the spaces that answered when the server refuses another one.
 
+Each command's envelope has a JSON Schema (draft 2020-12) in [docs/json-schema/v1](../json-schema/v1), named after the command: `koi-folder-link.json` for `koi folder link`, and `koi.json` for `koi` alone. `koi-help.json` covers `koi help` with any command after it. Schema 1 can gain optional fields, so a validator should allow fields it doesn't know.
+
 ## Decisions
 
 `koi status` and `koi resolve` list every pending decision in `decisions`. Every other command lists the decisions the running daemon holds. Each decision has every item it holds and the full command for each answer:

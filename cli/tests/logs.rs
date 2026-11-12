@@ -3,6 +3,8 @@
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 
+mod schema;
+
 /// Logs written to anything but a terminal, such as the journal of the systemd unit, carry no ANSI escapes.
 #[test]
 fn logs_to_a_pipe_are_plain_text() {
@@ -67,12 +69,14 @@ fn the_daemon_under_json_prints_its_lifecycle_as_json_lines() {
     assert_eq!(started["schema_version"], 1, "{started}");
     assert_eq!(started["event"], "started", "{started}");
     assert_eq!(started["folders"], 0, "{started}");
+    schema::check(&started);
 
     let help = daemon(true).arg("--help").output().unwrap();
     assert_eq!(help.status.code(), Some(0), "{help:?}");
     let help = String::from_utf8(help.stdout).unwrap();
     assert_eq!(help.lines().count(), 1, "{help}");
     let envelope: serde_json::Value = serde_json::from_str(&help).unwrap();
+    schema::check(&envelope);
     assert!(
         (envelope["data"]["help"].as_str().unwrap()).contains("_daemon"),
         "{envelope}"
@@ -83,6 +87,7 @@ fn the_daemon_under_json_prints_its_lifecycle_as_json_lines() {
     let busy = String::from_utf8(busy.stdout).unwrap();
     assert_eq!(busy.lines().count(), 1, "{busy}");
     let envelope: serde_json::Value = serde_json::from_str(&busy).unwrap();
+    schema::check(&envelope);
     assert_eq!(envelope["error"]["code"], "failed", "{envelope}");
 
     let killed = Command::new("kill")
@@ -101,6 +106,7 @@ fn the_daemon_under_json_prints_its_lifecycle_as_json_lines() {
     assert_eq!(events[0]["signal"], "SIGTERM");
     assert_eq!(events[1]["event"], "stopped");
     assert!(events.iter().all(|event| event["schema_version"] == 1));
+    events.iter().for_each(schema::check);
 
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(!stderr.contains('\u{1b}'), "{stderr:?}");

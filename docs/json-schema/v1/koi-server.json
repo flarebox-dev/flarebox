@@ -1,0 +1,361 @@
+{
+  "$defs": {
+    "AnswerChoice": {
+      "properties": {
+        "argv": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "consequence": {
+          "type": "string"
+        },
+        "token": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "token",
+        "consequence",
+        "argv"
+      ],
+      "type": "object"
+    },
+    "Code": {
+      "description": "What kind of failure an error is. Each code has one exit status.",
+      "oneOf": [
+        {
+          "const": "failed",
+          "description": "No more specific code applies.",
+          "type": "string"
+        },
+        {
+          "const": "usage",
+          "description": "The arguments are invalid, or input the command needs is missing.",
+          "type": "string"
+        },
+        {
+          "const": "decision_required",
+          "description": "`status --check` found a decision that needs a choice.",
+          "type": "string"
+        },
+        {
+          "const": "auth_required",
+          "description": "Credentials are missing or refused, or a person must log in.",
+          "type": "string"
+        },
+        {
+          "const": "halted",
+          "description": "Sync is halted or stopped, and the command cannot go on until that is fixed.",
+          "type": "string"
+        },
+        {
+          "const": "unavailable",
+          "description": "The server or the network is offline, unavailable or limits the rate for now.",
+          "type": "string"
+        },
+        {
+          "const": "stale_decision",
+          "description": "The decision answered no longer exists, or a request ID was used before with other arguments or for a pairing\ncode that has expired.",
+          "type": "string"
+        },
+        {
+          "const": "interrupted",
+          "description": "A signal stopped the command, or an earlier run with the same request ID has no recorded outcome.",
+          "type": "string"
+        }
+      ]
+    },
+    "Counts": {
+      "properties": {
+        "affected_files": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "deletions": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exceeded": {
+          "items": {
+            "$ref": "#/$defs/LimitKind"
+          },
+          "type": "array"
+        },
+        "space_files": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "deletions",
+        "affected_files",
+        "space_files",
+        "exceeded"
+      ],
+      "type": "object"
+    },
+    "Decision": {
+      "description": "A decision sync waits on, with every item it holds and the command for each answer.",
+      "properties": {
+        "answers": {
+          "items": {
+            "$ref": "#/$defs/AnswerChoice"
+          },
+          "type": "array"
+        },
+        "asked_at_ms": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "counts": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Counts"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "group": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecisionGroup"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/Item"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "$ref": "#/$defs/DecisionKind"
+        },
+        "requires_choice": {
+          "description": "False for a notice that only takes `dismiss`: it holds nothing and blocks nothing.",
+          "type": "boolean"
+        },
+        "space_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "space_id",
+        "kind",
+        "asked_at_ms",
+        "requires_choice",
+        "items",
+        "answers"
+      ],
+      "type": "object"
+    },
+    "DecisionGroup": {
+      "enum": [
+        "created_after_restore_point",
+        "changed_on_this_device",
+        "created_on_this_device",
+        "deleted_on_this_device",
+        "requested_before_reset"
+      ],
+      "type": "string"
+    },
+    "DecisionKind": {
+      "enum": [
+        "mass_delete",
+        "remote_mass_delete",
+        "ambiguous_disappearance",
+        "conflict",
+        "recovery"
+      ],
+      "type": "string"
+    },
+    "ErrorBody": {
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/Code"
+        },
+        "message": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ],
+      "type": "object"
+    },
+    "HelpData": {
+      "properties": {
+        "help": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "help"
+      ],
+      "type": "object"
+    },
+    "Item": {
+      "properties": {
+        "files": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "node_id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "node_id",
+        "path",
+        "files"
+      ],
+      "type": "object"
+    },
+    "LimitKind": {
+      "enum": [
+        "deletions",
+        "share"
+      ],
+      "type": "string"
+    },
+    "Next": {
+      "description": "A command to run next, as the arguments to pass.",
+      "properties": {
+        "argv": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "argv"
+      ],
+      "type": "object"
+    },
+    "Outcome": {
+      "oneOf": [
+        {
+          "enum": [
+            "error"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "ok",
+          "description": "The command did what it was asked.",
+          "type": "string"
+        },
+        {
+          "const": "accepted",
+          "description": "The work is recorded and happens later; it has not finished.",
+          "type": "string"
+        },
+        {
+          "const": "unchanged",
+          "description": "The state the command asks for already held, or the command repeated an accepted answer, so nothing changed.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "else": {
+    "properties": {
+      "error": {
+        "type": "null"
+      }
+    }
+  },
+  "if": {
+    "properties": {
+      "outcome": {
+        "const": "error"
+      }
+    }
+  },
+  "properties": {
+    "command": {
+      "const": "server"
+    },
+    "data": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/HelpData"
+        }
+      ]
+    },
+    "decisions": {
+      "items": {
+        "$ref": "#/$defs/Decision"
+      },
+      "type": "array"
+    },
+    "error": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ErrorBody"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "next_commands": {
+      "items": {
+        "$ref": "#/$defs/Next"
+      },
+      "type": "array"
+    },
+    "outcome": {
+      "$ref": "#/$defs/Outcome"
+    },
+    "schema_version": {
+      "const": 1
+    }
+  },
+  "required": [
+    "schema_version",
+    "command",
+    "outcome",
+    "data",
+    "error",
+    "decisions",
+    "next_commands"
+  ],
+  "then": {
+    "properties": {
+      "error": {
+        "type": "object"
+      }
+    }
+  },
+  "title": "koi server --json",
+  "type": "object"
+}
