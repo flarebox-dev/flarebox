@@ -5340,3 +5340,60 @@ fn an_agreement_survives_a_loss_only_on_a_kept_seq_or_its_exact_record() {
         );
     }
 }
+
+#[test]
+fn a_parked_edit_whose_name_a_new_folder_holds_is_sent() {
+    let mut trees = trees(&[(
+        "h",
+        Some(file(ROOT, "ss", 1)),
+        Some(file(ROOT, "ss", 1)),
+        Some(trashed(file(ROOT, "ß", 1))),
+    )]);
+    trees.set_local(
+        "h".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "ss", 2), 1)
+        },
+    );
+    trees.set_local("n".into(), local(dir(ROOT, "ß"), 2));
+    trees.settle();
+    let (mut effects, mut commits, mut ids) =
+        (Effects::default(), Commits::default(), IdGen::new(1));
+    assert_eq!(
+        effects
+            .plan(&trees, &mut ids, NOW)
+            .map(|record| record.effect.clone()),
+        None
+    );
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(uploads(&ops(&commit), 2), "{:?}", ops(&commit));
+}
+
+#[test]
+fn a_parked_edit_forked_for_a_concurrent_edit_keeps_its_parked_entry() {
+    let mut trees = trees(&[(
+        "h",
+        Some(file(ROOT, "ss", 1)),
+        Some(file(ROOT, "ss", 1)),
+        Some(remote(file(ROOT, "ß", 3))),
+    )]);
+    trees.set_local(
+        "h".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "ss", 2), 1)
+        },
+    );
+    trees.set_local("n".into(), local(dir(ROOT, "ß"), 2));
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(uploads(&ops(&commit), 2), "{:?}", ops(&commit));
+    let (fork, node) = (trees.local().iter())
+        .find(|(_, node)| node.identity.ino == 1)
+        .unwrap();
+    assert_ne!(fork, "h");
+    assert!(node.parked);
+    assert_eq!(trees.parked_name(fork), "h");
+}

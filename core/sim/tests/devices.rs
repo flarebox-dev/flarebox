@@ -1225,3 +1225,26 @@ fn a_conflict_copy_whose_name_a_file_of_the_same_commit_took_reaches_its_name() 
     ];
     converge(3, &phases).unwrap();
 }
+
+#[test]
+fn an_edited_file_parked_while_a_new_folder_takes_its_name_reaches_the_server() {
+    converge(
+        2,
+        &[
+            vec![(0, file("a")), (0, rename(0, 0, "ss"))],
+            vec![
+                (0, rename(0, 0, "ß")),
+                (0, Step::Work(0)),
+                (0, Step::Work(0)),
+                (0, Step::Work(0)),
+                (1, Step::Work(0)),
+                (1, EFFECT),
+                (1, folder("ß")),
+                (1, overwrite(0)),
+                (0, delete(0)),
+                (0, Step::Work(0)),
+            ],
+        ],
+    )
+    .unwrap();
+}
