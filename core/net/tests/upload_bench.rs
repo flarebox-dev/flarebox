@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use koidrive_net::{Api, Auth, Credentials, Session, SessionConfig, Transfer};
+use koidrive_net::{Api, Auth, Credentials, Session, SessionConfig, Transfer, UploadGate};
 use koidrive_proto::v1::{ChunkRef, Content, CreateFile, CreateSpaceRequest, Op, op, op_result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -22,6 +22,12 @@ use tracing::{Metadata, Subscriber};
 use crate::support::{commit, connected, owner, uuidv7};
 
 const CHUNK_BYTES: usize = 4 << 20;
+
+fn measurement_transfer(api: &Api, n: usize) -> Transfer {
+    let mut transfer = Transfer::new(api);
+    transfer.gate = UploadGate::new(n);
+    transfer
+}
 
 struct Config {
     ns: Vec<usize>,
@@ -42,10 +48,8 @@ impl Config {
         if ns.is_empty() || ns.len() > 4 || ns.iter().collect::<HashSet<_>>().len() != ns.len() {
             return Err("Ns must contain one to four distinct values");
         }
-        if ns.iter().any(|&n| n != 1) {
-            return Err(
-                "this build supports only N=1; Transfer::gate and UploadGate::new(n) are not available yet",
-            );
+        if ns.iter().any(|&n| !matches!(n, 1 | 2 | 4 | 8)) {
+            return Err("N must be one of 1,2,4,8");
         }
         let repetitions = repetitions
             .parse()
@@ -245,7 +249,7 @@ fn median(values: &mut [f64]) -> f64 {
 async fn upload_benchmark() {
     let setting = |key: &str, default: &str| std::env::var(key).unwrap_or_else(|_| default.into());
     let config = Config::parse(
-        &setting("KOIDRIVE_BENCH_NS", "1"),
+        &setting("KOIDRIVE_BENCH_NS", "1,2,4,8"),
         &setting("KOIDRIVE_BENCH_REPETITIONS", "3"),
         &setting("KOIDRIVE_BENCH_MIB", "1024"),
     )
@@ -369,12 +373,8 @@ async fn upload_benchmark() {
         )
         .unwrap();
         let history = connected(&mut events).await.history_id;
-        let transfer = Transfer::new(&api);
-        // When adding the gate here, update Config::parse and SUPPORTED_NS in server/scripts/deploy-test/bench.ts together.
-        assert_eq!(
-            n, 1,
-            "set Transfer::gate = UploadGate::new(n) here when the concurrency API is available"
-        );
+        let transfer = measurement_transfer(&api, n);
+        let n = transfer.gate.concurrency();
         *retries.lock().unwrap() = Retries::default();
         uploading.store(true, Ordering::Relaxed);
         let started = Instant::now();
@@ -469,11 +469,22 @@ async fn upload_benchmark() {
 }
 
 #[test]
-fn baseline_rejects_concurrency_before_network() {
-    for ns in ["2", "1,2,4,8", "0", "1,1"] {
+fn benchmark_accepts_only_supported_concurrency_before_network() {
+    for ns in ["0", "3", "16", "1,1", "1,2,4,8,1", ""] {
         assert!(Config::parse(ns, "3", "1024").is_err());
     }
-    assert!(Config::parse("1", "3", "1024").is_ok());
+    for ns in ["1", "2", "4", "8", "1,2,4,8", "8,1"] {
+        assert!(Config::parse(ns, "3", "1024").is_ok());
+    }
+}
+
+#[test]
+fn measurements_set_the_gate_and_report_its_concurrency() {
+    let api = Api::local_development("http://127.0.0.1:9".parse().unwrap()).unwrap();
+    for n in [1, 2, 4, 8] {
+        let transfer = measurement_transfer(&api, n);
+        assert_eq!(transfer.gate.concurrency(), n);
+    }
 }
 
 #[test]

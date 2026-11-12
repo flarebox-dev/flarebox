@@ -16,6 +16,15 @@ use super::*;
 use crate::session::Events;
 use crate::session::tests::{accept, config, listen, recv_rpc, reply, welcome};
 
+#[tokio::test]
+async fn upload_gate_reports_configured_concurrency_while_busy() {
+    let gate = UploadGate::new(2);
+    let permit = gate.enter().await;
+    assert_eq!(gate.concurrency(), 2);
+    assert_eq!(gate.clone().concurrency(), 2);
+    drop(permit);
+}
+
 fn chunk(bytes: &[u8]) -> ChunkRef {
     ChunkRef {
         hash: Sha256::digest(bytes).to_vec(),

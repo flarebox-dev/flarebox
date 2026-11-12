@@ -98,6 +98,7 @@ enum Attempt<T> {
 #[derive(Clone, Debug)]
 pub struct UploadGate {
     permits: Arc<Semaphore>,
+    concurrency: usize,
 }
 
 impl UploadGate {
@@ -110,7 +111,13 @@ impl UploadGate {
         assert!(concurrency > 0, "an upload gate needs at least one place");
         UploadGate {
             permits: Arc::new(Semaphore::new(concurrency)),
+            concurrency,
         }
+    }
+
+    /// The configured limit, including places currently occupied by uploads.
+    pub fn concurrency(&self) -> usize {
+        self.concurrency
     }
 
     async fn enter(&self) -> OwnedSemaphorePermit {
