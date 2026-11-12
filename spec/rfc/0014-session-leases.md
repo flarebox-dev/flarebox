@@ -1,0 +1,42 @@
+# RFC 0014: Session leases
+
+Status: proposed. Applies to spec v0 (format_version 1). Amends RFC 0009 §2, RFC 0006 §7, and RFC 0003 §3 and §4.
+
+Before the Space DO handles any request or WebSocket message, it asks the Account DO whether the principal is still active, with its kind and scope, and whether a rewind holds the space closed. Before it pushes a commit, it asks again for every live connection. Both calls run while the Space DO takes no other event, so every commit of a space waits for two round trips to the one Account DO of the deployment. That round trip, not the commit's own work, sets how many commits a space applies per second.
+
+This RFC lets the Space DO reuse an answer for a few seconds. A revocation and a rewind still take effect for every request that starts after them. A bare section number such as §2 refers to this RFC; sections of spec v0 are written as spec v0 §N.
+
+## 1. Leases
+
+Each answer of the Account DO to a session check carries `lease_ms`. The Space DO may use the answer for every request and message of that principal until `lease_ms` has passed, counted from the moment it sent the check. It then asks again. `lease_ms` is 5 seconds, or the time left until the principal's credential expires (RFC 0006 §7) if that is shorter. So an expired principal is refused at its expiry, as before.
+
+The Space DO keeps leases in memory only. A Space DO that restarts, for any reason, has none and asks the Account DO again. A revocation the space recorded (`revoked_devices`, RFC 0009 §2) comes before any lease. While the Space DO waits for an answer it takes no other event, and it stores the lease before the next event runs. So an answer can't land after a revocation notice or a rewind admission that reached the space later.
+
+The Worker still reads the principal's current row before it serves any authenticated route. Leases apply only inside the Space DO.
+
+## 2. Revocation
+
+The Account DO stores the revocation and a notice for every space in one transaction, then delivers each notice. A space that takes a notice records the revocation and closes the principal's sockets with 4003 at once. The Account DO answers 204 when every space has taken its notice. If a space did not take its notice, the Account DO waits until `lease_ms` has passed since it stored the revocation, and then answers 204. Every lease of that principal comes from an answer computed before the revocation, so every lease has ended by then. The notice stays queued and is retried as RFC 0009 §2 describes.
+
+The bound of RFC 0009 §2 is unchanged. No access token, refresh credential or socket of the revoked principal authorizes anything that starts after the 204. Before the 204, a space that has not taken its notice may still serve the principal, commits included, until its lease runs out. A 204 may take up to 5 seconds longer while a space can't be reached.
+
+## 3. Rewind closure
+
+A lease also carries whether the space is closed (RFC 0003 §4). The Space DO's rewind marker can't replace that check. Before preparing writes the marker, the space has none. After the restore, the restored database predates the marker and still holds the old history until completion runs.
+
+So admission closes the space for leases first. The Account DO answers every check of the space as closed from just before it asks the Space DO for the admission data (RFC 0003 §3, step 1). The Space DO drops all of its leases when it answers that call. Any lease the Space DO takes after that call says closed. By §1, an answer from before the closure was leased before that call and has been dropped. So every request that starts after admission sees the space closed, as RFC 0003 §4 requires.
+
+Two effects are new:
+
+- A refused admission can leave the space closed to sessions for up to one lease after the refusal.
+- After a rewind is completed or failed, a Space DO can go on answering the space as closed for up to one lease.
+
+Both delays are at most 5 seconds. In both, the space is closed when it could be open, never open when it must be closed.
+
+## 4. Changes to RFC 0009, RFC 0006 and RFC 0003
+
+In RFC 0009 §2, the first sentence becomes "The Account DO sets `revoked_at_ms` on the principal's row in one transaction, delivers a notice to every space, and answers 204 once each space took its notice or its lease has run out (RFC 0014 §2)." In the table, the access token row's sentence "The Worker reads the principal's current row before it serves any authenticated route, and the Space DO reads it again before each HTTP RPC, each WebSocket upgrade and each WebSocket message." becomes "The Worker reads the principal's current row before it serves any authenticated route. The Space DO checks the principal before each HTTP RPC, each WebSocket upgrade and each WebSocket message, from the Account DO's answer or a lease of it that ends before the 204 (RFC 0014)." In the open WebSockets row, "when the space next pushes a commit" becomes "when the space next pushes a commit after the 204".
+
+In RFC 0006 §7, "**Credential expiry.**" paragraph, "A revoked or expired principal is refused at once." becomes "An expired principal is refused from its expiry, and a revoked one from the 204 that answers its revocation (RFC 0014 §2).", and "the server checks the principal's current row on every request and every WebSocket message" becomes "the server checks the principal on every request and every WebSocket message, from its current row or from a lease that ends at the credential's expiry and before a revocation's 204 (RFC 0014)".
+
+In RFC 0003 §3, step 1 begins "The Account DO answers checks of the space as closed (RFC 0014 §3), then asks the Space DO, through a call that stores nothing, for:", and "Any failure refuses the request and records nothing." becomes "Any failure refuses the request, records nothing, and reopens the space within one lease (RFC 0014 §3)." In RFC 0003 §4, "The Worker and the Space DO already ask it about every request and message" becomes "The Worker asks it about every request, the Space DO asks it about every request and message or uses a lease that admission drops (RFC 0014 §3)", and the list of what a closed space refuses is followed by "A Space DO may go on answering the space as closed for up to one lease after the record is `completed` or `failed` (RFC 0014 §3)."

@@ -44,6 +44,8 @@ import { Close, HOLD_MS, type SpaceDO } from "../src/space-do";
 import { CallFailure } from "../src/space/commit";
 import { chunkKey, encodeChunkList } from "../src/space/store";
 import worker from "../src/worker";
+import { type AccountDO } from "../src/account-do";
+import { SESSION_LEASE_MS } from "../src/account/account";
 import { content, op, storedObjects, targetIncarnation } from "./helpers";
 
 const BASE = "https://koidrive.test";
@@ -112,6 +114,14 @@ async function createSpace(owner: DeviceCredentials): Promise<string> {
   const created = await call("/v1/spaces", { token: owner.access!.token, body: body(CreateSpaceRequestSchema, { name: `Home ${uuidv7()}` }) }, SpaceInfoSchema);
   expect(created.status).toBe(201);
   return created.message!.spaceId;
+}
+
+/** Moves the Space DO's clock past every lease it holds, so it asks the Account DO again (RFC 0014 section 1). */
+function passLeases(spaceId: string) {
+  return runInDurableObject(env.SPACE.get(env.SPACE.idFromName(spaceId)), (instance: SpaceDO) => {
+    const offsetMs = instance.clock() - Date.now() + SESSION_LEASE_MS + 1000;
+    instance.clock = () => Date.now() + offsetMs;
+  });
 }
 
 /** The commit_id and committed_at_ms of the commit at a seq (RFC 0013). */
@@ -365,6 +375,7 @@ describe("owner claim, pairing and tokens", () => {
     await runInDurableObject(account(), (_instance, state) => {
       state.storage.sql.exec("UPDATE devices SET revoked_at_ms = ? WHERE device_id = ?", Date.now(), phone.deviceId);
     });
+    await passLeases(spaceId);
     socket.send({ case: "reauth", value: { accessToken: phone.access!.token } });
     expect((await socket.waitClosed()).code).toBe(Close.DEVICE_REVOKED);
   });
@@ -381,6 +392,7 @@ describe("owner claim, pairing and tokens", () => {
       state.storage.sql.exec("UPDATE devices SET revoked_at_ms = ? WHERE device_id = ?", Date.now(), watch.deviceId);
     });
     expect(await account().isDeviceActive(watch.deviceId)).toBe(false);
+    await passLeases(spaceId);
 
     fresh.send({ case: "hello", value: { clientName: "test", clientVersion: "0", protoMin: 1, protoMax: 1, maxFormat: 1 } });
     expect(await fresh.next()).toMatchObject({ case: "goodbye", value: { code: Close.DEVICE_REVOKED } });
@@ -419,6 +431,7 @@ describe("owner claim, pairing and tokens", () => {
     await asking.start();
     const other = await Socket.connect(spaceId, owner);
     await other.start();
+    await passLeases(spaceId);
     vi.spyOn(console, "error").mockImplementation(() => {});
     const prototype = await runInDurableObject(account(), (instance: import("../src/account-do").AccountDO) => Object.getPrototypeOf(instance) as import("../src/account-do").AccountDO);
     const original = prototype.checkSession;
@@ -759,6 +772,7 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
       const socket = await Socket.connect(spaceId, pad);
       await socket.start();
       await updateDevice(pad.deviceId, assignment, value);
+      await passLeases(spaceId);
       expect((await refresh(pad)).status, assignment).toBe(401);
       expect(await send("/v1/spaces", { method: "GET", token: pad.access!.token })).toEqual({ status: 401, code: Error_Code.UNAUTHENTICATED });
       expect((await send("/v1/pair/start", { token: pad.access!.token })).status).toBe(401);
@@ -792,6 +806,7 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
       const socket = await Socket.connect(spaceId, pad);
       await socket.start();
       await updateDevice(pad.deviceId, column, value);
+      await passLeases(spaceId);
       await commitAsOwner(owner, spaceId, historyId);
       expect(await socket.next(), column).toMatchObject({ case: "goodbye", value: { code: Close.DEVICE_REVOKED } });
       expect((await watcher.pushed()).length).toBe(1);
@@ -811,6 +826,7 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
       throw new Error("injected Account DO failure");
     };
     try {
+      await passLeases(spaceId);
       await commitAsOwner(owner, spaceId, historyId);
       expect(await socket.next()).toMatchObject({ case: "goodbye", value: { code: Close.TRY_AGAIN_LATER } });
     } finally {
@@ -825,9 +841,11 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
     const socket = await Socket.connect(spaceId, pad);
     await socket.start();
     await updateDevice(pad.deviceId, "kind", "agent");
+    await passLeases(spaceId);
     socket.send({ case: "rpc", value: { reqId: 1n, call: { case: "listTree", value: {} } } });
     expect(await socket.next()).toMatchObject({ case: "goodbye", value: { code: Close.DEVICE_REVOKED } });
     await updateDevice(pad.deviceId, "kind", "device");
+    await passLeases(spaceId);
     const reopened = await Socket.connect(spaceId, pad);
     await reopened.start();
     expect((await reopened.rpc({ case: "listTree", value: {} })).case).toBe("tree");
@@ -853,6 +871,7 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
         },
       })) as never);
       const pending = (deviceId: string) => state.storage.sql.exec("SELECT COUNT(*) AS n FROM revocation_notices WHERE device_id = ?", deviceId).one().n;
+      instance.sessionLeaseMs = 0;
       try {
         for (const device of [repeated, alarmed]) {
           expect(await instance.revokeUserDevice({ userId: owner.userId, callerId: owner.deviceId, deviceId: device.deviceId, confirmLastDevice: false })).toMatchObject({ ok: true });
@@ -870,6 +889,7 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
         expect(delivered).toContain(alarmed.deviceId);
       } finally {
         spy.mockRestore();
+        instance.sessionLeaseMs = SESSION_LEASE_MS;
       }
     });
   });
@@ -954,6 +974,140 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
     }
     expect((await refresh(owner)).status).toBe(200);
     expect((await call(`/v1/spaces/${spaceId}/links`, { method: "GET", token }, ShareLinkListSchema)).status).toBe(200);
+  });
+});
+
+describe("RFC 0014 session leases", () => {
+  /** Runs body with the Account DO granting leases of leaseMs, so a test waits for one in about a second. */
+  async function withLease<T>(leaseMs: number, body: () => Promise<T>): Promise<T> {
+    const set = (value: number) => runInDurableObject(account(), (instance: AccountDO) => {
+      instance.sessionLeaseMs = value;
+    });
+    await set(leaseMs);
+    try {
+      return await body();
+    } finally {
+      await set(SESSION_LEASE_MS);
+    }
+  }
+
+  /** Makes every Space DO refuse revocation notices until the returned function runs. */
+  async function loseNotices(spaceId: string): Promise<() => void> {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const prototype = await runInDurableObject(env.SPACE.get(env.SPACE.idFromName(spaceId)), (instance: SpaceDO) => Object.getPrototypeOf(instance) as SpaceDO);
+    const original = prototype.closeDevice;
+    prototype.closeDevice = async () => {
+      throw new Error("injected lost revocation notice");
+    };
+    return () => {
+      prototype.closeDevice = original;
+    };
+  }
+
+  /** Revokes the device in the Account DO's row alone, as a revocation whose notice never reaches the space. */
+  function revokeRowOnly(deviceId: string) {
+    return runInDurableObject(account(), (_instance, state) => {
+      state.storage.sql.exec("UPDATE devices SET revoked_at_ms = ? WHERE device_id = ?", Date.now(), deviceId);
+    });
+  }
+
+  function listTree(socket: Socket) {
+    socket.send({ case: "rpc", value: { reqId: 1n, call: { case: "listTree", value: {} } } });
+    return socket.next();
+  }
+
+  it("lets no commit through that a device sends after the 204 of its revocation, during a burst of its commits", async () => {
+    await withLease(1000, async () => {
+      for (const notice of ["delivered", "lost"]) {
+        const owner = await getOwner();
+        const writer = await pairDevice(owner, "Burst " + notice);
+        const spaceId = await createSpace(owner);
+        const socket = await Socket.connect(spaceId, writer);
+        await socket.start();
+        const restore = notice === "lost" ? await loseNotices(spaceId) : () => {};
+        try {
+          let answered = false;
+          const revoked = send("/v1/devices/" + writer.deviceId, { method: "DELETE", token: owner.access!.token }).then((reply) => {
+            answered = true;
+            return reply;
+          });
+          const late: string[] = [];
+          for (let i = 1; i < 10_000; i++) {
+            const commitId = uuidv7();
+            if (answered) late.push(commitId);
+            socket.send({ case: "rpc", value: { reqId: BigInt(i), call: { case: "commit", value: { commitId, ...socket.slot(), baseSeq: 0n, ops: [op.mkdir(uuidv7(), spaceId, "Burst " + i)] } } } });
+            const reply = await socket.next().catch(() => undefined);
+            if (reply?.case !== "rpc" || reply.value.result.case !== "commit") break;
+            socket.acceptedSeq += 1n;
+          }
+          expect((await revoked).status, notice).toBe(204);
+          expect((await socket.waitClosed()).code, notice).toBe(Close.DEVICE_REVOKED);
+          const stored = await runInDurableObject(env.SPACE.get(env.SPACE.idFromName(spaceId)), (_instance, state) =>
+            state.storage.sql.exec("SELECT commit_id FROM commits").toArray().map((row) => String(row.commit_id)),
+          );
+          expect(stored.filter((commitId) => late.includes(commitId)), notice).toEqual([]);
+        } finally {
+          restore();
+        }
+      }
+    });
+  }, 30_000);
+
+  it("holds the 204 of a revocation whose notice a space did not take until the space's lease has run out", async () => {
+    await withLease(1000, async () => {
+      const owner = await getOwner();
+      const laptop = await pairDevice(owner, "Unreachable space");
+      const spaceId = await createSpace(owner);
+      const socket = await Socket.connect(spaceId, laptop);
+      await socket.start();
+      const restore = await loseNotices(spaceId);
+      try {
+        const startedAtMs = Date.now();
+        expect((await send("/v1/devices/" + laptop.deviceId, { method: "DELETE", token: owner.access!.token })).status).toBe(204);
+        expect(Date.now() - startedAtMs).toBeGreaterThanOrEqual(1000);
+        expect(socket.closed).toBeUndefined();
+        expect(await listTree(socket)).toMatchObject({ case: "goodbye", value: { code: Close.DEVICE_REVOKED } });
+      } finally {
+        restore();
+      }
+    });
+  }, 30_000);
+
+  it("asks the Account DO again once a lease has run out, and ends a lease when the device's credential expires", async () => {
+    const owner = await getOwner();
+    const spaceId = await createSpace(owner);
+    const revoked = await pairDevice(owner, "Revoked unseen");
+    const socket = await Socket.connect(spaceId, revoked);
+    await socket.start();
+    await revokeRowOnly(revoked.deviceId);
+    expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
+    await passLeases(spaceId);
+    expect(await listTree(socket)).toMatchObject({ case: "goodbye", value: { code: Close.DEVICE_REVOKED } });
+
+    const expiring = await pairDevice(owner, "Expiring");
+    await runInDurableObject(account(), (_instance, state) => {
+      state.storage.sql.exec("UPDATE devices SET expires_at_ms = ? WHERE device_id = ?", Date.now() + 2000, expiring.deviceId);
+    });
+    const fresh = await createSpace(owner);
+    const agent = await Socket.connect(fresh, expiring);
+    await agent.start();
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    expect(await listTree(agent)).toMatchObject({ case: "goodbye", value: { code: Close.DEVICE_REVOKED } });
+  }, 30_000);
+
+  it("starts a restarted Space DO with no leases", async () => {
+    const owner = await getOwner();
+    const tablet = await pairDevice(owner, "Restarted space");
+    const spaceId = await createSpace(owner);
+    const stub = env.SPACE.get(env.SPACE.idFromName(spaceId));
+    const identity = { userId: tablet.userId, deviceId: tablet.deviceId, deviceName: "Tablet", expiresAtMs: Date.now() + 900_000, kind: "device", scope: null };
+    const request = body(RpcRequestSchema, { reqId: 1n, call: { case: "listTree", value: {} } });
+    const ask = async () => fromBinary(RpcResponseSchema, await env.SPACE.get(env.SPACE.idFromName(spaceId)).httpRpc({ identity, origin: BASE }, request)).result;
+    expect((await ask()).case).toBe("tree");
+    await revokeRowOnly(tablet.deviceId);
+    expect((await ask()).case).toBe("tree");
+    await evictDurableObject(stub);
+    expect(await ask()).toMatchObject({ case: "error", value: { code: Error_Code.UNAUTHENTICATED } });
   });
 });
 

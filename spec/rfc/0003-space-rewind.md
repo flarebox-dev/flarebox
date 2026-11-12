@@ -69,12 +69,12 @@ The Account DO directs the rewind and keeps a record of it in its own storage, w
 
 An Account DO alarm drives the phases with backoff from one second up to ten minutes. Each phase is recorded before the call it starts, so a crash or an unknown call outcome resumes from the recorded phase.
 
-1. **Admission.** The Account DO asks the Space DO, through a call that changes nothing, for:
+1. **Admission.** The Account DO answers checks of the space as closed (RFC 0014 §3), then asks the Space DO, through a call that stores nothing, for:
    - its current `history_id` and `head_seq`;
    - whether the current history's descriptor is durable (§7);
    - the bookmark B for P.
 
-   It then checks §1 and §2. Any failure refuses the request and records nothing. Otherwise it records the rewind as `admitted`, with B, the new `history_id` and the rewind number. From then on the space is closed (§4).
+   It then checks §1 and §2. Any failure refuses the request, records nothing, and reopens the space within one lease (RFC 0014 §3). Otherwise it records the rewind as `admitted`, with B, the new `history_id` and the rewind number. From then on the space is closed (§4).
 2. **Preparing attempt k.** The Space DO:
    - closes every WebSocket after sending `Goodbye` with close code 4004 (space rewound);
    - writes a marker row for the rewind and attempt k, and reads its current bookmark M;
@@ -108,9 +108,11 @@ From admission until the record is `completed` or `failed`, the space is closed:
 - the Space DO's alarm runs no work and leaves the `schedule` table as it is;
 - the Account DO records no chunk retirements (§5, rule 8).
 
+A Space DO may go on answering the space as closed for up to one lease after the record is `completed` or `failed` (RFC 0014 §3).
+
 A closed alarm sets the alarm again for at most ten minutes later. Work that comes due during the closure, such as GC, the orphan sweep or export, therefore runs within ten minutes of reopening, even with no client activity.
 
-The Account DO decides whether the space is closed. The Worker and the Space DO already ask it about every request and message, and the alarm handler also asks it before it runs any work. So the restored database cannot run GC before completion has applied §5, and no client reaches the restored state before it carries its new history.
+The Account DO decides whether the space is closed. The Worker asks it about every request, the Space DO asks it about every request and message or uses a lease that admission drops (RFC 0014 §3), and the alarm handler also asks it before it runs any work. So the restored database cannot run GC before completion has applied §5, and no client reaches the restored state before it carries its new history.
 
 ## 5. Chunk retention
 

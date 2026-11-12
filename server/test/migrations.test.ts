@@ -4,6 +4,7 @@ import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import type { AccountDO } from "../src/account-do";
+import { SESSION_LEASE_MS } from "../src/account/account";
 import { MIGRATIONS as ACCOUNT_MIGRATIONS } from "../src/account/schema";
 import { sha256 } from "../src/crypto";
 import { OpResult_Code } from "../src/gen/koidrive/v1/commit_pb";
@@ -292,7 +293,7 @@ describe("upgraded objects keep working", () => {
       );
     });
     await evictDurableObject(stub);
-    expect(await stub.checkSession(deviceId)).toEqual({ active: true, revoked: false, closed: false, kind: "device", scope: null });
+    expect(await stub.checkSession(deviceId)).toEqual({ active: true, revoked: false, closed: false, kind: "device", scope: null, leaseMs: SESSION_LEASE_MS });
     const row = await inObject(stub, (sql) => sql.exec("SELECT kind, scope, expires_at_ms, issued_by FROM devices WHERE device_id = ?", deviceId).one());
     expect(row).toEqual({ kind: "device", scope: null, expires_at_ms: null, issued_by: null });
   });

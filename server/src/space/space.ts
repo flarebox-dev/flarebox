@@ -317,6 +317,8 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
     private exporting: Promise<void> | undefined;
     /** A stored commit could not set the alarm, so the next commit sets it. */
     private alarmStale = false;
+    /** Device checks the Account DO answered, each usable until untilMs on this object's clock (RFC 0014 section 1). */
+    private readonly leases = new Map<string, { check: SessionCheck; untilMs: number }>();
 
     /** Creates the space on first call; later calls with the same id do nothing. */
     async init(args: { spaceId: string; name: string; ownerUserId: string; spaceKey: Uint8Array }): Promise<void> {
@@ -440,19 +442,34 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
     }
 
     /**
-     * Asks the Account DO whether the device is still active, so a revocation stops the device even before its notice
-     * reaches this space, and remembers a refusal. It also says whether a rewind holds the space closed (RFC 0003
-     * section 4). Other events wait, so messages of one connection keep their order. Returns undefined when the Account
-     * DO cannot answer; the error is caught inside the callback, because an exception there would reset this object and
-     * drop every connection.
+     * The device's check without asking the Account DO: a recorded revocation, or a lease that has not run out (RFC 0014
+     * section 1). A lease runs from the moment the Space DO asked, so it ends no later than the Account DO expects.
+     */
+    private knownCheck(deviceId: string): SessionCheck | undefined {
+      if (this.revoked(deviceId)) return { active: false, revoked: true, closed: false, kind: "", scope: null, leaseMs: 0 };
+      const lease = this.leases.get(deviceId);
+      if (lease && this.clock() < lease.untilMs) return lease.check;
+      return undefined;
+    }
+
+    /**
+     * The device's check: whether it is still active, its kind and scope, and whether a rewind holds the space closed
+     * (RFC 0003 section 4). Without a lease it asks the Account DO and leases the answer. Other events wait while it asks,
+     * so messages of one connection keep their order and no notice or rewind admission lands between the answer and its
+     * lease. Returns undefined when the Account DO cannot answer; the error is caught inside the callback, because an
+     * exception there would reset this object and drop every connection.
      */
     protected async checkDevice(deviceId: string): Promise<SessionCheck | undefined> {
-      if (this.revoked(deviceId)) return { active: false, revoked: true, closed: false, kind: "", scope: null };
+      const known = this.knownCheck(deviceId);
+      if (known) return known;
       const account = this.account();
       const spaceId = String(getMeta(this.sql, "space_id"));
       const check = await this.state.blockConcurrencyWhile(async () => {
+        const askedAtMs = this.clock();
         try {
-          return await account.checkSession(deviceId, spaceId);
+          const answer = await account.checkSession(deviceId, spaceId);
+          this.leases.set(deviceId, { check: answer, untilMs: askedAtMs + answer.leaseMs });
+          return answer;
         } catch (error) {
           console.error("account device check failed", error);
           return undefined;
@@ -463,21 +480,25 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
     }
 
     /**
-     * checkDevice for every device with a live connection, in one Account DO call, so that a push reaches only principals
-     * that may still read the space. Returns undefined when the Account DO cannot answer.
+     * checkDevice for every device with a live connection, asking the Account DO once for those without a lease, so that a
+     * push reaches only principals that may still read the space. Returns undefined when the Account DO cannot answer.
      */
     private async checkDevices(deviceIds: string[]): Promise<Map<string, SessionCheck> | undefined> {
       const checks = new Map<string, SessionCheck>();
       const unknown = deviceIds.filter((deviceId) => {
-        if (this.revoked(deviceId)) checks.set(deviceId, { active: false, revoked: true, closed: false, kind: "", scope: null });
-        return !checks.has(deviceId);
+        const known = this.knownCheck(deviceId);
+        if (known) checks.set(deviceId, known);
+        return !known;
       });
       if (unknown.length === 0) return checks;
       const account = this.account();
       const spaceId = String(getMeta(this.sql, "space_id"));
       const answered = await this.state.blockConcurrencyWhile(async () => {
+        const askedAtMs = this.clock();
         try {
-          return await account.checkSessions(unknown, spaceId);
+          const answers = await account.checkSessions(unknown, spaceId);
+          for (const [deviceId, check] of Object.entries(answers)) this.leases.set(deviceId, { check, untilMs: askedAtMs + check.leaseMs });
+          return answers;
         } catch (error) {
           console.error("account device check failed", error);
           return undefined;
@@ -1262,9 +1283,11 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
 
     /**
      * Rewind admission (RFC 0003 section 3, step 1): the current history and head, whether the history's descriptor is
-     * durable in R2 (section 7), and the bookmark for the restore point. Changes nothing.
+     * durable in R2 (section 7), and the bookmark for the restore point. It stores nothing, but drops every lease, so the
+     * next check of any device asks the Account DO, which holds the space closed from before this call (RFC 0014 section 3).
      */
     async rewindInfo(restorePointMs: number): Promise<{ historyId: string; headSeq: number; descriptorDurable: boolean; bookmark: string }> {
+      this.leases.clear();
       const bookmark = await this.pitr.bookmarkForTime(restorePointMs);
       return { historyId: String(getMeta(this.sql, "history_id")), headSeq: this.headSeq, descriptorDurable: descriptorDurable(this.sql), bookmark };
     }

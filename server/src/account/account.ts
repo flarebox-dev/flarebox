@@ -50,6 +50,8 @@ const REWIND_MAX_AGE_MS = 29 * DAY_MS;
 const REWIND_RETRY_MIN_MS = 1000;
 /** How long the alarm waits before it delivers a revocation notice again to a space that did not take it. */
 const NOTICE_RETRY_MS = 30_000;
+/** How long a Space DO may use a device check before it asks again (RFC 0014 section 1). */
+export const SESSION_LEASE_MS = 5000;
 const REWIND_RETRY_MAX_MS = 10 * 60_000;
 
 /** The phases of a rewind record (RFC 0003 section 3). */
@@ -132,6 +134,7 @@ interface DeviceRow {
  * What checkSession answers: kind and scope come from the device's row, never from its token (RFC 0006 section 2).
  * revoked is set only for a device whose revocation is recorded, which cannot be undone; a device that is inactive
  * for another reason, such as an expired credential or a kind this server does not know, may become active again.
+ * leaseMs is how long a Space DO may use the answer, counted from when it asked (RFC 0014 section 1).
  */
 export interface SessionCheck {
   active: boolean;
@@ -139,6 +142,7 @@ export interface SessionCheck {
   closed: boolean;
   kind: string;
   scope: string | null;
+  leaseMs: number;
 }
 
 const KINDS: Record<string, DeviceInfo_Kind> = { device: DeviceInfo_Kind.DEVICE, agent: DeviceInfo_Kind.AGENT };
@@ -178,6 +182,10 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
     private readonly driving = new Set<string>();
     /** The [owner, name] of each space whose create is setting up its Space DO, as JSON. */
     private readonly creating = new Set<string>();
+    /** Spaces whose rewind admission has started and not yet been recorded or refused. Checks answer them closed (RFC 0014 section 3). */
+    private readonly admitting = new Set<string>();
+    /** How long a Space DO may use a device check (RFC 0014 section 1). Tests lower it. */
+    sessionLeaseMs = SESSION_LEASE_MS;
     /** The time rewinds are admitted, completed and timed out against, and token refreshes read. Tests replace it to move through days or back. */
     clock: () => number = () => Date.now();
     protected abstract readonly shares: ShareLinks;
@@ -469,7 +477,9 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
      * Revokes a device: its refresh credential stops working and its open WebSockets close with 4003. The revocation and
      * a notice to every space are stored together, and a notice stays until its space took it, so a space that cannot be
      * reached now gets it on a repeat or from the alarm. The alarm is armed before the first delivery, so the notices are
-     * retried even if this object is evicted before it delivers them.
+     * retried even if this object is evicted before it delivers them. While a notice is still pending, it returns only
+     * once a lease granted before the revocation has run out, so no space trusts the device after this returns (RFC 0014
+     * section 2).
      */
     async revokeDevice(deviceId: string): Promise<void> {
       const nowMs = Date.now();
@@ -484,6 +494,10 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       });
       await this.armAlarm();
       await this.deliverNotices(deviceId);
+      if (this.sql.exec("SELECT 1 FROM revocation_notices WHERE device_id = ? LIMIT 1", deviceId).toArray().length === 0) return;
+      const revokedAtMs = Number(this.sql.exec("SELECT revoked_at_ms FROM devices WHERE device_id = ?", deviceId).one().revoked_at_ms);
+      const leaseLeftMs = revokedAtMs + this.sessionLeaseMs - Date.now();
+      if (leaseLeftMs > 0) await new Promise((resolve) => setTimeout(resolve, leaseLeftMs));
     }
 
     /** Delivers the pending revocation notices, of one device or all that are due, and arms the alarm for those that failed. */
@@ -570,17 +584,24 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
     async checkSession(deviceId: string, spaceId?: string): Promise<SessionCheck> {
       const device = this.activeDevice(deviceId);
       const revoked = this.sql.exec("SELECT 1 FROM devices WHERE device_id = ? AND revoked_at_ms IS NOT NULL", deviceId).toArray().length > 0;
+      const untilExpiryMs = device?.expires_at_ms == null ? Infinity : device.expires_at_ms - Date.now();
       return {
         active: device !== undefined,
         revoked,
-        closed: spaceId !== undefined && this.spaceClosed(spaceId),
+        closed: spaceId !== undefined && this.heldClosed(spaceId),
         kind: device?.kind ?? "",
         scope: device?.scope ?? null,
+        leaseMs: Math.min(this.sessionLeaseMs, untilExpiryMs),
       };
     }
 
     async isSpaceClosed(spaceId: string): Promise<boolean> {
-      return this.spaceClosed(spaceId);
+      return this.heldClosed(spaceId);
+    }
+
+    /** Whether checks answer the space closed: a rewind holds it, or a rewind's admission has started (RFC 0014 section 3). */
+    private heldClosed(spaceId: string): boolean {
+      return this.spaceClosed(spaceId) || this.admitting.has(spaceId);
     }
 
     protected spaceClosed(spaceId: string): boolean {
@@ -618,38 +639,45 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
         .exec("SELECT 1 FROM rewinds WHERE space_id = ? AND ended_at_ms IS NOT NULL AND admitted_at_ms <= ? AND ended_at_ms >= ?", args.spaceId, point, point)
         .toArray();
       if (closedBefore.length > 0) return failure(Error_Code.INVALID_ARGUMENT, "restore_point_ms lies inside an earlier rewind of this space");
-      if (this.spaceClosed(args.spaceId)) return failure(Error_Code.RETRY_LATER, "another rewind of this space has not ended");
+      if (this.heldClosed(args.spaceId)) return failure(Error_Code.RETRY_LATER, "another rewind of this space has not ended");
 
-      let info;
+      // Checks answer the space closed from here, before rewindInfo drops the Space DO's leases, so no lease from before
+      // the admission outlives it (RFC 0014 section 3).
+      this.admitting.add(args.spaceId);
       try {
-        info = await this.spaceStub(args.spaceId).rewindInfo(point);
-      } catch (error) {
-        console.error("rewind admission failed", error);
-        return failure(Error_Code.RETRY_LATER, "the space could not be read; retry the rewind");
-      }
-      if (info.historyId !== args.expectedHistoryId) return failure(Error_Code.HISTORY_MISMATCH, "expected_history_id is not the space's current history");
-      if (!info.descriptorDurable) return failure(Error_Code.RETRY_LATER, "the space's current history is not exported to R2 yet");
-      if (this.rewindRow(args.rewindId) || this.spaceClosed(args.spaceId)) return failure(Error_Code.RETRY_LATER, "another rewind of this space has not ended");
+        let info;
+        try {
+          info = await this.spaceStub(args.spaceId).rewindInfo(point);
+        } catch (error) {
+          console.error("rewind admission failed", error);
+          return failure(Error_Code.RETRY_LATER, "the space could not be read; retry the rewind");
+        }
+        if (info.historyId !== args.expectedHistoryId) return failure(Error_Code.HISTORY_MISMATCH, "expected_history_id is not the space's current history");
+        if (!info.descriptorDurable) return failure(Error_Code.RETRY_LATER, "the space's current history is not exported to R2 yet");
+        if (this.rewindRow(args.rewindId) || this.spaceClosed(args.spaceId)) return failure(Error_Code.RETRY_LATER, "another rewind of this space has not ended");
 
-      const count = Number(this.sql.exec("SELECT rewind_count FROM space_rewinds WHERE space_id = ?", args.spaceId).toArray()[0]?.rewind_count ?? 0) + 1;
-      this.sql.exec(
-        "INSERT INTO space_rewinds (space_id, rewind_count) VALUES (?, ?) ON CONFLICT (space_id) DO UPDATE SET rewind_count = excluded.rewind_count",
-        args.spaceId,
-        count,
-      );
-      this.sql.exec(
-        `INSERT INTO rewinds (rewind_id, space_id, restore_point_ms, expected_history_id, bookmark, history_id, rewind_number, attempt,
-           phase, admitted_at_ms, next_try_ms) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'admitted', ?, ?)`,
-        args.rewindId,
-        args.spaceId,
-        point,
-        args.expectedHistoryId,
-        info.bookmark,
-        uuidv7(),
-        count,
-        nowMs,
-        Date.now() + REWIND_RETRY_MIN_MS,
-      );
+        const count = Number(this.sql.exec("SELECT rewind_count FROM space_rewinds WHERE space_id = ?", args.spaceId).toArray()[0]?.rewind_count ?? 0) + 1;
+        this.sql.exec(
+          "INSERT INTO space_rewinds (space_id, rewind_count) VALUES (?, ?) ON CONFLICT (space_id) DO UPDATE SET rewind_count = excluded.rewind_count",
+          args.spaceId,
+          count,
+        );
+        this.sql.exec(
+          `INSERT INTO rewinds (rewind_id, space_id, restore_point_ms, expected_history_id, bookmark, history_id, rewind_number, attempt,
+             phase, admitted_at_ms, next_try_ms) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'admitted', ?, ?)`,
+          args.rewindId,
+          args.spaceId,
+          point,
+          args.expectedHistoryId,
+          info.bookmark,
+          uuidv7(),
+          count,
+          nowMs,
+          Date.now() + REWIND_RETRY_MIN_MS,
+        );
+      } finally {
+        this.admitting.delete(args.spaceId);
+      }
       await this.armAlarm();
       await this.drive(args.rewindId);
       return this.rewindOutcome(args.rewindId);
