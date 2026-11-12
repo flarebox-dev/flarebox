@@ -13,6 +13,7 @@ import {
   type VersionInfo,
   VersionInfoSchema,
 } from "../gen/koidrive/v1/model_pb";
+import type { Sql, SqlCursor, SqlRow, SqlValue } from "../host";
 
 /** Chunks per row of version_chunk_pages, and per GetVersionChunks page. */
 export const PAGE_CHUNKS = 4096;
@@ -75,7 +76,7 @@ export function parseChunkKey(spaceId: string, key: string): { hashHex: string; 
   return { hashHex: match[2]!, incarnation: match[3]! };
 }
 
-export function rows<T>(cursor: SqlStorageCursor<Record<string, SqlStorageValue>>): T[] {
+export function rows<T>(cursor: SqlCursor<SqlRow>): T[] {
   return cursor.toArray() as unknown as T[];
 }
 
@@ -99,19 +100,19 @@ export function decodeChunkList(bytes: Uint8Array): ChunkRef[] {
   return out;
 }
 
-export function getMeta(sql: SqlStorage, key: string): SqlStorageValue | undefined {
+export function getMeta(sql: Sql, key: string): SqlValue | undefined {
   return sql.exec("SELECT value FROM meta WHERE key = ?", key).toArray()[0]?.value;
 }
 
-export function setMeta(sql: SqlStorage, key: string, value: SqlStorageValue): void {
+export function setMeta(sql: Sql, key: string, value: SqlValue): void {
   sql.exec("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", key, value);
 }
 
-export function getNode(sql: SqlStorage, nodeId: string): NodeRow | undefined {
+export function getNode(sql: Sql, nodeId: string): NodeRow | undefined {
   return rows<NodeRow>(sql.exec("SELECT * FROM nodes WHERE node_id = ?", nodeId))[0];
 }
 
-export function getVersion(sql: SqlStorage, versionId: string): VersionRow | undefined {
+export function getVersion(sql: Sql, versionId: string): VersionRow | undefined {
   return rows<VersionRow>(sql.exec("SELECT * FROM versions WHERE version_id = ?", versionId))[0];
 }
 
@@ -119,7 +120,7 @@ export function versionPageCount(version: VersionRow): number {
   return Math.max(1, Math.ceil(version.chunk_count / PAGE_CHUNKS));
 }
 
-export function versionChunkPage(sql: SqlStorage, version: VersionRow, page: number): ChunkRef[] {
+export function versionChunkPage(sql: Sql, version: VersionRow, page: number): ChunkRef[] {
   if (version.chunks) return page === 0 ? decodeChunkList(new Uint8Array(version.chunks)) : [];
   const row = sql
     .exec("SELECT chunks FROM version_chunk_pages WHERE version_id = ? AND page = ?", version.version_id, page)
@@ -127,14 +128,14 @@ export function versionChunkPage(sql: SqlStorage, version: VersionRow, page: num
   return row ? decodeChunkList(new Uint8Array(row.chunks as ArrayBuffer)) : [];
 }
 
-export function versionChunks(sql: SqlStorage, version: VersionRow): ChunkRef[] {
+export function versionChunks(sql: Sql, version: VersionRow): ChunkRef[] {
   const out: ChunkRef[] = [];
   for (let page = 0; page < versionPageCount(version); page++) out.push(...versionChunkPage(sql, version, page));
   return out;
 }
 
 /** Lists the chunks when inline is set and the version has at most INLINE_CHUNKS of them, or always when complete is set. */
-export function versionContent(sql: SqlStorage, version: VersionRow, inline: boolean, complete = false): Content {
+export function versionContent(sql: Sql, version: VersionRow, inline: boolean, complete = false): Content {
   return create(ContentSchema, {
     size: BigInt(version.size),
     mtimeNs: BigInt(version.mtime_ns),
@@ -146,7 +147,7 @@ export function versionContent(sql: SqlStorage, version: VersionRow, inline: boo
   });
 }
 
-export function versionInfo(sql: SqlStorage, version: VersionRow, complete = false): VersionInfo {
+export function versionInfo(sql: Sql, version: VersionRow, complete = false): VersionInfo {
   return create(VersionInfoSchema, {
     versionId: version.version_id,
     seq: BigInt(version.seq),
@@ -157,7 +158,7 @@ export function versionInfo(sql: SqlStorage, version: VersionRow, complete = fal
   });
 }
 
-export function nodeState(sql: SqlStorage, node: NodeRow, complete = false): NodeState {
+export function nodeState(sql: Sql, node: NodeRow, complete = false): NodeState {
   const version = node.cur_version_id ? getVersion(sql, node.cur_version_id) : undefined;
   return create(NodeStateSchema, {
     nodeId: node.node_id,

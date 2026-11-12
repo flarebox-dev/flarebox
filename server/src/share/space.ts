@@ -5,6 +5,7 @@ import { Error_Code } from "../gen/koidrive/v1/rpc_pb";
 import { NodeKind } from "../gen/koidrive/v1/model_pb";
 import { type ShareEntry, ShareEntrySchema, type ShareInfo, ShareInfoSchema, type ShareListing, ShareListingSchema } from "../gen/koidrive/v1/share_pb";
 import { base64url, fromBase64url } from "../crypto";
+import type { Sql } from "../host";
 import { isUuidV7, toHex } from "../ids";
 import type { ResolvedLink, ShareOutcome } from "./links";
 import { NodeKindValue, NodeStatusValue, ChunkState } from "../space/schema";
@@ -50,7 +51,7 @@ function refuse(code: Error_Code, message: string, status: number): { ok: false;
  * The node when it is reachable through a link with this root (RFC 0005 section 6): it is live, and following
  * parent_id from it reaches the root through live nodes only.
  */
-export function reachable(sql: SqlStorage, rootId: string, nodeId: string): NodeRow | undefined {
+export function reachable(sql: Sql, rootId: string, nodeId: string): NodeRow | undefined {
   if (!isUuidV7(nodeId)) return undefined;
   const node = getNode(sql, nodeId);
   let cur = node;
@@ -63,11 +64,11 @@ export function reachable(sql: SqlStorage, rootId: string, nodeId: string): Node
   return undefined;
 }
 
-function displayName(sql: SqlStorage, node: NodeRow): string {
+function displayName(sql: Sql, node: NodeRow): string {
   return node.parent_id === null ? String(getMeta(sql, "name") ?? "") : node.name;
 }
 
-function entry(sql: SqlStorage, node: NodeRow): ShareEntry {
+function entry(sql: Sql, node: NodeRow): ShareEntry {
   const version = node.kind === NodeKindValue.FILE && node.cur_version_id ? getVersion(sql, node.cur_version_id) : undefined;
   return create(ShareEntrySchema, {
     nodeId: node.node_id,
@@ -79,14 +80,14 @@ function entry(sql: SqlStorage, node: NodeRow): ShareEntry {
 }
 
 /** Whether a node can be the root of a new link: a live node of this space. */
-export function checkLinkRoot(sql: SqlStorage, nodeId: string): ShareOutcome<null> {
+export function checkLinkRoot(sql: Sql, nodeId: string): ShareOutcome<null> {
   const node = isUuidV7(nodeId) ? getNode(sql, nodeId) : undefined;
   if (!node || node.status !== NodeStatusValue.LIVE) return refuse(Error_Code.NOT_FOUND, "node_id is not a live node of this space", 404);
   return { ok: true, value: null };
 }
 
 /** GET /v1/share/{link_id}: the link's root. */
-export function shareInfo(sql: SqlStorage, rootId: string, expiresAtMs: number): ShareOutcome<ShareInfo> {
+export function shareInfo(sql: Sql, rootId: string, expiresAtMs: number): ShareOutcome<ShareInfo> {
   const root = reachable(sql, rootId, rootId);
   if (!root) return notReachable();
   const { kind, name, size, mtimeMs } = entry(sql, root);
@@ -94,7 +95,7 @@ export function shareInfo(sql: SqlStorage, rootId: string, expiresAtMs: number):
 }
 
 /** GET /v1/share/{link_id}/list: one page of a reachable folder's live children, by name_key and then node_id. */
-export function shareListing(sql: SqlStorage, rootId: string, dirId: string, cursor: string): ShareOutcome<ShareListing> {
+export function shareListing(sql: Sql, rootId: string, dirId: string, cursor: string): ShareOutcome<ShareListing> {
   const dir = reachable(sql, rootId, dirId || rootId);
   if (!dir) return notReachable();
   if (dir.kind !== NodeKindValue.DIR) return refuse(Error_Code.INVALID_ARGUMENT, "only a folder has a listing", 400);
@@ -141,7 +142,7 @@ export function shareListing(sql: SqlStorage, rootId: string, dirId: string, cur
  * GET /v1/share/{link_id}/file/{node_id}: the chunks of a reachable file's current version, each with the R2 key of its
  * current incarnation (RFC 0005 section 7). The keys come only from this space's rows.
  */
-export function shareFile(sql: SqlStorage, spaceId: string, rootId: string, nodeId: string): ShareOutcome<ShareFile> {
+export function shareFile(sql: Sql, spaceId: string, rootId: string, nodeId: string): ShareOutcome<ShareFile> {
   const node = reachable(sql, rootId, nodeId);
   if (!node) return notReachable();
   if (node.kind !== NodeKindValue.FILE || !node.cur_version_id) return refuse(Error_Code.INVALID_ARGUMENT, "only a file can be downloaded", 400);
@@ -172,7 +173,7 @@ export function shareFile(sql: SqlStorage, spaceId: string, rootId: string, node
  * Whether a download may go on with its next chunk: the link resolved again, and neither the space's rewind generation
  * nor its history changed since the download started (RFC 0005 section 7, step 5).
  */
-export function checkFence(sql: SqlStorage, spaceId: string, resolved: ShareOutcome<ResolvedLink>, fence: DownloadFence): ShareOutcome<null> {
+export function checkFence(sql: Sql, spaceId: string, resolved: ShareOutcome<ResolvedLink>, fence: DownloadFence): ShareOutcome<null> {
   if (!resolved.ok) return resolved;
   if (resolved.value.spaceId !== spaceId || resolved.value.generation !== fence.generation || String(getMeta(sql, "history_id")) !== fence.historyId) {
     return refuse(Error_Code.RETRY_LATER, "the space was rewound during this download", 503);

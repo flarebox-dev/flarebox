@@ -5,6 +5,7 @@
 // either creates the owner and the device or changes nothing but a failure count.
 
 import { Error_Code } from "../gen/koidrive/v1/rpc_pb";
+import type { Sql } from "../host";
 
 /** Wrong codes one client address may send in one window before further wrong codes are refused. */
 export const CLAIM_FAILURES_PER_WINDOW = 10;
@@ -63,7 +64,7 @@ const FAILURES_PER_WINDOW = { claim: CLAIM_FAILURES_PER_WINDOW, recovery: CLAIM_
 
 type FailureScope = keyof typeof FAILURES_PER_WINDOW;
 
-function throttled(sql: SqlStorage, scope: FailureScope, client: string, nowMs: number): boolean {
+function throttled(sql: Sql, scope: FailureScope, client: string, nowMs: number): boolean {
   const row = sql
     .exec("SELECT failures FROM claim_failures WHERE scope = ? AND client = ? AND window_start_ms > ?", scope, bucket(client), nowMs - CLAIM_FAILURE_WINDOW_MS)
     .toArray()[0];
@@ -71,7 +72,7 @@ function throttled(sql: SqlStorage, scope: FailureScope, client: string, nowMs: 
 }
 
 /** Counts a wrong code, dropping expired windows and keeping at most MAX_FAILURE_ROWS rows. */
-function recordFailure(sql: SqlStorage, scope: FailureScope, client: string, nowMs: number): void {
+function recordFailure(sql: Sql, scope: FailureScope, client: string, nowMs: number): void {
   sql.exec("DELETE FROM claim_failures WHERE window_start_ms <= ?", nowMs - CLAIM_FAILURE_WINDOW_MS);
   sql.exec(
     "INSERT INTO claim_failures (scope, client, failures, window_start_ms) VALUES (?, ?, 1, ?) ON CONFLICT (scope, client) DO UPDATE SET failures = failures + 1",
@@ -86,7 +87,7 @@ function recordFailure(sql: SqlStorage, scope: FailureScope, client: string, now
 }
 
 /** Refuses a wrong code and counts it against the client's address, or answers RETRY_LATER once the address sent too many. */
-export function wrongCode(sql: SqlStorage, scope: FailureScope, client: string, nowMs: number, message: string): { ok: false; code: Error_Code; message: string } {
+export function wrongCode(sql: Sql, scope: FailureScope, client: string, nowMs: number, message: string): { ok: false; code: Error_Code; message: string } {
   if (throttled(sql, scope, client, nowMs)) {
     return { ok: false, code: Error_Code.RETRY_LATER, message: "too many wrong codes from this address; try again in a few minutes" };
   }
@@ -95,7 +96,7 @@ export function wrongCode(sql: SqlStorage, scope: FailureScope, client: string, 
 }
 
 /** Stores a new claim code unless the deployment has an owner or a code is still valid. Returns whether it stored one. */
-export function storeClaimCode(sql: SqlStorage, codeHash: ArrayBuffer, nowMs: number, expiresAtMs: number): boolean {
+export function storeClaimCode(sql: Sql, codeHash: ArrayBuffer, nowMs: number, expiresAtMs: number): boolean {
   if (sql.exec("SELECT 1 FROM users LIMIT 1").toArray().length > 0) return false;
   sql.exec("DELETE FROM claim_codes WHERE expires_at_ms <= ?", nowMs);
   if (sql.exec("SELECT 1 FROM claim_codes LIMIT 1").toArray().length > 0) return false;
@@ -104,7 +105,7 @@ export function storeClaimCode(sql: SqlStorage, codeHash: ArrayBuffer, nowMs: nu
 }
 
 /** The deployment's owner, if it has one. */
-export function ownerOf(sql: SqlStorage): string | undefined {
+export function ownerOf(sql: Sql): string | undefined {
   const row = sql.exec("SELECT user_id FROM users ORDER BY created_at_ms, user_id LIMIT 1").toArray()[0];
   return row ? String(row.user_id) : undefined;
 }
@@ -115,7 +116,7 @@ export function ownerOf(sql: SqlStorage): string | undefined {
  * redeems; a wrong one counts against the client's address, and an address with too many recent wrong codes gets
  * RETRY_LATER for wrong codes.
  */
-export function redeemClaim(sql: SqlStorage, attempt: ClaimAttempt): ClaimOutcome {
+export function redeemClaim(sql: Sql, attempt: ClaimAttempt): ClaimOutcome {
   const owner = ownerOf(sql);
   if (owner !== attempt.ownerBefore) return { ok: false, code: Error_Code.RETRY_LATER, message: "the deployment changed during the claim; retry" };
   if (owner) return recover(sql, attempt);
@@ -137,7 +138,7 @@ export function redeemClaim(sql: SqlStorage, attempt: ClaimAttempt): ClaimOutcom
 }
 
 /** A wrong key counts and throttles the same with or without a configured key, so answers do not reveal whether one is. */
-function recover(sql: SqlStorage, attempt: ClaimAttempt): ClaimOutcome {
+function recover(sql: Sql, attempt: ClaimAttempt): ClaimOutcome {
   const key = presentedKey(attempt);
   if (!key) return wrongCode(sql, "recovery", attempt.client, attempt.nowMs, "this deployment already has an owner");
   const spent = spendKey(sql, key, attempt.nowMs);
@@ -150,7 +151,7 @@ function recover(sql: SqlStorage, attempt: ClaimAttempt): ClaimOutcome {
  * Records the new device's setup attempt and returns the attempt's earlier devices that never refreshed a token. Their
  * credentials never reached the client, so nobody can use them.
  */
-function joinAttempt(sql: SqlStorage, attempt: ClaimAttempt): string[] {
+function joinAttempt(sql: Sql, attempt: ClaimAttempt): string[] {
   if (!attempt.setupAttempt) return [];
   sql.exec("UPDATE devices SET setup_attempt = ? WHERE device_id = ?", attempt.setupAttempt, attempt.deviceId);
   return sql
@@ -160,7 +161,7 @@ function joinAttempt(sql: SqlStorage, attempt: ClaimAttempt): string[] {
 }
 
 /** Whether a device joinAttempt returned is still an unused device of that owner's attempt. */
-export function stillUnused(sql: SqlStorage, deviceId: string, setupAttempt: string, userId: string): boolean {
+export function stillUnused(sql: Sql, deviceId: string, setupAttempt: string, userId: string): boolean {
   return sql.exec(`SELECT 1 FROM devices WHERE ${UNUSED_OF_ATTEMPT} AND device_id = ?`, setupAttempt, userId, deviceId).toArray().length > 0;
 }
 
@@ -171,7 +172,7 @@ function presentedKey(attempt: ClaimAttempt): ArrayBuffer | undefined {
 }
 
 /** Records the key as used, or refuses it if it was used before. */
-function spendKey(sql: SqlStorage, key: ArrayBuffer, nowMs: number): ClaimOutcome | undefined {
+function spendKey(sql: Sql, key: ArrayBuffer, nowMs: number): ClaimOutcome | undefined {
   if (sql.exec("SELECT 1 FROM used_recovery_keys WHERE key_hash = ?", key).toArray().length > 0) {
     return refused("this recovery key was already used; set a new one");
   }

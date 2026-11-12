@@ -8,6 +8,7 @@ import { BinaryWriter } from "@bufbuild/protobuf/wire";
 import { ExportHeaderSchema, NodeSnapshotSchema, RetainedVersionSchema } from "../gen/koidrive/v1/export_pb";
 import type { CommitRecord } from "../gen/koidrive/v1/model_pb";
 import { sha256 } from "../crypto";
+import type { Database, Sql } from "../host";
 import { toHex, uuidv7Ms } from "../ids";
 import { getMeta, INLINE_CHUNKS, type NodeRow, nodeState, rows, setMeta, type VersionRow, versionInfo } from "./store";
 
@@ -78,17 +79,17 @@ function seqName(seq: number): string {
   return String(seq).padStart(20, "0");
 }
 
-function readState(sql: SqlStorage): ExportState {
+function readState(sql: Sql): ExportState {
   const stored = getMeta(sql, "export_state");
   if (stored === undefined) return { baseline: false, descriptor: false, dueSeq: null, since: { seq: 0, atMs: 0 }, done: [] };
   return JSON.parse(String(stored)) as ExportState;
 }
 
-function exportedSeq(sql: SqlStorage): number {
+function exportedSeq(sql: Sql): number {
   return Number(getMeta(sql, "exported_seq") ?? 0);
 }
 
-function scheduleExport(sql: SqlStorage, dueMs: number, lowerOnly: boolean): void {
+function scheduleExport(sql: Sql, dueMs: number, lowerOnly: boolean): void {
   sql.exec(
     `INSERT INTO schedule (task, due_ms) VALUES ('export', ?)
      ON CONFLICT (task) DO UPDATE SET due_ms = ${lowerOnly ? "MIN(due_ms, excluded.due_ms)" : "excluded.due_ms"}`,
@@ -101,7 +102,7 @@ function scheduleExport(sql: SqlStorage, dueMs: number, lowerOnly: boolean): voi
  * space's first history exports from seq 0 and writes its descriptor at once. A history that a rewind started exports
  * from restore_seq: a full snapshot is due at once, and the descriptor waits for it (RFC 0003 section 7).
  */
-export function startExport(sql: SqlStorage, fromSeq: number, atMs: number, baseline: boolean): void {
+export function startExport(sql: Sql, fromSeq: number, atMs: number, baseline: boolean): void {
   setMeta(sql, "exported_seq", fromSeq);
   const state: ExportState = { baseline, descriptor: false, dueSeq: baseline ? fromSeq : null, since: { seq: fromSeq, atMs }, done: [] };
   setMeta(sql, "export_state", JSON.stringify(state));
@@ -113,7 +114,7 @@ export function startExport(sql: SqlStorage, fromSeq: number, atMs: number, base
  * exports from restore_seq if a rewind started it, else from seq 0, and a full snapshot is due at once, because the log
  * of earlier commits omits the chunk lists of large versions.
  */
-export function bootstrapExport(sql: SqlStorage, atMs: number): void {
+export function bootstrapExport(sql: Sql, atMs: number): void {
   if (getMeta(sql, "space_id") === undefined || getMeta(sql, "export_state") !== undefined) return;
   const restoreSeq = getMeta(sql, "restore_seq");
   const fromSeq = Number(restoreSeq ?? 0);
@@ -124,7 +125,7 @@ export function bootstrapExport(sql: SqlStorage, atMs: number): void {
 }
 
 /** Whether the current history's descriptor is durable in R2, which rewind admission requires (RFC 0003 section 1). */
-export function descriptorDurable(sql: SqlStorage): boolean {
+export function descriptorDurable(sql: Sql): boolean {
   return readState(sql).descriptor;
 }
 
@@ -133,7 +134,7 @@ export function descriptorDurable(sql: SqlStorage): boolean {
  * waiting commit or at once after 1,000, and a snapshot at once after a version whose chunk list the log omits
  * (RFC 0004 section 3). Returns whether the schedule changed.
  */
-export function noteCommitted(sql: SqlStorage, record: CommitRecord): boolean {
+export function noteCommitted(sql: Sql, record: CommitRecord): boolean {
   const seq = Number(record.seq);
   const atMs = Number(record.committedAtMs);
   const waiting = seq - exportedSeq(sql);
@@ -160,12 +161,12 @@ async function gzip(data: Uint8Array): Promise<Uint8Array> {
 /** Writes the export of one Space DO to R2, one recorded step at a time. */
 export class Exporter {
   constructor(
-    private readonly storage: DurableObjectStorage,
+    private readonly storage: Database,
     private readonly bucket: R2Bucket,
     private readonly pageNodes: number,
   ) {}
 
-  private get sql(): SqlStorage {
+  private get sql(): Sql {
     return this.storage.sql;
   }
 

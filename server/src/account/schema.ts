@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import type { Sql } from "../host";
 import { type Migration, migrate as runMigrations } from "../migrations";
 
 // Account DO storage, following spec v0 section 4.2. Migrations only move forward.
@@ -83,6 +84,6 @@ export const MIGRATIONS: readonly Migration[] = [
   },
 ];
 
-export function migrate(sql: SqlStorage): void {
+export function migrate(sql: Sql): void {
   runMigrations(sql, "settings", MIGRATIONS);
 }
