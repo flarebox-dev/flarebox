@@ -4,7 +4,7 @@
 //! ask, the rules files they read for it, and the search that tells a move
 //! into a left-out path from a removal.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
 use std::os::fd::{AsFd, BorrowedFd};
@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 
 use rustix::fs::{FileType, Mode, OFlags};
 
-use crate::{EntryKind, FileId, Stat, is_gone, list, open_attached, open_dir_at, stat_at, stat_fd};
+use crate::{
+    Entry, EntryKind, FileId, Stat, is_gone, list, open_attached, open_dir_at, stat_at, stat_fd,
+};
 
 /// The name of a rules file.
 pub const RULES_FILE: &str = ".koiignore";
@@ -69,7 +71,52 @@ pub struct Rules {
     /// The names each listed folder holds that a rule leaves out
     /// ([`Ignored::Rule`] only).
     ignored: BTreeMap<PathBuf, BTreeSet<OsString>>,
+    budget: usize,
+    search: Search,
 }
+
+#[derive(Default)]
+struct Search {
+    walks: u64,
+    walk: Option<Vec<Listing>>,
+    pending: HashMap<Key, u64>,
+    decided: HashMap<Key, Option<PathBuf>>,
+    held: BTreeMap<PathBuf, Entry>,
+    scanned: Vec<PathBuf>,
+    reseeded: Vec<PathBuf>,
+}
+
+impl Search {
+    fn prune(&mut self) {
+        let keys: HashSet<Key> = (self.held.values())
+            .map(|entry| (entry.id, entry.kind))
+            .collect();
+        self.pending.retain(|key, _| keys.contains(key));
+        self.decided.retain(|key, _| keys.contains(key));
+        if self.pending.is_empty() {
+            self.walk = None;
+        }
+    }
+}
+
+pub(crate) struct Seeded {
+    scanned: Vec<PathBuf>,
+    reseeded: Vec<PathBuf>,
+}
+
+impl Seeded {
+    pub(crate) fn unscanned(&self, path: &Path) -> bool {
+        let under = |paths: &[PathBuf]| paths.iter().any(|scope| path.starts_with(scope));
+        !under(&self.scanned) || under(&self.reseeded)
+    }
+}
+
+struct Listing {
+    dir: PathBuf,
+    names: Vec<OsString>,
+}
+
+const SEARCH_BUDGET: usize = 20_000;
 
 impl Rules {
     pub fn new(ignore: Box<dyn Ignore + Send>) -> Self {
@@ -78,7 +125,32 @@ impl Rules {
             ignore,
             files: BTreeMap::new(),
             ignored: BTreeMap::new(),
+            budget: SEARCH_BUDGET,
+            search: Search::default(),
         }
+    }
+
+    /// The same rules with a search that looks at `budget` left-out entries
+    /// per rescan, and at least one.
+    pub fn with_search_budget(mut self, budget: usize) -> Self {
+        self.budget = budget.max(1);
+        self
+    }
+
+    pub(crate) fn searching(&self) -> bool {
+        !self.search.pending.is_empty()
+    }
+
+    pub(crate) fn held(&self) -> Option<&BTreeMap<PathBuf, Entry>> {
+        Some(&self.search.held).filter(|held| !held.is_empty())
+    }
+
+    pub(crate) fn forget(&mut self, scope: &Path) {
+        let search = &mut self.search;
+        search.held.retain(|path, _| !path.starts_with(scope));
+        search.prune();
+        search.reseeded.push(scope.to_path_buf());
+        search.reseeded = crate::outermost(std::mem::take(&mut search.reseeded));
     }
 
     /// The keys of `path`, under which the rules of the folder there are held.
@@ -109,7 +181,9 @@ impl Rules {
 
 /// The entries a search looks for, by identity and kind, and where it found
 /// each one.
-pub(crate) type Wanted = HashMap<(FileId, EntryKind), Option<PathBuf>>;
+pub(crate) type Wanted = HashMap<Key, Option<PathBuf>>;
+
+pub(crate) type Key = (FileId, EntryKind);
 
 /// The rules during one scan. Until the scan is published, [`Pending::undo`]
 /// takes back everything it changed in them.
@@ -220,6 +294,19 @@ impl<'r> Pending<'r> {
     /// Replaces the left-out names of every folder the scan listed.
     pub(crate) fn settle(&mut self) {
         for (folder, names) in std::mem::take(&mut self.listed) {
+            if let Some(walk) = &mut self.rules.search.walk {
+                let before = self.rules.ignored.get(&folder);
+                let added: Vec<OsString> = (names.iter().rev())
+                    .filter(|name| !before.is_some_and(|before| before.contains(*name)))
+                    .cloned()
+                    .collect();
+                if !added.is_empty() {
+                    walk.push(Listing {
+                        dir: folder.clone(),
+                        names: added,
+                    });
+                }
+            }
             if names.is_empty() {
                 self.rules.ignored.remove(&folder);
             } else {
@@ -228,11 +315,7 @@ impl<'r> Pending<'r> {
         }
     }
 
-    /// Looks for the `wanted` entries at the entries the rules leave out by
-    /// name, and below them when `below` is set, and sets where each one is.
-    /// The search lists and stats, and reads no file. It skips what it cannot
-    /// open and forgets a recorded name that is gone.
-    pub(crate) fn find(&mut self, root: BorrowedFd<'_>, wanted: &mut Wanted, below: bool) {
+    pub(crate) fn find(&mut self, root: BorrowedFd<'_>, wanted: &mut Wanted) {
         let mut missing = wanted.len();
         self.rules.ignored.retain(|folder, names| {
             if missing == 0 {
@@ -249,15 +332,12 @@ impl<'r> Pending<'r> {
                 }
                 match stat_at(dir.as_fd(), name) {
                     Ok(stat) => {
-                        look(
-                            dir.as_fd(),
-                            name,
-                            folder.join(name),
-                            &stat,
-                            wanted,
-                            &mut missing,
-                            below,
-                        );
+                        if let Some(entry) = stat.entry()
+                            && let Some(found @ None) = wanted.get_mut(&(entry.id, entry.kind))
+                        {
+                            *found = Some(folder.join(name));
+                            missing -= 1;
+                        }
                         true
                     }
                     Err(err) => !is_gone(&err),
@@ -265,6 +345,166 @@ impl<'r> Pending<'r> {
             });
             !names.is_empty()
         });
+    }
+
+    pub(crate) fn search(
+        &mut self,
+        root: BorrowedFd<'_>,
+        wanted: &mut Wanted,
+        fresh: &HashSet<Key>,
+        bounded: bool,
+    ) -> HashSet<Key> {
+        let Rules {
+            ignored,
+            budget,
+            search,
+            ..
+        } = &mut *self.rules;
+        let Search {
+            walks,
+            walk,
+            pending,
+            decided,
+            ..
+        } = search;
+        let next = *walks + 1;
+        for (key, found) in wanted.iter_mut() {
+            match decided.get(key) {
+                Some(Some(path)) if holds(root, path, *key) => *found = Some(path.clone()),
+                Some(None) if !fresh.contains(key) => {}
+                _ => {
+                    decided.remove(key);
+                    let needs = pending.entry(*key).or_insert(next);
+                    if fresh.contains(key) {
+                        *needs = next;
+                    }
+                }
+            }
+        }
+        let mut left = if bounded { *budget } else { usize::MAX };
+        while left > 0 && !pending.is_empty() {
+            let listings = walk.get_or_insert_with(|| {
+                *walks += 1;
+                (ignored.iter())
+                    .map(|(dir, names)| Listing {
+                        dir: dir.clone(),
+                        names: names.iter().rev().cloned().collect(),
+                    })
+                    .rev()
+                    .collect()
+            });
+            while left > 0
+                && !pending.is_empty()
+                && let Some(mut listing) = listings.pop()
+            {
+                let Ok(Some((dir, _))) = open_attached(root, &listing.dir, &mut |_| {}) else {
+                    continue;
+                };
+                let mut below = Vec::new();
+                while left > 0
+                    && let Some(name) = listing.names.pop()
+                {
+                    left -= 1;
+                    let Some(entry) = stat_at(dir.as_fd(), &name)
+                        .ok()
+                        .and_then(|stat| stat.entry())
+                    else {
+                        continue;
+                    };
+                    let key = (entry.id, entry.kind);
+                    let path = listing.dir.join(&name);
+                    if pending.remove(&key).is_some() {
+                        if let Some(found) = wanted.get_mut(&key) {
+                            *found = Some(path.clone());
+                        }
+                        decided.insert(key, Some(path.clone()));
+                    }
+                    if entry.kind == EntryKind::Dir
+                        && let Ok(sub) = open_dir_at(dir.as_fd(), &name)
+                        && let Ok(names) = list(sub.as_fd())
+                    {
+                        below.push(Listing {
+                            dir: path,
+                            names: names.into_iter().rev().collect(),
+                        });
+                    }
+                }
+                if !listing.names.is_empty() {
+                    listings.push(listing);
+                }
+                listings.extend(below.into_iter().rev());
+            }
+            if listings.is_empty() {
+                *walk = None;
+                let done = *walks;
+                pending.retain(|key, needs| {
+                    let open = *needs > done;
+                    if !open {
+                        decided.insert(*key, None);
+                    }
+                    open
+                });
+            }
+        }
+        if pending.is_empty() {
+            *walk = None;
+        }
+        (wanted.keys())
+            .filter(|key| pending.contains_key(key))
+            .copied()
+            .collect()
+    }
+
+    pub(crate) fn held_in(&self, scopes: &[PathBuf]) -> BTreeMap<PathBuf, Entry> {
+        (self.rules.search.held.iter())
+            .filter(|(path, _)| scopes.iter().any(|scope| path.starts_with(scope)))
+            .map(|(path, entry)| (path.clone(), *entry))
+            .collect()
+    }
+
+    pub(crate) fn take_held(
+        &mut self,
+        scopes: &[PathBuf],
+        stays: &[PathBuf],
+    ) -> BTreeMap<PathBuf, Entry> {
+        let held = &mut self.rules.search.held;
+        let (taken, kept) = std::mem::take(held).into_iter().partition(|(path, _)| {
+            scopes.iter().any(|scope| path.starts_with(scope))
+                && !stays.iter().any(|kept| path.starts_with(kept))
+        });
+        *held = kept;
+        taken
+    }
+
+    pub(crate) fn hold(&mut self, held: BTreeMap<PathBuf, Entry>) {
+        let search = &mut self.rules.search;
+        search.held.extend(held);
+        search.prune();
+    }
+
+    pub(crate) fn held(&self) -> impl Iterator<Item = &PathBuf> {
+        self.rules.search.held.keys()
+    }
+
+    pub(crate) fn cover(&mut self, scopes: &[PathBuf], unread: &[PathBuf]) -> Seeded {
+        let search = &mut self.rules.search;
+        let seeded = Seeded {
+            scanned: search.scanned.clone(),
+            reseeded: search.reseeded.clone(),
+        };
+        let under =
+            |path: &Path, paths: &[PathBuf]| paths.iter().any(|above| path.starts_with(above));
+        let still: Vec<PathBuf> = (unread.iter())
+            .filter(|path| seeded.unscanned(path))
+            .chain(seeded.reseeded.iter().filter(|path| under(path, unread)))
+            .cloned()
+            .collect();
+        search.scanned.extend(scopes.iter().cloned());
+        search.scanned = crate::outermost(std::mem::take(&mut search.scanned));
+        search.reseeded.retain(|path| !under(path, scopes));
+        search.reseeded.extend(still);
+        search.reseeded = crate::outermost(std::mem::take(&mut search.reseeded));
+        seeded
     }
 
     /// Drops the rules of every folder for which `is_folder` is false, and
@@ -356,47 +596,14 @@ fn read_rules(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<Option<Vec<u8>>> 
     Ok(Some(bytes))
 }
 
-/// Checks the entry `name` of `dir`, at `path` under the root, and everything
-/// below it when `below` is set, against `wanted`, until none is `missing`.
-fn look(
-    dir: BorrowedFd<'_>,
-    name: &OsStr,
-    path: PathBuf,
-    stat: &Stat,
-    wanted: &mut Wanted,
-    missing: &mut usize,
-    below: bool,
-) {
-    let Some(entry) = stat.entry() else {
-        return;
+fn holds(root: BorrowedFd<'_>, path: &Path, key: Key) -> bool {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return false;
     };
-    if let Some(found @ None) = wanted.get_mut(&(entry.id, entry.kind)) {
-        *found = Some(path.clone());
-        *missing -= 1;
-    }
-    if !below || entry.kind != EntryKind::Dir || *missing == 0 {
-        return;
-    }
-    let Ok(sub) = open_dir_at(dir, name) else {
-        return;
+    let Ok(Some((dir, _))) = open_attached(root, parent, &mut |_| {}) else {
+        return false;
     };
-    let Ok(names) = list(sub.as_fd()) else {
-        return;
-    };
-    for name in names {
-        if *missing == 0 {
-            return;
-        }
-        if let Ok(stat) = stat_at(sub.as_fd(), &name) {
-            look(
-                sub.as_fd(),
-                &name,
-                path.join(&name),
-                &stat,
-                wanted,
-                missing,
-                true,
-            );
-        }
-    }
+    (stat_at(dir.as_fd(), name).ok())
+        .and_then(|stat| stat.entry())
+        .is_some_and(|entry| (entry.id, entry.kind) == key)
 }
