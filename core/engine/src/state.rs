@@ -112,7 +112,8 @@ pub struct CommitsState {
     /// The local entries a Publish answer to a first link's question released, until the server
     /// applies their create.
     pub published: BTreeSet<NodeId>,
-    /// The nodes this device sent under a pending name, while R holds each at that name.
+    /// The nodes this device sent under a pending name, while R holds each at that name, live or
+    /// in the trash, and until a move to the name it takes is acknowledged.
     pub pending: BTreeMap<NodeId, Pending>,
     /// The mass-delete guard's window and confirmed deletions.
     pub guard: GuardState,

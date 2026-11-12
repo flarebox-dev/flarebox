@@ -6189,3 +6189,26 @@ fn a_pending_name_is_kept_while_its_node_is_in_the_trash_and_dropped_once_it_is_
     build(&mut commits, &mut trees, &mut ids).unwrap();
     assert!(!commits.state().pending.contains_key("a"));
 }
+
+#[test]
+fn an_owed_rename_that_lands_is_not_sent_again_once_another_device_names_the_node_back() {
+    let (mut commits, mut trees, mut ids) =
+        owing_its_name(&[synced("a", dir(ROOT, "a (pending)"))]);
+    let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&sent), [mv("a", ROOT, "a")]);
+    trees.set_remote("a".into(), remote_at(dir(ROOT, "a"), 1));
+    trees.set_remote("a".into(), remote_at(dir(ROOT, "a (pending)"), 2));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    assert!(commits.state().pending.is_empty());
+    let next = build(&mut commits, &mut trees, &mut ids);
+    assert!(
+        next.as_ref()
+            .is_none_or(|commit| !ops(commit).contains(&mv("a", ROOT, "a"))),
+        "{:?}",
+        next.as_ref().map(ops)
+    );
+}

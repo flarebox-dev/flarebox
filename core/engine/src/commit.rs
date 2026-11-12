@@ -1109,6 +1109,12 @@ impl Commits {
                     if cycle || (applied && owed) {
                         trees.revert(id.clone());
                     }
+                    if applied
+                        && (self.pending.get(id))
+                            .is_some_and(|pending| nfc(&moved.new_name) == nfc(&pending.name))
+                    {
+                        self.pending.remove(id);
+                    }
                     (id, applied || cycle)
                 }
                 Some(op::Op::Delete(delete)) => {
