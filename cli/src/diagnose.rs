@@ -379,16 +379,21 @@ fn delimiter(c: char) -> bool {
     c.is_whitespace() || "\"'<>()[]{},;=".contains(c)
 }
 
-/// How far a path that starts `text` goes. File names hold spaces, commas, quotes and parentheses, so a path runs to
-/// the first `: ` after which the line has no other `/`, as in `<path>: Permission denied`, or to the end of the line.
-/// When in doubt it takes too much.
+/// How far a path that starts `text` goes. File and folder names hold spaces, commas, quotes, parentheses and `: `, so
+/// nothing in the text can end one, except an operating system error that ends the line, as in
+/// `<path>: Permission denied (os error 13)`. Any other path runs to the end of the line, hiding what follows it.
 fn path_len(text: &str) -> usize {
     let line = &text[..text.find('\n').unwrap_or(text.len())];
-    let end = (line.match_indices(": "))
-        .map(|(index, _)| index)
-        .find(|&index| !line[index..].contains('/'))
-        .unwrap_or(line.len());
+    let end = os_error_start(line).unwrap_or(line.len());
     line[..end].trim_end_matches(['.', ':']).len()
+}
+
+/// Where `: <description> (os error <code>)` starts at the end of `line`, as Rust shows an operating system error.
+/// The descriptions the system gives hold no `: `.
+fn os_error_start(line: &str) -> Option<usize> {
+    let (head, code) = (line.trim_end().strip_suffix(')')?).rsplit_once(" (os error ")?;
+    code.parse::<i32>().ok()?;
+    head.rfind(": ")
 }
 
 /// What a word is, when it names something: a URL, an address, a path, a file or host name, or a token.
@@ -461,7 +466,7 @@ mod tests {
                 "space_id": "s1",
                 "space_name": "Tax Returns",
                 "state": "halted",
-                "problem": "cannot read /Users/ada/Secret Plans/budget 2026.xlsx: permission denied",
+                "problem": "cannot read /Users/ada/Secret Plans/budget 2026.xlsx: Permission denied (os error 13)",
             }],
             "conditions": [{"condition": "halted", "folder": "/Users/ada/Secret Plans", "problem": null}],
         })
@@ -501,7 +506,7 @@ thread 'tokio-runtime-worker' panicked at /Users/ada/Secret Plans/ledger.rs:1:1:
         for kept in [
             "the daemon is running",
             "linked a folder space_id=s1 path=<redacted>",
-            "permission denied",
+            "Permission denied (os error 13)",
             "\"state\": \"halted\"",
             "sync of a folder halted",
             "macOS 26.1 (aarch64)",
@@ -518,7 +523,7 @@ thread 'tokio-runtime-worker' panicked at /Users/ada/Secret Plans/ledger.rs:1:1:
         assert!(text.contains("\"space_name\": \"<space-1>\""), "{text}");
         assert!(text.contains("no space is called \"<space-1>\""), "{text}");
         assert!(
-            text.contains("cannot read <folder-1><path-1>: permission denied"),
+            text.contains("cannot read <folder-1><path-1>: Permission denied (os error 13)"),
             "{text}"
         );
     }
@@ -543,19 +548,24 @@ thread 'tokio-runtime-worker' panicked at /Users/ada/Secret Plans/ledger.rs:1:1:
         };
         for (reason, error, leaks) in [
             (
-                "/Volumes/외장 SSD/가족 사진/여권 사본 (김건우 900101).jpg: Permission denied",
-                ": Permission denied",
+                "/Volumes/외장 SSD/가족 사진/여권 사본 (김건우 900101).jpg: Permission denied (os error 13)",
+                ": Permission denied (os error 13)",
                 ["김건우", "900101", "jpg"],
             ),
             (
-                "/Users/ada/Library/Mobile Documents/com~apple~CloudDocs/병원/Kim, Gunwoo - HIV 검사 결과.pdf: Operation not permitted",
-                ": Operation not permitted",
+                "/Users/ada/Library/Mobile Documents/com~apple~CloudDocs/병원/Kim, Gunwoo - HIV 검사 결과.pdf: Operation not permitted (os error 1)",
+                ": Operation not permitted (os error 1)",
                 ["Gunwoo", "HIV", "검사"],
             ),
             (
-                "/Users/ada/Documents/O'Brien Family/taxes: Permission denied",
-                ": Permission denied",
+                "/Users/ada/Documents/O'Brien Family/taxes: Permission denied (os error 13)",
+                ": Permission denied (os error 13)",
                 ["Brien", "Family", "taxes"],
+            ),
+            (
+                "/home/ada/Sync/Re: 김건우 연봉계약서.pdf: Permission denied (os error 13)",
+                ": Permission denied (os error 13)",
+                ["김건우", "연봉계약서", "pdf"],
             ),
         ] {
             let out = redactor.log_line(&line(reason));
@@ -564,6 +574,55 @@ thread 'tokio-runtime-worker' panicked at /Users/ada/Secret Plans/ledger.rs:1:1:
             for leak in leaks {
                 assert!(!out.contains(leak), "{leak} in {out}");
             }
+        }
+    }
+
+    /// Paths built from random name parts, in the lines the daemon writes about a file or folder: no word of a name
+    /// reaches the file.
+    #[test]
+    fn no_word_of_a_random_path_survives_in_the_lines_the_daemon_writes() {
+        const WORDS: [&str; 8] = [
+            "김건우",
+            "연봉계약서",
+            "여권",
+            "Jiyeon",
+            "Passport",
+            "OBrien",
+            "Interview",
+            "x7",
+        ];
+        const GLUE: [&str; 10] = [" ", ": ", ", ", " (", ")", "'", "\"", ".", "-", ""];
+        const EXTENSIONS: [&str; 4] = ["", ".pdf", ".mp4", ".tar.gz"];
+        let shapes = [
+            "2026-11-12T06:29:23.000001Z  WARN koidrive_driver::folder: sync of a folder halted space_id=s1 reason=the folder: {}: Permission denied (os error 13)",
+            "2026-11-12T06:29:23.000001Z  WARN koidrive_driver::folder: the folder cannot be observed space_id=s1 error=cannot read {}: No such file or directory (os error 2)",
+            "2026-11-12T06:29:23.000001Z  INFO koidrive_driver::driver: linked a folder space_id=s1 path={}",
+            "2026-11-12T06:29:23.000001Z  WARN koidrive_driver::folder: the folder fails its root check space_id=s1 problem={} is not a folder",
+        ];
+        let mut rng = fastrand::Rng::with_seed(262);
+        for _ in 0..2000 {
+            let mut path = String::new();
+            for _ in 0..rng.usize(1..5) {
+                path.push('/');
+                for _ in 0..rng.usize(1..5) {
+                    path.push_str(WORDS[rng.usize(..WORDS.len())]);
+                    path.push_str(GLUE[rng.usize(..GLUE.len())]);
+                }
+                path.push_str(WORDS[rng.usize(..WORDS.len())]);
+            }
+            path.push_str(EXTENSIONS[rng.usize(..EXTENSIONS.len())]);
+            let shape = shapes[rng.usize(..shapes.len())];
+            let mut redactor = Redactor::default();
+            let out = redactor.log_line(&shape.replace("{}", &path));
+            for word in WORDS {
+                assert!(!out.contains(word), "{word} in {out}\nfrom {path}");
+            }
+            let problem = redactor
+                .json(&json!({ "problem": format!("cannot read {path}: Permission denied (os error 13)") }));
+            assert!(
+                WORDS.iter().all(|word| !problem.to_string().contains(word)),
+                "{problem}"
+            );
         }
     }
 
@@ -577,8 +636,9 @@ thread 'tokio-runtime-worker' panicked at /Users/ada/Secret Plans/ledger.rs:1:1:
     #[test]
     fn a_path_with_a_colon_in_a_name_runs_to_the_last_colon_before_the_error() {
         let mut redactor = Redactor::default();
-        let out = redactor.text("cannot read /x/Meeting: Jiyeon/notes: Permission denied");
-        assert_eq!(out, "cannot read <path-1>: Permission denied");
+        let out =
+            redactor.text("cannot read /x/Meeting: Jiyeon/notes: Permission denied (os error 13)");
+        assert_eq!(out, "cannot read <path-1>: Permission denied (os error 13)");
     }
 
     #[test]

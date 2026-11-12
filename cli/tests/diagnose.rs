@@ -54,7 +54,7 @@ fn diagnose_writes_a_file_without_the_profiles_paths_names_server_or_token() {
         fs::create_dir_all(log.parent().unwrap()).unwrap();
         let folder = home.path().join("Secret Plans");
         let line = format!(
-            "2026-11-12T06:29:23.000001Z  WARN koidrive_driver::folder: sync of a folder halted space_id=s1 reason=cannot read {}/budget.xlsx at {SERVER}/v1 with {TOKEN}: permission denied\n",
+            "2026-11-12T06:29:23.000001Z  WARN koidrive_driver::folder: sync of a folder halted space_id=s1 reason=cannot read {}/budget.xlsx at {SERVER}/v1 with {TOKEN}: Permission denied (os error 13)\n",
             folder.display()
         );
         fs::write(&log, line).unwrap();
@@ -92,7 +92,7 @@ fn diagnose_writes_a_file_without_the_profiles_paths_names_server_or_token() {
     assert!(text.contains("\"device_name\": \"<device-1>\""), "{text}");
     if cfg!(target_os = "macos") {
         assert!(text.contains("sync of a folder halted"), "{text}");
-        assert!(text.contains(": permission denied"), "{text}");
+        assert!(text.contains(": Permission denied (os error 13)"), "{text}");
     }
 }
 
