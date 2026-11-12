@@ -14,6 +14,7 @@ mod logfile;
 mod notify;
 mod pairing;
 mod report;
+mod request;
 mod service;
 mod setup;
 mod telemetry;
@@ -30,8 +31,9 @@ use koidrive_driver::{
     Answer, Credential, Driver, DriverError, FolderState, FolderStatus, Limit, MAX_DELETIONS,
     Paths, Question, QuestionKind, RecoveryGroup, Status,
 };
-use koidrive_net::{Auth, Reload};
+use koidrive_net::{ApiError, Auth, Reload};
 use koidrive_proto::v1::{CreateSpaceRequest, DeviceInfo, SpaceInfo, SpaceUsage};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
@@ -46,6 +48,7 @@ use crate::report::{
     HelpData, InvitationData, Lifecycle, RefusedSpace, RevokedData, SpaceData, SpacesData,
     StatusData, UnlinkedData, UsageData, UsagesData, VersionInfoData,
 };
+use crate::request::{Begun, Key, RequestId};
 
 #[derive(Parser)]
 #[command(
@@ -214,6 +217,8 @@ enum FolderAction {
     Restart {
         /// The linked folder.
         folder: PathBuf,
+        #[command(flatten)]
+        request: RequestArg,
     },
     /// Sync a folder again whose changes the server refused, after fixing the cause the status names.
     #[command(group = clap::ArgGroup::new("how").required(true).args(["resend", "replan"]))]
@@ -226,7 +231,18 @@ enum FolderAction {
         /// Plan the refused changes again into a new commit, for a cause fixed on this device.
         #[arg(long)]
         replan: bool,
+        #[command(flatten)]
+        request: RequestArg,
     },
+}
+
+/// `--request-id`, for a change an agent may run again after a timeout.
+#[derive(clap::Args)]
+pub struct RequestArg {
+    /// An ID you pick for this change, of letters, digits, - and _. Running the command again with the same ID and
+    /// arguments returns the first outcome and changes nothing again.
+    #[arg(long, value_name = "ID", value_parser = RequestId::parse)]
+    pub request_id: Option<RequestId>,
 }
 
 #[derive(Subcommand)]
@@ -238,7 +254,10 @@ enum ServiceAction {
 #[derive(Subcommand)]
 enum DeviceAction {
     /// Show a pairing code that adds another device to this server. It works once, for 10 minutes.
-    Invite,
+    Invite {
+        #[command(flatten)]
+        request: RequestArg,
+    },
     /// List the devices paired with the server, revoked ones included.
     List,
     /// Revoke another device, such as a lost one. It stops syncing at once, and the files on it stay there.
@@ -834,6 +853,17 @@ async fn questions(paths: &Paths) -> Result<Vec<Question>, CliError> {
     }
 }
 
+/// The decision `id` once it has an answer, waiting for sync or taken by it, for an answer given again.
+async fn answered_question(paths: &Paths, id: &str) -> Result<Option<Question>, CliError> {
+    let request = Request::AnsweredQuestion {
+        question_id: id.to_owned(),
+    };
+    match ipc::run(paths, request).await? {
+        Response::AnsweredQuestion { question } => Ok(question),
+        other => Err(unexpected(other)),
+    }
+}
+
 /// `koi status`: this device, its folders and the decisions waiting in them. It succeeds whenever it reads the
 /// status; with `check` it exits with the status of the most urgent condition (see [`report::check_exit`]).
 async fn status(paths: &Paths, check: bool) -> Result<Done, CliError> {
@@ -881,10 +911,13 @@ async fn resolve(
         done.decisions = questions.iter().map(Decision::of).collect();
         return Ok(done);
     };
-    let question = (questions.iter())
-        .find(|question| question.id == id)
-        .ok_or_else(|| DriverError::QuestionNotFound(id.clone()))?;
-    let answer = answer_to(question, &word)
+    let question = match questions.into_iter().find(|question| question.id == id) {
+        Some(question) => question,
+        None => answered_question(paths, &id)
+            .await?
+            .ok_or_else(|| DriverError::QuestionNotFound(id.clone()))?,
+    };
+    let answer = answer_to(&question, &word)
         .map_err(|message| CliError::usage(message).then(&["koi", "resolve", "--json"]))?;
     let request = Request::Answer {
         question_id: id.clone(),
@@ -898,6 +931,14 @@ async fn resolve(
             },
             "Resolved.\n",
         )),
+        Response::AlreadyAnswered => Ok(Done::ok(
+            AnsweredData {
+                decision_id: id,
+                answer: word.clone(),
+            },
+            format!("Already resolved with {}.\n", printable(&word)),
+        )
+        .unchanged()),
         other => Err(unexpected(other)),
     }
 }
@@ -912,13 +953,21 @@ async fn folder(paths: &Paths, action: FolderAction) -> Result<Done, CliError> {
         FolderAction::Unlink { folder } => Request::Unlink {
             folder: absolute(&folder)?,
         },
-        FolderAction::Restart { folder } => Request::Restart {
-            folder: absolute(&folder)?,
-        },
-        FolderAction::Retry { folder, replan, .. } => Request::Lift {
-            folder: absolute(&folder)?,
+        FolderAction::Restart { folder, request } => {
+            let folder = absolute(&folder)?;
+            let key = Key::restart(&folder);
+            Request::Restart { folder }.once(request.request_id, key)
+        }
+        FolderAction::Retry {
+            folder,
             replan,
-        },
+            request,
+            ..
+        } => {
+            let folder = absolute(&folder)?;
+            let key = Key::retry(&folder, replan);
+            Request::Lift { folder, replan }.once(request.request_id, key)
+        }
     };
     match ipc::run(paths, request).await? {
         Response::Linked { folder } => {
@@ -930,6 +979,15 @@ async fn folder(paths: &Paths, action: FolderAction) -> Result<Done, CliError> {
             );
             Ok(Done::ok(FolderData::of(&folder), text))
         }
+        Response::AlreadyLinked { folder } => {
+            let text = format!(
+                "{} is already linked to space {} ({}).\n",
+                printable(&folder.path),
+                printable(&folder.space_name),
+                printable(&folder.space_id)
+            );
+            Ok(Done::ok(FolderData::of(&folder), text).unchanged())
+        }
         Response::Unlinked { space_id, path } => {
             let text = format!(
                 "Unlinked {} from space {}. Its files and its .koidrive folder stay.\n",
@@ -937,10 +995,22 @@ async fn folder(paths: &Paths, action: FolderAction) -> Result<Done, CliError> {
                 printable(&space_id)
             );
             let data = UnlinkedData {
-                space_id,
+                space_id: Some(space_id),
                 path: path.display().to_string(),
             };
             Ok(Done::ok(data, text))
+        }
+        Response::NotLinked { path } => {
+            let path = path.display().to_string();
+            let text = format!(
+                "{} is not linked, so there is nothing to unlink.\n",
+                printable(&path)
+            );
+            let data = UnlinkedData {
+                space_id: None,
+                path,
+            };
+            Ok(Done::ok(data, text).unchanged())
         }
         Response::Restarted { folder } => restarted(folder),
         other => Err(unexpected(other)),
@@ -1004,41 +1074,65 @@ async fn device(paths: Paths, action: DeviceAction) -> Result<Done, CliError> {
     let auth = signed_in(&paths)?;
     match action {
         DeviceAction::List => {
-            let mut devices = Vec::new();
-            let mut cursor = String::new();
-            loop {
-                let page = auth.api().list_devices(&auth, &cursor).await?;
-                devices.extend(page.devices);
-                if page.next_cursor.is_empty() {
-                    break;
-                }
-                cursor = page.next_cursor;
-            }
+            let devices = devices(&auth).await?;
             let data = DevicesData {
                 devices: devices.iter().map(DeviceData::of).collect(),
             };
             Ok(Done::ok(data, device_table(&devices, now_ms())))
         }
-        DeviceAction::Invite => {
-            let started = auth.api().pair_start(&auth).await?;
-            let minutes = ((started.expires_at_ms - now_ms() + 59_999) / 60_000).max(1);
-            let code = pairing::join_args(&started.code, auth.api().base());
-            let note = format!(
-                "On the new device, run:\n  koi join {code}\nThe code works once, for about {minutes} minutes.\n"
-            );
-            let mut join_argv = vec!["koi".to_owned(), "join".to_owned()];
-            join_argv.extend(pairing::join_argv(&started.code, auth.api().base()));
-            let data = InvitationData {
-                join_argv,
+        DeviceAction::Invite { request } => {
+            let claim = match request.request_id {
+                None => None,
+                Some(id) => {
+                    let key = Key::new(
+                        "device invite",
+                        serde_json::json!({
+                            "server": auth.api().base().to_string(),
+                            "device_id": auth.credentials().device_id,
+                        }),
+                    );
+                    match request::begin(&paths, &id, &key)? {
+                        Begun::Done(recorded) => {
+                            let invitation = serde_json::from_value(recorded).map_err(|error| {
+                                format!("the record of the request {id} cannot be read: {error}")
+                            })?;
+                            return replayed(&id, &invitation, now_ms());
+                        }
+                        Begun::Claimed(claim) => Some(claim),
+                    }
+                }
+            };
+            let started = match auth.api().pair_start(&auth).await {
+                Ok(started) => started,
+                Err(error) => {
+                    if let Some(claim) = claim.filter(|_| refused(&error)) {
+                        claim.abandon();
+                    }
+                    return Err(error.into());
+                }
+            };
+            let invitation = Invitation {
+                code: started.code,
+                server: auth.api().base().to_string(),
                 expires_at_ms: started.expires_at_ms,
             };
-            Ok(Done::value(data, &code, note))
+            if let Some(claim) = claim {
+                claim.finish(&invitation)?;
+            }
+            invited(&invitation, now_ms())
         }
         DeviceAction::Revoke { id } => {
             if id == auth.credentials().device_id {
                 return Err(CliError::usage(
                     "this device cannot revoke itself; revoke it from another device",
                 ));
+            }
+            let revoked = devices(&auth).await.is_ok_and(|devices| {
+                (devices.iter()).any(|device| device.device_id == id && device.revoked_at_ms != 0)
+            });
+            if revoked {
+                let text = format!("Device {id} is already revoked.\n");
+                return Ok(Done::ok(RevokedData { device_id: id }, text).unchanged());
             }
             auth.api().revoke_device(&auth, &id).await?;
             let text = format!(
@@ -1049,8 +1143,78 @@ async fn device(paths: Paths, action: DeviceAction) -> Result<Done, CliError> {
     }
 }
 
-/// Runs a space command. Creating refuses a name another space has, since koi folder link names a space by its
-/// name.
+/// Whether the call changed nothing on the server: it was never sent, or the server refused it with a 4xx status. Without
+/// an answer, or with a 5xx status, whether or not its error could be read, the call may have changed something.
+fn refused(error: &ApiError) -> bool {
+    match error {
+        ApiError::Url(_) | ApiError::PathSegment(_) | ApiError::Credential(_) => true,
+        ApiError::Server { status, .. }
+        | ApiError::Status { status }
+        | ApiError::Unreadable { status } => (400..500).contains(status),
+        ApiError::Transport(_) | ApiError::TooLarge { .. } | ApiError::Decode(_) => false,
+    }
+}
+
+/// Every device of the account, page by page. A page that repeats an earlier cursor ends the listing as undecodable, as
+/// in `Api::list_spaces`.
+async fn devices(auth: &Auth) -> Result<Vec<DeviceInfo>, CliError> {
+    let mut devices = Vec::new();
+    let mut cursor = String::new();
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        let page = auth.api().list_devices(auth, &cursor).await?;
+        devices.extend(page.devices);
+        if page.next_cursor.is_empty() {
+            return Ok(devices);
+        }
+        if !seen.insert(page.next_cursor.clone()) {
+            return Err(ApiError::Decode("DeviceList").into());
+        }
+        cursor = page.next_cursor;
+    }
+}
+
+/// A pairing code `koi device invite` showed, as its request record keeps it.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct Invitation {
+    code: String,
+    server: String,
+    expires_at_ms: i64,
+}
+
+/// What `koi device invite` shows for `invitation`: the code on stdout, how to use it on stderr.
+fn invited(invitation: &Invitation, now_ms: i64) -> Result<Done, CliError> {
+    let server = url::Url::parse(&invitation.server).map_err(|error| error.to_string())?;
+    let minutes = ((invitation.expires_at_ms - now_ms + 59_999) / 60_000).max(1);
+    let code = pairing::join_args(&invitation.code, &server);
+    let note = format!(
+        "On the new device, run:\n  koi join {code}\nThe code works once, for about {minutes} minutes.\n"
+    );
+    let mut join_argv = vec!["koi".to_owned(), "join".to_owned()];
+    join_argv.extend(pairing::join_argv(&invitation.code, &server));
+    let data = InvitationData {
+        join_argv,
+        expires_at_ms: invitation.expires_at_ms,
+    };
+    Ok(Done::value(data, &code, note))
+}
+
+/// The invitation the request `id` showed before, or a stale request once it expired.
+fn replayed(id: &RequestId, invitation: &Invitation, now_ms: i64) -> Result<Done, CliError> {
+    if invitation.expires_at_ms <= now_ms {
+        return Err(CliError::new(
+            Code::StaleDecision,
+            format!(
+                "stale request: the pairing code of the request {id} expired; run koi device invite with a new \
+                 request ID"
+            ),
+        ));
+    }
+    invited(invitation, now_ms)
+}
+
+/// Runs a space command. Creating a name another space has returns that space, also when another run creates it at the
+/// same time, since koi folder link names a space by its name and the server keeps names unique.
 async fn space(paths: Paths, action: SpaceAction) -> Result<Done, CliError> {
     let auth = signed_in(&paths)?;
     let spaces = auth.api().list_spaces(&auth).await?.spaces;
@@ -1067,21 +1231,31 @@ async fn space(paths: Paths, action: SpaceAction) -> Result<Done, CliError> {
             if name.is_empty() {
                 return Err(CliError::usage("a space needs a name"));
             }
-            if let Some(taken) = spaces.iter().find(|space| space.name == name) {
-                return Err(CliError::usage(format!(
-                    "the space {} already has that name; link a folder to it, or pick another name",
-                    printable(&taken.space_id)
-                )));
+            let existing = |spaces: &[SpaceInfo]| {
+                let existing = spaces.iter().find(|space| space.name == name)?;
+                let id = printable(&existing.space_id);
+                let note = format!(
+                    "The space {} ({id}) already exists.\nLink a folder to it with koi folder link <folder> --space {id}.\n",
+                    printable(&existing.name),
+                );
+                Some(Done::value(SpaceData::of(existing), &id, note).unchanged())
+            };
+            if let Some(done) = existing(&spaces) {
+                return Ok(done);
             }
-            let created = auth
-                .api()
-                .create_space(
-                    &auth,
-                    &CreateSpaceRequest {
-                        name: name.to_owned(),
-                    },
-                )
-                .await?;
+            let request = CreateSpaceRequest {
+                name: name.to_owned(),
+            };
+            let created = match auth.api().create_space(&auth, &request).await {
+                Ok(created) => created,
+                Err(error) => {
+                    let now = auth.api().list_spaces(&auth).await.map(|list| list.spaces);
+                    return match now.ok().as_deref().and_then(existing) {
+                        Some(done) => Ok(done),
+                        None => Err(error.into()),
+                    };
+                }
+            };
             let id = printable(&created.space_id);
             let note = format!(
                 "Created the space {} ({id}).\nLink a folder to it with koi folder link <folder> --space {id}.\n",
@@ -1715,6 +1889,227 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Option<Command>, clap::Error> {
         Cli::try_parse_from(args).map(|cli| cli.command)
+    }
+
+    /// Answers one request per entry of `replies`, a status and a body, on a loopback port, in order, and returns the
+    /// server's URL and, once all are answered, the path of each request.
+    async fn serve(replies: Vec<(u16, Vec<u8>)>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = format!("http://{}/", listener.local_addr().unwrap());
+        let served = tokio::spawn(async move {
+            let mut paths = Vec::new();
+            for (status, body) in replies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                let read = socket.read(&mut request).await.unwrap();
+                let line = String::from_utf8_lossy(&request[..read])
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_owned();
+                paths.push(line.split(' ').nth(1).unwrap().to_owned());
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+            }
+            paths
+        });
+        (server, served)
+    }
+
+    fn token() -> (u16, Vec<u8>) {
+        let token = koidrive_proto::v1::AccessToken {
+            token: "token".into(),
+            expires_at_ms: i64::MAX,
+            ..Default::default()
+        };
+        (200, prost::Message::encode_to_vec(&token))
+    }
+
+    /// Saves a credential of `device_id` for `server` in `paths`, in place of any other.
+    fn signed_in_as(paths: &Paths, server: &str, device_id: &str) {
+        let _ = std::fs::remove_file(paths.credential());
+        Credential {
+            server: server.into(),
+            user_id: "u1".into(),
+            user_name: None,
+            device_id: device_id.into(),
+            device_name: "vm".into(),
+            refresh_credential: "secret".into(),
+        }
+        .save_new(&paths.credential())
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_device_list_stops_at_a_cursor_it_has_seen() {
+        let page = |cursor: &str| {
+            let page = koidrive_proto::v1::DeviceList {
+                devices: vec![DeviceInfo {
+                    device_id: cursor.into(),
+                    ..Default::default()
+                }],
+                next_cursor: cursor.into(),
+            };
+            (200, prost::Message::encode_to_vec(&page))
+        };
+        let (server, served) = serve(vec![token(), page("a"), page("b"), page("a")]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        signed_in_as(&paths, &server, "d1");
+        let auth = signed_in(&paths).unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), devices(&auth))
+            .await
+            .expect("the listing ended");
+        assert_eq!(outcome.unwrap_err().code, Code::Failed);
+        assert_eq!(served.await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_space_another_run_created_first_is_unchanged() {
+        let list = |spaces: Vec<SpaceInfo>| {
+            let list = koidrive_proto::v1::SpaceList {
+                spaces,
+                ..Default::default()
+            };
+            (200, prost::Message::encode_to_vec(&list))
+        };
+        let taken = koidrive_proto::v1::Error {
+            code: koidrive_proto::v1::error::Code::InvalidArgument as i32,
+            message: "you already have a space with this name".into(),
+            ..Default::default()
+        };
+        let notes = SpaceInfo {
+            space_id: ID.into(),
+            name: "Notes".into(),
+            ..Default::default()
+        };
+        let (server, served) = serve(vec![
+            token(),
+            list(Vec::new()),
+            (400, prost::Message::encode_to_vec(&taken)),
+            list(vec![notes]),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        signed_in_as(&paths, &server, "d1");
+        let create = SpaceAction::Create {
+            name: "Notes".into(),
+        };
+        let done = space(paths, create).await.unwrap();
+        assert_eq!(done.outcome, crate::report::Outcome::Unchanged);
+        assert_eq!(done.text, format!("{ID}\n"));
+        assert_eq!(
+            served.await.unwrap(),
+            ["/v1/token", "/v1/spaces", "/v1/spaces", "/v1/spaces"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replayed_invitation_belongs_to_the_device_that_asked_for_it() {
+        let started = koidrive_proto::v1::PairStartResponse {
+            code: "K7QM-2XPD".into(),
+            expires_at_ms: i64::MAX,
+        };
+        let started = (200, prost::Message::encode_to_vec(&started));
+        let (server, served) = serve(vec![token(), started]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let invite = || {
+            device(
+                paths.clone(),
+                DeviceAction::Invite {
+                    request: RequestArg {
+                        request_id: Some(RequestId::parse("r1").unwrap()),
+                    },
+                },
+            )
+        };
+        signed_in_as(&paths, &server, "d1");
+        let first = invite().await.unwrap();
+        assert_eq!(invite().await.unwrap().text, first.text);
+        signed_in_as(&paths, &server, "d2");
+        let other = invite().await.unwrap_err();
+        assert_eq!(other.code, Code::StaleDecision, "{other:?}");
+        assert_eq!(served.await.unwrap(), ["/v1/token", "/v1/pair/start"]);
+    }
+
+    #[test]
+    fn a_replayed_invitation_shows_the_first_code_until_it_expires() {
+        let invitation = Invitation {
+            code: "K7QM-2XPD".into(),
+            server: "https://files.example.com/".into(),
+            expires_at_ms: 600_000,
+        };
+        let id = RequestId::parse("r1").unwrap();
+        let first = invited(&invitation, 0).unwrap();
+        assert_eq!(first.text, "K7QM-2XPD@files.example.com\n");
+        let again = replayed(&id, &invitation, 599_999).unwrap();
+        assert_eq!(
+            (again.outcome, &again.data, &again.text),
+            (first.outcome, &first.data, &first.text)
+        );
+        let expired = replayed(&id, &invitation, 600_000).unwrap_err();
+        assert_eq!(expired.code, Code::StaleDecision);
+        assert_eq!(
+            expired.message,
+            "stale request: the pairing code of the request r1 expired; run koi device invite with a new request ID"
+        );
+        assert!(expired.next.is_empty());
+    }
+
+    #[test]
+    fn only_a_refusal_the_server_sent_counts_as_no_change() {
+        let refusal = ApiError::Server {
+            status: 429,
+            error: koidrive_net::ServerError(koidrive_proto::v1::Error::default()),
+        };
+        assert!(refused(&refusal));
+        assert!(refused(&ApiError::Status { status: 403 }));
+        assert!(refused(&ApiError::Unreadable { status: 400 }));
+        let transport = reqwest::Client::new().get("not a url").build().unwrap_err();
+        let internal = koidrive_proto::v1::Error {
+            code: koidrive_proto::v1::error::Code::Internal as i32,
+            ..Default::default()
+        };
+        for unknown in [
+            ApiError::Server {
+                status: 500,
+                error: koidrive_net::ServerError(internal),
+            },
+            ApiError::Transport(transport),
+            ApiError::Status { status: 504 },
+            ApiError::Unreadable { status: 502 },
+            ApiError::Decode("PairStartResponse"),
+            ApiError::TooLarge { limit: 1 },
+        ] {
+            assert!(!refused(&unknown), "{unknown:?}");
+        }
+    }
+
+    #[test]
+    fn request_ids_are_checked_where_they_are_parsed() {
+        assert!(parse(&["koi", "folder", "restart", "/a", "--request-id", "r-1_a"]).is_ok());
+        assert!(parse(&["koi", "device", "invite", "--request-id", "r1"]).is_ok());
+        assert!(parse(&["koi", "history", "restore", "a.txt", "--request-id", "r1"]).is_ok());
+        let error = parse(&[
+            "koi",
+            "folder",
+            "retry",
+            "/a",
+            "--resend",
+            "--request-id",
+            "../r1",
+        ])
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), ErrorKind::ValueValidation);
     }
 
     #[test]

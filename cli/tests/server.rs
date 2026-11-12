@@ -200,11 +200,15 @@ impl Machine {
 
     /// The data of the command's JSON envelope, after checking that the command succeeded.
     fn data(&self, args: &[&str]) -> Value {
+        self.envelope(args)["data"].clone()
+    }
+
+    fn envelope(&self, args: &[&str]) -> Value {
         let args: Vec<&str> = args.iter().copied().chain(["--json"]).collect();
         let envelope: Value = serde_json::from_str(&self.run(&args)).unwrap();
         assert_eq!(envelope["schema_version"], 1, "{envelope:#}");
         assert_eq!(envelope["error"], Value::Null, "{envelope:#}");
-        envelope["data"].clone()
+        envelope
     }
 
     /// Every entry of the profile's directories with its modification time and, for a file, its contents.
@@ -437,10 +441,41 @@ async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
             status["folders"][0]["state"] == "up_to_date"
         })
         .await;
+    let restart = ["folder", "restart", "Sync", "--request-id", "restart-1"];
+    let restarted = machine.envelope(&restart);
+    assert_eq!(restarted["outcome"], "ok", "{restarted:#}");
+    machine
+        .status_until("the folder restarted by request up to date", |status| {
+            status["folders"][0]["state"] == "up_to_date"
+        })
+        .await;
+    assert_eq!(machine.envelope(&restart), restarted, "the first outcome");
+    let output = machine.output(&["folder", "restart", "Sync", "--request-id", "restart-1"]);
+    let replayed = machine.output(&["folder", "restart", "Sync", "--request-id", "restart-1"]);
+    assert_eq!(
+        (&output.status, &output.stdout),
+        (&replayed.status, &replayed.stdout)
+    );
+    let stale = machine.output(&[
+        "folder",
+        "retry",
+        "Sync",
+        "--resend",
+        "--request-id",
+        "restart-1",
+        "--json",
+    ]);
+    assert_eq!(stale.status.code(), Some(7), "{stale:?}");
+    let envelope: Value = serde_json::from_slice(&stale.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "stale_decision", "{envelope:#}");
+    assert_eq!(envelope["next_commands"], Value::Array(Vec::new()));
 
     let unlinked = machine.run(&["folder", "unlink", "Sync"]);
     assert!(unlinked.contains(&space.space_id), "{unlinked}");
     assert_eq!(machine.status()["folders"], Value::Array(vec![]));
+    let again = machine.envelope(&["folder", "unlink", "Sync"]);
+    assert_eq!(again["outcome"], "unchanged", "{again:#}");
+    assert_eq!(again["data"]["space_id"], Value::Null, "{again:#}");
     assert!(
         !machine
             .path(&format!("state/koidrive/spaces/{}", space.space_id))
@@ -538,6 +573,9 @@ async fn a_device_revokes_a_lost_one_and_stops_syncing_when_another_revokes_it()
     assert!(own.contains("cannot revoke itself"), "{own}");
     let revoked = machine.run(&["device", "revoke", &lost.device_id]);
     assert!(revoked.starts_with("Revoked device"), "{revoked}");
+    let again = machine.envelope(&["device", "revoke", &lost.device_id]);
+    assert_eq!(again["outcome"], "unchanged", "{again:#}");
+    assert_eq!(again["data"]["device_id"], lost.device_id.as_str());
     let refresh = api()
         .token(&TokenRequest {
             device_id: lost.device_id.clone(),
@@ -1181,7 +1219,14 @@ async fn restore_brings_back_a_deleted_file_and_an_earlier_version() {
     let first = versions[1]["version_id"].as_str().unwrap();
     let again = machine.fails(&["history", "restore", note_arg, "--version", current]);
     assert!(again.contains("already the current version"), "{again}");
-    let asked = machine.output(&["history", "restore", gone_path.to_str().unwrap()]);
+    let restore_gone = [
+        "history",
+        "restore",
+        gone_path.to_str().unwrap(),
+        "--request-id",
+        "restore-gone",
+    ];
+    let asked = machine.output(&restore_gone);
     assert!(asked.status.success(), "{asked:?}");
     let stdout = String::from_utf8(asked.stdout).unwrap();
     let id = stdout
@@ -1222,6 +1267,32 @@ async fn restore_brings_back_a_deleted_file_and_an_earlier_version() {
     assert!(!report.contains("pending"), "{report}");
     let trash = machine.run(&["history", "trash", folder_arg]);
     assert!(trash.contains("Nothing from"), "{trash}");
+    assert_eq!(machine.run(&restore_gone), stdout, "the first restore");
+    let replayed = machine.envelope(&restore_gone);
+    assert_eq!(replayed["outcome"], "accepted", "{replayed:#}");
+    assert_eq!(replayed["data"]["request_id"], id);
+    assert_eq!(replayed["data"]["path"], "docs/gone.txt");
+    let count = restores().as_array().unwrap().len();
+    assert_eq!(count, 2, "no second restore");
+    let stale = machine.output(&[
+        "history",
+        "restore",
+        note_arg,
+        "--request-id",
+        "restore-gone",
+    ]);
+    assert_eq!(stale.status.code(), Some(7), "{stale:?}");
+    let stale = String::from_utf8(stale.stderr).unwrap();
+    assert!(stale.contains("stale request"), "{stale}");
+    machine.run(&["folder", "unlink", folder_arg]);
+    let unlinked = machine.envelope(&restore_gone);
+    assert_eq!(unlinked["outcome"], "accepted", "{unlinked:#}");
+    assert_eq!(unlinked["data"], replayed["data"], "{unlinked:#}");
+    assert_eq!(
+        unlinked["next_commands"],
+        serde_json::json!([]),
+        "{unlinked:#}"
+    );
     assert!(stop(daemon).success());
 }
 
@@ -1255,8 +1326,33 @@ async fn a_device_creates_a_space_and_links_a_folder_to_it() {
     assert_eq!(created, format!("{space_id}\n"), "only the ID");
     let listed = machine.run(&["space", "list"]);
     assert!(listed.contains(&format!("{space_id}  {name}")), "{listed}");
-    let again = machine.fails(&["space", "create", &name]);
-    assert!(again.contains("already has that name"), "{again}");
+    let again = machine.output(&["space", "create", &name]);
+    assert!(again.status.success(), "{again:?}");
+    assert_eq!(
+        String::from_utf8(again.stdout).unwrap(),
+        created,
+        "the same ID"
+    );
+    let note = String::from_utf8(again.stderr).unwrap();
+    assert!(
+        note.starts_with(&format!("The space {name} ({space_id}) already exists.\n")),
+        "{note}"
+    );
+    let again = machine.envelope(&["space", "create", &name]);
+    assert_eq!(again["outcome"], "unchanged", "{again:#}");
+    assert_eq!(again["data"]["space_id"], space_id);
+    assert_eq!(
+        owner
+            .api()
+            .list_spaces(&owner)
+            .await
+            .unwrap()
+            .spaces
+            .iter()
+            .filter(|space| space.name == name)
+            .count(),
+        1
+    );
     let blank = machine.fails(&["space", "create", "  "]);
     assert!(blank.contains("a space needs a name"), "{blank}");
 
@@ -1264,6 +1360,25 @@ async fn a_device_creates_a_space_and_links_a_folder_to_it() {
     fs::create_dir_all(&folder).unwrap();
     let linked = machine.run(&["folder", "link", folder.to_str().unwrap(), "--space", &name]);
     assert!(linked.contains(space_id), "{linked}");
+    for space in [name.as_str(), space_id] {
+        let again =
+            machine.envelope(&["folder", "link", folder.to_str().unwrap(), "--space", space]);
+        assert_eq!(again["outcome"], "unchanged", "{again:#}");
+        assert_eq!(again["data"]["space_id"], space_id);
+    }
+    let other = format!("other {}", uuidv7());
+    machine.run(&["space", "create", &other]);
+    let refused = machine.fails(&[
+        "folder",
+        "link",
+        folder.to_str().unwrap(),
+        "--space",
+        &other,
+    ]);
+    assert!(refused.contains("overlaps the linked folder"), "{refused}");
+    let folders = machine.status()["folders"].clone();
+    assert_eq!(folders.as_array().unwrap().len(), 1, "{folders:#}");
+    assert_eq!(folders[0]["space_id"], space_id);
     let owners = owner.api().list_spaces(&owner).await.unwrap().spaces;
     assert!(
         owners.iter().any(|space| space.space_id == space_id),
@@ -1291,14 +1406,17 @@ async fn two_creates_of_one_name_at_once_make_one_space() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy = format!("http://{}/", listener.local_addr().unwrap());
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let listings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let upstream = server_url();
     let service = tokio::spawn(async move {
         while let Ok((tcp, _)) = listener.accept().await {
             let barrier = barrier.clone();
+            let listings = listings.clone();
             let upstream = upstream.clone();
             tokio::spawn(async move {
                 let handler = service_fn(move |request: Request<Incoming>| {
                     let barrier = barrier.clone();
+                    let listings = listings.clone();
                     let upstream = upstream.clone();
                     async move {
                         let (parts, body) = request.into_parts();
@@ -1320,7 +1438,8 @@ async fn two_creates_of_one_name_at_once_make_one_space() {
                         let response = call.send().await.unwrap();
                         let status = response.status();
                         let body = response.bytes().await.unwrap();
-                        if listing {
+                        if listing && listings.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2
+                        {
                             barrier.wait().await;
                         }
                         Ok::<_, std::convert::Infallible>(
@@ -1370,27 +1489,33 @@ async fn two_creates_of_one_name_at_once_make_one_space() {
     fs::create_dir(&root).unwrap();
     credential["server"] = server_url().to_string().into();
     fs::write(&path, serde_json::to_vec(&credential).unwrap()).unwrap();
-    let created = outcomes
-        .iter()
-        .filter(|result| result.status.success())
-        .count();
-    let refused: Vec<String> = outcomes
-        .iter()
-        .filter(|result| !result.status.success())
-        .map(|result| String::from_utf8_lossy(&result.stderr).into_owned())
-        .collect();
-    assert_eq!((created, refused.len()), (1, 1), "{outcomes:?}");
-    assert!(
-        refused[0].contains("already have a space with this name"),
-        "{}",
-        refused[0]
-    );
     assert_eq!(count, 1, "both creates of one name made a space");
     let space_id = &spaces
         .iter()
         .find(|space| space.name == name)
         .unwrap()
         .space_id;
+    for outcome in &outcomes {
+        assert!(outcome.status.success(), "{outcome:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&outcome.stdout),
+            format!(
+                "{space_id}
+"
+            )
+        );
+    }
+    let notes: Vec<String> = (outcomes.iter())
+        .map(|outcome| String::from_utf8_lossy(&outcome.stderr).into_owned())
+        .collect();
+    assert_eq!(
+        notes
+            .iter()
+            .filter(|note| note.starts_with("Created the space"))
+            .count(),
+        1,
+        "{notes:?}"
+    );
     let linked = machine.run(&["folder", "link", root.to_str().unwrap(), "--space", &name]);
     assert!(linked.contains(space_id.as_str()), "{linked}");
 }
@@ -1435,6 +1560,34 @@ async fn a_device_shows_a_pairing_code_that_adds_another() {
     );
     let again = Machine::new().fails(&join);
     assert!(again.contains("invalid or expired pairing code"), "{again}");
+
+    let invite = ["device", "invite", "--request-id", "invite-1"];
+    let traced = first
+        .command(&[&invite[..], &["--json"]].concat())
+        .env("KOIDRIVE_LOG", "trace")
+        .output()
+        .unwrap();
+    assert!(traced.status.success(), "{traced:?}");
+    let asked: Value = serde_json::from_slice(&traced.stdout).unwrap();
+    assert_eq!(asked["outcome"], "ok", "{asked:#}");
+    let code = asked["data"]["join_argv"][2].as_str().unwrap();
+    let logs = String::from_utf8(traced.stderr).unwrap();
+    assert!(!logs.contains(code.split('@').next().unwrap()), "{logs}");
+    assert_eq!(first.envelope(&invite), asked, "the first invitation");
+    let shown = first.run(&invite);
+    assert!(
+        shown.starts_with(code.split('@').next().unwrap()),
+        "{shown}"
+    );
+    let mut join = vec!["join"];
+    let argv: Vec<&str> = (asked["data"]["join_argv"].as_array().unwrap().iter())
+        .skip(2)
+        .map(|arg| arg.as_str().unwrap())
+        .collect();
+    join.extend(&argv);
+    join.extend(["--name", "third"]);
+    let paired = Machine::new().run(&join);
+    assert!(paired.starts_with("Paired as third"), "{paired}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

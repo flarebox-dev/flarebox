@@ -29,9 +29,10 @@ pub enum Code {
     Halted,
     /// The server or the network is offline, unavailable or limits the rate for now.
     Unavailable,
-    /// The decision answered no longer exists.
+    /// The decision answered no longer exists, or a request ID was used before with other arguments or for a pairing
+    /// code that has expired.
     StaleDecision,
-    /// A signal stopped the command.
+    /// A signal stopped the command, or an earlier run with the same request ID has no recorded outcome.
     Interrupted,
 }
 
@@ -211,14 +212,22 @@ impl From<DriverError> for CliError {
                 CliError::new(Code::AuthRequired, message).then(&["koi", "setup"])
             }
             DriverError::NeedsConfirmation => CliError::new(Code::AuthRequired, message),
-            DriverError::QuestionNotFound(_) => CliError::new(
-                Code::StaleDecision,
-                format!("{message}; koi resolve lists the decisions waiting now"),
-            )
-            .then(&["koi", "resolve", "--json"]),
+            DriverError::QuestionNotFound(_) | DriverError::AnsweredOtherwise { .. } => {
+                CliError::new(
+                    Code::StaleDecision,
+                    format!("{message}; koi resolve lists the decisions waiting now"),
+                )
+                .then(&["koi", "resolve", "--json"])
+            }
             DriverError::AnswerNotAllowed { .. } => {
                 CliError::usage(message).then(&["koi", "resolve", "--json"])
             }
+            DriverError::UnlinkUnfinished(folder) => CliError::usage(message).then(&[
+                "koi",
+                "folder",
+                "unlink",
+                &folder.display().to_string(),
+            ]),
             DriverError::EmptyName
             | DriverError::EmptyUserName
             | DriverError::SpaceNotFound(_)
@@ -232,6 +241,7 @@ impl From<DriverError> for CliError {
             | DriverError::FolderHoldsProfile(_)
             | DriverError::FolderOverlaps(_)
             | DriverError::FolderOfOtherDevice { .. }
+            | DriverError::LinkedByOtherDevice { .. }
             | DriverError::SpaceAlreadyLinked(_)
             | DriverError::MarkerOfOtherSpace(_)
             | DriverError::UnsupportedFileSystem
@@ -366,6 +376,10 @@ mod tests {
             DriverError::FolderHoldsProfile(PathBuf::from("/home/ada/.local/state/koidrive")),
             DriverError::FolderOfOtherDevice {
                 device_id: "d2".into(),
+                server: "https://files.example.com".into(),
+            },
+            DriverError::LinkedByOtherDevice {
+                device_id: "d1".into(),
                 server: "https://files.example.com".into(),
             },
             DriverError::SpaceAlreadyLinked(PathBuf::from("/home/ada/Docs")),

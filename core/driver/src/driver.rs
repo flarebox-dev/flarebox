@@ -91,6 +91,10 @@ pub enum DriverError {
         "the folder is linked by device {device_id} of {server}; unlink it there first, or remove its .koidrive/device.json"
     )]
     FolderOfOtherDevice { device_id: String, server: String },
+    #[error(
+        "the folder was linked by device {device_id} of {server}, not by this profile's device; unlink it and link it again"
+    )]
+    LinkedByOtherDevice { device_id: String, server: String },
     #[error("the space is already linked to {} on this device", koidrive_fs::quoted(.0))]
     SpaceAlreadyLinked(PathBuf),
     #[error(
@@ -103,8 +107,15 @@ pub enum DriverError {
     UnsupportedFileSystem,
     #[error("{} is not a linked folder", koidrive_fs::quoted(.0))]
     NotLinked(PathBuf),
+    #[error(
+        "unlinking {} did not finish; unlink it again to finish",
+        koidrive_fs::quoted(.0)
+    )]
+    UnlinkUnfinished(PathBuf),
     #[error("no unanswered question has the id {0:?}")]
     QuestionNotFound(String),
+    #[error("the question was answered with {given}")]
+    AnsweredOtherwise { given: Answer },
     #[error("the question accepts only {}", allowed.iter().map(|a| a.as_str()).collect::<Vec<_>>().join(" or "))]
     AnswerNotAllowed { allowed: &'static [Answer] },
     #[error("no linked folder syncs the space {0:?}")]
@@ -165,6 +176,24 @@ pub(crate) fn lift_halt(path: &Path, lift: Lift) -> Result<(), DriverError> {
         LiftError::NotHalted => DriverError::NothingToLift,
         LiftError::NeedsConfirmation => DriverError::NeedsConfirmation,
     })
+}
+
+/// What [`Driver::answer`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answered {
+    /// The answer is recorded now.
+    Now,
+    /// The question had this answer already, waiting for the engine or taken by it, and nothing changed.
+    Already,
+}
+
+/// What [`Driver::link`] did, with the folder's status.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Linked {
+    /// The folder is linked now.
+    New(FolderStatus),
+    /// The folder was already linked to the space, and nothing changed.
+    Already(FolderStatus),
 }
 
 /// Runs sync for the folders one profile links. The Linux daemon and the macOS app use it alike: the daemon serves
@@ -626,8 +655,9 @@ impl Driver {
     }
 
     /// Links `folder` to the space with id or name `space`: checks the folder, writes its root marker, and creates
-    /// its store. The folder starts syncing at once if the driver is running.
-    pub async fn link(&self, folder: &Path, space: &str) -> Result<FolderStatus, DriverError> {
+    /// its store. The folder starts syncing at once if the driver is running. A folder already linked to that space
+    /// stays as it is, and one linked to another space is refused.
+    pub async fn link(&self, folder: &Path, space: &str) -> Result<Linked, DriverError> {
         let _lifecycle = self.inner.lifecycle.lock().await;
         let credential = self.credential()?;
         let root = fs::canonicalize(folder).map_err(|error| match error.kind() {
@@ -636,6 +666,33 @@ impl Driver {
         })?;
         if !root.is_dir() {
             return Err(DriverError::NotAFolder(root));
+        }
+        let here = (self.inner.folders.lock().unwrap().values())
+            .find(|linked| linked.link.root == root)
+            .map(|linked| {
+                let status = linked.status.lock().unwrap().clone();
+                (linked.link.clone(), status, linked.unlink.is_some())
+            });
+        if let Some((link, status, unlinking)) = here {
+            if unlinking {
+                return Err(DriverError::UnlinkUnfinished(root));
+            }
+            if link.device_id != credential.device_id || link.server_url != credential.server {
+                return Err(DriverError::LinkedByOtherDevice {
+                    device_id: link.device_id,
+                    server: link.server_url,
+                });
+            }
+            let space_id = link.space_id;
+            let same = space == space_id || {
+                let auth = self.auth(&credential)?;
+                resolve_space(auth.api().list_spaces(&auth).await?.spaces, space)?.space_id
+                    == space_id
+            };
+            return match same {
+                true => Ok(Linked::Already(status)),
+                false => Err(DriverError::FolderOverlaps(root)),
+            };
         }
         self.check_placement(&root, &self.inner.folders.lock().unwrap())?;
         if !probe_no_replace(&root).map_err(io_error(&root))? {
@@ -716,7 +773,7 @@ impl Driver {
         drop(folders);
         self.changed();
         let status = status.lock().unwrap().clone();
-        Ok(status)
+        Ok(Linked::New(status))
     }
 
     /// Stops syncing the folder at `folder` and forgets its sync state. The files stay, and so does the folder's
@@ -806,18 +863,58 @@ impl Driver {
         Ok(questions)
     }
 
+    /// The question `question_id` once it has an answer, while the answer waits for the engine or after the engine took
+    /// it, so that an answer given again can be read against it. None when the question is unanswered or the engine
+    /// dropped it before it took an answer.
+    pub fn answered_question(&self, question_id: &str) -> Result<Option<Question>, DriverError> {
+        for space_id in self.space_ids() {
+            let path = self.inner.paths.store(&space_id)?;
+            let mut store = Store::open(&path).map_err(store_error(&path))?;
+            let stored = store
+                .transaction(|tx| {
+                    let current = (tx.questions()?.into_iter())
+                        .find(|stored| stored.question_id == question_id);
+                    match current {
+                        Some(stored) => Ok(stored.answer.is_some().then_some(stored)),
+                        None => tx.taken_question(question_id),
+                    }
+                })
+                .map_err(store_error(&path))?;
+            if let Some(question) = stored.and_then(|stored| decode_question(&space_id, &stored)) {
+                return Ok(Some(question));
+            }
+        }
+        Ok(None)
+    }
+
     /// Records the answer to a question. The folder's task takes it as the engine's `UserDecision` input, now if it
-    /// runs and otherwise when it next opens the folder.
-    pub fn answer(&self, question_id: &str, answer: Answer) -> Result<(), DriverError> {
+    /// runs and otherwise when it next opens the folder. The same answer again, while it waits for the task or after
+    /// the engine took it, changes nothing. Another answer is refused, and so is any answer to a question the engine
+    /// dropped before it took the answer, as when it asks again about a changed set.
+    pub fn answer(&self, question_id: &str, answer: Answer) -> Result<Answered, DriverError> {
+        let earlier = |given: &str| match given.parse::<Answer>() {
+            Ok(given) if given == answer => Ok(None),
+            Ok(given) => Err(DriverError::AnsweredOtherwise { given }),
+            Err(_) => Err(DriverError::QuestionNotFound(question_id.to_owned())),
+        };
         for space_id in self.space_ids() {
             let path = self.inner.paths.store(&space_id)?;
             let mut store = Store::open(&path).map_err(store_error(&path))?;
             let outcome = store
                 .transaction(|tx| {
-                    let Some(stored) = tx.questions()?.into_iter().find(|stored| {
-                        stored.question_id == question_id && stored.answer.is_none()
-                    }) else {
-                        return Ok(None);
+                    let stored = (tx.questions()?.into_iter())
+                        .find(|stored| stored.question_id == question_id);
+                    let stored = match stored {
+                        None => {
+                            return Ok((tx.taken_question(question_id)?)
+                                .and_then(|taken| taken.answer)
+                                .map(|given| earlier(&given.answer)));
+                        }
+                        Some(StoredQuestion {
+                            answer: Some(given),
+                            ..
+                        }) => return Ok(Some(earlier(&given.answer))),
+                        Some(stored) => stored,
                     };
                     let Some(question) = decode_question(&space_id, &stored) else {
                         return Ok(None);
@@ -836,13 +933,14 @@ impl Driver {
                         .iter()
                         .filter(|q| q.answer.is_none())
                         .count();
-                    Ok(Some(Ok(left as u64)))
+                    Ok(Some(Ok(Some(left as u64))))
                 })
                 .map_err(store_error(&path))?;
             match outcome {
                 None => continue,
                 Some(Err(error)) => return Err(error),
-                Some(Ok(left)) => {
+                Some(Ok(None)) => return Ok(Answered::Already),
+                Some(Ok(Some(left))) => {
                     if let Some(folder) = self.inner.folders.lock().unwrap().get(&space_id) {
                         folder.status.lock().unwrap().questions = left;
                         if let Some(run) = &folder.run {
@@ -851,7 +949,7 @@ impl Driver {
                     }
                     tracing::info!(space_id, question_id, %answer, "answered a question");
                     self.changed();
-                    return Ok(());
+                    return Ok(Answered::Now);
                 }
             }
         }
@@ -1562,16 +1660,161 @@ mod tests {
                 allowed: [Answer::Delete, Answer::Restore]
             })
         ));
-        driver.answer("q1", Answer::Restore).unwrap();
+        assert_eq!(driver.answer("q1", Answer::Restore).unwrap(), Answered::Now);
         assert!(matches!(
             driver.answer("q1", Answer::Delete),
-            Err(DriverError::QuestionNotFound(_))
+            Err(DriverError::AnsweredOtherwise {
+                given: Answer::Restore
+            })
         ));
         assert_eq!(driver.questions().unwrap(), [mass_delete("q2")]);
         assert_eq!(driver.status().folders[0].questions, 1);
 
         let stored = driver.stored_questions(SPACE).unwrap();
         assert_eq!(stored[0].answer.as_ref().unwrap().answer, "restore");
+    }
+
+    #[test]
+    fn the_same_answer_again_changes_nothing_until_the_engine_drops_the_question_without_it() {
+        let (_dir, paths, _root) = profile(&[mass_delete("q1"), mass_delete("q2")]);
+        let driver = Driver::open(paths.clone()).unwrap();
+        let store = || Store::open(paths.store(SPACE).unwrap()).unwrap();
+        assert_eq!(driver.answer("q1", Answer::Delete).unwrap(), Answered::Now);
+        assert_eq!(
+            driver.answer("q1", Answer::Delete).unwrap(),
+            Answered::Already
+        );
+
+        assert!(store().transaction(|tx| tx.take_answer("q1")).unwrap());
+        assert_eq!(
+            driver.answer("q1", Answer::Delete).unwrap(),
+            Answered::Already
+        );
+        assert!(matches!(
+            driver.answer("q1", Answer::Restore),
+            Err(DriverError::AnsweredOtherwise {
+                given: Answer::Delete
+            })
+        ));
+
+        assert_eq!(driver.answer("q2", Answer::Delete).unwrap(), Answered::Now);
+        store()
+            .transaction(|tx| {
+                tx.remove_question("q2")?;
+                tx.put_question(&StoredQuestion {
+                    question_id: "q3".into(),
+                    asked_at_ms: 20,
+                    body: serde_json::to_vec(&mass_delete("q3")).unwrap(),
+                    answer: None,
+                })
+            })
+            .unwrap();
+        assert!(matches!(
+            driver.answer("q2", Answer::Delete),
+            Err(DriverError::QuestionNotFound(_))
+        ));
+        assert_eq!(driver.questions().unwrap(), [mass_delete("q3")]);
+    }
+
+    #[test]
+    fn a_question_asked_again_after_the_engine_took_its_answer_reads_as_unanswered() {
+        let (_dir, paths, _root) = profile(&[mass_delete("q1")]);
+        let driver = Driver::open(paths.clone()).unwrap();
+        let store = || Store::open(paths.store(SPACE).unwrap()).unwrap();
+        assert_eq!(driver.answer("q1", Answer::Delete).unwrap(), Answered::Now);
+        assert!(store().transaction(|tx| tx.take_answer("q1")).unwrap());
+        assert_eq!(
+            driver.answered_question("q1").unwrap(),
+            Some(mass_delete("q1"))
+        );
+
+        store()
+            .transaction(|tx| {
+                tx.put_question(&StoredQuestion {
+                    question_id: "q1".into(),
+                    asked_at_ms: 30,
+                    body: serde_json::to_vec(&mass_delete("q1")).unwrap(),
+                    answer: None,
+                })
+            })
+            .unwrap();
+        assert_eq!(driver.answered_question("q1").unwrap(), None);
+        assert_eq!(driver.questions().unwrap(), [mass_delete("q1")]);
+        assert_eq!(driver.answer("q1", Answer::Restore).unwrap(), Answered::Now);
+    }
+
+    #[tokio::test]
+    async fn the_same_answer_again_changes_nothing_after_the_folder_took_it() {
+        use koidrive_engine::question::{ConflictFile, Revisions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Koidrive");
+        let paths = Paths::under(&base.join("profile"));
+        linked(&paths, &root, "d1");
+        let file = |node_id: &str| ConflictFile {
+            node_id: node_id.into(),
+            revisions: Revisions {
+                content_rev: 2,
+                meta_rev: 1,
+            },
+        };
+        let kind = QuestionKind::Conflict {
+            original: file("n-original"),
+            copy: file("n-copy"),
+            sent_in: None,
+        };
+        let shown = Question {
+            id: "c1".into(),
+            lineage: "c1".into(),
+            space_id: SPACE.into(),
+            asked_at_ms: 10,
+            kind: kind.clone(),
+            items: Vec::new(),
+        };
+        Store::open(paths.store(SPACE).unwrap())
+            .unwrap()
+            .transaction(|tx| {
+                let mut state = tx.engine_state()?;
+                state.commits.questions = vec![koidrive_engine::question::Question {
+                    id: "c1".into(),
+                    asked_at_ms: 10,
+                    kind,
+                    held: BTreeMap::new(),
+                    answer: None,
+                    shown: BTreeMap::new(),
+                }];
+                tx.set_engine_state(&state)?;
+                tx.put_question(&StoredQuestion {
+                    question_id: "c1".into(),
+                    asked_at_ms: 10,
+                    body: serde_json::to_vec(&shown).unwrap(),
+                    answer: None,
+                })
+            })
+            .unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+        assert_eq!(
+            driver.answer("c1", Answer::KeepBoth).unwrap(),
+            Answered::Now
+        );
+
+        driver.start();
+        eventually("the folder takes the answer", || {
+            driver.stored_questions(SPACE).unwrap().is_empty()
+        })
+        .await;
+        assert_eq!(
+            driver.answer("c1", Answer::KeepBoth).unwrap(),
+            Answered::Already
+        );
+        assert!(matches!(
+            driver.answer("c1", Answer::KeepCopy),
+            Err(DriverError::AnsweredOtherwise {
+                given: Answer::KeepBoth
+            })
+        ));
+        driver.stop().await;
     }
 
     #[tokio::test]
@@ -2980,6 +3223,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn linking_a_folder_whose_unlink_is_unfinished_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Koidrive");
+        let paths = Paths::under(&base.join("profile"));
+        let (driver, gate) = paused_driver(&paths, &root).await;
+        let unlink = tokio::spawn({
+            let driver = driver.clone();
+            let root = root.clone();
+            async move { driver.unlink(&root).await }
+        });
+        assert!(still_waiting(&unlink).await);
+        unlink.abort();
+        assert!(unlink.await.unwrap_err().is_cancelled());
+        gate.open();
+        let space_id = driver.status().folders[0].space_id.clone();
+        let linked = driver.link(&root, &space_id).await;
+        assert!(
+            matches!(linked, Err(DriverError::UnlinkUnfinished(ref folder)) if *folder == root),
+            "{linked:?}"
+        );
+        driver.sign_out(true).await.unwrap();
+        signed_out(&driver, &paths, &root);
+    }
+
+    #[tokio::test]
     async fn no_task_starts_while_an_unlink_is_unfinished() {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
@@ -3447,6 +3716,83 @@ mod tests {
         assert_eq!(fs::read(root.join("keep.txt")).unwrap(), b"mine");
         drop(driver);
         assert!(Driver::open(paths).unwrap().status().folders.is_empty());
+    }
+
+    #[tokio::test]
+    async fn linking_a_folder_to_the_space_it_syncs_changes_nothing_and_to_another_is_refused() {
+        let (_dir, paths, root) = profile(&[]);
+        let token = prost::Message::encode_to_vec(&koidrive_proto::v1::AccessToken {
+            token: "token".into(),
+            expires_at_ms: i64::MAX,
+            ..Default::default()
+        });
+        let spaces = prost::Message::encode_to_vec(&koidrive_proto::v1::SpaceList {
+            spaces: vec![
+                SpaceInfo {
+                    space_id: SPACE.into(),
+                    name: "Projects".into(),
+                    ..Default::default()
+                },
+                SpaceInfo {
+                    space_id: "0190f0a0-0000-7000-8000-000000000002".into(),
+                    name: "Notes".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        let (server, served) =
+            serve_recorded(vec![(200, token), (200, spaces.clone()), (200, spaces)]).await;
+        Store::open(paths.store(SPACE).unwrap())
+            .unwrap()
+            .transaction(|tx| {
+                let link = tx.link()?.unwrap();
+                tx.set_link(&Link {
+                    server_url: server.clone(),
+                    ..link
+                })
+            })
+            .unwrap();
+        Credential {
+            server,
+            ..credential("d1")
+        }
+        .save_new(&paths.credential())
+        .unwrap();
+        let driver = Driver::open(paths).unwrap();
+        let before = driver.status().folders;
+
+        assert_eq!(
+            driver.link(&root, SPACE).await.unwrap(),
+            Linked::Already(before[0].clone())
+        );
+        assert_eq!(
+            driver.link(&root, "Projects").await.unwrap(),
+            Linked::Already(before[0].clone())
+        );
+        assert!(matches!(
+            driver.link(&root, "Notes").await,
+            Err(DriverError::FolderOverlaps(path)) if path == root
+        ));
+        assert_eq!(driver.status().folders, before);
+        assert_eq!(read_marker(&root).unwrap(), None);
+        let paths: Vec<String> = (served.await.unwrap().into_iter())
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(paths, ["/v1/token", "/v1/spaces", "/v1/spaces"]);
+    }
+
+    #[tokio::test]
+    async fn linking_a_folder_another_device_linked_is_refused_and_changes_nothing() {
+        let (_dir, paths, root) = profile(&[]);
+        credential("d2").save_new(&paths.credential()).unwrap();
+        let driver = Driver::open(paths).unwrap();
+        let before = driver.status().folders;
+        assert!(matches!(
+            driver.link(&root, SPACE).await,
+            Err(DriverError::LinkedByOtherDevice { device_id, .. }) if device_id == "d1"
+        ));
+        assert_eq!(driver.status().folders, before);
     }
 
     #[tokio::test]

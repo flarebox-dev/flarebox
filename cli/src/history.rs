@@ -26,6 +26,7 @@ use crate::report::{
     Done, Outcome, RequestData, RequestsData, RestoreAskedData, TrashData, TrashEntry, VersionData,
     VersionsData,
 };
+use crate::request::{self, Key, RequestId};
 use crate::{ago, now_ms, printable, signed_in, size, unexpected};
 
 /// The most entries asked for in one page; the server sends at most this many.
@@ -54,6 +55,8 @@ pub enum HistoryAction {
         /// path.
         #[arg(long, conflicts_with = "version")]
         node: Option<String>,
+        #[command(flatten)]
+        request: crate::RequestArg,
     },
     /// List the restores asked for in a linked folder and how each one went.
     Requests {
@@ -71,7 +74,8 @@ pub async fn run(paths: &Paths, action: HistoryAction) -> Result<Done, CliError>
             path,
             version,
             node,
-        } => restore(paths, &path, version, node).await,
+            request,
+        } => restore(paths, &path, version, node, request.request_id).await,
         HistoryAction::Requests { folder } => requests(paths, &folder).await,
     }
 }
@@ -144,13 +148,85 @@ async fn versions(paths: &Paths, file: &Path) -> Result<Done, CliError> {
 /// `koi history restore <path>`: asks the folder's engine to bring the deletion at `path` back from the trash, or, with
 /// `version`, to make that version of the live file at `path` current again. `node` picks one of several deletions
 /// that had the path. The request is checked against the server's listings first, so a typo fails here and not after
-/// the next commit.
+/// the next commit. With `request_id`, a restore already asked for under that ID is reported again from its record,
+/// without reading the server. The record is read again when a check fails, since another run with the ID may have
+/// asked for the restore meanwhile.
 async fn restore(
     paths: &Paths,
     path: &Path,
     version: Option<String>,
     node: Option<String>,
+    request_id: Option<RequestId>,
 ) -> Result<Done, CliError> {
+    let key = Key::restore(
+        &lexical(&crate::absolute(path)?),
+        version.as_deref(),
+        node.as_deref(),
+    );
+    if let Some(id) = &request_id
+        && let Some(recorded) = request::recorded(paths, id, &key)?
+    {
+        return replayed(paths, id, recorded).await;
+    }
+    let (linked, below, restore) = match checked(paths, path, version, node).await {
+        Ok(checked) => checked,
+        Err(error) => {
+            let Some(id) = &request_id else {
+                return Err(error);
+            };
+            return match request::recorded(paths, id, &key)? {
+                None => Err(error),
+                Some(recorded) => replayed(paths, id, recorded).await,
+            };
+        }
+    };
+    let request = Request::Restore {
+        space_id: linked.space_id.clone(),
+        restore,
+        folder: linked.path.clone(),
+        path: below.join("/"),
+    };
+    match ipc::run(paths, request.once(request_id, key)).await? {
+        Response::Restore {
+            id, folder, path, ..
+        } => {
+            let state = (folder == linked.path).then_some(linked.state);
+            Ok(asked(&folder, &path, id, state))
+        }
+        other => Err(unexpected(other)),
+    }
+}
+
+/// Reports the restore that the run of `id` recorded. Its folder's state comes from the profile, and only while the
+/// folder is linked to the restore's space.
+async fn replayed(
+    paths: &Paths,
+    id: &RequestId,
+    recorded: serde_json::Value,
+) -> Result<Done, CliError> {
+    let Ok(Response::Restore {
+        id: restore_id,
+        space_id,
+        folder,
+        path,
+    }) = serde_json::from_value(recorded)
+    else {
+        return Err(format!("the record of the request {id} is not a restore").into());
+    };
+    let state = (linked_folders(paths).await.ok().into_iter().flatten())
+        .find(|linked| linked.path == folder && linked.space_id == space_id)
+        .map(|linked| linked.state);
+    Ok(asked(&folder, &path, restore_id, state))
+}
+
+/// The folder `path` is in, the names below its root, and the restore to ask for, once the server's listings show that
+/// the restore can be made.
+async fn checked(
+    paths: &Paths,
+    path: &Path,
+    version: Option<String>,
+    node: Option<String>,
+) -> Result<(FolderStatus, Vec<String>, RestoreRequest), CliError> {
     let (linked, below) = locate(paths, path).await?;
     if below.is_empty() {
         return Err(CliError::usage(format!(
@@ -207,34 +283,41 @@ async fn restore(
             }
         }
     };
-    let request = Request::Restore {
-        space_id: linked.space_id.clone(),
-        restore: request,
-    };
-    let id = match ipc::run(paths, request).await? {
-        Response::Restore { id } => id,
-        other => return Err(unexpected(other)),
-    };
+    Ok((linked, below, request))
+}
+
+/// What `koi history restore` reports for the restore `id` of `path` in `folder`. `state` is the folder's state while it is
+/// linked to the restore's space. Without it, nothing follows: `koi history requests` needs the folder linked.
+fn asked(folder: &str, path: &str, id: String, state: Option<FolderState>) -> Done {
+    let shown = printable(path);
     let mut note = format!("Asked to restore {shown} (restore {}).\n", printable(&id));
-    if linked.state == FolderState::Stopped {
-        note.push_str("The folder sends it once the daemon runs; koi status shows why it doesn't. koi history requests shows how it went.\n");
-    } else {
-        note.push_str(&format!(
+    match state {
+        Some(FolderState::Stopped) => {
+            note.push_str(&format!(
+                "The folder sends it once the daemon runs; koi status shows why it doesn't. koi history requests {} shows how it went.\n",
+                printable(folder)
+            ))
+        }
+        Some(_) => note.push_str(&format!(
             "The folder sends it with its next commit. koi history requests {} shows how it went.\n",
-            printable(&linked.path)
-        ));
+            printable(folder)
+        )),
+        None => {}
     }
     let value = printable(&id);
     let data = RestoreAskedData {
         request_id: id,
-        folder: linked.path.clone(),
-        path: below.join("/"),
+        folder: folder.to_owned(),
+        path: path.to_owned(),
     };
     let done = Done {
         outcome: Outcome::Accepted,
         ..Done::value(data, &value, note)
     };
-    Ok(done.then(&["koi", "history", "requests", &linked.path]))
+    match state {
+        Some(_) => done.then(&["koi", "history", "requests", folder]),
+        None => done,
+    }
 }
 
 /// `koi history requests [folder]`: the restores asked for in the folder's space, those that ended first.
@@ -341,20 +424,25 @@ fn trashed_at<'a>(
     }
 }
 
-/// The linked folder that holds `path`, and the names below it as typed. The folders come from the daemon, or from the
-/// profile's stores read without writing anything when no daemon runs. `path` need not exist here, since a file
+/// The folders the profile links, from the daemon, or from the profile's stores read without writing anything when no
+/// daemon runs.
+async fn linked_folders(paths: &Paths) -> Result<Vec<FolderStatus>, CliError> {
+    match ipc::ask(paths, &Request::Status).await? {
+        Some(Response::Status { status }) => Ok(status.folders),
+        Some(other) => Err(unexpected(other)),
+        None => Driver::linked_folders(paths).map_err(|error| match error {
+            DriverError::Busy(_) => CliError::from(ipc::busy(paths)),
+            other => CliError::from(other),
+        }),
+    }
+}
+
+/// The linked folder that holds `path`, and the names below it as typed. `path` need not exist here, since a file
 /// deleted on this device may still be on the server. Symbolic links are followed only up to the linked folder: below
 /// it a link is a node of the space like any other, so the names stay as typed and never select the node a local link
 /// points to.
 async fn locate(paths: &Paths, path: &Path) -> Result<(FolderStatus, Vec<String>), CliError> {
-    let folders = match ipc::ask(paths, &Request::Status).await? {
-        Some(Response::Status { status }) => status.folders,
-        Some(other) => return Err(unexpected(other)),
-        None => Driver::linked_folders(paths).map_err(|error| match error {
-            DriverError::Busy(_) => CliError::from(ipc::busy(paths)),
-            other => CliError::from(other),
-        })?,
-    };
+    let folders = linked_folders(paths).await?;
     let typed = lexical(&crate::absolute(path)?);
     let components: Vec<Component> = typed.components().collect();
     let mut prefix = PathBuf::new();
@@ -967,6 +1055,123 @@ mod tests {
         assert_eq!(found("café.txt"), Some("other"));
         assert_eq!(found("docs/missing.txt"), None);
         assert_eq!(found("café.txt/below"), None);
+    }
+
+    /// A profile signed in to a server that never answers, whose folder `Koidrive` syncs `SPACE`, and the record of the
+    /// finished request `done` that restored `a.txt` in `space_id`.
+    async fn silent_profile(
+        space_id: &str,
+    ) -> (tempfile::TempDir, Paths, PathBuf, tokio::net::TcpListener) {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let paths = Paths::under(&base.join("profile"));
+        let root = base.join("Koidrive");
+        std::fs::create_dir_all(&root).unwrap();
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = format!("http://{}/", silent.local_addr().unwrap());
+        Credential {
+            server: server.clone(),
+            user_id: "user".into(),
+            user_name: None,
+            device_id: "d1".into(),
+            device_name: "laptop".into(),
+            refresh_credential: "refresh".into(),
+        }
+        .save_new(&paths.credential())
+        .unwrap();
+        let store = paths.store(SPACE).unwrap();
+        std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+        koidrive_store::Store::open(&store)
+            .unwrap()
+            .transaction(|tx| {
+                tx.set_link(&koidrive_store::Link {
+                    space_id: SPACE.into(),
+                    space_name: "Projects".into(),
+                    root: root.clone(),
+                    root_dev: 1,
+                    server_url: server.clone(),
+                    device_id: "d1".into(),
+                    linked_at_ms: 1,
+                })
+            })
+            .unwrap();
+        let request::Begun::Claimed(claim) = request::begin(
+            &paths,
+            &RequestId::parse("done").unwrap(),
+            &restore_key(&root),
+        )
+        .unwrap() else {
+            panic!("the request was claimed before");
+        };
+        claim
+            .finish(&Response::Restore {
+                id: "restore-1".into(),
+                space_id: space_id.into(),
+                folder: root.display().to_string(),
+                path: "a.txt".into(),
+            })
+            .unwrap();
+        (dir, paths, root, silent)
+    }
+
+    fn restore_key(root: &Path) -> Key {
+        Key::restore(&root.join("a.txt"), None, None)
+    }
+
+    async fn restore_again(paths: &Paths, root: &Path, id: &str) -> Result<Done, CliError> {
+        let file = root.join("a.txt");
+        let run = restore(
+            paths,
+            &file,
+            None,
+            None,
+            Some(RequestId::parse(id).unwrap()),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("the run waited for the server")
+    }
+
+    #[tokio::test]
+    async fn a_finished_restore_is_reported_from_its_record_without_the_server() {
+        let (_dir, paths, root, silent) = silent_profile(SPACE).await;
+        let done = restore_again(&paths, &root, "done").await.unwrap();
+        assert_eq!(done.text, "restore-1\n");
+        assert_eq!(
+            done.next,
+            [crate::report::Next::of(&[
+                "koi",
+                "history",
+                "requests",
+                &root.display().to_string()
+            ])]
+        );
+
+        let request::Begun::Claimed(claim) = request::begin(
+            &paths,
+            &RequestId::parse("going").unwrap(),
+            &restore_key(&root),
+        )
+        .unwrap() else {
+            panic!("the request was claimed before");
+        };
+        drop(claim);
+        let error = restore_again(&paths, &root, "going").await.unwrap_err();
+        assert_eq!(error.code, crate::error::Code::Interrupted, "{error:?}");
+
+        let called =
+            tokio::time::timeout(std::time::Duration::from_millis(100), silent.accept()).await;
+        assert!(called.is_err(), "the server was called");
+    }
+
+    #[tokio::test]
+    async fn a_replayed_restore_offers_no_follow_up_once_its_folder_syncs_another_space() {
+        let (_dir, paths, root, _silent) =
+            silent_profile("0194f8a2-0000-7000-8000-00000000000b").await;
+        let done = restore_again(&paths, &root, "done").await.unwrap();
+        assert_eq!(done.text, "restore-1\n");
+        assert_eq!(done.note, "Asked to restore a.txt (restore restore-1).\n");
+        assert!(done.next.is_empty(), "{:?}", done.next);
     }
 
     #[tokio::test]

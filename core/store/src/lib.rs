@@ -382,6 +382,15 @@ const MIGRATIONS: &[&str] = &[
         node_id TEXT PRIMARY KEY
     ) STRICT, WITHOUT ROWID;
 ",
+    "
+    CREATE TABLE taken_answers (
+        question_id TEXT PRIMARY KEY,
+        asked_at_ms INTEGER NOT NULL,
+        body BLOB NOT NULL,
+        answer TEXT NOT NULL,
+        answered_at_ms INTEGER NOT NULL
+    ) STRICT, WITHOUT ROWID;
+",
 ];
 
 /// The schema version this build writes.
@@ -1049,6 +1058,45 @@ impl Tx<'_> {
             params![question_id, body],
         )?;
         Ok(())
+    }
+
+    /// Removes an answered question whose answer the engine took, and keeps the question with its answer, so that the
+    /// same answer given again can be told from one to a question the engine dropped. Returns false, changing nothing,
+    /// when the question has no answer.
+    pub fn take_answer(&self, question_id: &str) -> Result<bool> {
+        let kept = self.0.execute(
+            "INSERT OR REPLACE INTO taken_answers (question_id, asked_at_ms, body, answer, answered_at_ms)
+             SELECT question_id, asked_at_ms, body, answer, answered_at_ms FROM questions
+             WHERE question_id = ?1 AND answer IS NOT NULL",
+            [question_id],
+        )?;
+        if kept > 0 {
+            self.remove_question(question_id)?;
+        }
+        Ok(kept > 0)
+    }
+
+    /// The question whose answer the engine took, with that answer, as [`Tx::take_answer`] kept it.
+    pub fn taken_question(&self, question_id: &str) -> Result<Option<StoredQuestion>> {
+        Ok(self
+            .0
+            .query_row(
+                "SELECT question_id, asked_at_ms, body, answer, answered_at_ms
+                 FROM taken_answers WHERE question_id = ?1",
+                [question_id],
+                |row| {
+                    Ok(StoredQuestion {
+                        question_id: row.get(0)?,
+                        asked_at_ms: row.get(1)?,
+                        body: row.get(2)?,
+                        answer: Some(GivenAnswer {
+                            answer: row.get(3)?,
+                            answered_at_ms: row.get(4)?,
+                        }),
+                    })
+                },
+            )
+            .optional()?)
     }
 
     pub fn remove_question(&self, question_id: &str) -> Result<bool> {

@@ -28,13 +28,15 @@ Without `--json`, a command whose result is one value prints only that value on 
 |---|---|
 | `schema_version` | Always 1 |
 | `command` | The subcommand, such as `folder link`. Empty for `koi` alone |
-| `outcome` | `ok`, `accepted` or `error` |
+| `outcome` | `ok`, `accepted`, `unchanged` or `error` |
 | `data` | The command's result. Its shape depends on the command. `null` when there is none |
 | `error` | `null` on success. Otherwise `code`, `message` and `retryable` |
 | `decisions` | The sync decisions waiting on this device, described below |
 | `next_commands` | Commands to run next, each as an `argv` array. Present only when there is a real next step |
 
 `accepted` means the command recorded work that happens later. Answering a decision and asking for a restore return it. Check `koi status` or `koi history requests` to see the work finish.
+
+`unchanged` means the state the command asks for was already there, so the command changed nothing. It exits 0, and `data` describes the state as it is. [Run a change again](#run-a-change-again) lists the commands that return it.
 
 A failed command can still carry `data`. For example, `koi space usage` returns the spaces that answered when the server refuses another one.
 
@@ -60,19 +62,40 @@ A failed command can still carry `data`. For example, `koi space usage` returns 
 
 `kind` is `mass_delete`, `remote_mass_delete`, `ambiguous_disappearance`, `recovery` or `conflict`. A `recovery` decision also has a `group`. A `conflict` decision's `items` are its two files, and its answers are `keep-node:<id>` for each file's node ID and `keep-both` (see [Decisions](status.md#decisions)). A `remote_mass_delete` notice has `requires_choice: false`. It only takes `dismiss` and holds nothing back. Don't pick an answer that deletes files on your own. Ask the person.
 
+## Run a change again
+
+A command can time out before you see its result. Run it again: the commands below never make a change twice.
+
+These commands set a state, so running one again when the state already holds returns `unchanged` with exit status 0:
+
+- `koi folder link <folder> --space <space>` when the folder is already linked to that space. Linking it to another space fails and changes nothing. With a space name rather than an ID, the command reads the server's space list, so it fails while the server can't be reached.
+- `koi folder unlink <folder>` when the folder isn't linked. `data` then has only `path`.
+- `koi device revoke <id>` when the device is already revoked.
+- `koi space create <name>` when a space has that name. It prints that space's ID, as for a new space.
+- `koi resolve <id> <answer>` with the answer the decision already took. Another answer, or a decision that was replaced, fails with `stale_decision` (exit 7).
+
+These commands make a new change each time they run: `koi history restore`, `koi device invite`, `koi folder restart` and `koi folder retry`. Give them `--request-id <id>` on the first attempt. The ID is 1 to 128 ASCII letters, digits, `-` and `_`, and you pick it. Running the command again with the same ID and arguments returns the first outcome, with the same `data` and the same stdout, and changes nothing. This holds after the daemon or the machine restarts.
+
+- The same ID with other arguments fails with `stale_decision` (exit 7) and no next command. Repeat the first call as it was, or pick a new ID. An ID for `koi device invite` also belongs to the device and server that ran it.
+- A pairing code expires after about 10 minutes. After that, `koi device invite` with its ID fails with `stale_decision`. Run it with a new ID.
+- A command whose change is known to have failed records nothing, so running it again with its ID tries again.
+- If the first run stopped before it recorded its outcome, still runs, or couldn't tell whether its change happened (for example, the server didn't answer), the command fails with `interrupted` (exit 130). Read the state with `koi status --json` or `koi history requests`. To make the change, use a new ID.
+
+The records are in `requests/` in the profile's state directory (`~/.local/state/koidrive` by default), readable only by you. A record of `koi device invite` holds the pairing code. Pairing codes never appear in the logs.
+
 ## Exit status
 
 | Status | Meaning | What to do |
 |---|---|---|
-| 0 | The command succeeded, or recorded work for later | Read `outcome`. `accepted` isn't done yet |
+| 0 | The command succeeded, found nothing to change, or recorded work for later | Read `outcome`. `accepted` isn't done yet |
 | 1 | Another failure | Read `error` and `next_commands` |
 | 2 | Invalid arguments, or input the command needs is missing | Correct the call. Running it again unchanged fails again |
 | 3 | `status --check` found a decision that needs a choice | Read the answers in `decisions` |
 | 4 | A credential is missing or refused, or a person must log in | Run the command in `next_commands`, or ask a person to |
 | 5 | A folder is halted or stopped | Fix the cause the folder's `problem` names |
 | 6 | The server is offline, unavailable or limits the rate | Try again later. `retryable` is true |
-| 7 | The decision answered no longer exists | Read the current decisions with `koi resolve --json` |
-| 130 | Ctrl-C stopped the command | Read the state before you run a change again |
+| 7 | The decision answered no longer exists, or a request ID was used with other arguments or its pairing code expired | Read the current state, then decide again |
+| 130 | Ctrl-C stopped the command, or an earlier run with the same request ID has no recorded outcome | Read the state before you run a change again |
 
 The `error.code` values match these: `failed`, `usage`, `decision_required`, `auth_required`, `halted`, `unavailable`, `stale_decision` and `interrupted`.
 

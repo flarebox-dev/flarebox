@@ -145,7 +145,7 @@ impl Engine {
     }
 
     /// Takes the answers the person gave to the engine's questions (`Driver::answer`) and removes the rows of the
-    /// ones it took, in the transaction the caller's checkpoint ends. The engine routes each answer by the question's
+    /// ones it took, keeping each answer it took ([`Tx::take_answer`]), in the transaction the caller's checkpoint ends. The engine routes each answer by the question's
     /// kind. An answer to a question the engine no longer asks changes nothing: what it held changed since, and the
     /// engine asks about it again.
     pub fn accept_answers(&mut self, tx: &Tx<'_>) -> Result<(), Error> {
@@ -156,7 +156,7 @@ impl Engine {
             };
             if (self.commits).decide(&stored.question_id, answer) {
                 tracing::info!(question_id = stored.question_id, %answer, "took an answer to a question");
-                tx.remove_question(&stored.question_id)?;
+                tx.take_answer(&stored.question_id)?;
             }
         }
         Ok(())

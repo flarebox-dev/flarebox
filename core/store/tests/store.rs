@@ -111,6 +111,7 @@ fn migrations_apply_from_empty() {
             "restore_intents",
             "restore_requests",
             "synced_nodes",
+            "taken_answers",
             "trashed_here",
             "waiting_updates",
             "watched_contents",
@@ -1028,6 +1029,7 @@ fn a_cursor_stored_before_it_could_record_a_server_behind_it_records_none() {
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
         .unwrap();
     drop_cursor_tokens(&conn);
+    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.pragma_update(None, "user_version", 4).unwrap();
     drop(conn);
 
@@ -1073,6 +1075,7 @@ fn a_store_from_before_contents_were_watched_opens_with_nothing_watched() {
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
         .unwrap();
     drop_cursor_tokens(&conn);
+    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.pragma_update(None, "user_version", 5).unwrap();
     drop(conn);
 
@@ -1116,6 +1119,7 @@ fn a_store_from_before_edits_were_recorded_opens_with_none_recorded() {
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
         .unwrap();
     drop_cursor_tokens(&conn);
+    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.pragma_update(None, "user_version", 10).unwrap();
     drop(conn);
 
@@ -1153,6 +1157,7 @@ fn a_store_from_before_deletes_were_recorded_opens_with_none_recorded() {
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
         .unwrap();
     drop_cursor_tokens(&conn);
+    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.pragma_update(None, "user_version", 6).unwrap();
     drop(conn);
 
@@ -1197,6 +1202,7 @@ fn a_store_from_before_the_guard_opens_with_an_empty_guard() {
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
         .unwrap();
     drop_cursor_tokens(&conn);
+    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.pragma_update(None, "user_version", 7).unwrap();
     drop(conn);
 
@@ -1247,6 +1253,7 @@ fn a_store_from_before_questions_showed_local_shapes_keeps_its_questions() {
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
         .unwrap();
     drop_cursor_tokens(&conn);
+    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.pragma_update(None, "user_version", 8).unwrap();
     drop(conn);
 
@@ -1281,6 +1288,7 @@ fn a_store_from_before_nodes_in_ignored_folders_were_stored_opens_with_none_reco
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
         .unwrap();
     drop_cursor_tokens(&conn);
+    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.pragma_update(None, "user_version", 9).unwrap();
     drop(conn);
 
@@ -1320,6 +1328,7 @@ fn a_store_from_before_remote_removals_were_counted_opens_with_none_counted() {
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
         .unwrap();
     drop_cursor_tokens(&conn);
+    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.pragma_update(None, "user_version", 11).unwrap();
     drop(conn);
 
@@ -1349,6 +1358,7 @@ fn a_store_from_before_positions_were_watched_opens_with_none_watched() {
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
         .unwrap();
     drop_cursor_tokens(&conn);
+    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.pragma_update(None, "user_version", 12).unwrap();
     drop(conn);
 
@@ -1425,6 +1435,7 @@ fn a_store_from_before_waiting_updates_kept_their_origin_takes_the_accepted_slot
     )
     .unwrap();
     drop_cursor_tokens(&conn);
+    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.pragma_update(None, "user_version", 13).unwrap();
     drop(conn);
 
@@ -1463,6 +1474,7 @@ fn a_cursor_stored_before_commit_tokens_opens_with_none() {
     let conn = Connection::open(&path).unwrap();
     drop_cursor_tokens(&conn);
     conn.execute_batch("DROP TABLE published_nodes;").unwrap();
+    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.pragma_update(None, "user_version", 15).unwrap();
     drop(conn);
 
@@ -1513,6 +1525,7 @@ fn a_store_from_before_watched_positions_were_kept_takes_them_from_s() {
     )
     .unwrap();
     drop_cursor_tokens(&conn);
+    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.pragma_update(None, "user_version", 14).unwrap();
     drop(conn);
 
@@ -1536,8 +1549,8 @@ fn a_store_from_before_published_entries_were_recorded_opens_with_none_recorded(
         .unwrap();
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch("DROP TABLE published_nodes;").unwrap();
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
-        .unwrap();
+    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
+    conn.pragma_update(None, "user_version", 16).unwrap();
     drop(conn);
 
     let mut store = Store::open(&path).unwrap();
@@ -1597,6 +1610,7 @@ fn a_version_3_store_opens_with_empty_restore_tables() {
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
         .unwrap();
     drop_cursor_tokens(&conn);
+    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.pragma_update(None, "user_version", 3).unwrap();
     drop(conn);
 
@@ -1859,6 +1873,35 @@ fn link_and_questions_persist() {
             Ok::<_, Error>(())
         })
         .unwrap();
+
+    let mut store = Store::open(&path).unwrap();
+    store
+        .transaction(|tx| {
+            assert_eq!(tx.taken_question("q2")?, None);
+            let q2 = (tx.questions()?.into_iter())
+                .find(|question| question.question_id == "q2")
+                .unwrap();
+            tx.put_question(&question("q3", 30))?;
+            assert!(
+                !tx.take_answer("q3")?,
+                "an unanswered question has nothing to take"
+            );
+            assert!(tx.take_answer("q2")?);
+            assert_eq!(tx.taken_question("q2")?, Some(q2));
+            let left: Vec<String> = (tx.questions()?.into_iter())
+                .map(|question| question.question_id)
+                .collect();
+            assert_eq!(left, ["q3"]);
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(
+        (store.transaction(|tx| tx.taken_question("q2")).unwrap())
+            .and_then(|question| question.answer),
+        Some(answer.clone()),
+        "a taken answer outlives the store's reopening"
+    );
 }
 
 #[test]

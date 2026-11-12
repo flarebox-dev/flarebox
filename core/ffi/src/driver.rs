@@ -19,7 +19,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use koidrive_driver::{
-    self as driver, Driver, DriverError, FolderState as DriverFolderState, Paths, Status, api_for,
+    self as driver, Driver, DriverError, FolderState as DriverFolderState, Linked, Paths, Status,
+    api_for,
 };
 use koidrive_net::{Api, ApiError, Auth, PROTO_MAX, PROTO_MIN};
 use koidrive_proto::v1::{CreateSpaceRequest, error::Code};
@@ -514,7 +515,7 @@ impl Core for DriverCore {
 
     fn link_folder(&self, space_id: &str, path: &str) -> Result<LinkedFolder, SessionError> {
         self.change(|driver| {
-            let linked = self
+            let (Linked::New(linked) | Linked::Already(linked)) = self
                 .runtime
                 .block_on(driver.link(Path::new(path), space_id))
                 .map_err(driver_error)?;
@@ -539,20 +540,26 @@ impl Core for DriverCore {
     }
 
     fn answer(&self, question_id: &str, answer: Answer) -> Result<(), SessionError> {
-        self.change(|driver| {
-            driver
-                .answer(question_id, driver_answer(answer))
-                .map_err(driver_error)
-        })
+        self.change(
+            |driver| match driver.answer(question_id, driver_answer(answer)) {
+                Ok(driver::Answered::Now) => Ok(()),
+                Ok(driver::Answered::Already) => Err(SessionError::QuestionNotFound),
+                Err(error) => Err(driver_error(error)),
+            },
+        )
     }
 
     fn dismiss_notice(&self, notice_id: &str) -> Result<(), SessionError> {
         self.change(
             |driver| match driver.answer(notice_id, driver::Answer::Dismiss) {
-                Err(DriverError::QuestionNotFound(_) | DriverError::AnswerNotAllowed { .. }) => {
-                    Err(SessionError::NoticeNotFound)
-                }
-                done => done.map_err(driver_error),
+                Ok(driver::Answered::Now) => Ok(()),
+                Ok(driver::Answered::Already)
+                | Err(
+                    DriverError::QuestionNotFound(_)
+                    | DriverError::AnswerNotAllowed { .. }
+                    | DriverError::AnsweredOtherwise { .. },
+                ) => Err(SessionError::NoticeNotFound),
+                Err(error) => Err(driver_error(error)),
             },
         )
     }
@@ -833,14 +840,17 @@ fn driver_error(error: DriverError) -> SessionError {
             }
         }
         DriverError::FolderInUse(_) => SessionError::FolderInUse,
-        DriverError::FolderOfOtherDevice { device_id, .. } => {
+        DriverError::FolderOfOtherDevice { device_id, .. }
+        | DriverError::LinkedByOtherDevice { device_id, .. } => {
             SessionError::FolderOfOtherDevice { device_id }
         }
         DriverError::SpaceAlreadyLinked(_) => SessionError::SpaceAlreadyLinked,
         DriverError::MarkerOfOtherSpace(_) => SessionError::MarkerOfOtherSpace,
         DriverError::UnsupportedFileSystem => SessionError::UnsupportedFileSystem,
         DriverError::NotLinked(_) => SessionError::FolderNotLinked,
-        DriverError::QuestionNotFound(_) => SessionError::QuestionNotFound,
+        DriverError::QuestionNotFound(_) | DriverError::AnsweredOtherwise { .. } => {
+            SessionError::QuestionNotFound
+        }
         DriverError::AnswerNotAllowed { .. } => SessionError::AnswerNotAllowed,
         error @ (DriverError::Credential(_) | DriverError::Store { .. }) => {
             SessionError::NotSaved {

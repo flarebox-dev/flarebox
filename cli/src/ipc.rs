@@ -14,8 +14,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use koidrive_driver::{
-    Account, Answer, Credential, Driver, DriverError, FolderStatus, Paths, Question,
-    RestoreRequest, RestoreStatus, Status,
+    Account, Answer, Answered, Credential, Driver, DriverError, FolderState, FolderStatus, Linked,
+    Paths, Question, RestoreRequest, RestoreStatus, Status,
 };
 use koidrive_engine::commit::Lift;
 use rustix::io::Errno;
@@ -25,6 +25,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::error::{CliError, Code};
 use crate::report::Next;
+use crate::request::{self, Begun, Key, RequestId};
 use crate::service::Blocked;
 
 /// The longest request or response line the socket accepts.
@@ -72,20 +73,49 @@ pub enum Request {
         replan: bool,
     },
     Questions,
+    /// `Driver::answered_question`.
+    AnsweredQuestion {
+        question_id: String,
+    },
     Answer {
         question_id: String,
         answer: Answer,
     },
-    /// Records a restore in the folder of `space_id`, for its engine to send.
+    /// Records a restore in the folder of `space_id`, for its engine to send. `space_id`, `folder` and `path`, the folder's
+    /// root and the path in it, come back in the response, so that the record of a request ID can report the restore again
+    /// when the folder is no longer linked.
     Restore {
         space_id: String,
         restore: RestoreRequest,
+        folder: String,
+        path: String,
     },
     Restores {
         space_id: String,
     },
     /// The linked folders that this process may not read.
     Access,
+    /// Runs `run` once for `request_id`: a later request with the same ID and key gets the first response, and one
+    /// with another key fails as stale (see [`request`]).
+    Once {
+        request_id: RequestId,
+        key: Key,
+        run: Box<Request>,
+    },
+}
+
+impl Request {
+    /// This request run once for `request_id`, or as it is without one.
+    pub fn once(self, request_id: Option<RequestId>, key: Key) -> Request {
+        match request_id {
+            Some(request_id) => Request::Once {
+                request_id,
+                key,
+                run: Box::new(self),
+            },
+            None => self,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,8 +130,16 @@ pub enum Response {
     Linked {
         folder: FolderStatus,
     },
+    /// The folder was already linked to the space.
+    AlreadyLinked {
+        folder: FolderStatus,
+    },
     Unlinked {
         space_id: String,
+        path: PathBuf,
+    },
+    /// The folder to unlink was not linked.
+    NotLinked {
         path: PathBuf,
     },
     Restarted {
@@ -110,9 +148,17 @@ pub enum Response {
     Questions {
         questions: Vec<Question>,
     },
+    AnsweredQuestion {
+        question: Option<Question>,
+    },
     Answered,
+    /// The decision was answered before with the same answer.
+    AlreadyAnswered,
     Restore {
         id: String,
+        space_id: String,
+        folder: String,
+        path: String,
     },
     Restores {
         restores: Vec<RestoreStatus>,
@@ -139,6 +185,37 @@ impl Response {
             next: error.next,
         }
     }
+}
+
+/// Runs `request` unless an earlier run of `request_id` recorded its response, and records the response. A response
+/// the CLI reports as a failure removes the record instead, so the next run with the ID tries again: an error, where the
+/// driver fails before its change or rolls it back, and a restart or lift that left the folder halted, which is safe
+/// to repeat once the cause is fixed. A run cancelled midway leaves the record without an outcome. The record is written in the
+/// process that runs the driver, so a client that stops waiting does not keep the outcome from being recorded.
+async fn once(driver: &Driver, request_id: RequestId, key: Key, request: Request) -> Response {
+    let claim = match request::begin(driver.paths(), &request_id, &key) {
+        Ok(Begun::Claimed(claim)) => claim,
+        Ok(Begun::Done(recorded)) => {
+            return serde_json::from_value(recorded).unwrap_or_else(|error| {
+                Response::failed(CliError::from(format!(
+                    "the record of the request {request_id} cannot be read: {error}"
+                )))
+            });
+        }
+        Err(error) => return Response::failed(error),
+    };
+    let response = Box::pin(handle(driver, request)).await;
+    let failed = match &response {
+        Response::Error { .. } => true,
+        Response::Restarted { folder } => folder.state == FolderState::Halted,
+        _ => false,
+    };
+    if failed {
+        claim.abandon();
+    } else if let Err(error) = claim.finish(&response) {
+        tracing::warn!(%request_id, error = error.message, "could not record the outcome of a request");
+    }
+    response
 }
 
 /// Runs one request.
@@ -168,14 +245,23 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
             .sign_out_device(&device_id)
             .await
             .map(|()| Response::SignedOut),
-        Request::Link { folder, space } => driver
-            .link(&folder, &space)
-            .await
-            .map(|folder| Response::Linked { folder }),
-        Request::Unlink { folder } => driver.unlink(&folder).await.map(|link| Response::Unlinked {
-            space_id: link.space_id,
-            path: link.root,
-        }),
+        Request::Link { folder, space } => {
+            driver
+                .link(&folder, &space)
+                .await
+                .map(|linked| match linked {
+                    Linked::New(folder) => Response::Linked { folder },
+                    Linked::Already(folder) => Response::AlreadyLinked { folder },
+                })
+        }
+        Request::Unlink { folder } => match driver.unlink(&folder).await {
+            Ok(link) => Ok(Response::Unlinked {
+                space_id: link.space_id,
+                path: link.root,
+            }),
+            Err(DriverError::NotLinked(path)) => Ok(Response::NotLinked { path }),
+            Err(error) => Err(error),
+        },
         Request::Restart { folder } => driver
             .restart(&folder)
             .await
@@ -187,21 +273,42 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
         Request::Questions => driver
             .questions()
             .map(|questions| Response::Questions { questions }),
+        Request::AnsweredQuestion { question_id } => driver
+            .answered_question(&question_id)
+            .map(|question| Response::AnsweredQuestion { question }),
         Request::Answer {
             question_id,
             answer,
         } => driver
             .answer(&question_id, answer)
-            .map(|()| Response::Answered),
-        Request::Restore { space_id, restore } => driver
+            .map(|answered| match answered {
+                Answered::Now => Response::Answered,
+                Answered::Already => Response::AlreadyAnswered,
+            }),
+        Request::Restore {
+            space_id,
+            restore,
+            folder,
+            path,
+        } => driver
             .restore(&space_id, restore)
-            .map(|id| Response::Restore { id }),
+            .map(|id| Response::Restore {
+                id,
+                space_id,
+                folder,
+                path,
+            }),
         Request::Restores { space_id } => driver
             .restores(&space_id)
             .map(|restores| Response::Restores { restores }),
         Request::Access => Ok(Response::Access {
             blocked: unreadable(driver.status().folders).await,
         }),
+        Request::Once {
+            request_id,
+            key,
+            run,
+        } => return once(driver, request_id, key, *run).await,
     };
     outcome.unwrap_or_else(|error| Response::failed(error.into()))
 }
@@ -508,7 +615,7 @@ pub fn busy(paths: &Paths) -> String {
 }
 
 /// Runs `request` in the daemon, or in a driver of its own when no daemon runs. A failed request is an error. Without
-/// a daemon and without a state directory, the status and the questions are read as a profile that is not set up,
+/// a daemon and without a state directory, the status and the questions, answered or not, are read as a profile that is not set up,
 /// without opening a driver, so reading them creates nothing.
 pub async fn run(paths: &Paths, request: Request) -> Result<Response, CliError> {
     let response = match ask(paths, &request).await? {
@@ -522,6 +629,11 @@ pub async fn run(paths: &Paths, request: Request) -> Result<Response, CliError> 
             Response::Questions {
                 questions: Vec::new(),
             }
+        }
+        None if matches!(request, Request::AnsweredQuestion { .. })
+            && !paths.state_dir.exists() =>
+        {
+            Response::AnsweredQuestion { question: None }
         }
         None => {
             let driver = Driver::open(paths.clone()).map_err(|error| match error {
@@ -834,12 +946,353 @@ mod tests {
                 node_id: "n1".into(),
                 version_id: "v1".into(),
             },
+            folder: "/home/ada/Docs".into(),
+            path: "a.txt".into(),
         };
         let json = serde_json::to_string(&request).unwrap();
         assert_eq!(
             json,
-            r#"{"request":"restore","space_id":"s1","restore":{"type":"version","node_id":"n1","version_id":"v1"}}"#
+            r#"{"request":"restore","space_id":"s1","restore":{"type":"version","node_id":"n1","version_id":"v1"},"folder":"/home/ada/Docs","path":"a.txt"}"#
         );
         assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+    }
+
+    const SPACE: &str = "0190f0a0-0000-7000-8000-000000000001";
+
+    /// A profile whose folder `Koidrive` syncs one space, which waits on the decision `q1`.
+    fn linked_profile() -> (tempfile::TempDir, Paths, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let paths = Paths::under(&base.join("profile"));
+        let root = base.join("Koidrive");
+        fs::create_dir_all(&root).unwrap();
+        let store_path = paths.store(SPACE).unwrap();
+        fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+        let question = Question {
+            id: "q1".into(),
+            lineage: "q1".into(),
+            space_id: SPACE.into(),
+            asked_at_ms: 10,
+            kind: koidrive_driver::QuestionKind::AmbiguousDisappearance,
+            items: Vec::new(),
+        };
+        koidrive_store::Store::open(&store_path)
+            .unwrap()
+            .transaction(|tx| {
+                tx.set_link(&koidrive_store::Link {
+                    space_id: SPACE.into(),
+                    space_name: "Projects".into(),
+                    root: root.clone(),
+                    root_dev: 1,
+                    server_url: "https://files.example.com/".into(),
+                    device_id: "d1".into(),
+                    linked_at_ms: 1,
+                })?;
+                tx.put_question(&koidrive_store::StoredQuestion {
+                    question_id: question.id.clone(),
+                    asked_at_ms: question.asked_at_ms,
+                    body: serde_json::to_vec(&question).unwrap(),
+                    answer: None,
+                })
+            })
+            .unwrap();
+        (dir, paths, root)
+    }
+
+    #[tokio::test]
+    async fn resolve_reads_a_decision_sync_took_so_the_same_word_is_unchanged_and_another_is_stale()
+    {
+        use koidrive_engine::question::{ConflictFile, Revisions};
+
+        let (_dir, paths, _root) = linked_profile();
+        let file = |node_id: &str| ConflictFile {
+            node_id: node_id.into(),
+            revisions: Revisions {
+                content_rev: 2,
+                meta_rev: 1,
+            },
+        };
+        let conflict = Question {
+            id: "c1".into(),
+            lineage: "c1".into(),
+            space_id: SPACE.into(),
+            asked_at_ms: 20,
+            kind: koidrive_driver::QuestionKind::Conflict {
+                original: file("n-original"),
+                copy: file("n-copy"),
+                sent_in: None,
+            },
+            items: Vec::new(),
+        };
+        let store = || koidrive_store::Store::open(paths.store(SPACE).unwrap()).unwrap();
+        store()
+            .transaction(|tx| {
+                tx.put_question(&koidrive_store::StoredQuestion {
+                    question_id: conflict.id.clone(),
+                    asked_at_ms: conflict.asked_at_ms,
+                    body: serde_json::to_vec(&conflict).unwrap(),
+                    answer: None,
+                })
+            })
+            .unwrap();
+        let resolve =
+            |id: &str, word: &str| crate::resolve(&paths, Some(id.into()), Some(word.into()));
+        let outcome = |done: Result<crate::report::Done, CliError>| match done {
+            Ok(done) => Ok(done.outcome),
+            Err(error) => Err(error.code),
+        };
+        use crate::report::Outcome;
+
+        assert_eq!(
+            outcome(resolve("c1", "keep-node:n-original").await),
+            Ok(Outcome::Accepted)
+        );
+        assert_eq!(
+            outcome(resolve("c1", "keep-node:n-original").await),
+            Ok(Outcome::Unchanged)
+        );
+        assert!(store().transaction(|tx| tx.take_answer("c1")).unwrap());
+        assert_eq!(
+            outcome(resolve("c1", "keep-node:n-original").await),
+            Ok(Outcome::Unchanged)
+        );
+        for other in ["keep-node:n-copy", "keep-both"] {
+            assert_eq!(
+                outcome(resolve("c1", other).await),
+                Err(Code::StaleDecision),
+                "{other}"
+            );
+        }
+
+        assert_eq!(
+            outcome(resolve("q1", "delete").await),
+            Ok(Outcome::Accepted)
+        );
+        store().transaction(|tx| tx.remove_question("q1")).unwrap();
+        assert_eq!(
+            outcome(resolve("q1", "delete").await),
+            Err(Code::StaleDecision)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_answer_is_unchanged_after_sync_took_it_and_another_answer_is_stale() {
+        let (_dir, paths, _root) = linked_profile();
+        let driver = Driver::open(paths.clone()).unwrap();
+        let answer = |question_id: &str, answer| {
+            handle(
+                &driver,
+                Request::Answer {
+                    question_id: question_id.into(),
+                    answer,
+                },
+            )
+        };
+        assert_eq!(answer("q1", Answer::Delete).await, Response::Answered);
+        assert_eq!(
+            answer("q1", Answer::Delete).await,
+            Response::AlreadyAnswered
+        );
+        assert!(
+            koidrive_store::Store::open(paths.store(SPACE).unwrap())
+                .unwrap()
+                .transaction(|tx| tx.take_answer("q1"))
+                .unwrap()
+        );
+        assert!(driver.questions().unwrap().is_empty());
+        assert_eq!(
+            answer("q1", Answer::Delete).await,
+            Response::AlreadyAnswered
+        );
+
+        let Response::Error {
+            code,
+            message,
+            next,
+        } = answer("q1", Answer::Restore).await
+        else {
+            panic!("another answer was taken");
+        };
+        assert_eq!(code, Code::StaleDecision);
+        assert_eq!(
+            message,
+            "the question was answered with delete; koi resolve lists the decisions waiting now"
+        );
+        assert_eq!(next, [Next::of(&["koi", "resolve", "--json"])]);
+    }
+
+    #[tokio::test]
+    async fn an_answer_the_daemon_acknowledged_outlives_the_daemon_and_is_unchanged_after_sync_took_it()
+     {
+        let (_dir, paths, _root) = linked_profile();
+        let answer = || Request::Answer {
+            question_id: "q1".into(),
+            answer: Answer::Delete,
+        };
+        let driver = Driver::open(paths.clone()).unwrap();
+        assert_eq!(handle(&driver, answer()).await, Response::Answered);
+        drop(driver);
+        let mut store = koidrive_store::Store::open(paths.store(SPACE).unwrap()).unwrap();
+        assert!(store.transaction(|tx| tx.take_answer("q1")).unwrap());
+        drop(store);
+        let driver = Driver::open(paths.clone()).unwrap();
+        assert_eq!(handle(&driver, answer()).await, Response::AlreadyAnswered);
+    }
+
+    #[tokio::test]
+    async fn question_ids_that_differ_in_case_are_different_questions() {
+        let (_dir, paths, _root) = linked_profile();
+        let driver = Driver::open(paths.clone()).unwrap();
+        let answer = |question_id: &str| {
+            handle(
+                &driver,
+                Request::Answer {
+                    question_id: question_id.into(),
+                    answer: Answer::Delete,
+                },
+            )
+        };
+        assert_eq!(answer("q1").await, Response::Answered);
+        koidrive_store::Store::open(paths.store(SPACE).unwrap())
+            .unwrap()
+            .transaction(|tx| tx.take_answer("q1"))
+            .unwrap();
+        let Response::Error { code, .. } = answer("Q1").await else {
+            panic!("the answer to q1 was taken as one to Q1");
+        };
+        assert_eq!(code, Code::StaleDecision);
+        assert_eq!(answer("q1").await, Response::AlreadyAnswered);
+    }
+
+    #[tokio::test]
+    async fn an_answer_to_a_decision_replaced_before_sync_took_it_is_stale() {
+        let (_dir, paths, _root) = linked_profile();
+        let driver = Driver::open(paths.clone()).unwrap();
+        let answer = || {
+            handle(
+                &driver,
+                Request::Answer {
+                    question_id: "q1".into(),
+                    answer: Answer::Delete,
+                },
+            )
+        };
+        assert_eq!(answer().await, Response::Answered);
+        let replacement = Question {
+            id: "q2".into(),
+            lineage: "q2".into(),
+            space_id: SPACE.into(),
+            asked_at_ms: 20,
+            kind: koidrive_driver::QuestionKind::AmbiguousDisappearance,
+            items: Vec::new(),
+        };
+        koidrive_store::Store::open(paths.store(SPACE).unwrap())
+            .unwrap()
+            .transaction(|tx| {
+                tx.remove_question("q1")?;
+                tx.put_question(&koidrive_store::StoredQuestion {
+                    question_id: "q2".into(),
+                    asked_at_ms: 20,
+                    body: serde_json::to_vec(&replacement).unwrap(),
+                    answer: None,
+                })
+            })
+            .unwrap();
+        assert_eq!(driver.questions().unwrap(), [replacement]);
+        let Response::Error { code, next, .. } = answer().await else {
+            panic!("the dropped answer was reported as taken");
+        };
+        assert_eq!(code, Code::StaleDecision);
+        assert_eq!(next, [Next::of(&["koi", "resolve", "--json"])]);
+    }
+
+    #[tokio::test]
+    async fn a_restart_that_leaves_the_folder_halted_records_nothing_so_its_id_runs_again() {
+        let (_dir, paths, root) = linked_profile();
+        let driver = Driver::open(paths.clone()).unwrap();
+        driver.start();
+        let request_id = RequestId::parse("r1").unwrap();
+        let restart = || {
+            let key = Key::restart(&root);
+            Request::Restart {
+                folder: root.clone(),
+            }
+            .once(Some(request_id.clone()), key)
+        };
+        for _ in 0..2 {
+            let Response::Restarted { folder } = handle(&driver, restart()).await else {
+                panic!("the restart failed");
+            };
+            assert_eq!(folder.state, FolderState::Halted, "{folder:?}");
+            assert!(!crate::request::request_file(&paths, &request_id).exists());
+        }
+        driver.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_request_with_an_id_runs_once_and_its_record_outlives_the_folder_and_the_daemon() {
+        let (_dir, paths, root) = linked_profile();
+        let driver = Driver::open(paths.clone()).unwrap();
+        let id = |text: &str| Some(RequestId::parse(text).unwrap());
+        let restart = |folder: &Path, request_id| {
+            let key = Key::restart(folder);
+            Request::Restart {
+                folder: folder.to_path_buf(),
+            }
+            .once(request_id, key)
+        };
+        let first = handle(&driver, restart(&root, id("r1"))).await;
+        assert!(matches!(first, Response::Restarted { .. }), "{first:?}");
+        let unlinked = handle(
+            &driver,
+            Request::Unlink {
+                folder: root.clone(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(unlinked, Response::Unlinked { .. }),
+            "{unlinked:?}"
+        );
+        assert_eq!(
+            handle(
+                &driver,
+                Request::Unlink {
+                    folder: root.clone()
+                }
+            )
+            .await,
+            Response::NotLinked { path: root.clone() }
+        );
+        assert_eq!(handle(&driver, restart(&root, id("r1"))).await, first);
+        drop(driver);
+        let driver = Driver::open(paths.clone()).unwrap();
+        assert_eq!(handle(&driver, restart(&root, id("r1"))).await, first);
+
+        let other = handle(&driver, restart(&root.join("Other"), id("r1"))).await;
+        assert!(
+            matches!(
+                &other,
+                Response::Error {
+                    code: Code::StaleDecision,
+                    ..
+                }
+            ),
+            "{other:?}"
+        );
+        for _ in 0..2 {
+            let failed = handle(&driver, restart(&root, id("r2"))).await;
+            assert!(
+                matches!(
+                    &failed,
+                    Response::Error {
+                        code: Code::Usage,
+                        ..
+                    }
+                ),
+                "{failed:?}"
+            );
+            assert!(!crate::request::request_file(&paths, &id("r2").unwrap()).exists());
+        }
     }
 }
