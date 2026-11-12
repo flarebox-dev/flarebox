@@ -585,12 +585,15 @@ impl Snapshot {
     /// [`Rescan::unsettled`]. The search goes on in the next rescans, of any
     /// paths, and the removal is reported by the next rescan of its path after
     /// the search has decided it, or as a rename when that rescan finds its
-    /// identity at an included path. An entry that takes its path makes the
-    /// search run to its end, so the removal is reported first. The first
-    /// rescan of a path with new `rules` also runs the search to its end for
-    /// each entry there whose path now holds another identity, so a removal
-    /// another watcher held is not read as a replacement; a path below a
-    /// folder the rescan cannot read is not counted as scanned. A held entry whose
+    /// identity at an included path. A file created at its path is held back
+    /// with it, and both are reported once the search has decided: as a
+    /// modification when the search did not find the removed entry, and as
+    /// the removal and then the creation when it did. A rename or a change
+    /// onto its path makes the search run to its end, so the removal is
+    /// reported first. The first rescan of a path with new `rules` holds
+    /// each entry there whose path now holds another identity the same way,
+    /// so a removal another watcher held is not read as a replacement; a path
+    /// below a folder the rescan cannot read is not counted as scanned. A held entry whose
     /// removal the scan cannot confirm, as below a folder it cannot read,
     /// stays held.
     ///
@@ -1265,6 +1268,29 @@ fn find_ignored(
             Change::Created { .. } | Change::Modified { .. } => {}
         }
     }
+    let saved: Vec<PathBuf> = (changes.iter())
+        .filter_map(|change| match change {
+            Change::Removed {
+                path,
+                kind: EntryKind::File,
+            } => Some(path.clone()),
+            _ => None,
+        })
+        .filter(|path| {
+            (changes.iter()).any(|change| {
+                matches!(change, Change::Created { path: at, kind: EntryKind::File } if at == path)
+            })
+        })
+        .collect();
+    changes
+        .retain(|change| !matches!(change, Change::Created { path, .. } if saved.contains(path)));
+    for change in changes.iter_mut() {
+        if let Change::Removed { path, .. } = change
+            && saved.contains(path)
+        {
+            *change = Change::Modified { path: path.clone() };
+        }
+    }
     arrivals
 }
 
@@ -1665,8 +1691,8 @@ pub trait Watcher {
     /// how the disk differs from `known` there, and every file of `known` it
     /// finds as modified. Entries outside `scope` are not reported again
     /// unless they changed. A removal held at or below `scope` is left to
-    /// `known`: that rescan runs the search to its end for each entry of
-    /// `known` whose path now holds another identity, as the first scan of a
+    /// `known`: that rescan holds each entry of `known` whose path now holds
+    /// another identity until the search decides it, as the first scan of a
     /// new watcher does.
     fn reset(&mut self, scope: &Path, known: BTreeMap<PathBuf, Known>);
 }
