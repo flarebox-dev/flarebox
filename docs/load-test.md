@@ -25,7 +25,7 @@ It uses the Deploy test's protected `deploy-test` environment, secrets, trust ch
 | `s1` | Writers: 1, 5, 10, 25, 50, 100, 200 | One space | Commits per second of one space |
 | `s4` | Spaces: 1, 4, 16 | 25 writers in each space | Whether commits per second grow with spaces, or stop at a limit the spaces share |
 
-The `steps` input replaces the list, for example `1,5` for a short trial. A step may have at most 400 writers in all, because one runner holds every connection. `warmup_seconds` may be at most 600 and `measure_seconds` at most 1800, so a full run fits the run step's 240 minutes.
+The `steps` input replaces the list, for example `1,5` for a short trial. A step may have at most 400 writers in all, because one runner holds every connection. `warmup_seconds` may be at most 600 and `measure_seconds` at most 1800, and all steps together at most 180 minutes, so the run step's 240 minutes also hold setup, calibration and analytics. The defaults take 70 minutes for `s1` and 30 for `s4`.
 
 ## Reading the table
 

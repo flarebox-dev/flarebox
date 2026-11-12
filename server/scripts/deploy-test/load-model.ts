@@ -20,6 +20,8 @@ export interface Config {
 export const S4_WRITERS_PER_SPACE = 25;
 /** One runner holds every connection, so a run may not ask for more. */
 export const MAX_WRITERS = 400;
+/** Warmup and measuring time of all steps together. The run step's 240 minutes also hold up to an hour of setup, calibration and analytics. */
+export const MAX_STEPS_MS = 180 * 60_000;
 /** Used when the Analytics API cannot measure the rows a commit writes. Above every estimate in the plan (20 to 40). */
 export const FALLBACK_ROWS_PER_COMMIT = 60;
 /** Headroom on the calibrated rows per commit, for commits that write more than the calibration's did. */
@@ -56,6 +58,10 @@ export function readConfig(env: Record<string, string | undefined>): Config {
     maxRowsWritten: whole(env, "LOAD_MAX_ROWS_WRITTEN", 40_000_000, 1),
     subscribersPerSpace: whole(env, "LOAD_SUBSCRIBERS", 1, 0),
   };
+  const stepsMs = steps.length * (config.warmupMs + config.measureMs);
+  if (stepsMs > MAX_STEPS_MS) {
+    throw new Error(steps.length + " steps of " + (config.warmupMs + config.measureMs) / 1000 + " s take " + stepsMs / 60_000 + " minutes; at most " + MAX_STEPS_MS / 60_000 + " fit the run step with setup, calibration and analytics");
+  }
   const last = layout(config, steps.at(-1)!);
   if (last.spaces * last.writersPerSpace > MAX_WRITERS) {
     throw new Error("the last step needs " + last.spaces * last.writersPerSpace + " writers; one runner holds at most " + MAX_WRITERS);

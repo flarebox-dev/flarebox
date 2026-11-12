@@ -230,8 +230,6 @@ async function write(writer: Writer): Promise<void> {
       }
       continue;
     }
-    const started = performance.now();
-    let response: RpcResponse;
     try {
       await session.keepToken();
     } catch {
@@ -241,6 +239,8 @@ async function write(writer: Writer): Promise<void> {
       backoffMs = Math.min(backoffMs * 2, 15_000);
       continue;
     }
+    const started = performance.now();
+    let response: RpcResponse;
     try {
       response = await session.commit(writer.nodeId, writer.contents[next]!);
     } catch (error) {

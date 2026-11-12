@@ -32,6 +32,8 @@ describe("the load test's configuration", () => {
     expect(() => readConfig({ LOAD_SCENARIO: "s1", LOAD_MEASURE_SECONDS: "5" })).toThrow(/at least 10/);
     expect(() => readConfig({ LOAD_SCENARIO: "s1", LOAD_MEASURE_SECONDS: "1801" })).toThrow(/at most 1800/);
     expect(() => readConfig({ LOAD_SCENARIO: "s1", LOAD_WARMUP_SECONDS: "601" })).toThrow(/at most 600/);
+    expect(() => readConfig({ LOAD_SCENARIO: "s1", LOAD_WARMUP_SECONDS: "600", LOAD_MEASURE_SECONDS: "1800" })).toThrow(/7 steps of 2400 s take 280 minutes; at most 180/);
+    expect(readConfig({ LOAD_SCENARIO: "s4", LOAD_WARMUP_SECONDS: "600", LOAD_MEASURE_SECONDS: "1800" }).steps).toEqual([1, 4, 16]);
   });
 });
 
