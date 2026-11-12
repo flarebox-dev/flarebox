@@ -531,7 +531,13 @@ pub fn stuck(trees: &Trees) -> BTreeMap<NodeId, Stuck> {
             Some(((*id).clone(), Stuck::HeldBy(by)))
         })
         .collect();
+    let idle = planned.iter().all(|id| match view.step(id) {
+        Step::Apply(..) => false,
+        Step::Blocked(Some(holder)) => !view.parkable(&holder),
+        _ => true,
+    });
     let parked: Vec<(NodeId, Stuck)> = (planned.iter())
+        .filter(|_| idle)
         .filter(|id| !stuck.contains_key(**id))
         .filter(|id| trees.local().get(id).is_some_and(|node| node.parked))
         .map(|id| {
@@ -677,7 +683,12 @@ impl<'a> View<'a> {
         let local = self.trees.local().get(id);
         let remote = self.trees.remote().live(id);
         if let Some(local) = local.filter(|local| local.parked && self.trees.ignored(id)) {
-            return self.unpark(id, local, &local.shape);
+            let away = remote.filter(|remote| {
+                self.held_by_excluded(id, &local.shape)
+                    && !(self.trees.edited(id) && self.trees.ignored_in_remote(id))
+                    && self.blocked(id, remote).is_none()
+            });
+            return self.unpark(id, local, away.unwrap_or(&local.shape));
         }
         let (local, remote) = match (local, remote) {
             (None, None) => return Step::Skip,
@@ -842,10 +853,14 @@ impl<'a> View<'a> {
 
     fn goes_home(&self, id: &str, remote: &Shape) -> bool {
         self.trees.edited(id) && self.trees.ignored_in_remote(id)
-            || matches!(
-                self.blocked(id, remote),
-                Some(Step::Blocked(Some(holder))) if self.trees.excluded(&holder)
-            )
+            || self.held_by_excluded(id, remote)
+    }
+
+    fn held_by_excluded(&self, id: &str, target: &Shape) -> bool {
+        matches!(
+            self.blocked(id, target),
+            Some(Step::Blocked(Some(holder))) if self.trees.excluded(&holder)
+        )
     }
 
     /// Moves a parked node to `target`'s position with its content as L has it.

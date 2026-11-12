@@ -1436,6 +1436,55 @@ fn an_edit_whose_r_folder_the_rules_exclude_is_not_parked_to_free_its_name() {
     }));
 }
 
+#[test]
+fn a_file_parked_for_a_name_swap_is_not_reported_while_the_swap_goes_on() {
+    let (mut trees, mut disk) = space(&[
+        ("a", Some(file(ROOT, "x", 1)), Some(file(ROOT, "y", 1))),
+        ("b", Some(file(ROOT, "y", 2)), Some(file(ROOT, "x", 2))),
+    ]);
+    trees.settle();
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let park = effects.plan(&trees, &mut ids, NOW).unwrap().clone();
+    assert!(matches!(
+        park.effect,
+        Effect::Move {
+            to: Location::Parked(_),
+            ..
+        }
+    ));
+    disk.apply(&park.effect).unwrap();
+    effects.done(&mut trees, &park.effect_id, None).unwrap();
+    trees.settle();
+    assert_eq!(koidrive_engine::effects::stuck(&trees), BTreeMap::new());
+}
+
+#[test]
+fn an_ignored_parked_file_whose_local_name_an_excluded_folder_holds_goes_into_it_as_r_has_it() {
+    let (mut trees, mut disk) = space(&[
+        ("e", Some(dir(ROOT, "A")), Some(dir(ROOT, "A"))),
+        ("p", Some(file("e", "A", 1)), Some(file("e", "A", 1))),
+    ]);
+    trees.set_rules(
+        &[] as &[&str],
+        Some(koidrive_engine::ignore::RuleFile::parse(b"A\n")),
+    );
+    let mut local = trees.local().get("p").unwrap().clone();
+    local.parked = true;
+    local.shape = file(ROOT, "A", 1);
+    trees.set_local("p".into(), local);
+    trees.revert("p".into());
+    let entry = disk.entries.get_mut(&2).unwrap();
+    entry.area = Area::Parked;
+    entry.name = "p".into();
+    trees.check().unwrap();
+    disk.matches(&trees).unwrap();
+    assert!(trees.excluded("e") && trees.ignored("p"));
+    converge(&mut trees, &mut disk, 10).unwrap();
+    let p = trees.local().get("p").unwrap();
+    assert!(!p.parked);
+    assert_eq!(p.shape, file("e", "A", 1));
+}
+
 /// A valid tree over `n0`, `n1`, ... from one [`Draw`] per node, as in tests/trees.rs, where each
 /// node has the kind and file content of `kinds`. S and R are drawn with their own ranks, so their
 /// moves can swap, rotate and nest into each other.
