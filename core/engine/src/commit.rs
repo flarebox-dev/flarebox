@@ -1168,9 +1168,11 @@ impl Commits {
                 Some(op::Op::Delete(delete)) => {
                     let done = applied || code == Code::Superseded;
                     if done {
+                        let kept = delete.requires.as_ref().map(|kept| kept.node_id.as_str());
                         for id in flight.deletes.get(&delete.node_id).into_iter().flatten() {
                             synced.set(id, None);
-                            trees.record_trashed(id, result.seq);
+                            let kept = kept.filter(|_| *id == delete.node_id);
+                            trees.record_trashed(id, result.seq, kept);
                         }
                     }
                     (&delete.node_id, done)
@@ -1280,7 +1282,8 @@ impl Commits {
             *sent_in = None;
             match (sent, code) {
                 (op::Op::Delete(delete), Code::Applied) => {
-                    trees.record_trashed(&delete.node_id, result.seq);
+                    let kept = delete.requires.as_ref().map(|kept| kept.node_id.as_str());
+                    trees.record_trashed(&delete.node_id, result.seq, kept);
                     closed.insert(id);
                 }
                 (op::Op::UpdateContent(update), Code::Applied) => {
@@ -2151,7 +2154,9 @@ fn plan(
         }
         let synced = trees.acknowledged(id);
         let Some(local) = trees.local().get(id).map(|node| &node.shape) else {
-            if deletes(trees, id, needed) {
+            let kept_settled =
+                (trees.kept_original(id)).is_none_or(|kept| trees.class(kept) == Class::InSync);
+            if kept_settled && deletes(trees, id, needed) {
                 deleted.insert(id.clone());
             }
             continue;
@@ -2323,9 +2328,17 @@ fn plan(
             Want::Delete { id, members } => {
                 scratch.trash(&id);
                 deletes.insert(id.clone(), members.into_iter().collect());
+                let requires = trees.kept_original(&id).map(|kept| {
+                    let held = trees.remote().get(kept);
+                    proto::NodeRevisions {
+                        node_id: kept.clone(),
+                        content_rev: held.map_or(0, |node| node.content_rev),
+                        meta_rev: held.map_or(0, |node| node.meta_rev),
+                    }
+                });
                 op::Op::Delete(proto::Delete {
                     node_id: id,
-                    requires: None,
+                    requires,
                 })
             }
             Want::Restore { op, .. } => {

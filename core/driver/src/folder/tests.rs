@@ -8192,3 +8192,82 @@ fn an_excluded_folder_deleted_after_a_move_leaves_l(
     }
     assert!(!held(&b));
 }
+
+fn keep_original_lost_by_a_restore(deleted_on_c: bool) -> (Remote, Site, Vec<Commit>) {
+    let mut remote = Remote::new();
+    let ((site_a, mut a), (site_b, mut b)) = edited_on_both(&mut remote);
+    let mut chunks = Server::default();
+    chunks.chunks.clone_from(&remote.chunks.chunks);
+    let mut restored = Remote {
+        space: remote.space.clone(),
+        chunks,
+        results: remote.results.clone(),
+    };
+    answer(&site_b, Answer::KeepOriginal);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
+    assert_eq!(remote.names(), ["main.go"]);
+
+    let (site_c, mut c) = linked(&mut restored, "c");
+    c.settle();
+    assert_eq!(names(&site_c.root), [COPY, "main.go"]);
+    if deleted_on_c {
+        fs::remove_file(site_c.root.join("main.go")).unwrap();
+        c.scan_until(|c| !c.work.is_empty());
+        c.run(&mut restored);
+    }
+
+    let sent = b.sent.len();
+    b.event(Event::Connected(restored.space.welcome(&b.caller)))
+        .unwrap();
+    for _ in 0..3 {
+        b.pull(&restored);
+        b.run(&mut restored);
+        b.settle();
+    }
+    let resent = b.sent[sent..].to_vec();
+    (restored, site_b, resent)
+}
+
+fn resent_deletes(resent: &[Commit]) -> Vec<&koidrive_proto::v1::Delete> {
+    (resent.iter().flat_map(|commit| &commit.ops))
+        .filter_map(|sent| match &sent.op {
+            Some(op::Op::Delete(delete)) => Some(delete),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_lost_keep_original_is_not_sent_again_once_another_device_deleted_the_original() {
+    let (restored, site_b, resent) = keep_original_lost_by_a_restore(true);
+
+    assert_eq!(restored.names(), [COPY]);
+    assert_eq!(
+        files(&site_b.root),
+        [(COPY.to_owned(), "from b".to_owned())]
+    );
+    assert_eq!(
+        resent_deletes(&resent),
+        Vec::<&koidrive_proto::v1::Delete>::new()
+    );
+}
+
+#[test]
+fn a_lost_keep_original_is_sent_again_requiring_the_original() {
+    let (restored, site_b, resent) = keep_original_lost_by_a_restore(false);
+
+    assert_eq!(restored.names(), ["main.go"]);
+    assert_eq!(
+        files(&site_b.root),
+        [("main.go".to_owned(), "from a".to_owned())]
+    );
+    let original = (restored.space.nodes().into_iter())
+        .find(|node| node.name == "main.go")
+        .unwrap();
+    let required: Vec<_> = (resent_deletes(&resent).into_iter())
+        .map(|delete| delete.requires.clone().map(|kept| kept.node_id))
+        .collect();
+    assert_eq!(required, [Some(original.node_id)]);
+}

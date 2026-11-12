@@ -212,6 +212,13 @@ impl Tx<'_> {
         while let Some(row) = rows.next()? {
             state.trees.resends.insert(row.get(0)?);
         }
+        let mut stmt = self
+            .0
+            .prepare_cached("SELECT node_id, kept FROM kept_originals")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            state.trees.kept_originals.insert(row.get(0)?, row.get(1)?);
+        }
 
         if let Some((accepted, halt, code, cap)) = self
             .0
@@ -295,6 +302,7 @@ impl Tx<'_> {
             "unsent_edits",
             "replaced_versions",
             "resends",
+            "kept_originals",
             "effect_state",
             "failed_effects",
             "restore_intents",
@@ -533,6 +541,20 @@ impl Tx<'_> {
         }
         for node in new.difference(old) {
             put.execute([node])?;
+        }
+        let mut remove = self
+            .0
+            .prepare_cached("DELETE FROM kept_originals WHERE node_id = ?1")?;
+        let mut put = self.0.prepare_cached(
+            "INSERT OR REPLACE INTO kept_originals (node_id, kept) VALUES (?1, ?2)",
+        )?;
+        let (removed, changed) =
+            differences(&before.trees.kept_originals, &after.trees.kept_originals);
+        for node in removed {
+            remove.execute([node])?;
+        }
+        for (node, kept) in changed {
+            put.execute(params![node, kept])?;
         }
 
         let (old, new) = (&before.commits, &after.commits);
