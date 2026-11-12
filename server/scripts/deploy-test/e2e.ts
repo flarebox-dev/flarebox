@@ -300,7 +300,7 @@ export async function startDaemon(on: Device): Promise<void> {
   writeFileSync(join(on.dir, "daemon.pid"), String(daemon.pid));
   const runtime = join(on.env.XDG_RUNTIME_DIR!, "koidrive");
   await until(on.name + "'s daemon to answer", 30_000, () => {
-    if (daemon.exitCode !== null) fail(on.name + "'s daemon exited with " + daemon.exitCode + ": " + readFileSync(join(on.dir, "daemon.log"), "utf8").slice(-2000));
+    if (daemon.exitCode !== null || daemon.signalCode !== null) fail(on.name + "'s daemon exited with " + (daemon.exitCode ?? daemon.signalCode) + ": " + readFileSync(join(on.dir, "daemon.log"), "utf8").slice(-2000));
     if (!existsSync(runtime) || !readdirSync(runtime).some((name) => /^daemon-[0-9a-f]{8}\.sock$/.test(name))) return undefined;
     return answers(on) ? true : undefined;
   });
