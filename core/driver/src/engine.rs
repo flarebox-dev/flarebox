@@ -2830,4 +2830,12 @@ mod tests {
         assert_eq!(local_at(&engine.trees, Path::new("d/x")), x);
         assert_eq!(in_l(&engine), on_disk(&snapshot));
     }
+
+    #[test]
+    fn a_file_back_at_its_path_in_another_folder_follows_that_folder() {
+        replay(&[
+            &["mkdir ß", "mkdir ß/a", "write ß/b"],
+            &["mv ß a", "mv a/b a/a/b", "mv a/a ß"],
+        ]);
+    }
 }
