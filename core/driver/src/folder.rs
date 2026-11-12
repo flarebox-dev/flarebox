@@ -848,6 +848,10 @@ impl Folder {
                     }
                 }
                 Stuck::Parked => format!("it has no free place here; {}", kept.unwrap_or_default()),
+                Stuck::Behind(node) if held.get(node) == Some(&Stuck::Parked) => format!(
+                    "waits for {}, which has no free place here",
+                    quoted_item(node)
+                ),
                 Stuck::Behind(node) => format!(
                     "waits for {}, whose name here is taken by an entry this device's rules exclude",
                     quoted_item(node)
