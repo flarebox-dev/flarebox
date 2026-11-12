@@ -11,7 +11,9 @@ use koidrive_engine::guard::{Counted, GuardState, RemoteDeletion, Trash};
 use koidrive_engine::ids::uuid_v7;
 use koidrive_engine::question::{Answer, Held, Limit, Question, QuestionKind, Revisions};
 use koidrive_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
-use koidrive_engine::state::{Agreed, CommitsState, EffectsState, Pending, StateError, TreesState};
+use koidrive_engine::state::{
+    Agreed, CommitsState, EffectsState, MovedHere, Pending, StateError, TreesState,
+};
 use koidrive_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape, TreeError};
 use koidrive_proto::v1::{Commit, CommitResult, Delete, Move, Op, OpResult, op};
 
@@ -102,7 +104,16 @@ fn trees_state() -> TreesState {
         lost: ["a".into()].into(),
         displaced: Default::default(),
         edited_here: [("a".into(), 1)].into(),
-        moved_here: [("a".into(), 1)].into(),
+        moved_here: [("a".into(), MovedHere { seq: 1, from: None })].into(),
+        moved_from: [(
+            "p".into(),
+            Agreed {
+                rev: 1,
+                parent: ROOT.into(),
+                name: "q".into(),
+            },
+        )]
+        .into(),
         unsent_edits: Default::default(),
         resends: Default::default(),
         replaced_versions: [("a".into(), vec!["v1".into()])].into(),
@@ -478,18 +489,20 @@ fn trees_restore_a_valid_state_and_refuse_each_broken_one() {
             StateError::NotRemote("gone".into()),
         ),
         (
-            "a node moved here that R holds trashed",
+            "R's record before a move of a node the commit in flight does not move",
             trees(),
             broken(trees_state(), |state| {
-                state.moved_here.insert("t".into(), 5);
+                let from = state.moved_from["p"].clone();
+                state.moved_from.insert("a".into(), from);
             }),
-            StateError::NotMovedHere("t".into()),
+            StateError::NotMovedFrom("a".into()),
         ),
         (
-            "a node moved here whose position R holds from another commit",
+            "a node moved here that R holds at a revision before that commit",
             trees(),
             broken(trees_state(), |state| {
-                state.moved_here.insert("a".into(), 2);
+                let moved = MovedHere { seq: 2, from: None };
+                state.moved_here.insert("a".into(), moved);
             }),
             StateError::NotMovedHere("a".into()),
         ),

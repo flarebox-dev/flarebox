@@ -8,7 +8,7 @@ use koidrive_ignore::Status;
 
 use crate::ignore::{LocalRules, Matcher, RuleFile, is_rules_file};
 use crate::names::name_key;
-use crate::state::{Agreed, StateError, TreesState};
+use crate::state::{Agreed, MovedHere, StateError, TreesState};
 use crate::tree::{
     Content, FileIdentity, Kind, LocalNode, Names, Node, NodeId, RemoteNode, Shape, Tree,
     TreeError, same, same_content,
@@ -194,7 +194,9 @@ pub struct Trees {
     /// R holds that content.
     edited_here: BTreeMap<NodeId, u64>,
     /// See [`TreesState::moved_here`].
-    moved_here: BTreeMap<NodeId, u64>,
+    moved_here: BTreeMap<NodeId, MovedHere>,
+    /// See [`TreesState::moved_from`].
+    moved_from: BTreeMap<NodeId, Agreed>,
     /// See [`TreesState::unsent_edits`].
     unsent_edits: BTreeSet<NodeId>,
     replaced_versions: BTreeMap<NodeId, Vec<String>>,
@@ -270,6 +272,7 @@ impl Trees {
             discarded: BTreeMap::new(),
             edited_here: BTreeMap::new(),
             moved_here: BTreeMap::new(),
+            moved_from: BTreeMap::new(),
             unsent_edits: BTreeSet::new(),
             replaced_versions: BTreeMap::new(),
             resends: BTreeSet::new(),
@@ -499,8 +502,23 @@ impl Trees {
         if (self.edited_here.get(&id)).is_some_and(|&seq| node.trashed || node.edit_rev != seq) {
             self.edited_here.remove(&id);
         }
-        if (self.moved_here.get(&id)).is_some_and(|&seq| node.trashed || node.meta_rev != seq) {
+        let kept = |seq: u64| {
+            node.meta_rev >= seq
+                && (self.r.get(&id)).is_some_and(|old| old.shape.same_position(&node.shape))
+        };
+        if (self.moved_here.get(&id)).is_some_and(|moved| !kept(moved.seq)) {
             self.moved_here.remove(&id);
+        }
+        let replaced = (self.r.get(&id))
+            .filter(|old| !old.trashed && old.meta_rev < node.meta_rev)
+            .filter(|_| self.watched_positions.contains_key(&id));
+        if let Some(old) = replaced {
+            let from = Agreed {
+                rev: old.meta_rev,
+                parent: old.shape.parent.clone(),
+                name: old.shape.name.clone(),
+            };
+            self.moved_from.insert(id.clone(), from);
         }
         if node.is_live() && node.shape.kind == Kind::File && is_rules_file(&node.shape.name) {
             self.remote_rules_files.insert(id.clone());
@@ -582,6 +600,7 @@ impl Trees {
         self.replaced_versions.remove(id);
         self.resends.remove(id);
         self.moved_here.remove(id);
+        self.moved_from.remove(id);
         if self.r.remove(id).is_some() {
             self.mark(id);
         }
@@ -1133,6 +1152,7 @@ impl Trees {
     /// moves, and stops watching any other node.
     pub fn watch_positions(&mut self, ids: impl IntoIterator<Item = NodeId>) {
         self.watched_positions = ids.into_iter().map(|id| (id, None)).collect();
+        self.moved_from.clear();
     }
 
     /// The latest position of `id` that L and R agreed on since [`Trees::watch_positions`] started
@@ -1198,23 +1218,26 @@ impl Trees {
     }
 
     /// Records that a create or a move of this device, in the commit at `seq`, set the position of
-    /// `id`, if R holds the position of that commit.
+    /// `id`, if R holds the position of that commit, with R's record of `id` before it.
     pub fn record_moved(&mut self, id: &str, seq: u64) {
         if (self.r.get(id)).is_some_and(|remote| !remote.trashed && remote.meta_rev == seq) {
-            self.moved_here.insert(id.to_owned(), seq);
+            let from = (self.moved_from.get(id))
+                .filter(|from| from.rev < seq)
+                .cloned();
+            self.moved_here
+                .insert(id.to_owned(), MovedHere { seq, from });
         }
     }
 
     /// The nodes whose position a create or a move of this device set, and whose position S and R
-    /// still hold, each with the seq of that commit, for [`Trees::forget_lost`] once a bootstrap
-    /// has replaced R.
-    pub fn moved_here(&self) -> Vec<(NodeId, u64)> {
+    /// still hold, for [`Trees::forget_lost`] once a bootstrap has replaced R.
+    pub fn moved_here(&self) -> Vec<(NodeId, MovedHere)> {
         (self.moved_here.iter())
             .filter(|(id, _)| {
                 let (remote, synced) = (self.r.live(id), self.s.live(id));
                 remote.zip(synced).is_some_and(|(r, s)| r.same_position(s))
             })
-            .map(|(id, seq)| (id.clone(), *seq))
+            .map(|(id, moved)| (id.clone(), moved.clone()))
             .collect()
     }
 
@@ -1289,8 +1312,11 @@ impl Trees {
     /// move: a device that did not set S's position cannot tell whether a lost commit set it, and
     /// sending it again would undo a move another device made since. `moved` lists the
     /// nodes whose position a create or a move of this device set before the bootstrap
-    /// ([`Trees::moved_here`]), each with the seq of that commit. S forgets such a node when the
-    /// seq is above `held_through`, so the position this device set is sent again.
+    /// ([`Trees::moved_here`]). S forgets such a node when the server lost that commit, its seq
+    /// above `held_through`, and R may hold the node as it was before the commit: at a revision at
+    /// or below `held_through`, or with the record R held just before the commit, or when that
+    /// record is not known. So the position this device set is sent again, unless another device
+    /// moved the node after it.
     ///
     /// `trashed` lists what deletes of this device had trashed before the bootstrap
     /// ([`Trees::trashed_here`]), and `held_through` the seq of the newest commit of this device the
@@ -1362,12 +1388,24 @@ impl Trees {
         trashed: Vec<Trashed>,
         edited: Vec<(NodeId, u64)>,
         synced: Vec<NodeId>,
-        moved: Vec<(NodeId, u64)>,
+        moved: Vec<(NodeId, MovedHere)>,
         held_through: u64,
         accepted: u64,
     ) {
+        let before = |id: &NodeId, moved: &MovedHere| {
+            (self.r.get(id))
+                .filter(|remote| !remote.trashed)
+                .is_some_and(|remote| {
+                    remote.meta_rev <= held_through
+                        || (moved.from.as_ref()).is_none_or(|from| {
+                            from.rev == remote.meta_rev
+                                && from.parent == remote.shape.parent
+                                && from.name == remote.shape.name
+                        })
+                })
+        };
         let lost_moves: BTreeSet<NodeId> = (moved.into_iter())
-            .filter(|(_, seq)| *seq > held_through)
+            .filter(|(id, moved)| moved.seq > held_through && before(id, moved))
             .map(|(id, _)| id)
             .collect();
         let lost_edits: BTreeSet<NodeId> = (edited.iter())
@@ -2129,6 +2167,7 @@ impl Trees {
             displaced: self.displaced.clone(),
             edited_here: self.edited_here.clone(),
             moved_here: self.moved_here.clone(),
+            moved_from: self.moved_from.clone(),
             unsent_edits: self.unsent_edits.clone(),
             replaced_versions: self.replaced_versions.clone(),
             resends: self.resends.clone(),
@@ -2188,11 +2227,15 @@ impl Trees {
         if let Some((id, _)) = state.edited_here.iter().find(|entry| !edited(entry)) {
             return Err(StateError::NotEditedHere(id.clone()));
         }
-        let moved = |(id, seq): &(&NodeId, &u64)| {
-            (self.r.get(id)).is_some_and(|remote| !remote.trashed && remote.meta_rev == **seq)
+        let moved = |(id, moved): &(&NodeId, &MovedHere)| {
+            (self.r.get(id)).is_some_and(|remote| remote.meta_rev >= moved.seq)
         };
         if let Some((id, _)) = state.moved_here.iter().find(|entry| !moved(entry)) {
             return Err(StateError::NotMovedHere(id.clone()));
+        }
+        let watched = |id: &&NodeId| state.watched_positions.contains_key(*id);
+        if let Some(id) = state.moved_from.keys().find(|id| !watched(id)) {
+            return Err(StateError::NotMovedFrom(id.clone()));
         }
         if let Some(id) = state
             .unsent_edits
@@ -2222,6 +2265,7 @@ impl Trees {
             displaced,
             edited_here,
             moved_here,
+            moved_from,
             unsent_edits,
             replaced_versions,
             resends,
@@ -2244,6 +2288,7 @@ impl Trees {
         self.displaced = displaced;
         self.edited_here = edited_here;
         self.moved_here = moved_here;
+        self.moved_from = moved_from;
         self.unsent_edits = unsent_edits;
         self.replaced_versions = replaced_versions;
         self.resends = resends;

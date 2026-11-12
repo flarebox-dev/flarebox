@@ -3194,32 +3194,46 @@ fn a_move_another_device_made_after_a_loss_is_taken() {
     assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
 }
 
-#[test]
-fn a_move_of_this_device_the_server_lost_is_sent_again() {
-    let mut trees = trees(&[(
+fn n_at_x() -> (Trees, Commits, IdGen) {
+    let trees = trees(&[(
         "n",
         Some(file(ROOT, "x", 1)),
         Some(file(ROOT, "x", 1)),
         Some(remote(file(ROOT, "x", 1))),
     )]);
+    (trees, Commits::default(), IdGen::new(1))
+}
+
+fn move_n_to_y_at(seq: u64, trees: &mut Trees, commits: &mut Commits, ids: &mut IdGen) {
     trees.set_local("n".into(), local(file(ROOT, "y", 1), 1));
     trees.settle();
-    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
-    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    let commit = build(commits, trees, ids).unwrap();
     assert_eq!(ops(&commit), [mv("n", ROOT, "y")]);
-    trees.set_remote("n".into(), remote_at(file(ROOT, "y", 1), 2));
+    trees.set_remote("n".into(), remote_at(file(ROOT, "y", 1), seq));
     commits
-        .received(result(2, vec![outcome(op_result::Code::Applied)]))
+        .received(result(seq, vec![outcome(op_result::Code::Applied)]))
         .unwrap();
-    assert!(commits.acknowledge(&mut trees, 2));
+    assert!(commits.acknowledge(trees, seq));
     trees.settle();
-    assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
+}
+
+fn lose_with_n_at(
+    n: RemoteNode,
+    device_seq: u64,
+    trees: &mut Trees,
+    commits: &mut Commits,
+    ids: &mut IdGen,
+) -> Vec<op::Op> {
+    assert_eq!(
+        commits.connected(&welcome(device_seq)),
+        Reconnect::AheadOfServer
+    );
     let (trashed, edited, moved) = (
         trees.trashed_here(),
         trees.edited_here(),
         trees.moved_here(),
     );
-    trees.set_remote("n".into(), remote(file(ROOT, "x", 1)));
+    trees.set_remote("n".into(), n);
     trees.forget_lost(
         trashed,
         edited,
@@ -3228,8 +3242,63 @@ fn a_move_of_this_device_the_server_lost_is_sent_again() {
         commits.accepted(),
     );
     trees.settle();
-    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
-    assert_eq!(ops(&commit), [mv("n", ROOT, "y")]);
+    build(commits, trees, ids).map_or_else(Vec::new, |commit| ops(&commit))
+}
+
+#[test]
+fn a_move_of_this_device_the_server_lost_is_sent_again() {
+    let (mut trees, mut commits, mut ids) = n_at_x();
+    move_n_to_y_at(2, &mut trees, &mut commits, &mut ids);
+    let n = remote(file(ROOT, "x", 1));
+    let sent = lose_with_n_at(n, 0, &mut trees, &mut commits, &mut ids);
+    assert_eq!(sent, [mv("n", ROOT, "y")]);
+}
+
+#[test]
+fn a_lost_move_is_not_sent_over_a_move_another_device_made_after_the_loss() {
+    let (mut trees, mut commits, mut ids) = n_at_x();
+    move_n_to_y_at(2, &mut trees, &mut commits, &mut ids);
+    let n = remote_at(file(ROOT, "z", 1), 3);
+    let sent = lose_with_n_at(n, 0, &mut trees, &mut commits, &mut ids);
+    assert!(sent.is_empty());
+    assert_eq!(trees.class("n"), Class::Remote);
+}
+
+#[test]
+fn a_lost_move_is_sent_again_after_another_device_trashed_and_restored_the_node() {
+    let (mut trees, mut commits, mut ids) = n_at_x();
+    move_n_to_y_at(2, &mut trees, &mut commits, &mut ids);
+    let trashed_at_3 = RemoteNode {
+        meta_rev: 3,
+        ..trashed(file(ROOT, "y", 1))
+    };
+    trees.set_remote("n".into(), trashed_at_3);
+    trees.set_remote("n".into(), remote_at(file(ROOT, "y", 1), 4));
+    trees.settle();
+    let n = remote(file(ROOT, "x", 1));
+    let sent = lose_with_n_at(n, 0, &mut trees, &mut commits, &mut ids);
+    assert_eq!(sent, [mv("n", ROOT, "y")]);
+}
+
+#[test]
+fn a_lost_move_is_sent_again_over_a_move_the_server_kept_from_before_it() {
+    let (mut trees, mut commits, mut ids) = n_at_x();
+    trees.set_local("pad".into(), local(file(ROOT, "pad", 7), 99));
+    trees.settle();
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    trees.set_remote("pad".into(), remote_at(file(ROOT, "pad", 7), 5));
+    commits
+        .received(result(5, vec![outcome(op_result::Code::Applied)]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 5));
+    trees.set_remote("n".into(), remote_at(file(ROOT, "z", 1), 7));
+    trees.set_local("n".into(), local(file(ROOT, "z", 1), 1));
+    trees.settle();
+    move_n_to_y_at(9, &mut trees, &mut commits, &mut ids);
+    let n = remote_at(file(ROOT, "z", 1), 7);
+    let sent = lose_with_n_at(n, 1, &mut trees, &mut commits, &mut ids);
+    assert_eq!(commits.held_through(), 5);
+    assert_eq!(sent, [mv("n", ROOT, "y")]);
 }
 
 #[test]

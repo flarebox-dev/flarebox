@@ -1402,6 +1402,39 @@ fn a_folder_renamed_after_a_restore_is_not_moved_back_by_a_device_that_never_mov
     }
 }
 
+#[test]
+fn a_rename_after_a_restore_is_not_undone_by_the_lost_rename_it_replaced() {
+    let mut after = vec![(0, RESTORE), (1, Step::Connect)];
+    for _ in 0..12 {
+        after.extend([(1, Step::Work(0)), (1, DELIVER), (1, EFFECT)]);
+    }
+    after.extend([
+        (1, SCAN),
+        (1, rename(0, 0, "ss")),
+        (1, SCAN),
+        (1, COMMIT),
+        (1, COMMIT),
+        (1, DELIVER),
+        (1, Step::Work(0)),
+        (1, DELIVER),
+    ]);
+    let world = converge(
+        2,
+        &[
+            vec![(0, file("a"))],
+            vec![(0, BACKUP), (0, rename(0, 0, "b"))],
+            after,
+        ],
+    )
+    .unwrap();
+    for device in &world.devices {
+        let names: Vec<&str> = (device.disk.entries().values())
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["ss"]);
+    }
+}
+
 fn created_again_by_both_and_deleted_by_one(made: Step, edit: bool) -> World {
     let mut lost = vec![
         (0, RESTORE),

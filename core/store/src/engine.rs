@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use koidrive_engine::classify::{Origin, Waiting};
 use koidrive_engine::commit::{Halt, InFlight};
 use koidrive_engine::effects::{Base, Dir, Displaced, Effect, EffectRecord, Location};
-use koidrive_engine::state::{Agreed, CommitsState, EffectsState, Pending, TreesState};
+use koidrive_engine::state::{Agreed, CommitsState, EffectsState, MovedHere, Pending, TreesState};
 use koidrive_engine::tree::{FileIdentity, Kind, NodeId, Shape};
 use koidrive_proto::v1::{Commit, CommitResult, Content, NodeKind};
 use prost::{Message, Oneof};
@@ -190,12 +190,32 @@ impl Tx<'_> {
         while let Some(row) = rows.next()? {
             state.trees.edited_here.insert(row.get(0)?, row.get(1)?);
         }
-        let mut stmt = self
-            .0
-            .prepare_cached("SELECT node_id, seq FROM moved_here")?;
+        let mut stmt = self.0.prepare_cached(
+            "SELECT node_id, seq, from_rev, from_parent_id, from_name FROM moved_here",
+        )?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
-            state.trees.moved_here.insert(row.get(0)?, row.get(1)?);
+            let parent = row.get::<_, Option<String>>(3)?.unwrap_or_default();
+            let from = (row.get::<_, Option<u64>>(2)?)
+                .zip(row.get::<_, Option<String>>(4)?)
+                .map(|(rev, name)| Agreed { rev, parent, name });
+            let seq = row.get(1)?;
+            state
+                .trees
+                .moved_here
+                .insert(row.get(0)?, MovedHere { seq, from });
+        }
+        let mut stmt = self
+            .0
+            .prepare_cached("SELECT node_id, rev, parent_id, name FROM moved_from")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let from = Agreed {
+                rev: row.get(1)?,
+                parent: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                name: row.get(3)?,
+            };
+            state.trees.moved_from.insert(row.get(0)?, from);
         }
         let mut stmt = self.0.prepare_cached("SELECT node_id FROM unsent_edits")?;
         let mut rows = stmt.query([])?;
@@ -307,6 +327,7 @@ impl Tx<'_> {
             "recorded_nodes",
             "edited_here",
             "moved_here",
+            "moved_from",
             "unsent_edits",
             "replaced_versions",
             "resends",
@@ -508,15 +529,37 @@ impl Tx<'_> {
         let mut remove = self
             .0
             .prepare_cached("DELETE FROM moved_here WHERE node_id = ?1")?;
-        let mut put = self
-            .0
-            .prepare_cached("INSERT OR REPLACE INTO moved_here (node_id, seq) VALUES (?1, ?2)")?;
+        let mut put = self.0.prepare_cached(
+            "INSERT OR REPLACE INTO moved_here (node_id, seq, from_rev, from_parent_id, from_name)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
         let (removed, changed) = differences(&before.trees.moved_here, &after.trees.moved_here);
         for node in removed {
             remove.execute([node])?;
         }
-        for (node, seq) in changed {
-            put.execute(params![node, seq])?;
+        for (node, moved) in changed {
+            let from = moved.from.as_ref();
+            put.execute(params![
+                node,
+                moved.seq,
+                from.map(|from| from.rev),
+                from.and_then(|from| non_empty(&from.parent)),
+                from.map(|from| &from.name),
+            ])?;
+        }
+        let mut remove = self
+            .0
+            .prepare_cached("DELETE FROM moved_from WHERE node_id = ?1")?;
+        let mut put = self.0.prepare_cached(
+            "INSERT OR REPLACE INTO moved_from (node_id, rev, parent_id, name)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        let (removed, changed) = differences(&before.trees.moved_from, &after.trees.moved_from);
+        for node in removed {
+            remove.execute([node])?;
+        }
+        for (node, from) in changed {
+            put.execute(params![node, from.rev, non_empty(&from.parent), &from.name])?;
         }
         let mut remove = self
             .0

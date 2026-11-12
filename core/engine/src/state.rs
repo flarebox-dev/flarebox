@@ -29,6 +29,14 @@ pub struct Agreed {
     pub name: String,
 }
 
+/// A position a create or a move of this device set: the seq of its commit, and R's record of the
+/// node just before that commit, when R held one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MovedHere {
+    pub seq: u64,
+    pub from: Option<Agreed>,
+}
+
 /// What [`Trees`](crate::classify::Trees) holds besides the nodes of R, L and S.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TreesState {
@@ -67,9 +75,12 @@ pub struct TreesState {
     /// The files whose content an edit of this device set, each with the seq of its commit, while
     /// R holds that content.
     pub edited_here: BTreeMap<NodeId, u64>,
-    /// The nodes whose position a create or a move of this device set, each with the seq of its
-    /// commit, while R holds them live at that position.
-    pub moved_here: BTreeMap<NodeId, u64>,
+    /// The nodes whose position a create or a move of this device set, while R holds them at that
+    /// position, also after a delete and a restore of the node.
+    pub moved_here: BTreeMap<NodeId, MovedHere>,
+    /// For each node the commit in flight creates or moves, R's record before R's latest change
+    /// of it.
+    pub moved_from: BTreeMap<NodeId, Agreed>,
     /// The files whose content in L is an edit of this device that the server does not hold,
     /// although S and R may hold the same bytes (section 4.4).
     pub unsent_edits: BTreeSet<NodeId>,
@@ -176,9 +187,11 @@ pub enum StateError {
     /// A file is recorded as edited by this device, but R does not hold the content of that
     /// commit.
     NotEditedHere(NodeId),
-    /// A node is recorded as moved by this device, but R does not hold it live at the position of
+    /// A node is recorded as moved by this device, but R does not hold it at a revision at or after
     /// that commit.
     NotMovedHere(NodeId),
+    /// R's record before a move is kept for a node the commit in flight does not create or move.
+    NotMovedFrom(NodeId),
     /// A file is recorded with an edit the server does not hold, but L does not hold it.
     NotUnsentEdit(NodeId),
     NotRemote(NodeId),
