@@ -541,6 +541,26 @@ fn a_file_moved_below_a_folder_that_takes_its_name_in_one_batch_is_kept() {
     assert_eq!(files(&site.root), both);
 }
 
+/// Device b renames the folder `a` to `x`, makes a new folder `a` and moves `x` into it as `a/s` before its observer
+/// looks. The scan reports the old folder's move into the new one and the new folder's creation, so L stays a tree that
+/// a restart can load, and the file reaches device a two levels down.
+#[test]
+fn a_folder_moved_into_a_new_folder_that_takes_its_name_in_one_batch_keeps_l_a_tree() {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site_a.root.join("a")).unwrap();
+    a.create(&mut remote, &site_a.root.join("a/f"), b"the file");
+    let (site, mut b) = linked(&mut remote, "b");
+    b.settle();
+    fs::rename(site.root.join("a"), site.root.join("x")).unwrap();
+    fs::create_dir(site.root.join("a")).unwrap();
+    fs::rename(site.root.join("x"), site.root.join("a/s")).unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site, &mut b));
+    let moved = [("a/s/f".to_owned(), "the file".to_owned())];
+    assert_eq!(files(&site_a.root), moved);
+    assert_eq!(files(&site.root), moved);
+}
+
 /// Device b swaps the file `a` and the folder `b` through a third name before its observer looks. The scan reports
 /// two renames that each take the other's name. The folder keeps its child, and the file keeps its bytes, under the
 /// name the server gives one side of a name swap (design §2.6).
