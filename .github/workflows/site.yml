@@ -36,7 +36,7 @@ jobs:
     # Pages builds no previews for pull requests from forks, and a merge group deploys nothing.
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     permissions:
       contents: read
       checks: read
@@ -93,12 +93,12 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           check() {
-            local url=$1/install.sh attempts=$2 served="$RUNNER_TEMP/served-install.sh" headers="$RUNNER_TEMP/served-install.headers" status type media
+            local url=$1/install.sh attempts=$2 expected=$3 revision=$4 served="$RUNNER_TEMP/served-install.sh" headers="$RUNNER_TEMP/served-install.headers" status type media
             for attempt in $(seq 1 "$attempts"); do
               status="$(curl --silent --show-error --max-time 20 --dump-header "$headers" --output "$served" --write-out '%{http_code}' "$url")" || status=000
-              [ "$status" != 200 ] || cmp -s install.sh "$served" || status="200 with other bytes"
+              [ "$status" != 200 ] || cmp -s "$expected" "$served" || status="200 with other bytes"
               [ "$status" != 200 ] || break
-              [ "$attempt" -lt "$attempts" ] || { echo "::error::$url returned HTTP $status, not 200 with install.sh at $SHA, after $attempts attempts."; return 1; }
+              [ "$attempt" -lt "$attempts" ] || { echo "::error::$url returned HTTP $status, not 200 with install.sh at $revision, after $attempts attempts."; return 1; }
               sleep 10
             done
             type="$(tr -d '\r' <"$headers" | awk 'tolower($1) == "content-type:" { $1 = ""; sub(/^ /, ""); print }' | tail -n 1)"
@@ -107,14 +107,16 @@ jobs:
               echo "::error::$url is served as '$type', not text/plain. Check site/_headers."
               return 1
             fi
-            echo "$url matches install.sh ($(wc -c <install.sh) bytes, sha256 $(sha256sum install.sh | cut -d' ' -f1)) and is served as $type."
+            echo "$url matches install.sh at $revision ($(wc -c <"$expected") bytes, sha256 $(sha256sum "$expected" | cut -d' ' -f1)) and is served as $type."
             grep -i '^cache-control:' "$headers" || true
           }
-          check "$DEPLOYMENT" 12
-          if [ -n "$PRODUCTION" ] && ! check "$PRODUCTION" 36; then
+          check "$DEPLOYMENT" 12 install.sh "$SHA"
+          if [ -n "$PRODUCTION" ] && ! check "$PRODUCTION" 36 install.sh "$SHA"; then
             main="$(gh api "repos/$REPO/commits/main" --jq .sha)"
             if [ "$main" = "$SHA" ]; then
               exit 1
             fi
-            echo "::notice::main moved on to $main, so production may serve a newer install.sh. That commit's run checks it."
+            echo "::notice::main moved on to $main while this check ran, so production is checked against install.sh at $main."
+            gh api -H "Accept: application/vnd.github.raw" "repos/$REPO/contents/install.sh?ref=$main" >"$RUNNER_TEMP/main-install.sh"
+            check "$PRODUCTION" 36 "$RUNNER_TEMP/main-install.sh" "$main"
           fi
