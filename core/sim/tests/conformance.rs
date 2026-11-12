@@ -19,6 +19,15 @@ const FILE: &str = concat!(
     "/../../spec/testdata/scenarios/space-conformance-v1.json"
 );
 
+const NUMBERS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../spec/testdata/scenarios/runner-numbers-v1.json"
+);
+
+const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+
+const MAX_REPEAT: u64 = 65_536;
+
 const SEQUENCES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../spec/testdata/scenarios/space-commit-sequences-v1.json"
@@ -46,7 +55,11 @@ fn main() {
             "{check} ... FAILED: regenerate it with cargo test -p koidrive-sim --test conformance -- --write"
         );
     }
-    let self_tests = self_tests(&doc);
+    let self_tests: Vec<(String, Outcome)> = self_tests(&doc)
+        .into_iter()
+        .map(|(name, outcome)| (name.to_owned(), outcome))
+        .chain(number_tests(&doc))
+        .collect();
     for (name, outcome) in &self_tests {
         match outcome {
             Ok(()) => println!("self-test {name} ... ok"),
@@ -64,7 +77,80 @@ fn main() {
 
 fn load(path: &str) -> Value {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {path}: {e}"))
+    parse_doc(&text).unwrap_or_else(|e| panic!("{path}: {e}"))
+}
+
+fn parse_doc(text: &str) -> Result<Value, String> {
+    plain_integers(text)?;
+    serde_json::from_str(text).map_err(|e| e.to_string())
+}
+
+fn plain_integers(text: &str) -> Outcome {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                while i < bytes.len() && b"+-.eE0123456789".contains(&bytes[i]) {
+                    i += 1;
+                }
+                let token = &text[start..i];
+                if token.contains(['.', 'e', 'E']) {
+                    return Err(format!(
+                        "numbers must be written as plain integers, got {token}"
+                    ));
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(())
+}
+
+fn number_tests(doc: &Value) -> Vec<(String, Outcome)> {
+    let fixture = std::fs::read_to_string(FILE)
+        .expect("read the conformance file")
+        .replace("\"repeat\": 1024\n", "\"repeat\": 1024.0\n");
+    let float_in_fixture = match parse_doc(&fixture) {
+        Err(e) if e.contains("numbers must be written as plain integers, got 1024.0") => Ok(()),
+        other => Err(format!("got {other:?}")),
+    };
+    let mut tests = vec![(
+        "the-fixture-with-repeat-1024.0-fails".to_owned(),
+        float_in_fixture,
+    )];
+    tests.extend(cases(doc));
+    tests
+}
+
+fn cases(doc: &Value) -> Vec<(String, Outcome)> {
+    load(NUMBERS)["cases"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|case| {
+            let token = case["repeat"].as_str().unwrap_or_default();
+            let text = format!(
+                r#"{{"name": "repeat", "devices": {{"a": {{"name": "A"}}}}, "contents": {{"c": {{"chunks": [{{"text": "x", "repeat": {token}}}]}}}}, "steps": []}}"#
+            );
+            let got = parse_doc(&text).and_then(|scenario| run(doc, &scenario));
+            let outcome = match (got, case["error"].as_str()) {
+                (Ok(()), None) => Ok(()),
+                (Err(e), Some(want)) if e.contains(want) => Ok(()),
+                (Ok(()), Some(want)) => Err(format!("passed, expected {want}")),
+                (Err(e), _) => Err(format!("failed with {e}")),
+            };
+            (format!("repeat-{token}"), outcome)
+        })
+        .collect()
 }
 
 fn file_name(path: &str) -> &str {
@@ -496,11 +582,21 @@ fn opt_str<'a>(value: &'a Value, field: &str) -> Result<Option<&'a str>, String>
 }
 
 fn opt_u64(value: &Value, field: &str) -> Result<Option<u64>, String> {
-    opt(value, field, "a non-negative integer", Value::as_u64)
+    opt(value, field, "a non-negative integer", |v| {
+        v.as_u64().filter(|n| *n <= MAX_SAFE_INTEGER)
+    })
 }
 
 fn opt_i64(value: &Value, field: &str) -> Result<Option<i64>, String> {
-    opt(value, field, "an integer", Value::as_i64)
+    opt(value, field, "an integer", |v| {
+        v.as_i64().filter(|n| n.unsigned_abs() <= MAX_SAFE_INTEGER)
+    })
+}
+
+fn opt_u32(value: &Value, field: &str) -> Result<Option<u32>, String> {
+    opt(value, field, "an integer from 0 to 4294967295", |v| {
+        v.as_u64().and_then(|n| u32::try_from(n).ok())
+    })
 }
 
 fn opt_bool(value: &Value, field: &str) -> Result<Option<bool>, String> {
@@ -599,26 +695,32 @@ fn chunk_list(chunks: &[Value]) -> Result<Vec<ChunkRef>, String> {
             "a chunk",
             &["text", "counter_le32", "size", "repeat"],
         )?;
-        let pieces: Vec<Vec<u8>> = match (opt_str(chunk, "text")?, opt_u64(chunk, "counter_le32")?)
+        let pieces: Vec<Vec<u8>> = match (opt_str(chunk, "text")?, opt_u32(chunk, "counter_le32")?)
         {
             (Some(text), None) => vec![text.as_bytes().to_vec()],
-            (None, Some(n)) => (0..n as u32).map(|i| i.to_le_bytes().to_vec()).collect(),
+            (None, Some(n)) => (0..n).map(|i| i.to_le_bytes().to_vec()).collect(),
             _ => {
                 return Err(format!(
                     "a chunk needs exactly one of text and counter_le32: {chunk}"
                 ));
             }
         };
-        let size = opt_u64(chunk, "size")?;
+        let size = opt_u32(chunk, "size")?;
         let listed: Vec<ChunkRef> = pieces
             .iter()
             .map(|bytes| ChunkRef {
                 hash: Sha256::digest(bytes).to_vec(),
-                size: size.map_or(bytes.len() as u32, |s| s as u32),
+                size: size.unwrap_or(bytes.len() as u32),
                 encoding: 0,
             })
             .collect();
-        for _ in 0..opt_u64(chunk, "repeat")?.unwrap_or(1) {
+        let repeat = opt(
+            chunk,
+            "repeat",
+            &format!("an integer from 1 to {MAX_REPEAT}"),
+            |v| v.as_u64().filter(|n| (1..=MAX_REPEAT).contains(n)),
+        )?;
+        for _ in 0..repeat.unwrap_or(1) {
             out.extend(listed.iter().cloned());
         }
     }
@@ -726,7 +828,7 @@ impl Run {
                     user_id: "user".into(),
                     device_name: req(opt_str(device, "name"), "name")?.to_owned(),
                     role,
-                    max_format: opt_u64(device, "max_format")?.unwrap_or(1) as u32,
+                    max_format: opt_u32(device, "max_format")?.unwrap_or(1),
                 },
             );
         }
@@ -1202,7 +1304,7 @@ impl Run {
         }
         let receipts = if !upload {
             let from = opt_str(body, "receipts_from")?.unwrap_or(space).to_owned();
-            let delta = opt_u64(body, "receipt_size_delta")?.unwrap_or(0) as u32;
+            let delta = opt_u32(body, "receipt_size_delta")?.unwrap_or(0);
             self.wallets
                 .get(&(session.device_id.clone(), from))
                 .cloned()
@@ -1680,7 +1782,7 @@ impl Run {
         let request = ListVersions {
             node_id: self.id(space, req(opt_str(body, "node"), "node")?)?,
             cursor,
-            limit: opt_u64(body, "limit")?.unwrap_or(0) as u32,
+            limit: opt_u32(body, "limit")?.unwrap_or(0),
         };
         let expect = expectation(step, &[], &["count", "versions", "next_cursor"])?;
         let result = self.rpc(

@@ -4,8 +4,9 @@ import { create, type DescMessage, fromBinary, type MessageInitShape, toBinary }
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import hand from "../../spec/testdata/scenarios/space-conformance-v1.json";
-import sequences from "../../spec/testdata/scenarios/space-commit-sequences-v1.json";
+import numbers from "../../spec/testdata/scenarios/runner-numbers-v1.json";
+import hand from "../../spec/testdata/scenarios/space-conformance-v1.json?raw";
+import sequences from "../../spec/testdata/scenarios/space-commit-sequences-v1.json?raw";
 import { signChunkGrant, sha256 } from "../src/crypto";
 import {
   type CommitResult,
@@ -42,10 +43,34 @@ import { OWNER, targetIncarnation } from "./helpers";
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type Obj = { [key: string]: Json };
 
-const doc = hand as unknown as Obj;
+const MAX_REPEAT = 65_536;
+const MAX_U32 = 0xffffffff;
+
+function plainIntegers(text: string): void {
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] === '"') {
+      i++;
+      while (i < text.length && text[i] !== '"') i += text[i] === "\\" ? 2 : 1;
+      i++;
+    } else if (/[-0-9]/.test(text[i]!)) {
+      const start = i;
+      while (i < text.length && /[-+.eE0-9]/.test(text[i]!)) i++;
+      const token = text.slice(start, i);
+      if (/[.eE]/.test(token)) fail(`numbers must be written as plain integers, got ${token}`);
+    } else i++;
+  }
+}
+
+function parseDoc(text: string): Obj {
+  plainIntegers(text);
+  return JSON.parse(text) as Obj;
+}
+
+const doc = parseDoc(hand);
 const files: [string, Obj][] = [
   ["space-conformance-v1.json", doc],
-  ["space-commit-sequences-v1.json", sequences as unknown as Obj],
+  ["space-commit-sequences-v1.json", parseDoc(sequences)],
 ];
 const ORIGIN = "https://koidrive.test";
 const CHUNKER = "fastcdc2020-1m-4m-16m";
@@ -83,6 +108,10 @@ const optUint = (value: Obj, field: string) =>
   opt(value, field, "a non-negative integer", (v) => (typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : undefined));
 const optInt = (value: Obj, field: string) =>
   opt(value, field, "an integer", (v) => (typeof v === "number" && Number.isSafeInteger(v) ? v : undefined));
+const optU32 = (value: Obj, field: string) =>
+  opt(value, field, "an integer from 0 to 4294967295", (v) => (typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= MAX_U32 ? v : undefined));
+const optRepeat = (value: Obj) =>
+  opt(value, "repeat", `an integer from 1 to ${MAX_REPEAT}`, (v) => (typeof v === "number" && Number.isInteger(v) && v >= 1 && v <= MAX_REPEAT ? v : undefined));
 const optBool = (value: Obj, field: string) => opt(value, field, "a boolean", (v) => (typeof v === "boolean" ? v : undefined));
 const optList = (value: Obj, field: string) => opt(value, field, "a list", (v) => (Array.isArray(v) ? v : undefined));
 
@@ -147,7 +176,7 @@ async function chunkList(list: Json[]): Promise<Chunk[]> {
   for (const entry of list) {
     const chunk = keys(entry, "a chunk", ["text", "counter_le32", "size", "repeat"]);
     const text = optStr(chunk, "text");
-    const counter = optUint(chunk, "counter_le32");
+    const counter = optU32(chunk, "counter_le32");
     let pieces: Uint8Array[];
     if (text !== undefined && counter === undefined) pieces = [encoder.encode(text)];
     else if (text === undefined && counter !== undefined) {
@@ -157,10 +186,10 @@ async function chunkList(list: Json[]): Promise<Chunk[]> {
         return bytes;
       });
     } else fail(`a chunk needs exactly one of text and counter_le32: ${show(entry)}`);
-    const size = optUint(chunk, "size");
+    const size = optU32(chunk, "size");
     const listed: Chunk[] = [];
     for (const bytes of pieces) listed.push({ ref: create(ChunkRefSchema, { hash: await sha256(bytes), size: size ?? bytes.length }), bytes });
-    for (let i = 0; i < (optUint(chunk, "repeat") ?? 1); i++) out.push(...listed);
+    for (let i = 0; i < (optRepeat(chunk) ?? 1); i++) out.push(...listed);
   }
   return out;
 }
@@ -201,7 +230,7 @@ class Run {
     optList(scenario, "covers");
     const nowMs = req(optInt(file, "now_ms"), "now_ms");
     const mtimeText = req(optStr(file, "mtime_ns"), "mtime_ns");
-    if (!/^-?\d+$/.test(mtimeText)) fail("mtime_ns must be an int64 written as a string");
+    if (!/^-?\d+$/.test(mtimeText) || BigInt.asIntN(64, BigInt(mtimeText)) !== BigInt(mtimeText)) fail("mtime_ns must be an int64 written as a string");
     const run = new Run(nowMs, BigInt(mtimeText));
     const names = "spaces" in scenario ? strings(req(optList(scenario, "spaces"), "spaces"), "spaces") : ["main"];
     for (const name of names) {
@@ -223,7 +252,7 @@ class Run {
         kind: "device",
         scope: null,
         role: role as Role,
-        maxFormat: optUint(device, "max_format") ?? 1,
+        maxFormat: optU32(device, "max_format") ?? 1,
         origin: ORIGIN,
       });
     }
@@ -511,7 +540,7 @@ class Run {
     let receipts: UploadReceipt[];
     if (!upload) {
       const from = optStr(body, "receipts_from") ?? space;
-      const delta = optUint(body, "receipt_size_delta") ?? 0;
+      const delta = optU32(body, "receipt_size_delta") ?? 0;
       receipts = (this.wallets.get(`${session.deviceId}/${from}`) ?? []).map((r) => create(UploadReceiptSchema, { ...r, size: r.size + delta }));
     } else {
       receipts = await this.upload(
@@ -723,7 +752,7 @@ class Run {
     }
     const nodeId = this.id(space, req(optStr(body, "node"), "node"));
     const expect = expectation(step, [], ["count", "versions", "next_cursor"]);
-    const result = await this.rpc(space, session, atMs, { case: "listVersions", value: { nodeId, cursor, limit: optUint(body, "limit") ?? 0 } });
+    const result = await this.rpc(space, session, atMs, { case: "listVersions", value: { nodeId, cursor, limit: optU32(body, "limit") ?? 0 } });
     const code = optStr(expect, "error");
     if (result.case === "error") {
       if (code === undefined) fail(`ListVersions failed: ${errorName(result.value.code)}`);
@@ -961,6 +990,28 @@ describe("conformance runner self-tests", () => {
   for (const [name, scenario, edit, reason] of cases) {
     it(name, async () => {
       expect(await mutate(scenario, edit)).toContain(reason);
+    });
+  }
+});
+
+describe("number parity with the Rust runner (spec/testdata/scenarios/runner-numbers-v1.json)", () => {
+  it("the fixture with repeat 1024.0 fails", () => {
+    const fixture = hand.replace('"repeat": 1024\n', '"repeat": 1024.0\n');
+    expect(fixture).not.toBe(hand);
+    expect(() => parseDoc(fixture)).toThrow("numbers must be written as plain integers, got 1024.0");
+  });
+  for (const entry of numbers.cases) {
+    it(`repeat-${entry.repeat}`, async () => {
+      const text = `{"name": "repeat", "devices": {"a": {"name": "A"}}, "contents": {"c": {"chunks": [{"text": "x", "repeat": ${entry.repeat}}]}}, "steps": []}`;
+      let got: string | undefined;
+      try {
+        got = await run(parseDoc(text));
+      } catch (error) {
+        if (!(error instanceof Failure)) throw error;
+        got = error.message;
+      }
+      if (entry.error === null) expect(got).toBeUndefined();
+      else expect(got).toContain(entry.error);
     });
   }
 });
