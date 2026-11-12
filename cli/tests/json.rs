@@ -502,6 +502,41 @@ fn a_help_or_version_flag_before_a_subcommand_reports_the_command_it_belongs_to(
 }
 
 #[test]
+fn help_named_after_a_group_is_the_help_of_the_commands_after_it() {
+    let profile = Profile::new();
+    for (args, command, shown) in [
+        (
+            &["space", "help"][..],
+            "help space",
+            &["space", "--help"][..],
+        ),
+        (
+            &["space", "help", "list"],
+            "help space list",
+            &["space", "list", "--help"],
+        ),
+        (
+            &["folder", "help", "-h"],
+            "help folder",
+            &["folder", "--help"],
+        ),
+        (&["help", "space"], "help space", &["space", "--help"]),
+    ] {
+        let (code, envelope) = profile.json(&[args, &["--json"]].concat());
+        assert_eq!(code, 0, "{args:?} {envelope:#}");
+        assert_eq!(envelope["command"], command, "{args:?} {envelope:#}");
+        let (_, expected) = profile.json(&[shown, &["--json"]].concat());
+        assert_eq!(
+            envelope["data"]["help"], expected["data"]["help"],
+            "{args:?}"
+        );
+    }
+    let (code, envelope) = profile.json(&["folder", "link", "help", "--json"]);
+    assert_eq!(code, 2, "{envelope:#}");
+    assert_eq!(envelope["command"], "folder link", "{envelope:#}");
+}
+
+#[test]
 fn every_command_prints_its_help_as_an_envelope_its_schema_takes() {
     let profile = Profile::new();
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/json-schema/v1");

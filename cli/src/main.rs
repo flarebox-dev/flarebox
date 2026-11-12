@@ -665,7 +665,17 @@ fn help_names(args: &[OsString]) -> Option<Vec<&str>> {
         .take_while(|arg| *arg != "--")
         .filter_map(|arg| arg.to_str())
         .filter(|arg| !arg.starts_with('-'));
-    (names.next() == Some("help")).then(|| names.collect())
+    let mut command = Cli::command();
+    let mut path = Vec::new();
+    while let Some(name) = names.next() {
+        if name == "help" && command.has_subcommands() {
+            path.extend(names);
+            return Some(path);
+        }
+        command = command.find_subcommand(name)?.clone();
+        path.push(name);
+    }
+    None
 }
 
 fn help_done(help: String) -> Done {
