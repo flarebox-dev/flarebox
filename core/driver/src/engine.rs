@@ -668,9 +668,8 @@ impl Engine {
                 !self.trees.recorded_local(node)
                     && (self.path_of(node))
                         .is_some_and(|at| !left.iter().any(|path| at.starts_with(path)))
-                    && unscanned
-                        .as_ref()
-                        .map_or_else(|| self.scanned(node), |set| !set.contains(*node))
+                    && self.scanned(node)
+                    && unscanned.as_ref().is_none_or(|set| !set.contains(*node))
             })
             .cloned()
             .collect();
