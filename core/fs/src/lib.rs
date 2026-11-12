@@ -1974,7 +1974,7 @@ pub use effect::{
 };
 pub use ignore::{Ignore, Ignored, RULES_FILE, Rules};
 use ignore::{Pending, RulesRead, Wanted};
-pub use recovered::recovered_name;
+pub use recovered::{recovered_name, utc_date};
 pub use resolve::{Base, Dir, Folder, Location, PARKED_DIR, Space, Unresolved};
 pub use root::{
     Marker, PRIVATE_DIR, RootProblem, check_root, probe_no_replace, read_marker, rename_no_replace,

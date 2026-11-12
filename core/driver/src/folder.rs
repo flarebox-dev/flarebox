@@ -379,11 +379,7 @@ impl Folder {
                     }
                     self.list_again(&mut work);
                 }
-                Ok(Reason::HistoryChanged) => {
-                    return Err(Stop::Recovery(
-                        "the space was rewound or restored on the server".into(),
-                    ));
-                }
+                Ok(Reason::HistoryChanged) => return Err(Stop::Recovery(rewound(&resync))),
                 Ok(Reason::Unspecified) | Err(_) => {
                     return Err(Stop::Protocol(format!(
                         "the server asked for a resync for an unknown reason ({})",
@@ -991,7 +987,8 @@ impl Folder {
         Ok(out)
     }
 
-    /// A `Welcome` (design §4.4 and §2.8). A cursor of another history stops the task before anything is replaced.
+    /// A `Welcome` (design §4.4 and §2.8). A cursor of another history subscribes from that cursor and plans nothing, so
+    /// the server's `HISTORY_CHANGED` names the seq the space was rewound to and stops the task before anything is replaced.
     /// The engine then compares the server's count of this device's commits with the store. A folder that was
     /// never synced lists the tree, and any other subscribes from its cursor once. After a reconnect the session
     /// resumes by itself.
@@ -1014,10 +1011,9 @@ impl Folder {
         if let Some(cursor) = &self.engine.cursor
             && cursor.history_id != welcome.history_id
         {
-            return Err(Stop::Recovery(format!(
-                "the server's history of this space changed from {} to {} (a rewind or a restore)",
-                cursor.history_id, welcome.history_id
-            )));
+            work.push(Work::Subscribe(resume(&cursor.history_id, &cursor.base())));
+            self.stream = Stream::Connecting;
+            return Ok(());
         }
         let commits = &self.engine.commits;
         let never_synced = self.engine.cursor.is_none()
@@ -2046,6 +2042,20 @@ fn later(
             _ => None,
         }),
     })
+}
+
+fn rewound(resync: &koidrive_proto::v1::ResyncRequired) -> String {
+    if resync.restore_seq == 0 {
+        return "the space was rewound or restored on the server".into();
+    }
+    let at =
+        UNIX_EPOCH + Duration::from_millis(u64::try_from(resync.restore_point_ms).unwrap_or(0));
+    format!(
+        "the space was rewound on the server to seq {} (requested {} {})",
+        resync.restore_seq,
+        koidrive_fs::utc_date(at),
+        utc(at)
+    )
 }
 
 /// The time of day of `at` in UTC, such as `00:00 UTC`.
