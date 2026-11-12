@@ -3354,6 +3354,37 @@ fn a_lost_move_is_sent_again_over_a_position_the_server_kept_that_a_listing_skip
 }
 
 #[test]
+fn a_lost_move_is_not_sent_over_another_position_at_a_revision_this_device_saw() {
+    let (mut trees, mut commits, mut ids) = n_at_x();
+    take_remote_move("z", 7, &mut trees);
+    move_n_to_y_at(9, &mut trees, &mut commits, &mut ids);
+    let n = remote_at(file(ROOT, "w", 1), 7);
+    let sent = lose_with_n_at(n, 0, &mut trees, &mut commits, &mut ids);
+    assert!(sent.is_empty());
+    assert_eq!(trees.class("n"), Class::Remote);
+}
+
+#[test]
+fn a_lost_move_is_not_sent_once_another_device_moved_the_node_elsewhere() {
+    let (mut trees, mut commits, mut ids) = n_at_x();
+    move_n_to_y_at(9, &mut trees, &mut commits, &mut ids);
+    take_remote_move("z", 10, &mut trees);
+    assert!(trees.moved_here().is_empty());
+    let n = remote(file(ROOT, "x", 1));
+    let sent = lose_with_n_at(n, 0, &mut trees, &mut commits, &mut ids);
+    assert!(sent.is_empty());
+    assert_eq!(trees.class("n"), Class::Remote);
+}
+
+#[test]
+fn a_move_is_no_longer_recorded_once_r_holds_its_position_at_an_older_revision() {
+    let (mut trees, mut commits, mut ids) = n_at_x();
+    move_n_to_y_at(9, &mut trees, &mut commits, &mut ids);
+    trees.set_remote("n".into(), remote_at(file(ROOT, "y", 1), 5));
+    assert!(trees.moved_here().is_empty());
+}
+
+#[test]
 fn a_lost_move_is_not_sent_over_a_position_this_device_never_saw() {
     let (mut trees, mut commits, mut ids) = n_at_x();
     take_remote_move("z", 7, &mut trees);
