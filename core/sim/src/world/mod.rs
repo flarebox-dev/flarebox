@@ -20,7 +20,8 @@
 //!   overwrote or deleted a file that held it, or when the commit deletes a folder above the
 //!   file, which sends the write to the server's trash. The engine tells contents apart by their
 //!   bytes, so a user who overwrites or deletes a file does the same to a later write of the same
-//!   bytes to that file.
+//!   bytes to that file, and a commit that gives a file a write of the bytes it holds takes none
+//!   out.
 //! - A write the server does not hold stays on the disk of the device it was made on until that
 //!   device's user overwrites or deletes it.
 //! - A write that a restore took from the server while a disk held it is on the server again
@@ -36,9 +37,9 @@
 //! - Every disk equals the server's live tree, and every engine reports L = S = R with nothing
 //!   in flight, blocked, parked or halted.
 //! - No commit moved a node to a name that the user of its device never gave to anything, other
-//!   than the pending name a swap goes through (design section 2.6) and, until the devices are
-//!   quiet again, a name that L or the server held for a node whose shape a restore took from the
-//!   server (section 4.4), and no commit took a write out of the server's live tree that the user
+//!   than, until the devices are quiet again, a name that L or the server held for a node whose
+//!   shape a restore took from the server (section 4.4), and the pending name a swap goes through
+//!   to one of these names (design section 2.6), and no commit took a write out of the server's live tree that the user
 //!   of its device never overwrote or deleted.
 //! - No node keeps a pending name that no user gave.
 //! - No write is in two files of the server, except one a restore took from the server while a
@@ -267,10 +268,10 @@ fn pending_stem(name: &str) -> Option<&str> {
     (n.is_empty() || numbered(n)).then_some(stem)
 }
 
-/// Whether a user gave `name` to something, or `name` is the pending name of such a name. A
-/// pending name may only be passed through: [`World::converged`] fails on a node that keeps one.
-fn given(named: &BTreeSet<&str>, name: &str) -> bool {
-    named.contains(name) || pending_stem(name).is_some_and(|stem| named.contains(stem))
+/// Whether `asked` takes `name`, or `name` is the pending name of a name it takes. A pending
+/// name may only be passed through: [`World::converged`] fails on a node that keeps one.
+fn given(asked: impl Fn(&str) -> bool, name: &str) -> bool {
+    asked(name) || pending_stem(name).is_some_and(asked)
 }
 
 /// Fails when an effect sent a file to the local trash that held a write the server never held.
@@ -1452,12 +1453,13 @@ impl World {
                 let session = device.session.clone();
                 let sent = Commit { receipts, ..commit };
                 let made_up = sent.ops.iter().find_map(|op| match &op.op {
-                    Some(op::Op::Move(moved))
-                        if !given(&self.named[d], &moved.new_name)
-                            && !(self.restored_names[d].get(&moved.node_id))
-                                .is_some_and(|names| names.contains(&moved.new_name)) =>
-                    {
-                        Some(moved)
+                    Some(op::Op::Move(moved)) => {
+                        let restored = self.restored_names[d].get(&moved.node_id);
+                        let asked = |name: &str| {
+                            self.named[d].contains(name)
+                                || restored.is_some_and(|names| names.contains(name))
+                        };
+                        (!given(asked, &moved.new_name)).then_some(moved)
                     }
                     _ => None,
                 });
@@ -1480,7 +1482,17 @@ impl World {
                                     _ => None,
                                 })
                                 .collect();
-                            let gone = before.iter().filter(|(w, _)| !after.contains_key(w));
+                            let digests: BTreeMap<NodeId, Vec<u8>> =
+                                (self.space.nodes().into_iter())
+                                    .filter(|node| node.status == NodeStatus::Live as i32)
+                                    .filter_map(|node| {
+                                        Some((node.node_id, node.current?.content?.manifest_digest))
+                                    })
+                                    .collect();
+                            let gone = before.iter().filter(|(w, node)| {
+                                let digest = self.held.get(*node).and_then(|held| held.get(*w));
+                                !after.contains_key(w) && digests.get(*node) != digest
+                            });
                             for (lost, node) in gone {
                                 // The engine tells contents apart by their bytes. A user who
                                 // overwrites or deletes a file therefore does the same to a later
