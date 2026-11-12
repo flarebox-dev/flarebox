@@ -2660,3 +2660,81 @@ fn a_deep_folder_renamed_while_a_search_is_paused_is_followed() {
         }
     }
 }
+
+#[test]
+fn a_scanned_folder_replaced_above_a_paused_search_keeps_the_move() {
+    for budget in 1..=8 {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, RULES_FILE, "ig/\n");
+        write(root, "f.txt", "f");
+        write(root, "proj/keep.txt", "k");
+        for i in 0..5 {
+            write(root, &format!("proj/ig/p/n{i}"), "x");
+        }
+        let mut rules = rules().with_search_budget(budget);
+        let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
+        fs::rename(root.join("f.txt"), root.join("proj/ig/p/f.txt")).unwrap();
+        for rescan in 1..1000 {
+            let changes = snapshot
+                .rescan_with_rules(root, whole(), &mut rules)
+                .unwrap()
+                .changes;
+            if let Some(change) = changes.iter().find(|change| match change {
+                Change::Removed { path, .. } | Change::Ignored { from: path, .. } => {
+                    path == Path::new("f.txt")
+                }
+                _ => false,
+            }) {
+                assert!(
+                    matches!(change, Change::Ignored { .. }),
+                    "budget {budget}: {change:?}"
+                );
+                break;
+            }
+            if rescan == 1 {
+                fs::rename(root.join("proj"), root.join("old")).unwrap();
+                fs::create_dir_all(root.join("proj/ig/p")).unwrap();
+                fs::rename(root.join("old/ig/p/f.txt"), root.join("proj/ig/p/f.txt")).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn an_unreadable_folder_past_the_open_folder_cap_does_not_stop_the_search() {
+    use std::os::unix::fs::PermissionsExt;
+    for depth in [3, 15, 16, 20, 30] {
+        for budget in [50, 1000] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            write(root, RULES_FILE, "ig/\n");
+            let locked: PathBuf = std::iter::once("ig")
+                .chain(std::iter::repeat_n("c", depth))
+                .chain(["locked"])
+                .collect();
+            write(root, &locked.join("x").to_string_lossy(), "x");
+            write(root, "f.txt", "f");
+            let mut rules = rules().with_search_budget(budget);
+            let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
+            fs::set_permissions(root.join(&locked), fs::Permissions::from_mode(0o000)).unwrap();
+            fs::remove_file(root.join("f.txt")).unwrap();
+            let mut paths = whole().to_vec();
+            let mut changes = Vec::new();
+            for _ in 0..1000 {
+                let rescan = snapshot.rescan_with_rules(root, paths, &mut rules).unwrap();
+                if !rescan.changes.is_empty() {
+                    changes = rescan.changes;
+                    break;
+                }
+                paths = rescan.unsettled;
+            }
+            fs::set_permissions(root.join(&locked), fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(
+                changes,
+                [removed("f.txt", File)],
+                "depth {depth} budget {budget}"
+            );
+        }
+    }
+}
