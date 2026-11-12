@@ -15,13 +15,9 @@ work_dir="$macos_dir/build/ffi"
 export MACOSX_DEPLOYMENT_TARGET=14.0
 
 cd "$repo_root"
-cargo build --locked --release -p koidrive-ffi
 target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
+cargo build --locked --release -p koidrive-ffi --target-dir "$target_dir"
 lib="$target_dir/release/libkoidrive_ffi.a"
-if [ ! -f "$lib" ]; then
-  echo "error: cargo built koidrive-ffi but $lib is missing. This script finds the library through CARGO_TARGET_DIR or <repo>/target; set CARGO_TARGET_DIR instead of build.target-dir or CARGO_BUILD_TARGET_DIR." >&2
-  exit 1
-fi
 
 rm -rf "$work_dir"
 bindgen=(cargo run --locked --quiet -p koidrive-ffi --features bindgen --bin uniffi-bindgen-swift
