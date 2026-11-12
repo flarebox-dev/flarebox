@@ -1055,6 +1055,38 @@ fn entries_swapped_through_a_third_name_are_renamed() {
     assert_eq!(snapshot, Snapshot::scan(root).unwrap());
 }
 
+#[test]
+fn files_moved_back_to_their_paths_after_their_folders_swap_are_renamed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for (folder, file) in [("a", "1"), ("b", "2")] {
+        fs::create_dir_all(root.join(folder).join("s")).unwrap();
+        fs::write(root.join(folder).join("s").join(file), file).unwrap();
+    }
+    let mut snapshot = Snapshot::scan(root).unwrap();
+
+    for (from, to) in [
+        ("a", "t"),
+        ("b", "a"),
+        ("t", "b"),
+        ("a/s/2", "b/s/2"),
+        ("b/s/1", "a/s/1"),
+    ] {
+        fs::rename(root.join(from), root.join(to)).unwrap();
+    }
+    let changes = snapshot.rescan(root, [PathBuf::new()]).unwrap().changes;
+    assert_eq!(
+        changes,
+        [
+            renamed("a", "b", Dir),
+            renamed("a/s/1", "a/s/1", File),
+            renamed("b", "a", Dir),
+            renamed("b/s/2", "b/s/2", File)
+        ]
+    );
+    assert_eq!(snapshot, Snapshot::scan(root).unwrap());
+}
+
 /// A file written over by renaming a new file onto it keeps its path: the
 /// old file is gone, so nothing was swapped.
 #[test]
