@@ -129,10 +129,11 @@ export class MockCloudflare {
       }
       if (api === "/workers/observability/telemetry/query" && method === "POST") {
         if (this.observabilityStatus !== 200) return send(this.observabilityStatus, { success: false, errors: [{ code: 10000, message: "Authentication error" }], messages: [], result: null });
-        const { timeframe } = JSON.parse(body) as { timeframe: { from: number; to: number } };
+        const { timeframe, parameters } = JSON.parse(body) as { timeframe: { from: number; to: number }; parameters: { filters: { key: string; operation: string; value: string }[] } };
+        const script = parameters.filters.find((filter) => filter.key === "$workers.scriptName" && filter.operation === "eq")?.value;
         const visible = this.logQueries++ >= this.logsLagQueries;
         const events = (visible ? this.logs : [])
-          .filter((log) => log.timestamp >= timeframe.from && log.timestamp <= timeframe.to)
+          .filter((log) => log.timestamp >= timeframe.from && log.timestamp <= timeframe.to && (script === undefined || log.script === script))
           .map((log) => ({ timestamp: log.timestamp, $metadata: { service: log.script, level: "log", message: log.message }, $workers: { scriptName: log.script }, source: { message: log.message } }));
         return ok({ events: { events } });
       }

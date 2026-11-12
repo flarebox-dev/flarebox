@@ -255,9 +255,9 @@ async function claimCode(account: Account, name: string, fromMs: number): Promis
 
 async function claim(account: Account): Promise<void> {
   const state = readState();
-  if (state.deployments.length === 0) fail("nothing is deployed yet");
+  const first = state.deployments[0] ?? fail("nothing is deployed yet");
   const url = state.url!;
-  const fromMs = Date.now() - CLOCK_SKEW_MS;
+  const fromMs = first.atMs - CLOCK_SKEW_MS;
   try {
     await workerEvents(account, state.name, fromMs);
   } catch (error) {

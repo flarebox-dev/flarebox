@@ -555,6 +555,16 @@ describe("claim", () => {
     expect(status).toBe(0);
   });
 
+  it("finds a code an earlier claim attempt had /setup issue minutes before", async () => {
+    claimState();
+    writeState({ ...readState(), deployments: [{ ...readState().deployments[0]!, atMs: Date.now() - 10 * 60_000 }] });
+    mock.setupRequests = 1;
+    mock.logs.push({ script: NAME, message: "Koidrive claim code (valid for 1 hour): " + mock.claimCode, timestamp: Date.now() - 5 * 60_000 });
+    const { status, output } = await runTs("claim");
+    expect(output).toContain("Claimed " + mock.url);
+    expect(status).toBe(0);
+  });
+
   it("opens no /setup and spends no code when the token cannot query the logs", async () => {
     mock.observabilityStatus = 403;
     claimState();
