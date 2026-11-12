@@ -6,10 +6,6 @@ import KoidriveFFI
 import KoidriveModel
 import SwiftUI
 
-/// Renders every designed state of the windows, in light and dark, as PNG files, then quits. A Debug build does it
-/// when started with `-RenderSnapshots <directory>`, for comparing the app with the design renders:
-///
-///     open Koidrive.app --args -RenderSnapshots /tmp/koidrive-snapshots
 @MainActor
 enum Snapshots {
     static var directory: URL? {
@@ -150,8 +146,6 @@ enum Snapshots {
         ]
     }
 
-    /// Draws the view in a window of its own, at `width` and its ideal height unless `height` is set, and writes it
-    /// as a PNG. A `titled` window includes its title bar.
     private static func capture(_ view: some View, width: CGFloat, height: CGFloat? = nil, titled: String?,
                                 dark: Bool, to url: URL) async {
         let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)

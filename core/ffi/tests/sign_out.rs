@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Signing out of a profile whose folders are linked, against a server that never answers: the
-//! folders' tasks run, but sign-out does not need the server.
-
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -15,7 +12,6 @@ use koidrive_driver::{Credential, Limit, Paths, Question, QuestionKind};
 use koidrive_ffi::{Answer, SessionEvent, SessionListener, SyncSession, SyncStatus};
 use koidrive_store::{Link, Store, StoredQuestion};
 
-/// Nothing listens on the discard port.
 const SERVER: &str = "http://127.0.0.1:9/";
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -26,8 +22,6 @@ impl SessionListener for Ignore {
     fn on_event(&self, _: SessionEvent) {}
 }
 
-/// A paired profile in `base` with a folder linked at `base/<space>` for each of `spaces`, each
-/// holding one file of the person's and asked `questions` mass-delete questions, `<space>-<n>`.
 fn paired_profile(base: &Path, spaces: &[&str], questions: usize) -> PathBuf {
     let profile = base.join("profile");
     let paths = Paths::under(&profile);
@@ -97,7 +91,6 @@ fn open(profile: &Path) -> Arc<SyncSession> {
     SyncSession::open(Box::new(Ignore), profile.to_str().unwrap().into()).unwrap()
 }
 
-/// Waits until `path` exists, or returns false after `WAIT`.
 fn appears(path: &Path) -> bool {
     let deadline = Instant::now() + WAIT;
     while !path.exists() {

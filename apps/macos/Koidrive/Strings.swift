@@ -3,8 +3,6 @@
 import KoidriveFFI
 import Foundation
 
-// User-facing text for the core's values. Every string goes through the Localizable catalog.
-
 extension SyncStatus {
     var title: String {
         switch self {
@@ -18,7 +16,6 @@ extension SyncStatus {
         case .halted: String(localized: "A folder stopped syncing")
         }
     }
-
 }
 
 extension FolderState {
@@ -62,7 +59,6 @@ extension Question {
         }
     }
 
-    /// The title of an answer's button, which depends on the question. Every answer applies to all of its items.
     func title(for answer: Answer) -> String {
         switch (answer, kind) {
         case (.delete, .recovery): String(localized: "Delete All on Server")
@@ -78,7 +74,6 @@ extension Question {
         }
     }
 
-    /// What the answers apply to, under the answer buttons: "Applies to all 3 items · 1,086 files".
     var scope: String {
         let files = fileCount(affectedFiles)
         return switch items.count {
@@ -88,7 +83,6 @@ extension Question {
         }
     }
 
-    /// The title of the sheet that asks again before a destructive answer.
     func confirmation(for answer: Answer) -> String {
         switch (answer, kind) {
         case (.delete, .recovery): String(localized: "Delete \(itemCount(items.count)) on the server?")
@@ -99,7 +93,6 @@ extension Question {
         }
     }
 
-    /// The message of the sheet that asks again before a destructive answer.
     func confirmationMessage(for answer: Answer) -> String {
         switch (answer, kind) {
         case (.delete, .recovery): String(localized: "This deletes \(fileCount(affectedFiles)) on the server and every device. The server keeps them in its trash.")
@@ -108,7 +101,6 @@ extension Question {
         }
     }
 
-    /// The heading above the held items.
     var itemsHeading: String {
         switch kind {
         case .massDelete: String(localized: "Held deletions")
@@ -116,7 +108,6 @@ extension Question {
         }
     }
 
-    /// The symbol beside the question in the questions sidebar.
     var symbolName: String {
         switch kind {
         case .massDelete: "trash"
@@ -171,7 +162,6 @@ extension RecoveryCause {
         return cause + " " + String(localized: "Restored to \(date).")
     }
 
-    /// The cause in a few words, for the questions sidebar.
     var shortText: String {
         guard let ms = restorePointMs else {
             return switch trigger {
@@ -325,17 +315,14 @@ extension SessionError {
     }
 }
 
-/// "1 item", "2 items", with plural forms from the catalog.
 func itemCount(_ count: Int) -> String {
     String(localized: "\(count) items")
 }
 
-/// "1 deletion", "2 deletions", with plural forms from the catalog.
 func deletionCount(_ count: UInt64) -> String {
     String(localized: "\(count) deletions")
 }
 
-/// "1 file", "2 files", with plural forms from the catalog.
 func fileCount(_ count: UInt64) -> String {
     String(localized: "\(count) files")
 }

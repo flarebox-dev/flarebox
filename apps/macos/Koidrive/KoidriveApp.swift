@@ -36,7 +36,6 @@ struct KoidriveApp: App {
         _model = State(initialValue: model)
     }
 
-    /// Tells the person why the sync profile can't be opened, then quits.
     private static func quit(after error: any Error) -> Never {
         let alert = NSAlert()
         alert.messageText = String(localized: "Koidrive can't start")
@@ -79,7 +78,7 @@ enum WindowID {
 }
 
 extension OpenWindowAction {
-    /// Opens a window and brings the app forward, which a menu bar app must do itself.
+    /// Brings the app forward, which a menu bar app must do itself.
     @MainActor
     func show(_ id: String) {
         self(id: id)

@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The contents of the fake's scenarios.
-
 use super::*;
 
 pub(super) struct Script {

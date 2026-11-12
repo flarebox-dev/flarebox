@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The session object the app holds.
-
 use std::sync::Arc;
 
 use crate::core::{Core, Events, SessionListener};

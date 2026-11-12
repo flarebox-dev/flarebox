@@ -5,7 +5,6 @@ import KoidriveFFI
 import KoidriveModel
 import SwiftUI
 
-/// The first-run setup window: server, sign-in, folder.
 struct SetupView: View {
     @Environment(AppModel.self) private var app
     @State private var setup: SetupModel?
@@ -86,7 +85,6 @@ extension SetupModel.Step {
     }
 }
 
-/// A step's icon, title and help, as at the top of each setup step.
 private struct StepHeader: View {
     let systemImage: String
     let title: LocalizedStringKey
@@ -109,7 +107,6 @@ private struct StepHeader: View {
     }
 }
 
-/// A text field with its label above it.
 private struct Field<Accessory: View>: View {
     let label: LocalizedStringKey
     @Binding var text: String
@@ -248,7 +245,6 @@ private struct SignInStep: View {
     }
 }
 
-/// Chooses a space and a folder and links them. The settings window reuses it to add a folder.
 struct FolderStep: View {
     @Bindable var setup: SetupModel
 
@@ -327,7 +323,6 @@ struct FolderStep: View {
     }
 }
 
-/// A path with the home folder written as ~, as Finder shows it.
 func abbreviatingHome(_ path: String) -> String {
     (path as NSString).abbreviatingWithTildeInPath
 }

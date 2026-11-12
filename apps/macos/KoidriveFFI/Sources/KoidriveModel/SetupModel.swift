@@ -57,7 +57,7 @@ public final class SetupModel {
     }
 
     /// Whether the server step asks about usage reports: only until someone has chosen, here or with the CLI, and
-    /// never while an environment variable such as `DO_NOT_TRACK` decides, as the CLI does.
+    /// never while an environment variable such as `DO_NOT_TRACK` decides.
     public var asksForUsageReports: Bool { !app.telemetry.decided && !app.telemetry.locked }
 
     /// Whether signing in claims the server rather than pairing with it.
@@ -136,8 +136,6 @@ public final class SetupModel {
         }
     }
 
-    /// Runs one step at a time: a step asked for while another runs is dropped, so two space
-    /// reloads never race to pick the selected space.
     private func attempt(_ body: () async throws -> Void) async {
         guard !isBusy else { return }
         isBusy = true

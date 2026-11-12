@@ -39,8 +39,6 @@ struct SettingsView: View {
     }
 }
 
-// MARK: Folders
-
 struct FoldersSettings: View {
     @Environment(AppModel.self) private var model
     @State private var adding: SetupModel?
@@ -183,8 +181,6 @@ private struct AddFolderSheet: View {
     }
 }
 
-// MARK: Account
-
 struct AccountSettings: View {
     @Environment(AppModel.self) private var model
     @State private var devices: [Device] = []
@@ -195,7 +191,6 @@ struct AccountSettings: View {
     @State private var confirmingOffline = false
     @State private var error: SessionError?
 
-    /// `pairing` shows a pairing code from the start, for previews.
     init(pairing: PairingCode? = nil) {
         _pairing = State(initialValue: pairing)
     }
@@ -340,7 +335,6 @@ private struct SectionHeading: View {
     }
 }
 
-/// One row of a settings group.
 private struct SettingsRow<Content: View>: View {
     @ViewBuilder let content: Content
 
@@ -424,8 +418,6 @@ private struct PairingCodeLabel: View {
     }
 }
 
-// MARK: Storage
-
 struct StorageSettings: View {
     @Environment(AppModel.self) private var model
     @State private var storage = StorageModel()
@@ -470,8 +462,6 @@ struct StorageSettings: View {
         }
     }
 
-    /// A space's usage rows, or why the server refused them. With a single space its section has
-    /// no header.
     @ViewBuilder
     private func usage(of entry: SpaceStorage) -> some View {
         switch entry.usage {
@@ -505,8 +495,6 @@ private struct StorageRow: View {
         }
     }
 }
-
-// MARK: Problems
 
 struct ProblemsSettings: View {
     @Environment(AppModel.self) private var model
@@ -588,7 +576,6 @@ private struct ProblemRow: View {
 }
 
 extension ProblemKind {
-    /// Whether the problem is about the linked folder itself, so its path says where.
     var concernsTheFolder: Bool {
         switch self {
         case .folderMissing, .folderNotAFolder, .folderUnreadable, .folderOnOtherVolume, .markerMissing,
@@ -599,8 +586,6 @@ extension ProblemKind {
         }
     }
 }
-
-// MARK: General
 
 struct GeneralSettings: View {
     @Environment(AppModel.self) private var app

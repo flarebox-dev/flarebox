@@ -28,8 +28,6 @@ extension SyncSession {
     }
 }
 
-/// Forwards session events into a stream and finishes it when Rust drops the listener.
-///
 /// Rust calls `onEvent` while holding the core's lock, so the relay only yields and never
 /// calls back into the session.
 private final class EventRelay: SessionListener {
