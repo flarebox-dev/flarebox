@@ -189,10 +189,7 @@ rm "$HOME/running"
 pass 'an upgrade restarts the running background service of every profile'
 
 if [ "$(uname -s)" = Linux ]; then
-    mkdir "$tmp/daemon"
-    ln -s "$(command -v cat)" "$tmp/daemon/koi"
-    mkfifo "$tmp/daemon/_daemon"
-    (cd "$tmp/daemon" && exec ./koi _daemon) &
+    perl -e '$0 = "/opt/old/koi _daemon"; sleep 300' &
     daemon=$!
     touch "$HOME/nobus"
     sh "$root/install.sh" 2> "$tmp/nobus.log"
