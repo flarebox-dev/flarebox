@@ -191,7 +191,7 @@ class Socket {
   }
 
   async waitClosed(): Promise<{ code: number; reason: string }> {
-    return this.until(() => this.closed, "close").catch(() => this.closed!);
+    return this.until(() => this.closed, "close");
   }
 
   async hello(maxFormat = 1): Promise<Welcome> {
@@ -1846,7 +1846,6 @@ describe("WebSocket session", () => {
     expect((await sb.pushed())[0]!.seq).toBe(1n);
 
     sb.ws.close(1000, "network drop");
-    await sb.waitClosed();
     await sa.commit(1n, [op.mkdir(uuidv7(), spaceId, "two")]);
     await sa.commit(2n, [op.mkdir(uuidv7(), spaceId, "three")]);
 
