@@ -22,6 +22,50 @@
       ],
       "type": "object"
     },
+    "ArgumentInfo": {
+      "properties": {
+        "about": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "repeated": {
+          "type": "boolean"
+        },
+        "required": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "required",
+        "repeated",
+        "about"
+      ],
+      "type": "object"
+    },
+    "Auth": {
+      "description": "What the command signs in with.",
+      "oneOf": [
+        {
+          "enum": [
+            "none"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "device",
+          "description": "This device's credential, from `koi setup`. Without one it fails with `auth_required`.",
+          "type": "string"
+        },
+        {
+          "const": "cloudflare",
+          "description": "A Cloudflare login, which only `--interactive` starts. Without one it fails with `auth_required`.",
+          "type": "string"
+        }
+      ]
+    },
     "Blocked": {
       "description": "A folder that the daemon may not read, as its `access` request finds it.",
       "properties": {
@@ -83,6 +127,63 @@
           "type": "string"
         }
       ]
+    },
+    "CommandInfo": {
+      "properties": {
+        "about": {
+          "type": "string"
+        },
+        "aliases": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "arguments": {
+          "items": {
+            "$ref": "#/$defs/ArgumentInfo"
+          },
+          "type": "array"
+        },
+        "auth": {
+          "$ref": "#/$defs/Auth"
+        },
+        "command": {
+          "description": "The subcommand path, as in the envelope's `command`.",
+          "type": "string"
+        },
+        "options": {
+          "items": {
+            "$ref": "#/$defs/OptionInfo"
+          },
+          "type": "array"
+        },
+        "output": {
+          "$ref": "#/$defs/Output"
+        },
+        "schema": {
+          "description": "The file of the schema of its envelope in docs/json-schema/v1.",
+          "type": "string"
+        },
+        "subcommands": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "command",
+        "about",
+        "aliases",
+        "arguments",
+        "options",
+        "subcommands",
+        "auth",
+        "output",
+        "schema"
+      ],
+      "type": "object"
     },
     "Counts": {
       "properties": {
@@ -221,12 +322,20 @@
     },
     "HelpData": {
       "properties": {
+        "commands": {
+          "description": "The command asked about and every command under it.",
+          "items": {
+            "$ref": "#/$defs/CommandInfo"
+          },
+          "type": "array"
+        },
         "help": {
           "type": "string"
         }
       },
       "required": [
-        "help"
+        "help",
+        "commands"
       ],
       "type": "object"
     },
@@ -273,6 +382,55 @@
       ],
       "type": "object"
     },
+    "OptionInfo": {
+      "properties": {
+        "about": {
+          "type": "string"
+        },
+        "global": {
+          "description": "Whether every subcommand takes it too.",
+          "type": "boolean"
+        },
+        "long": {
+          "type": "string"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "short": {
+          "maxLength": 1,
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value": {
+          "description": "The name of the value it takes, or null for a flag.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "values": {
+          "description": "The values it accepts, when it accepts only some.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "long",
+        "short",
+        "value",
+        "values",
+        "required",
+        "global",
+        "about"
+      ],
+      "type": "object"
+    },
     "Outcome": {
       "oneOf": [
         {
@@ -294,6 +452,21 @@
         {
           "const": "unchanged",
           "description": "The state the command asks for already held, or the command repeated an accepted answer, so nothing changed.",
+          "type": "string"
+        }
+      ]
+    },
+    "Output": {
+      "description": "What it prints on stdout with `--json`. It never reads stdin then.",
+      "oneOf": [
+        {
+          "const": "envelope",
+          "description": "One envelope.",
+          "type": "string"
+        },
+        {
+          "const": "lines",
+          "description": "One JSON object per line while it runs.",
           "type": "string"
         }
       ]

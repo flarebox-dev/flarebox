@@ -576,5 +576,74 @@ fn every_command_prints_its_help_as_an_envelope_its_schema_takes() {
         assert_eq!(code, 0, "{envelope:#}");
         assert_eq!(envelope["command"], command.as_str(), "{envelope:#}");
         assert!(envelope["data"]["help"].is_string(), "{envelope:#}");
+        assert_eq!(
+            envelope["data"]["commands"][0]["command"],
+            command.as_str(),
+            "{envelope:#}"
+        );
+    }
+}
+
+#[test]
+fn the_help_manifest_names_each_command_its_schema_and_the_sign_in_it_needs() {
+    let profile = Profile::new();
+    std::fs::create_dir(profile.home.path().join("docs")).unwrap();
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/json-schema/v1");
+    let (_, help) = profile.json(&["help", "--json"]);
+    let mut checked = Vec::new();
+    for info in help["data"]["commands"].as_array().unwrap() {
+        let command = info["command"].as_str().unwrap();
+        let schema = info["schema"].as_str().unwrap();
+        assert!(dir.join(schema).is_file(), "{info:#}");
+        let samples: &[&str] = match command {
+            "space create" => &["Work"],
+            "folder link" => &["docs", "--space", "Work"],
+            "folder unlink" | "folder restart" => &["docs"],
+            "folder retry" => &["docs", "--resend"],
+            "" | "help" | "service start" | "_daemon" | "history trash" => continue,
+            _ if info["subcommands"].as_array().unwrap().is_empty() => &[],
+            _ => continue,
+        };
+        let needs_values = info["arguments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|arg| arg["required"] == true);
+        if needs_values && samples.is_empty() {
+            continue;
+        }
+        let mut args: Vec<&str> = command.split_whitespace().collect();
+        args.extend(samples);
+        args.push("--json");
+        let (_, envelope) = profile.json(&args);
+        let next = envelope["next_commands"].as_array().unwrap();
+        match info["auth"].as_str().unwrap() {
+            "device" => {
+                assert_eq!(envelope["error"]["code"], "auth_required", "{envelope:#}");
+                assert_eq!(argv(&next[0]), ["koi", "setup"], "{envelope:#}");
+            }
+            "cloudflare" => {
+                assert_eq!(envelope["error"]["code"], "auth_required", "{envelope:#}");
+                assert_eq!(
+                    argv(&next[0]).last(),
+                    Some(&"--interactive"),
+                    "{envelope:#}"
+                );
+            }
+            _ => assert_ne!(envelope["error"]["code"], "auth_required", "{envelope:#}"),
+        }
+        checked.push(command.to_owned());
+    }
+    for command in [
+        "status",
+        "space list",
+        "folder link",
+        "server deploy",
+        "telemetry on",
+    ] {
+        assert!(
+            checked.iter().any(|checked| checked == command),
+            "{checked:?}"
+        );
     }
 }

@@ -4,6 +4,7 @@ use schemars::generate::SchemaSettings;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde_json::{Map, Value, json};
 
+use crate::manifest::file_name;
 use crate::report::{
     AccountData, AnsweredData, ChoicesData, DaemonLine, DevicesData, DiagnosticsData, Empty,
     Envelope, FolderData, HelpData, InvitationData, RequestsData, RestoreAskedData, RevokedData,
@@ -102,36 +103,19 @@ pub fn envelope(command: &str) -> Option<Value> {
     Some(Value::Object(root))
 }
 
-pub fn file_name(command: &str) -> String {
-    match command {
-        "" => "koi.json".to_owned(),
-        command => format!("koi-{}.json", command.replace(' ', "-")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
     use std::path::Path;
 
-    use clap::CommandFactory;
-
     use super::*;
     use crate::report::Done;
 
     fn commands() -> Vec<String> {
-        fn walk(command: &clap::Command, path: &str, all: &mut Vec<String>) {
-            all.push(path.to_owned());
-            for sub in (command.get_subcommands()).filter(|sub| sub.get_name() != "help") {
-                walk(sub, format!("{path} {}", sub.get_name()).trim_start(), all);
-            }
-        }
-        let mut all = Vec::new();
-        let mut root = crate::Cli::command();
-        root.build();
-        walk(&root, "", &mut all);
-        all.push("help".to_owned());
-        all
+        crate::manifest::commands("")
+            .into_iter()
+            .map(|info| info.command)
+            .collect()
     }
 
     #[test]

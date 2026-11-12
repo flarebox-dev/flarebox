@@ -879,6 +879,66 @@ pub struct ChoicesData {
 #[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct HelpData {
     pub help: String,
+    /// The command asked about and every command under it.
+    pub commands: Vec<CommandInfo>,
+}
+
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
+pub struct CommandInfo {
+    /// The subcommand path, as in the envelope's `command`.
+    pub command: String,
+    pub about: String,
+    pub aliases: Vec<String>,
+    pub arguments: Vec<ArgumentInfo>,
+    pub options: Vec<OptionInfo>,
+    pub subcommands: Vec<String>,
+    pub auth: Auth,
+    pub output: Output,
+    /// The file of the schema of its envelope in docs/json-schema/v1.
+    pub schema: String,
+}
+
+/// What the command signs in with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Auth {
+    None,
+    /// This device's credential, from `koi setup`. Without one it fails with `auth_required`.
+    Device,
+    /// A Cloudflare login, which only `--interactive` starts. Without one it fails with `auth_required`.
+    Cloudflare,
+}
+
+/// What it prints on stdout with `--json`. It never reads stdin then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Output {
+    /// One envelope.
+    Envelope,
+    /// One JSON object per line while it runs.
+    Lines,
+}
+
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
+pub struct ArgumentInfo {
+    pub name: String,
+    pub required: bool,
+    pub repeated: bool,
+    pub about: String,
+}
+
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
+pub struct OptionInfo {
+    pub long: String,
+    pub short: Option<char>,
+    /// The name of the value it takes, or null for a flag.
+    pub value: Option<String>,
+    /// The values it accepts, when it accepts only some.
+    pub values: Vec<String>,
+    pub required: bool,
+    /// Whether every subcommand takes it too.
+    pub global: bool,
+    pub about: String,
 }
 
 #[derive(Debug, PartialEq, Serialize, JsonSchema)]
