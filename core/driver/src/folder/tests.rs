@@ -2986,8 +2986,8 @@ fn a_scan_that_unblocks_a_node_without_planning_an_effect_stores_it_unblocked() 
 /// the file to make room for the folder. Before `b` moves the file into the folder, the user there makes a folder `ß`
 /// in it and then excludes `ss/`, which `ß` matches after case folding. Nothing can put the file at `a/ß` or back
 /// at `a`, so the folder `a` and the files in it wait for the name the file keeps (design §5.10). The folder is up to
-/// date, its problem names the file, where it is kept and the entry that holds its name, and what waits behind it. The
-/// excluded folder and the file's bytes stay as they are.
+/// date, its problem names the file, where it is kept and the entry that holds its name, and what waits behind it. An
+/// edit of `a/a` on `b` still reaches the server. The excluded folder and the file's bytes stay as they are.
 #[test]
 fn a_file_whose_place_an_excluded_folder_holds_is_named_with_what_waits_for_its_name() {
     let mut remote = Remote::new();
@@ -3029,7 +3029,13 @@ fn a_file_whose_place_an_excluded_folder_holds_is_named_with_what_waits_for_its_
     b.settle();
     fs::write(site.root.join("a/a"), b"edited on b").unwrap();
     b.settle();
+    assert_eq!(b.run(&mut remote), ["upload", "send"]);
+    b.settle();
     assert!(b.run(&mut remote).is_empty());
+    a.pull_at_once(&remote);
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(fs::read(site_a.root.join("a/a")).unwrap(), b"edited on b");
 
     let view = b.folder.view();
     let waits = "waits for a/ß, whose name here is taken by an entry this device's rules exclude";

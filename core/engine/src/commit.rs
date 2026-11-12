@@ -587,7 +587,7 @@ impl Commits {
     /// edit of a file is sent before the restore of an earlier version and so becomes a version
     /// itself. While such an op is left for a later commit, the restore waits with it. It also
     /// waits while its node is not settled: a node left out of planning (a problem node, a node
-    /// whose S update waits and that L did not move away from the waiting position, a parked one),
+    /// whose S update waits and that L did not change, a parked one),
     /// and a node L and R agree on while S lags ([`Class::Same`]). A folder is not deleted in the
     /// commit that restores a node into it.
     ///
@@ -619,7 +619,7 @@ impl Commits {
         self.ask_again(trees, ids, now_ms);
         trees.reclaim();
         let parked = trees.local().iter().filter(|(_, node)| node.parked);
-        let waiting = (trees.waiting().keys()).filter(|id| !moved_locally(trees, id));
+        let waiting = (trees.waiting().keys()).filter(|id| !changed_locally(trees, id));
         let mut skip: BTreeSet<NodeId> = self
             .problems
             .iter()
@@ -926,9 +926,12 @@ impl Commits {
     /// came back to is a remote change. When L and R agreed on a newer position
     /// ([`Trees::position_after`]), S takes that position, and a rename by the server does not
     /// revert the node. S first takes what every op sent, as without an agreement, and then each
-    /// agreed position S can hold, with the rest of the shape the ops gave the node. A node whose
-    /// agreed position S cannot hold, because another node holds its name or its parent is gone,
-    /// keeps what was sent, and is reverted when the server renamed it. A conflict copy is re-keyed in L, and so is
+    /// agreed position S can hold, with the rest of the shape the ops gave the node; agreed positions
+    /// that only fit together are made together ([`update_synced`]). A node whose agreed position S
+    /// cannot hold, because another node holds its name or its parent is gone, keeps what was sent,
+    /// and the agreed position waits as its S update while L or R still holds it there, so the node
+    /// is not planned until S can hold it. A node whose agreement does not wait is reverted when the
+    /// server renamed it. A conflict copy is re-keyed in L, and so is
     /// a directory merged into one L does not hold yet. When L already holds the conflict copy,
     /// because a log replay brought it before the result and the effects downloaded it, the local
     /// file keeps its ID and takes what was sent as its S, so the server's content replaces it. When L already holds the directory it was
@@ -1142,16 +1145,24 @@ impl Commits {
                 positions.set(id, Some(shape));
             }
         }
-        let tried: BTreeSet<NodeId> = positions.ids().collect();
-        let refused: BTreeSet<NodeId> = (positions.apply(trees).into_iter())
-            .map(|(id, _)| id)
-            .collect();
-        let taken: BTreeSet<&NodeId> = tried.difference(&refused).collect();
+        let mut taken: BTreeSet<NodeId> = positions.ids().collect();
+        let (waits, dropped): (Vec<_>, Vec<_>) =
+            (positions.apply(trees).into_iter()).partition(|(id, shape)| {
+                let local = trees.local().get(id).map(|node| &node.shape);
+                (local.into_iter().chain(trees.remote().live(id))).any(|held| {
+                    shape
+                        .as_ref()
+                        .is_some_and(|agreed| held.same_position(agreed))
+                })
+            });
+        for (id, _) in dropped {
+            taken.remove(&id);
+        }
         rest.retain(|(id, _)| !taken.contains(id));
-        for id in unreverted.iter().filter(|id| !taken.contains(id)) {
+        for id in unreverted.iter().filter(|id| !taken.contains(*id)) {
             trees.revert(id.clone());
         }
-        for (id, shape) in rest {
+        for (id, shape) in rest.into_iter().chain(waits) {
             trees.wait(id, shape, Origin::Commit(flight.commit.device_seq));
         }
         let mut closed = BTreeSet::new();
@@ -1459,8 +1470,9 @@ fn deletes(trees: &Trees, id: &str, needed: &BTreeSet<NodeId>) -> bool {
 }
 
 /// Makes the S updates, the last for each node, that leave S a valid tree: all of them together
-/// when they fit together, otherwise each that fits on its own and then the rest together again,
-/// while any is made. Returns the rest.
+/// when they fit together, otherwise those left once each update that a node outside the batch
+/// blocks is taken out ([`blocked`]), otherwise each that fits on its own and then the rest together
+/// again, while any is made. Returns the rest.
 fn update_synced(
     trees: &mut Trees,
     updates: Vec<(NodeId, Option<Shape>)>,
@@ -1471,18 +1483,24 @@ fn update_synced(
         left.push((id, shape));
     }
     while !left.is_empty() {
-        let before: Vec<(NodeId, Option<Shape>)> = left
-            .iter()
-            .map(|(id, _)| (id.clone(), trees.synced().live(id).cloned()))
-            .collect();
-        for (id, shape) in &left {
-            trees.set_synced(id.clone(), shape.clone());
-        }
-        if trees.synced().check(Names::ByKey).is_ok() {
+        if set_synced_together(trees, &left) {
             return Vec::new();
         }
-        for (id, shape) in before {
-            trees.set_synced(id, shape);
+        let mut fitting = left.clone();
+        let mut out = Vec::new();
+        loop {
+            let batch: BTreeMap<NodeId, Option<Shape>> = fitting.iter().cloned().collect();
+            let (stuck, rest): (Vec<_>, Vec<_>) = (fitting.into_iter())
+                .partition(|(id, shape)| blocked(trees, &batch, id, shape.as_ref()));
+            fitting = rest;
+            if stuck.is_empty() {
+                break;
+            }
+            out.extend(stuck);
+        }
+        if !out.is_empty() && !fitting.is_empty() && set_synced_together(trees, &fitting) {
+            left = out;
+            continue;
         }
         let count = left.len();
         left.retain(|(id, shape)| !trees.set_synced_if_valid(id.clone(), shape.clone()));
@@ -1491,6 +1509,49 @@ fn update_synced(
         }
     }
     left
+}
+
+/// Sets S for every node of `updates` when S stays a valid tree with all of them. Returns whether it
+/// did.
+fn set_synced_together(trees: &mut Trees, updates: &[(NodeId, Option<Shape>)]) -> bool {
+    let before: Vec<(NodeId, Option<Shape>)> = (updates.iter())
+        .map(|(id, _)| (id.clone(), trees.synced().live(id).cloned()))
+        .collect();
+    for (id, shape) in updates {
+        trees.set_synced(id.clone(), shape.clone());
+    }
+    if trees.synced().check(Names::ByKey).is_ok() {
+        return true;
+    }
+    for (id, shape) in before {
+        trees.set_synced(id, shape);
+    }
+    false
+}
+
+/// Whether a node outside `batch` keeps the update of `id` to `shape` from fitting, whatever else
+/// the batch makes: S gives the name it takes to a node the batch does not update, or neither S nor
+/// the batch holds its folder, or S holds a node the batch does not update under the node it
+/// removes.
+fn blocked(
+    trees: &Trees,
+    batch: &BTreeMap<NodeId, Option<Shape>>,
+    id: &str,
+    shape: Option<&Shape>,
+) -> bool {
+    let Some(shape) = shape else {
+        return trees
+            .synced_children(id)
+            .any(|child| !batch.contains_key(child));
+    };
+    let placed = (batch.get(&shape.parent))
+        .is_some_and(|next| next.as_ref().is_some_and(|next| next.kind == Kind::Dir));
+    let held = !batch.contains_key(&shape.parent)
+        && (trees.synced().live(&shape.parent)).is_some_and(|parent| parent.kind == Kind::Dir);
+    let root = shape.parent == trees.synced().root;
+    let taken = (trees.synced_holders(&shape.parent, &shape.name))
+        .any(|child| child != id && !batch.contains_key(child));
+    !(root || placed || held) || taken
 }
 
 /// What changed about the files of a conflict since it was asked.
@@ -1759,11 +1820,12 @@ fn acknowledged_class(trees: &Trees, id: &str) -> Class {
     classify(local, acknowledged(trees, id), remote)
 }
 
-/// Whether L moved a node whose S update waits away from the waiting position, where R still
-/// holds it. Such a node is planned and rebased against the waiting shape, since the update may
-/// never fit while L holds the node elsewhere, as when a folder R trashed takes its name key in S
-/// and L cannot remove that folder while the node is inside it.
-fn moved_locally(trees: &Trees, id: &str) -> bool {
+/// Whether L changed a node whose S update waits: L edited it, or moved it away from the waiting
+/// position while R still holds it there. Such a node is planned and rebased against the waiting
+/// shape. An edit is uploaded while only the position waits, wherever R holds the node, and a move
+/// is planned because the update may never fit while L holds the node elsewhere, as when a folder
+/// R trashed takes its name key in S and L cannot remove that folder while the node is inside it.
+fn changed_locally(trees: &Trees, id: &str) -> bool {
     let (
         Some(local),
         Some(Waiting {
@@ -1774,8 +1836,14 @@ fn moved_locally(trees: &Trees, id: &str) -> bool {
     else {
         return false;
     };
-    let held = |shape: &Shape| shape.same_position(waiting);
-    !held(local) && trees.remote().live(id).is_some_and(held)
+    let edited = local.kind != waiting.kind
+        || match (&local.content, &waiting.content) {
+            (Some(a), Some(b)) => !same_content(a, b),
+            (a, b) => a.is_some() != b.is_some(),
+        };
+    let moved = !local.same_position(waiting)
+        && (trees.remote().live(id)).is_some_and(|remote| remote.same_position(waiting));
+    edited || moved
 }
 
 /// What is left of a waiting S update. Its position is stale once R no longer has the node there
