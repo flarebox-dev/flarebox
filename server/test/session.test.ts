@@ -1151,6 +1151,20 @@ describe("RFC 0014 session leases", () => {
     }
   });
 
+  it("answers a Resume sent right after Hello by a socket without a lease in the order they were sent", async () => {
+    const owner = await getOwner();
+    const device = await pairDevice(owner, "Pipelined");
+    const spaceId = await createSpace(owner);
+    const socket = await Socket.connect(spaceId, device);
+    await runInDurableObject(env.SPACE.get(env.SPACE.idFromName(spaceId)), (instance: SpaceDO) => {
+      (instance as unknown as { leases: Map<string, unknown> }).leases.clear();
+    });
+    socket.send({ case: "hello", value: { clientName: "test", clientVersion: "0", protoMin: 1, protoMax: 1, maxFormat: 1 } });
+    socket.send({ case: "resume", value: { historyId: "none", sinceSeq: 0n, sinceCommitId: "", sinceCommittedAtMs: 0n } });
+    expect((await socket.next()).case).toBe("welcome");
+    expect((await socket.next()).case).not.toBe("goodbye");
+  });
+
   it("renews in one blocking check every connected device whose lease has run out", async () => {
     const owner = await getOwner();
     const spaceId = await createSpace(owner);

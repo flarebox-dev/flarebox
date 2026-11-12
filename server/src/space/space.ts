@@ -452,7 +452,22 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
     }
 
     protected async checkDevice(deviceId: string): Promise<SessionCheck | undefined> {
-      return this.knownCheck(deviceId) ?? (await this.coldChecks([deviceId]))?.get(deviceId);
+      return this.knownCheck(deviceId) ?? (await this.coldCheck([deviceId]))?.[deviceId];
+    }
+
+    protected async admitDevice(deviceId: string): Promise<SessionCheck | undefined> {
+      const known = this.knownCheck(deviceId);
+      if (known) return known;
+      if (!this.gathering) {
+        const gathered = new Set<string>();
+        const answers = new Promise((resolve) => setTimeout(resolve, 0)).then(() => {
+          this.gathering = undefined;
+          return this.coldCheck(gathered);
+        });
+        this.gathering = { deviceIds: gathered, answers };
+      }
+      this.gathering.deviceIds.add(deviceId);
+      return (await this.gathering.answers)?.[deviceId];
     }
 
     private async checkDevices(deviceIds: string[]): Promise<Map<string, SessionCheck> | undefined> {
@@ -463,32 +478,17 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
         return !known;
       });
       if (unknown.length === 0) return checks;
-      const answered = await this.coldChecks(unknown);
+      const answered = await this.coldCheck(unknown);
       if (!answered) return undefined;
-      for (const [deviceId, check] of answered) checks.set(deviceId, check);
+      for (const deviceId of unknown) if (answered[deviceId]) checks.set(deviceId, answered[deviceId]);
       return checks;
-    }
-
-    private async coldChecks(deviceIds: string[]): Promise<Map<string, SessionCheck> | undefined> {
-      if (!this.gathering) {
-        const gathered = new Set<string>();
-        const answers = new Promise((resolve) => setTimeout(resolve, 0)).then(() => {
-          this.gathering = undefined;
-          return this.checkGathered(gathered);
-        });
-        this.gathering = { deviceIds: gathered, answers };
-      }
-      for (const deviceId of deviceIds) this.gathering.deviceIds.add(deviceId);
-      const answers = await this.gathering.answers;
-      if (!answers) return undefined;
-      return new Map(deviceIds.flatMap((deviceId) => (answers[deviceId] ? [[deviceId, answers[deviceId]] as const] : [])));
     }
 
     /**
      * The error is caught inside the callback, because an exception there would reset this object and drop every
      * connection.
      */
-    private async checkGathered(deviceIds: Set<string>): Promise<Record<string, SessionCheck> | undefined> {
+    private async coldCheck(deviceIds: Iterable<string>): Promise<Record<string, SessionCheck> | undefined> {
       const account = this.account();
       const spaceId = String(getMeta(this.sql, "space_id"));
       const answers = await this.state.blockConcurrencyWhile(async () => {
