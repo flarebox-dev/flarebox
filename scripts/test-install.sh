@@ -14,21 +14,44 @@ export KOIDRIVE_VERSION=v0.0.0
 unset KOIDRIVE_INSTALL_DIR
 mkdir -p "$HOME" "$tmp/package" "$tmp/releases/download/v0.0.0" "$tmp/releases/latest" "$tmp/bin" "$tmp/services"
 export PATH="$tmp/services:$PATH"
-for manager in systemctl launchctl; do
-    cat > "$tmp/services/$manager" <<'EOF'
+cat > "$tmp/services/systemctl" <<'EOF'
+#!/bin/sh
+set -f
+printf '%s\n' "$*" >> "$HOME/services.log"
+[ "$1 $2" = '--user list-units' ] || exit 0
+if [ -e "$HOME/nobus" ]; then
+    printf 'Failed to connect to bus: No medium found\n' >&2
+    exit 1
+fi
+shift 2
+state= patterns=
+for arg; do
+    case $arg in
+        --state=*) state=${arg#--state=} ;;
+        -*) ;;
+        *) patterns="$patterns $arg" ;;
+    esac
+done
+{
+    printf '%s\n' 'other.service active' 'koidrive-backup.service active' 'koidrive-0badf00d.service failed'
+    [ ! -e "$HOME/running" ] || sed 's/$/ active/' "$HOME/running"
+} | while read -r unit active; do
+    [ -z "$state" ] || [ "$active" = "$state" ] || continue
+    for pattern in $patterns; do
+        case $unit in
+            $pattern) printf '%s loaded %s running Koidrive\n' "$unit" "$active"; break ;;
+        esac
+    done
+done
+EOF
+cat > "$tmp/services/launchctl" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >> "$HOME/services.log"
-running() { [ ! -e "$HOME/running" ] || cat "$HOME/running"; }
-case "$*" in
-    "--user list-units --type=service --state=active --plain --no-legend koidrive.service koidrive-*.service")
-        running | sed 's/$/ loaded active running Koidrive sync/' ;;
-    list)
-        printf 'PID\tStatus\tLabel\n101\t0\tcom.example.other\n102\t0\tdev.koidrive.koiz\n'
-        running | sed 's/^/103\t0\t/' ;;
-esac
+[ "$*" = list ] || exit 0
+printf 'PID\tStatus\tLabel\n101\t0\tcom.example.other\n102\t0\tdev.koidrive.koiz\n104\t0\tdev.koidrive.koi.backup\n-\t0\tdev.koidrive.koi.0badf00d\n'
+[ ! -e "$HOME/running" ] || sed 's/^/103\t0\t/' "$HOME/running"
 EOF
-    chmod +x "$tmp/services/$manager"
-done
+chmod +x "$tmp/services/systemctl" "$tmp/services/launchctl"
 cp "$binary" "$tmp/package/koi"
 archive=koidrive-$target.tar.gz
 release=$tmp/releases/download/v0.0.0
@@ -166,7 +189,25 @@ rm "$HOME/running"
 pass 'an upgrade restarts the running background service of every profile'
 
 if [ "$(uname -s)" = Linux ]; then
-    printf 'Passed 18 installer tests on %s\n' "$(uname -s)"
+    mkdir "$tmp/daemon"
+    ln -s "$(command -v cat)" "$tmp/daemon/koi"
+    mkfifo "$tmp/daemon/_daemon"
+    (cd "$tmp/daemon" && exec ./koi _daemon) &
+    daemon=$!
+    touch "$HOME/nobus"
+    sh "$root/install.sh" 2> "$tmp/nobus.log"
+    rm "$HOME/nobus"
+    kill "$daemon"
+    if ! grep -F "the koi daemon with process ID $daemon still runs the old koi" "$tmp/nobus.log"; then
+        cat "$tmp/nobus.log"
+        printf 'Expected an upgrade without a systemd user manager to name the daemon that still runs the old koi\n' >&2
+        exit 1
+    fi
+    pass 'an upgrade without a systemd user manager names the daemon that still runs the old koi'
+fi
+
+if [ "$(uname -s)" = Linux ]; then
+    printf 'Passed 19 installer tests on %s\n' "$(uname -s)"
 else
     cat > "$tmp/bin/uname" <<'EOF'
 #!/bin/sh
