@@ -90,13 +90,8 @@ fn below<N: Node>(tree: &Tree<N>, id: &str, folders: &BTreeSet<NodeId>) -> bool 
     false
 }
 
-/// The names from the root to `id` in `tree` with the node's kind, or `None` when the tree does not
-/// hold the node live and placed under live, placed folders.
 fn path<'a, N: Node>(tree: &'a Tree<N>, id: &str) -> Option<(Vec<&'a str>, Kind)> {
-    let held = |id: &str| {
-        tree.get(id)
-            .filter(|node| node.is_live() && node.is_placed())
-    };
+    let held = |id: &str| tree.get(id).filter(|node| node.is_live());
     let shape = held(id)?.shape();
     let mut names = vec![shape.name.as_str()];
     let mut current = shape.parent.as_str();
@@ -779,6 +774,10 @@ impl Trees {
         local == Some(true)
             || ignored(path(&self.s, id)) == Some(true)
             || ignored(path(&self.r, id)) == Some(true)
+    }
+
+    pub(crate) fn ignored_in_remote(&self, id: &str) -> bool {
+        path(&self.r, id).is_some_and(|(names, kind)| self.ignores(&names, kind))
     }
 
     /// The name of a parked node's entry in the parked directory: its ID, or, for a node re-keyed

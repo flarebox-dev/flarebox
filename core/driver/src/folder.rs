@@ -826,21 +826,28 @@ impl Folder {
             reasons.entry(id).or_default().push(why.to_owned());
         }
         for (id, stuck) in &held {
+            let kept = trees
+                .local()
+                .get(id)
+                .is_some_and(|node| node.parked)
+                .then(|| {
+                    let parked = Path::new(koidrive_fs::PRIVATE_DIR)
+                        .join(koidrive_fs::PARKED_DIR)
+                        .join(trees.parked_name(id));
+                    format!("it is kept in {}", koidrive_fs::quoted(&parked))
+                });
             let why = match stuck {
                 Stuck::HeldBy(by) => {
                     let why = format!(
                         "its name here is taken by {}, which this device's rules exclude",
                         quoted_item(by)
                     );
-                    if !trees.local().get(id).is_some_and(|node| node.parked) {
-                        why
-                    } else {
-                        let parked = Path::new(koidrive_fs::PRIVATE_DIR)
-                            .join(koidrive_fs::PARKED_DIR)
-                            .join(trees.parked_name(id));
-                        format!("{why}; it is kept in {}", koidrive_fs::quoted(&parked))
+                    match kept {
+                        Some(kept) => format!("{why}; {kept}"),
+                        None => why,
                     }
                 }
+                Stuck::Parked => format!("it has no free place here; {}", kept.unwrap_or_default()),
                 Stuck::Behind(node) => format!(
                     "waits for {}, whose name here is taken by an entry this device's rules exclude",
                     quoted_item(node)

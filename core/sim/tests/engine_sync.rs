@@ -1308,10 +1308,16 @@ fn run_ignoring(
     prop_assert_eq!(unsettled, Vec::<&String>::new());
     prop_assert!(commits.problems().is_empty(), "{:?}", commits.problems());
     prop_assert!(effects.blocked().is_empty(), "{:?}", effects.blocked());
-    let stays_parked = |id: &str| device.trees.ignored(id) || waiting.contains(id);
+    let reported = koidrive_engine::effects::stuck(&device.trees);
+    let stays_parked = |id: &str| {
+        waiting.contains(id)
+            || !device.trees.reverted().contains(id)
+                && device.trees.ignored(id)
+                && reported.contains_key(id)
+    };
     prop_assert!(
         (device.trees.local().iter()).all(|(id, node)| !node.parked || stays_parked(id)),
-        "a node the rules do not leave out is still parked"
+        "a parked node is neither on its way out nor reported"
     );
     let server: Vec<(String, Option<koidrive_engine::tree::Shape>)> = space
         .nodes()

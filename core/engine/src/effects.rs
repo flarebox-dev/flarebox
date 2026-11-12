@@ -509,6 +509,8 @@ pub enum Stuck {
     /// one, or for a folder that waits so, or the node cannot be put into its folder in R
     /// because that folder is stuck so.
     Behind(NodeId),
+    /// The node is parked, and neither its place in R nor the one L keeps for it is free here.
+    Parked,
 }
 
 /// The nodes section 5.10 reports as problems: each node the planner considers whose place is held
@@ -529,8 +531,21 @@ pub fn stuck(trees: &Trees) -> BTreeMap<NodeId, Stuck> {
             Some(((*id).clone(), Stuck::HeldBy(by)))
         })
         .collect();
+    let parked: Vec<(NodeId, Stuck)> = (planned.iter())
+        .filter(|id| !stuck.contains_key(**id))
+        .filter(|id| trees.local().get(id).is_some_and(|node| node.parked))
+        .map(|id| {
+            let held_by =
+                (trees.remote().live(id)).and_then(|remote| match view.blocked(id, remote) {
+                    Some(Step::Blocked(Some(holder))) if trees.excluded(&holder) => Some(holder),
+                    _ => None,
+                });
+            ((*id).clone(), held_by.map_or(Stuck::Parked, Stuck::HeldBy))
+        })
+        .collect();
+    stuck.extend(parked);
     let root = |stuck: &BTreeMap<NodeId, Stuck>, id: &str| match stuck.get(id)? {
-        Stuck::HeldBy(_) => Some(id.to_owned()),
+        Stuck::HeldBy(_) | Stuck::Parked => Some(id.to_owned()),
         Stuck::Behind(root) => Some(root.clone()),
     };
     loop {
@@ -577,7 +592,13 @@ fn holds_below(trees: &Trees, id: &str) -> bool {
     let parent = |node: &str| {
         let home = local
             .get(node)
-            .filter(|held| held.parked && trees.ignored(node))
+            .filter(|held| {
+                held.parked
+                    && (trees.ignored(node)
+                        || remote
+                            .live(node)
+                            .is_some_and(|shape| View::new(trees).goes_home(node, shape)))
+            })
             .map(|held| &held.shape);
         (home
             .or_else(|| remote.live(node))
@@ -693,6 +714,9 @@ impl<'a> View<'a> {
             }
             (Some(local), Some(remote)) => (local, remote),
         };
+        if local.parked && self.goes_home(id, remote) {
+            return self.unpark(id, local, &local.shape);
+        }
         if local.parked && !remote_only(self.trees, id) {
             return self.unpark(id, local, remote);
         }
@@ -813,6 +837,14 @@ impl<'a> View<'a> {
             })
     }
 
+    fn goes_home(&self, id: &str, remote: &Shape) -> bool {
+        self.trees.edited(id) && self.trees.ignored_in_remote(id)
+            || matches!(
+                self.blocked(id, remote),
+                Some(Step::Blocked(Some(holder))) if self.trees.excluded(&holder)
+            )
+    }
+
     /// Moves a parked node to `target`'s position with its content as L has it.
     fn unpark(&self, id: &str, local: &LocalNode, target: &Shape) -> Step {
         if let Some(blocked) = self.blocked(id, target) {
@@ -878,29 +910,9 @@ impl<'a> View<'a> {
             _ => return Some(Step::Blocked(None)),
         }
         if self.inside(parent, id) {
-            let stays = self.held_by_excluded(parent, id);
-            return Some(Step::Blocked((!stays).then(|| id.to_owned())));
+            return Some(Step::Blocked(None));
         }
         None
-    }
-
-    /// True when an excluded node is on the way up from `inner` to `id`, which holds it on disk.
-    /// No effect moves an excluded node, so parking `id` would never let it move into `inner`.
-    fn held_by_excluded(&self, inner: &str, id: &str) -> bool {
-        let mut current = inner;
-        for _ in 0..=self.trees.local().len() {
-            if current == id {
-                return false;
-            }
-            if self.trees.excluded(current) {
-                return true;
-            }
-            match self.trees.local().get(current) {
-                Some(node) => current = &node.shape.parent,
-                None => return false,
-            }
-        }
-        false
     }
 
     /// The excluded node that keeps `id` from its place, if one does: the name it moves to is held
