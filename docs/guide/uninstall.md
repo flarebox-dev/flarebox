@@ -4,16 +4,15 @@
 
 Your files stay where they are.
 
-1. Unlink each folder. Find them with `koi status`:
+1. Unlink each folder. Find them with `koi status`. Unlinking the last one stops and removes the [background service](install.md#background-sync):
 
    ```sh
    koi folder unlink ~/Koidrive
    ```
 
-2. Stop the daemon. On Linux with the systemd unit, run `systemctl --user disable --now koidrive`.
-3. Revoke the device from another device with `koi device revoke <id>`.
-4. Delete Koidrive's files on this machine: `~/.local/state/koidrive` and `~/.config/koidrive`, or the `koidrive` folders under `$XDG_STATE_HOME` and `$XDG_CONFIG_HOME` when those are set to absolute paths, and the `.koidrive/` folder in each folder it linked. `.koidrive/trash/` holds files that sync replaced in the last 7 days, so look through it first.
-5. Remove the command with `cargo uninstall koidrive-cli`. If you copied it to `~/.local/bin` for the systemd unit, delete that copy and `~/.config/systemd/user/koidrive.service` too.
+2. Revoke the device from another device with `koi device revoke <id>`.
+3. Delete Koidrive's files on this machine: `~/.local/state/koidrive` and `~/.config/koidrive`, or the `koidrive` folders under `$XDG_STATE_HOME` and `$XDG_CONFIG_HOME` when those are set to absolute paths, and the `.koidrive/` folder in each folder it linked. `.koidrive/trash/` holds files that sync replaced in the last 7 days, so look through it first.
+4. Remove the command: delete `~/.local/bin/koi`, or run `cargo uninstall koidrive-cli` for a build from source.
 
 The macOS app is a separate device with its own profile. To remove it, quit the app, revoke its device from another device, and delete the app, `~/Library/Application Support/Koidrive`, and the `.koidrive/` folder in each folder the app linked. Look through each folder's `.koidrive/trash/` before you delete it. Until that folder is gone, another device can't link the folder.
 
@@ -25,7 +24,7 @@ This deletes the server: the Worker, its Durable Objects and the R2 bucket with 
 koi server delete --interactive
 ```
 
-You log in with Cloudflare. Koidrive finds the server, names the bucket and the number of objects in it, and asks before it deletes anything. It deletes the Worker, then empties and deletes the bucket. If another Worker in the account uses the same bucket, Koidrive keeps the bucket. If the delete stops halfway, run the command again to finish it.
+You log in with Cloudflare. Koidrive finds the server, names the bucket and the number of objects in it, and asks before it deletes anything. It deletes the Worker, then empties and deletes the bucket. If another Worker in the account uses the same bucket, Koidrive keeps the bucket. If the delete stops halfway, run the command again to finish it. When this device syncs with the deleted server at its workers.dev address, Koidrive also stops and removes this device's background service.
 
 - `--worker <name>` picks the server when the account holds several.
 - `--yes` deletes without asking.

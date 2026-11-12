@@ -5,22 +5,27 @@
 //! line goes each way per connection. The socket is the owner's only: its directory is 0700, the socket 0600, and
 //! the daemon also refuses a peer running as another user.
 
+use std::collections::BTreeSet;
 use std::fs::{self, DirBuilder};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Duration;
 
 use koidrive_driver::{
     Account, Answer, Credential, Driver, DriverError, FolderStatus, Paths, Question,
     RestoreRequest, RestoreStatus, Status,
 };
 use koidrive_engine::commit::Lift;
+use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::error::{CliError, Code};
 use crate::report::Next;
+use crate::service::Blocked;
 
 /// The longest request or response line the socket accepts.
 const MAX_LINE: u64 = 16 << 20;
@@ -79,6 +84,8 @@ pub enum Request {
     Restores {
         space_id: String,
     },
+    /// The linked folders that this process may not read.
+    Access,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +118,9 @@ pub enum Response {
         restores: Vec<RestoreStatus>,
     },
     SignedOut,
+    Access {
+        blocked: Vec<Blocked>,
+    },
     /// A failed request. An older daemon sends only `message`, which reads as [`Code::Failed`].
     Error {
         message: String,
@@ -189,8 +199,53 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
         Request::Restores { space_id } => driver
             .restores(&space_id)
             .map(|restores| Response::Restores { restores }),
+        Request::Access => Ok(Response::Access {
+            blocked: unreadable(driver.status().folders).await,
+        }),
     };
     outcome.unwrap_or_else(|error| Response::failed(error.into()))
+}
+
+/// The folders whose read by [`unreadable`] has not ended.
+static READING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// The linked folders this process may not read. macOS keeps a launch agent out of the folders that its privacy
+/// settings guard, such as Documents, until the person allows it, and asks while the first read waits. Each read
+/// runs on a thread of its own, which a read waiting for the person keeps until the answer, so the runtime never waits
+/// for it. A folder whose earlier read still waits gets no second thread, however often the status is asked for.
+async fn unreadable(folders: Vec<FolderStatus>) -> Vec<Blocked> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let reads: Vec<_> = (folders.into_iter())
+        .map(|folder| {
+            let (send, receive) = tokio::sync::oneshot::channel();
+            if READING.lock().unwrap().insert(folder.path.clone()) {
+                let path = folder.path.clone();
+                std::thread::spawn(move || {
+                    let read = fs::read_dir(&path).map(drop);
+                    READING.lock().unwrap().remove(&path);
+                    send.send(read)
+                });
+            }
+            (folder.path, receive)
+        })
+        .collect();
+    let mut blocked = Vec::new();
+    for (folder, read) in reads {
+        match tokio::time::timeout_at(deadline, read).await {
+            Err(_) | Ok(Err(_)) => blocked.push(Blocked {
+                folder,
+                waiting: true,
+            }),
+            Ok(Ok(Err(error))) if error.raw_os_error() == Some(Errno::PERM.raw_os_error()) => {
+                blocked.push(Blocked {
+                    folder,
+                    waiting: false,
+                })
+            }
+            Ok(Ok(_)) => {}
+        }
+    }
+    blocked
 }
 
 /// Binds the daemon's socket. The caller holds the profile lock, so a socket file left behind is stale.

@@ -192,14 +192,13 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: sh scripts/test-install.sh "target/$TARGET/release/koi" "$TARGET"
-      - name: Package the CLI and user unit
+      - name: Package the CLI
         env:
           TARGET: ${{ matrix.target }}
         run: |
           mkdir -p dist package
           cp "target/$TARGET/release/koi" package/koi
-          cp cli/systemd/koidrive.service package/koidrive.service
-          tar -czf "dist/koidrive-$TARGET.tar.gz" -C package koi koidrive.service
+          tar -czf "dist/koidrive-$TARGET.tar.gz" -C package koi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cli-${{ matrix.target }}
@@ -279,7 +278,7 @@ jobs:
             codesign --verify --strict --verbose=2 "$package/koi"
             ditto -c -k "$package/koi" "$package.zip"
             NOTARY_KEY_PATH="$secrets_dir/notary-key.p8" apps/macos/scripts/notarize.sh "$package.zip"
-            tar -czf "$archive" -C "$package" koi koidrive.service
+            tar -czf "$archive" -C "$package" koi
             echo "Signed and notarized koi in $archive."
           done
       - name: Remove signing material

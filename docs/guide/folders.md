@@ -29,7 +29,7 @@ A space syncs to at most one folder on each device. Koidrive refuses a folder th
 - another device linked and hasn't unlinked;
 - is on a file system without a rename that refuses to replace its target, which Koidrive needs to write files safely.
 
-The folder syncs while [the daemon](install.md#run-the-sync-daemon) runs. To stop syncing it:
+The folder syncs in the [background](install.md#background-sync) from then on. To stop syncing it:
 
 ```sh
 koi folder unlink ~/Koidrive
@@ -97,7 +97,7 @@ The local trash is separate from the space's trash on the server, which [Trash, 
 
 ## Uploads at once
 
-Koidrive uploads up to 4 chunks of file content at once. The limit counts across all folders this profile links. Set another number from 1 to 16 in `config.toml`. With 1, Koidrive sends one chunk at a time, as versions before this setting did:
+Koidrive uploads up to 4 chunks of file content at once. The limit counts across all folders this profile links. Set another number from 1 to 16 in `config.toml`. With 1, Koidrive sends one chunk at a time:
 
 ```toml
 [upload]

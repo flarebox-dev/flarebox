@@ -81,7 +81,7 @@ The `error.code` values match these: `failed`, `usage`, `decision_required`, `au
 `koi status` exits 0 whenever it can read the status. `koi status --check` exits with the status of the most urgent condition:
 
 1. 4 when this device isn't set up.
-2. 5 when a folder is halted, or stopped because the daemon isn't running.
+2. 5 when a folder is halted, or stopped because the daemon isn't running. `service` in the same output says whether the background service runs and why not.
 3. 3 when a decision needs a choice. A notice that only takes `dismiss` doesn't count.
 4. 6 when a folder is offline, or puts a call off until later. The folder's `wait` says why: `quota` when the server refused for a used-up limit or full storage, `retry` when the call kept failing for another reason. `until_ms` is when it's sent again.
 

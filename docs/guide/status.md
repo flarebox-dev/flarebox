@@ -9,6 +9,7 @@ koi status
 ```
 Device: laptop (019a...) on https://koidrive.alice.workers.dev
 Daemon: running
+Background service: running (koidrive.service)
 /home/alice/Koidrive  space Koidrive (019a...)  UpToDate  seq 1204 of 1204, 3120 remote nodes, 3118 local entries, 0 need you
 ```
 
@@ -16,7 +17,7 @@ Each linked folder has one line. Its state is one of these:
 
 | State | Meaning |
 |---|---|
-| `Stopped` | The daemon isn't running |
+| `Stopped` | The daemon isn't running. The `Background service` line says why |
 | `Connecting` | Opening a session with the server |
 | `Bootstrapping` | Reading the space's whole file tree, the first time or after a long time offline |
 | `CatchingUp` | Applying changes from other devices |
@@ -56,7 +57,7 @@ Other problems need you. Fix what the problem names, then:
 koi folder restart ~/Koidrive
 ```
 
-This stops the folder and syncs it again from the start. While the daemon isn't running, the folder syncs at the next start.
+This stops the folder and syncs it again from the start. To start the [background service](install.md#background-sync), run `koi service start`.
 
 Problems that end with "this build cannot recover the folder yet" mean the folder's sync state and the server disagree in a way that this version can't resolve, for example after the space was rewound on the server. A restart doesn't fix them. To sync the space again, unlink the folder and link a new, empty folder to the space. Then copy over any files you changed in the old folder.
 

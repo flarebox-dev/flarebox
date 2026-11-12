@@ -19,7 +19,7 @@ This guide covers the `koi` command on macOS and Linux, version 0.1.0.
 
 ## Pages
 
-1. [Install](install.md): build the command and run the sync daemon.
+1. [Install](install.md): install the command, and how it syncs in the background.
 2. [Set up](setup.md): deploy a server, add devices, create spaces and upgrade the server.
 3. [Folders](folders.md): link a folder, choose what syncs with `.koiignore`, and what Koidrive doesn't sync.
 4. [Conflicts](conflicts.md): what happens when two devices change the same file.
