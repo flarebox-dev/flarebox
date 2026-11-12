@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use koidrive_engine::classify::{Class, Origin, Trees, Waiting};
+use koidrive_engine::classify::{Class, Trees};
 use koidrive_engine::effects::{Base, Dir, Displaced, Effect, EffectError, Effects, Location};
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::names::name_key;
@@ -1059,7 +1059,7 @@ fn a_parked_edit_brings_back_its_deleted_folder_after_a_remote_move_into_an_igno
 }
 
 #[test]
-fn a_reverted_folder_whose_r_folder_sits_inside_it_is_parked_once() {
+fn a_reverted_folder_whose_r_folder_sits_inside_it_waits_in_place() {
     let (mut trees, mut disk) = space(&[
         ("y", Some(dir(ROOT, "b")), Some(dir(ROOT, "b"))),
         ("x", Some(dir("y", "c")), Some(dir("y", "c"))),
@@ -1096,102 +1096,39 @@ fn a_reverted_folder_whose_r_folder_sits_inside_it_is_parked_once() {
     trees.check().unwrap();
     disk.matches(&trees).unwrap();
     let done = converge(&mut trees, &mut disk, 10).unwrap();
-    assert!(
-        matches!(
-            done.as_slice(),
-            [Effect::Move {
-                to: Location::Parked(_),
-                ..
-            }]
-        ),
-        "{done:?}"
-    );
-    assert!(trees.local().get("x").unwrap().parked);
+    assert!(done.is_empty(), "{done:?}");
+    assert!(!trees.local().get("x").unwrap().parked);
 }
 
 #[test]
-fn a_folder_the_user_deleted_is_not_brought_back_for_a_refused_child_that_goes_elsewhere() {
+fn a_reverted_parked_file_whose_r_name_an_excluded_node_holds_goes_back_to_its_local_position() {
     let (mut trees, mut disk) = space(&[
-        ("d", Some(dir(ROOT, "d")), Some(dir(ROOT, "d"))),
-        ("logs", Some(dir(ROOT, "logs")), Some(dir(ROOT, "logs"))),
-        ("f", Some(file("d", "f", 1)), Some(file("logs", "f", 1))),
+        ("e", Some(file(ROOT, "z", 9)), Some(file(ROOT, "z", 9))),
+        ("x", Some(file(ROOT, "x", 1)), Some(file(ROOT, "A", 1))),
     ]);
     trees.set_rules(
         &[] as &[&str],
-        Some(koidrive_engine::ignore::RuleFile::parse(b"logs/\n")),
+        Some(koidrive_engine::ignore::RuleFile::parse(b"a\n")),
     );
-    let mut local = trees.local().get("f").unwrap().clone();
+    let mut moved = trees.local().get("e").unwrap().clone();
+    moved.shape = file(ROOT, "a", 9);
+    trees.set_local("e".into(), moved);
+    disk.entries.get_mut(&1).unwrap().name = "a".into();
+    let mut local = trees.local().get("x").unwrap().clone();
     local.parked = true;
-    trees.set_local("f".into(), local);
-    trees.remove_local("d");
-    trees.revert("d".into());
-    trees.revert("f".into());
-    disk.entries.remove(&1);
-    let entry = disk.entries.get_mut(&3).unwrap();
+    local.shape = file(ROOT, "y", 1);
+    trees.set_local("x".into(), local);
+    trees.revert("x".into());
+    let entry = disk.entries.get_mut(&2).unwrap();
     entry.area = Area::Parked;
-    entry.name = "f".into();
+    entry.name = "x".into();
     trees.check().unwrap();
     disk.matches(&trees).unwrap();
-    assert!(trees.ignored("f"));
-    let done = converge(&mut trees, &mut disk, 10).unwrap();
-    assert!(
-        matches!(
-            done.as_slice(),
-            [Effect::Move {
-                from: Location::Parked(_),
-                ..
-            }]
-        ),
-        "{done:?}"
-    );
-    assert!(trees.local().get("d").is_none());
-    assert_eq!(trees.local().get("f").unwrap().shape, file("logs", "f", 1));
-}
-
-#[test]
-fn a_parked_node_whose_waiting_name_is_taken_goes_to_its_r_position_when_the_rules_leave_it_out() {
-    let (mut trees, mut disk) = space(&[
-        ("d", Some(dir(ROOT, "d")), Some(dir(ROOT, "d"))),
-        ("logs", Some(dir(ROOT, "logs")), Some(dir(ROOT, "logs"))),
-        ("f", Some(file("logs", "f", 1)), Some(file("logs", "f", 1))),
-        ("g", Some(file("d", "f", 1)), Some(file("d", "f", 1))),
-    ]);
-    let mut f = trees.local().get("f").unwrap().clone();
-    f.parked = true;
-    f.shape = file("d", "f", 1);
-    trees.set_local("f".into(), f);
-    let mut state = trees.state();
-    state.waiting.insert(
-        "f".into(),
-        Waiting {
-            shape: Some(file("d", "f", 1)),
-            origin: Origin::Other,
-        },
-    );
-    trees.restore(state).unwrap();
-    trees.rules_scanned();
-    trees.set_rules(
-        &[] as &[&str],
-        Some(koidrive_engine::ignore::RuleFile::parse(b"logs/\n")),
-    );
-    let entry = disk.entries.get_mut(&3).unwrap();
-    entry.area = Area::Parked;
-    entry.name = "f".into();
-    trees.check().unwrap();
-    disk.matches(&trees).unwrap();
-    assert!(trees.ignored("f"));
-    let done = converge(&mut trees, &mut disk, 10).unwrap();
-    assert!(
-        matches!(
-            done.as_slice(),
-            [Effect::Move {
-                from: Location::Parked(_),
-                ..
-            }]
-        ),
-        "{done:?}"
-    );
-    assert_eq!(trees.local().live("f").unwrap(), &file("logs", "f", 1));
+    assert!(trees.ignored("x") && trees.excluded("e"));
+    converge(&mut trees, &mut disk, 10).unwrap();
+    let x = trees.local().get("x").unwrap();
+    assert!(!x.parked);
+    assert_eq!(x.shape, file(ROOT, "y", 1));
 }
 
 /// A valid tree over `n0`, `n1`, ... from one [`Draw`] per node, as in tests/trees.rs, where each

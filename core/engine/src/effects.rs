@@ -211,12 +211,14 @@ impl Effects {
     /// into the node's own subtree. A directory is removed only once it is empty. When no such
     /// effect applies, a node that blocks one is parked, if it is a candidate itself or its S
     /// update waits ([`Trees::waiting`]), since the commit layer does not plan it either: the entry
-    /// holding a name, or a directory that would move into its own subtree. A blocker that already
-    /// sits where R has it is not parked, since its own effect would move it straight back and take
-    /// the name again. A node whose park failed gets no effect until L changes: the parked
-    /// directory always has room, so the park failed on the entry itself, and the node's own effect
-    /// would fail on it too, taking turns with the park for as long as L stays as it is. A rename
-    /// that changes only case or normalization goes through the parked directory too.
+    /// holding a name, or a directory that would move into its own subtree, when an effect moves a
+    /// node between the two out of it. Otherwise the directory waits where it is for the commit
+    /// layer. A blocker that already sits where R has it is not parked, since its own effect would
+    /// move it straight back and take the name again. A node whose park failed gets no effect until
+    /// L changes: the parked directory always has room, so the park failed on the entry itself, and
+    /// the node's own effect would fail on it too, taking turns with the park for as long as L
+    /// stays as it is. A rename that changes only case or normalization goes through the parked
+    /// directory too.
     ///
     /// A parked node with a local change, such as an edit observed in the parked directory, is
     /// only moved out: to its R position, or to the position L keeps for it when R has none. Its
@@ -224,14 +226,13 @@ impl Effects {
     ///
     /// An excluded node ([`Trees::excluded`]) gets no effect and is never parked, and neither is a
     /// node whose own place an excluded node holds. A parked node that the rules now leave out is
-    /// only moved back to the position L keeps for it, unless the server refused that position
-    /// ([`Trees::reverted`]) or its S update waits, and it holds no unuploaded edit: such a node
-    /// goes to its R position. Nothing is planned while the rules are unknown
-    /// ([`Trees::rules_known`]), or for a node below a folder whose rules are unknown
-    /// ([`Trees::held`]). A `.koiignore` file that R holds and the disk does not yet is written
-    /// before any other effect below its folder (section 5.10). The driver reads the rules of a
-    /// rules file it wrote and passes them to [`Trees::set_rules`] before it asks for the next
-    /// effect, so the rules are in force before the nodes they cover arrive.
+    /// only moved back to the position L keeps for it, and nothing is planned while the rules are
+    /// unknown ([`Trees::rules_known`]), or for a node below a folder whose rules are unknown
+    /// ([`Trees::held`]). A `.koiignore` file that R
+    /// holds and the disk does not yet is written before any other effect below its folder
+    /// (section 5.10). The driver reads the rules of a rules file it wrote and passes them to
+    /// [`Trees::set_rules`] before it asks for the next effect, so the rules are in force before
+    /// the nodes they cover arrive.
     pub fn plan(&mut self, trees: &Trees, ids: &mut IdGen, now_ms: u64) -> Option<&EffectRecord> {
         if self.in_flight.is_some() || !trees.rules_known() {
             return None;
@@ -578,7 +579,7 @@ fn holds_below(trees: &Trees, id: &str) -> bool {
     let parent = |node: &str| {
         let home = local
             .get(node)
-            .filter(|held| held.parked && trees.ignored(node) && keeps_local_position(trees, node))
+            .filter(|held| held.parked && trees.ignored(node))
             .map(|held| &held.shape);
         (home
             .or_else(|| remote.live(node))
@@ -596,10 +597,6 @@ fn holds_below(trees: &Trees, id: &str) -> bool {
         }
         false
     })
-}
-
-fn keeps_local_position(trees: &Trees, id: &str) -> bool {
-    !(trees.reverted().contains(id) || trees.waiting().contains_key(id)) || trees.edited(id)
 }
 
 /// Whether the node's only change is remote. While its S update waits, the waiting shape stands
@@ -646,13 +643,18 @@ impl<'a> View<'a> {
     fn step(&self, id: &str) -> Step {
         let local = self.trees.local().get(id);
         let remote = self.trees.remote().live(id);
-        let home = keeps_local_position(self.trees, id);
-        if let Some(local) = local.filter(|local| local.parked && self.trees.ignored(id) && home) {
+        if let Some(local) = local.filter(|local| local.parked && self.trees.ignored(id)) {
             return self.unpark(id, local, &local.shape);
         }
         let (local, remote) = match (local, remote) {
             (None, None) => return Step::Skip,
-            (Some(local), None) if local.parked && !remote_only(self.trees, id) && home => {
+            (Some(local), None)
+                if local.parked
+                    && !remote_only(self.trees, id)
+                    && (!(self.trees.reverted().contains(id)
+                        || self.trees.waiting().contains_key(id))
+                        || self.trees.edited(id)) =>
+            {
                 return self.unpark(id, local, &local.shape);
             }
             (Some(local), None) => return self.remove(id, local),
@@ -861,23 +863,27 @@ impl<'a> View<'a> {
             _ => return Some(Step::Blocked(None)),
         }
         if self.inside(parent, id) {
-            let stays = self.held_by_excluded(parent, id);
-            return Some(Step::Blocked((!stays).then(|| id.to_owned())));
+            return Some(Step::Blocked(
+                self.parking_frees(parent, id).then(|| id.to_owned()),
+            ));
         }
         None
     }
 
-    /// True when an excluded node is on the way up from `inner` to `id`, which holds it on disk.
-    /// No effect moves an excluded node, so parking `id` would never let it move into `inner`.
-    fn held_by_excluded(&self, inner: &str, id: &str) -> bool {
+    /// True when parking `id` lets it move into `inner`, which it holds on disk: an effect moves a
+    /// node on the way up from `inner` to `id` out of it, and no excluded node, which no effect
+    /// moves, is on that way. Otherwise `id` waits for the commit layer to move `inner` out.
+    fn parking_frees(&self, inner: &str, id: &str) -> bool {
         let mut current = inner;
+        let mut moved = false;
         for _ in 0..=self.trees.local().len() {
             if current == id {
-                return false;
+                return moved;
             }
             if self.trees.excluded(current) {
-                return true;
+                return false;
             }
+            moved |= candidate(self.trees, current) || self.trees.waiting().contains_key(current);
             match self.trees.local().get(current) {
                 Some(node) => current = &node.shape.parent,
                 None => return false,

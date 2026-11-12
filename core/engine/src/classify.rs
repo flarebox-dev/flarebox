@@ -761,8 +761,7 @@ impl Trees {
 
     /// Whether the node is outside the sync tree on this device, as [`Trees::excluded`] decides
     /// it, also when the node is parked. The effects move a parked node that is ignored back to
-    /// the position L keeps for it, or to its R position when the server refused that one
-    /// ([`Trees::reverted`]), and it is excluded from then on.
+    /// the position L keeps for it, and it is excluded from then on.
     pub fn ignored(&self, id: &str) -> bool {
         if self.recorded_local(id) || self.displaced.contains_key(id) {
             return true;
