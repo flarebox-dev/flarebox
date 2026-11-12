@@ -296,6 +296,7 @@ impl Fetch for (&Session, &Transfer) {
     ) -> Result<(), ChunkError> {
         self.1
             .download(self.0, chunks, |chunk, bytes| {
+                crate::volume::downloaded(bytes.len());
                 std::future::ready(write(chunk, &bytes))
             })
             .await

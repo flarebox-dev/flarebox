@@ -219,13 +219,18 @@ fn common(id: &InstallId, environment: &Environment) -> Map<String, Value> {
     properties
 }
 
-/// Counters as `c.<metric>.<label>` numbers and histograms as `h.<metric>.<label>` objects, so each is one column
-/// in PostHog.
+/// Counters as `c.<metric>.<label>` numbers, levels as `l.<metric>.<label>` numbers and histograms as
+/// `h.<metric>.<label>` objects, so each is one column in PostHog.
 fn daily(report: &DailyReport) -> Map<String, Value> {
     let mut properties = Map::new();
     for (metric, labels) in &report.counters {
         for (label, count) in labels {
             properties.insert(format!("c.{metric}.{label}"), json!(count));
+        }
+    }
+    for (metric, labels) in &report.levels {
+        for (label, value) in labels {
+            properties.insert(format!("l.{metric}.{label}"), json!(value));
         }
     }
     for (metric, labels) in &report.histograms {
@@ -261,7 +266,7 @@ mod tests {
     use super::*;
     use crate::recorder::Recorder;
     use crate::schema::{
-        Client, Command, Counter, Event, Outcome, SetupFlow, SetupStep, SourceFile,
+        Client, Command, Counter, Event, Level, Outcome, SetupFlow, SetupStep, SourceFile, Synced,
     };
 
     fn environment() -> Environment {
@@ -272,6 +277,9 @@ mod tests {
         store.set(true).unwrap();
         let recorder = Recorder::on();
         recorder.count_on(day, Counter::Command(Command::Setup), 2);
+        recorder.count_on(day, Counter::Sync(Synced::BytesUploaded), 5_000_000);
+        recorder.level_on(day, Level::Nodes, 1_500);
+        recorder.level_on(day, Level::Nodes, 900);
         recorder.event(Event::SetupStep {
             day,
             flow: SetupFlow::Cloudflare,
@@ -319,6 +327,8 @@ mod tests {
             assert!(event["properties"].get("day").is_none());
         }
         assert_eq!(events[0]["properties"]["c.command.setup"], 2);
+        assert_eq!(events[0]["properties"]["c.sync.bytes_uploaded"], 5_000_000);
+        assert_eq!(events[0]["properties"]["l.sync.nodes"], 1_500);
         assert_eq!(events[1]["properties"]["cloudflare_code"], 10042);
         assert_eq!(events[2]["properties"]["file"], SourceFile::EXTERNAL);
     }
@@ -372,6 +382,9 @@ mod tests {
         let report = &mut queue["days"]["20404"];
         report["counters"]["/home/fixture/private"] = json!({ "confidential.txt": 1 });
         report["counters"]["command"]["Alice Notes"] = json!(1);
+        report["counters"]["sync"]["Alice Notes"] = json!(1);
+        report["levels"]["/home/fixture/private"] = json!({ "confidential.txt": 1 });
+        report["levels"]["sync"]["Alice Notes"] = json!(1);
         report["histograms"]["/home/fixture"] = json!({
             "notes.txt": { "shift": 0, "buckets": vec![0u64; 16], "count": 1, "sum": 1 }
         });
@@ -392,6 +405,7 @@ mod tests {
             assert!(!request.contains(secret), "{secret} in {request}");
         }
         assert!(request.contains("c.command.setup"));
+        assert!(request.contains("l.sync.nodes"));
     }
 
     /// A batch that was not accepted goes again with the same uuids, so PostHog keeps one copy if both arrived.

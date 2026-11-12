@@ -323,9 +323,28 @@ async fn a_file_of_several_chunks_arrives_with_the_same_bytes() {
     let mut b = Device::linked(&owner, &space, "b").await;
     converged(&a, &b).await;
 
+    let before = koidrive_driver::volume();
     fs::write(a.folder().join("large.bin"), &bytes).unwrap();
     let (synced, _) = converged(&a, &b).await;
     assert_eq!(synced, Tree::from([("large.bin".into(), file(&bytes))]));
+    let after = koidrive_driver::volume();
+    let size = bytes.len() as u64;
+    assert!(
+        after.bytes_uploaded - before.bytes_uploaded >= size,
+        "{before:?} {after:?}"
+    );
+    assert!(
+        after.bytes_downloaded - before.bytes_downloaded >= size,
+        "{before:?} {after:?}"
+    );
+    assert!(
+        after.commits_sent > before.commits_sent,
+        "{before:?} {after:?}"
+    );
+    assert!(
+        after.commits_received > before.commits_received,
+        "{before:?} {after:?}"
+    );
     a.stop().await;
     b.stop().await;
 }

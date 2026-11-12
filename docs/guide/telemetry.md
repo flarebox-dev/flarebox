@@ -49,6 +49,7 @@ On top of that, reports hold:
 - How many times each `koi` command group, such as `koi folder`, ran in a day. Only the group's name, never its action or arguments.
 - The steps of `koi setup` and `koi server ...` (log in, R2, bucket, Worker upload, serving, claim, pairing), `koi server upgrade` and `koi server delete`: whether each one succeeded and roughly how long it took.
 - Where Koidrive panicked: the source file and line in Koidrive's own code. Never the panic's message.
+- Exact daily totals from the daemon: commits sent and received, bytes of file content uploaded and downloaded, and the day's highest number of linked spaces and of the files and folders they hold. Only totals over all your spaces, never a count per space or per file.
 
 Later versions add sync timings and error types to this page as they add them to the reports.
 

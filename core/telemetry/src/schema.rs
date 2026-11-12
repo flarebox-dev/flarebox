@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 /// The layout version of the properties a report sends. It changes when a property changes meaning.
 pub const SCHEMA: u16 = 1;
 
-/// What one install recorded on one UTC day. Its keys are always those of a [`Counter`] or a [`Measure`]: only a
+/// What one install recorded on one UTC day. Its keys are always those of a [`Counter`], a [`Level`] or a [`Measure`]: only a
 /// [`Recorder`](crate::Recorder) fills it, and reading one from JSON keeps only the keys of the closed set.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(from = "StoredReport")]
@@ -21,6 +21,9 @@ pub struct DailyReport {
     /// Sums, by metric and then by label.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) counters: BTreeMap<String, BTreeMap<String, u64>>,
+    /// The day's highest readings, by metric and then by label.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) levels: BTreeMap<String, BTreeMap<String, u64>>,
     /// Distributions, by metric and then by label.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) histograms: BTreeMap<String, BTreeMap<String, Histogram>>,
@@ -33,10 +36,12 @@ struct StoredReport {
     #[serde(default)]
     counters: BTreeMap<String, BTreeMap<String, u64>>,
     #[serde(default)]
+    levels: BTreeMap<String, BTreeMap<String, u64>>,
+    #[serde(default)]
     histograms: BTreeMap<String, BTreeMap<String, Histogram>>,
 }
 
-/// Rebuilds the report from the closed set of counters and measures, so a key that is not one of theirs, or a
+/// Rebuilds the report from the closed set of counters, levels and measures, so a key that is not one of theirs, or a
 /// histogram with another shift, is dropped.
 impl From<StoredReport> for DailyReport {
     fn from(stored: StoredReport) -> Self {
@@ -52,6 +57,16 @@ impl From<StoredReport> for DailyReport {
             {
                 (report.counters.entry(metric.to_owned()).or_default())
                     .insert(label.to_owned(), count);
+            }
+        }
+        for (metric, label) in Level::all().map(Level::key) {
+            if let Some(&value) = stored
+                .levels
+                .get(metric)
+                .and_then(|labels| labels.get(label))
+            {
+                (report.levels.entry(metric.to_owned()).or_default())
+                    .insert(label.to_owned(), value);
             }
         }
         for (metric, label, shift) in Measure::all().map(Measure::key) {
@@ -76,6 +91,13 @@ impl DailyReport {
                 *sum = sum.saturating_add(count);
             }
         }
+        for (metric, labels) in other.levels {
+            let into = self.levels.entry(metric).or_default();
+            for (label, value) in labels {
+                let highest = into.entry(label).or_default();
+                *highest = (*highest).max(value);
+            }
+        }
         for (metric, labels) in other.histograms {
             let into = self.histograms.entry(metric).or_default();
             for (label, histogram) in labels {
@@ -87,7 +109,7 @@ impl DailyReport {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.counters.is_empty() && self.histograms.is_empty()
+        self.counters.is_empty() && self.levels.is_empty() && self.histograms.is_empty()
     }
 }
 
@@ -224,17 +246,75 @@ pub enum Outcome {
 pub enum Counter {
     /// A CLI command ran. Only its name; never its arguments.
     Command(Command),
+    /// What the daemon synced, over all its linked folders.
+    Sync(Synced),
 }
 
 impl Counter {
     /// Every counter, for checking the keys of a stored report.
     pub fn all() -> impl Iterator<Item = Counter> {
-        Command::ALL.into_iter().map(Counter::Command)
+        (Command::ALL.into_iter().map(Counter::Command)).chain(Synced::ALL.map(Counter::Sync))
     }
 
     pub(crate) fn key(self) -> (&'static str, &'static str) {
         match self {
             Counter::Command(command) => ("command", command.name()),
+            Counter::Sync(synced) => ("sync", synced.name()),
+        }
+    }
+}
+
+/// The sync totals of a day, summed over every linked folder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Synced {
+    /// Commits of this device the server accepted.
+    CommitsSent,
+    /// Commits of the server's log that reached this device.
+    CommitsReceived,
+    /// File content uploaded, in bytes: the chunks the server did not hold yet.
+    BytesUploaded,
+    /// File content downloaded, in bytes.
+    BytesDownloaded,
+}
+
+impl Synced {
+    pub const ALL: [Synced; 4] = [
+        Synced::CommitsSent,
+        Synced::CommitsReceived,
+        Synced::BytesUploaded,
+        Synced::BytesDownloaded,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Synced::CommitsSent => "commits_sent",
+            Synced::CommitsReceived => "commits_received",
+            Synced::BytesUploaded => "bytes_uploaded",
+            Synced::BytesDownloaded => "bytes_downloaded",
+        }
+    }
+}
+
+/// A reading kept as the day's highest: a metric and its label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Level {
+    /// Folders linked to a space.
+    Spaces,
+    /// Nodes of the spaces' remote trees, files and folders, live and trashed.
+    Nodes,
+}
+
+impl Level {
+    pub const ALL: [Level; 2] = [Level::Spaces, Level::Nodes];
+
+    pub fn all() -> impl Iterator<Item = Level> {
+        Level::ALL.into_iter()
+    }
+
+    pub(crate) fn key(self) -> (&'static str, &'static str) {
+        match self {
+            Level::Spaces => ("sync", "spaces"),
+            Level::Nodes => ("sync", "nodes"),
         }
     }
 }
@@ -571,6 +651,51 @@ mod tests {
             serde_json::to_value(&report).unwrap(),
             serde_json::json!({ "day": 100, "counters": { "command": { "status": 3 } } })
         );
+    }
+
+    #[test]
+    fn a_stored_report_keeps_only_known_sync_counters_and_levels() {
+        let stored = serde_json::json!({
+            "day": 100,
+            "counters": { "sync": { "bytes_uploaded": 4096, "Alice Notes": 1 } },
+            "levels": {
+                "sync": { "spaces": 2, "nodes": 1500, "/home/alice": 1 },
+                "Alice Notes": { "spaces": 1 },
+            },
+        });
+        let report: DailyReport = serde_json::from_value(stored).unwrap();
+        assert_eq!(
+            serde_json::to_value(&report).unwrap(),
+            serde_json::json!({
+                "day": 100,
+                "counters": { "sync": { "bytes_uploaded": 4096 } },
+                "levels": { "sync": { "nodes": 1500, "spaces": 2 } },
+            })
+        );
+    }
+
+    #[test]
+    fn levels_merge_as_the_highest_and_counters_as_the_sum() {
+        let report = |bytes: u64, nodes: u64| -> DailyReport {
+            serde_json::from_value(serde_json::json!({
+                "day": 100,
+                "counters": { "sync": { "bytes_downloaded": bytes } },
+                "levels": { "sync": { "nodes": nodes } },
+            }))
+            .unwrap()
+        };
+        let mut day = report(100, 70);
+        day.merge(report(20, 30));
+        assert_eq!(day.counters["sync"]["bytes_downloaded"], 120);
+        assert_eq!(day.levels["sync"]["nodes"], 70);
+    }
+
+    #[test]
+    fn every_counter_and_level_has_its_own_key() {
+        let counters: std::collections::BTreeSet<_> = Counter::all().map(Counter::key).collect();
+        assert_eq!(counters.len(), Counter::all().count());
+        let levels: std::collections::BTreeSet<_> = Level::all().map(Level::key).collect();
+        assert_eq!(levels.len(), Level::ALL.len());
     }
 
     #[test]

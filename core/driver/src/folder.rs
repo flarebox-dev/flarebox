@@ -682,6 +682,7 @@ impl Folder {
         };
         match result {
             Ok(result) => {
+                crate::volume::commit_sent();
                 self.failures = 0;
                 self.commit_ended();
                 self.result(&commit.commit_id, result)?;
@@ -1074,6 +1075,7 @@ impl Folder {
 
     /// Commits of the log. A gap subscribes again from the last commit applied.
     fn changes(&mut self, records: &[CommitRecord], work: &mut Vec<Work>) -> Result<(), Stop> {
+        crate::volume::commits_received(records.len());
         let (applied, since) = match &mut self.stream {
             Stream::Connecting | Stream::Listing { .. } => return Ok(()),
             Stream::Replaying(staging) => (
@@ -2015,9 +2017,11 @@ async fn upload_chunks(
     let read = |chunk: &ChunkRef| {
         let (upload, chunk) = (upload.clone(), chunk.clone());
         async move {
-            tokio::task::spawn_blocking(move || upload.read(&chunk))
+            let bytes = tokio::task::spawn_blocking(move || upload.read(&chunk))
                 .await
-                .map_err(io::Error::other)?
+                .map_err(io::Error::other)??;
+            crate::volume::uploaded(bytes.len());
+            Ok(bytes)
         }
     };
     transfer.upload(session, &upload.chunks, read).await

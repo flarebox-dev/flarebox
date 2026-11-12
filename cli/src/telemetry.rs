@@ -7,8 +7,10 @@ use std::future::Future;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use koidrive_driver::Paths;
-use koidrive_telemetry::schema::{self, Client, Counter, Outcome, SetupFlow, SetupStep, magnitude};
+use koidrive_driver::{Driver, Paths, Status, Volume};
+use koidrive_telemetry::schema::{
+    self, Client, Counter, Level, Outcome, SetupFlow, SetupStep, Synced, magnitude,
+};
 use koidrive_telemetry::{
     Environment, Event, InstallId, Mode, Recorder, Sent, Source, Store, Uploader,
     install_panic_hook, should_ask,
@@ -233,12 +235,58 @@ async fn send(store: &Store, client: Client) -> Option<Sent> {
     .ok()
 }
 
-/// The daemon's loop: every ten minutes it moves the sums to disk and sends what is due. When it stops it only moves
-/// them to disk, so that stopping never waits on the network; a later run sends them. It reads the choice again each
-/// time, so `koi telemetry off` stops it without a restart.
-pub async fn run_daemon(stop: tokio::sync::oneshot::Receiver<()>) {
+/// The daemon's loop: every ten minutes it records what `driver` synced, moves the sums to disk and sends what is
+/// due. When it stops it records and moves them to disk only, so that stopping never waits on the network; a later
+/// run sends them. It reads the choice again each time, so `koi telemetry off` stops it without a restart.
+pub async fn run_daemon(stop: tokio::sync::oneshot::Receiver<()>, driver: Driver) {
     let Some(run) = RUN.get() else { return };
-    every(TICK, stop, flush, || send(&run.store, Client::CliDaemon)).await;
+    let mut last = koidrive_driver::volume();
+    let tick = || {
+        record_sync(
+            &run.recorder,
+            &mut last,
+            koidrive_driver::volume(),
+            &driver.status(),
+        );
+        flush();
+    };
+    every(TICK, stop, tick, || send(&run.store, Client::CliDaemon)).await;
+}
+
+/// Adds what was synced between `last` and `now`, and keeps the linked spaces and their nodes as readings of the day.
+fn record_sync(recorder: &Recorder, last: &mut Volume, now: Volume, status: &Status) {
+    let totals = [
+        (Synced::CommitsSent, now.commits_sent, last.commits_sent),
+        (
+            Synced::CommitsReceived,
+            now.commits_received,
+            last.commits_received,
+        ),
+        (
+            Synced::BytesUploaded,
+            now.bytes_uploaded,
+            last.bytes_uploaded,
+        ),
+        (
+            Synced::BytesDownloaded,
+            now.bytes_downloaded,
+            last.bytes_downloaded,
+        ),
+    ];
+    for (synced, now, before) in totals {
+        let added = now.saturating_sub(before);
+        if added > 0 {
+            recorder.count(Counter::Sync(synced), added);
+        }
+    }
+    *last = now;
+    recorder.level(Level::Spaces, status.folders.len() as u64);
+    let nodes = status
+        .folders
+        .iter()
+        .map(|folder| folder.remote_nodes)
+        .sum();
+    recorder.level(Level::Nodes, nodes);
 }
 
 /// Runs `tick` and then `work` every `period` until `stop` fires, and `tick` once more then. A `work` still running
@@ -268,6 +316,64 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn the_daemon_records_what_was_synced_since_its_last_tick() {
+        let recorder = Recorder::on();
+        let folder = |remote_nodes| koidrive_driver::FolderStatus {
+            space_id: "s".into(),
+            space_name: "Alice Notes".into(),
+            path: "/home/alice/Notes".into(),
+            state: koidrive_driver::FolderState::UpToDate,
+            history_id: None,
+            last_seq: None,
+            head_seq: None,
+            remote_nodes,
+            local_entries: None,
+            questions: 0,
+            problem: None,
+            wait: None,
+        };
+        let status = Status {
+            account: None,
+            running: true,
+            folders: vec![folder(1_000), folder(500)],
+        };
+        let mut last = Volume {
+            bytes_uploaded: 100,
+            ..Volume::default()
+        };
+        let now = Volume {
+            commits_sent: 3,
+            bytes_uploaded: 4_196,
+            ..Volume::default()
+        };
+        record_sync(&recorder, &mut last, now, &status);
+        record_sync(
+            &recorder,
+            &mut last,
+            now,
+            &Status {
+                folders: vec![],
+                ..status
+            },
+        );
+        assert_eq!(last, now);
+        let day = recorder.take().days.into_values().next().unwrap();
+        let report = serde_json::to_value(day).unwrap();
+        assert_eq!(
+            report["counters"]["sync"],
+            serde_json::json!({ "commits_sent": 3, "bytes_uploaded": 4_096 })
+        );
+        assert_eq!(
+            report["levels"]["sync"],
+            serde_json::json!({ "spaces": 2, "nodes": 1_500 })
+        );
+        let text = report.to_string();
+        for private in ["Alice", "/home"] {
+            assert!(!text.contains(private), "{private} in {text}");
+        }
+    }
 
     #[tokio::test]
     async fn stopping_drops_a_send_in_progress_and_flushes_once_more() {

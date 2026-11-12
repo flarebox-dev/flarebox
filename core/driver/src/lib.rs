@@ -33,6 +33,7 @@ mod restore;
 #[cfg(test)]
 mod scripted;
 mod status;
+mod volume;
 
 pub use config::{Config, ConfigError, LocalTrash, SyncRules};
 pub use credential::{Credential, CredentialError, SET_UP_AGAIN, api_for};
@@ -44,3 +45,4 @@ pub use paths::{Paths, PathsError};
 pub use question::{Answer, HeldItem, Limit, Question, QuestionKind, RecoveryGroup};
 pub use restore::{RestoreRejection, RestoreRequest, RestoreState, RestoreStatus, RestoreWait};
 pub use status::{Account, FolderState, FolderStatus, Status, Wait, WaitKind};
+pub use volume::{Volume, volume};
