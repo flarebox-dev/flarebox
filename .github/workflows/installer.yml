@@ -35,10 +35,9 @@ jobs:
       REPO: ${{ github.repository }}
       URL: https://koidrive.com/install.sh
     steps:
-      - name: Redeploy koidrive.com once raw.githubusercontent.com serves this commit's install.sh
+      - name: Redeploy koidrive.com once raw.githubusercontent.com serves main's install.sh
         if: github.event_name == 'push'
         env:
-          SHA: ${{ github.sha }}
           SITE_DEPLOY_HOOK: ${{ secrets.SITE_DEPLOY_HOOK }}
         run: |
           if [ -z "$SITE_DEPLOY_HOOK" ]; then
@@ -46,15 +45,20 @@ jobs:
             exit 1
           fi
           expected="$RUNNER_TEMP/expected-install.sh" raw="$RUNNER_TEMP/raw-install.sh"
-          gh api -H "Accept: application/vnd.github.raw" "repos/$REPO/contents/install.sh?ref=$SHA" >"$expected"
+          main=
           for attempt in $(seq 1 40); do
+            latest="$(gh api "repos/$REPO/commits/main" --jq .sha)"
+            if [ "$latest" != "$main" ]; then
+              main=$latest
+              gh api -H "Accept: application/vnd.github.raw" "repos/$REPO/contents/install.sh?ref=$main" >"$expected"
+            fi
             curl --silent --max-time 20 --output "$raw" "https://raw.githubusercontent.com/$REPO/main/install.sh" || true
             cmp -s "$expected" "$raw" && break
-            [ "$attempt" -lt 40 ] || { echo "::error::raw.githubusercontent.com did not serve install.sh at $SHA after 40 attempts."; exit 1; }
+            [ "$attempt" -lt 40 ] || { echo "::error::raw.githubusercontent.com did not serve install.sh at $main after 40 attempts."; exit 1; }
             sleep 15
           done
           curl --fail --silent --show-error --max-time 30 --request POST --output /dev/null "$SITE_DEPLOY_HOOK"
-          echo "raw.githubusercontent.com serves install.sh at $SHA; triggered a koidrive.com deploy."
+          echo "raw.githubusercontent.com serves install.sh at $main; triggered a koidrive.com deploy."
       - name: Check that koidrive.com serves main's install.sh
         run: |
           served="$RUNNER_TEMP/served-install.sh" headers="$RUNNER_TEMP/served-install.headers" expected="$RUNNER_TEMP/main-install.sh"
