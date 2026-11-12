@@ -2,20 +2,25 @@
 
 name: Site
 
+# Cloudflare Pages builds the site from this repository on its own: a preview for each branch
+# and production from main (build command "sh scripts/site-build.sh", output "site-dist").
+# This workflow holds no Cloudflare credentials. It waits for the Pages check run on the
+# commit, then checks that the deployment serves install.sh unchanged.
+
 on:
   push:
     branches: [main]
     paths:
       - "site/**"
-      - ".github/workflows/site.yml"
-      - "scripts/site-setup.sh"
       - "install.sh"
+      - "scripts/site-build.sh"
+      - ".github/workflows/site.yml"
   pull_request:
     paths:
       - "site/**"
-      - ".github/workflows/site.yml"
-      - "scripts/site-setup.sh"
       - "install.sh"
+      - "scripts/site-build.sh"
+      - ".github/workflows/site.yml"
   merge_group:
 
 permissions:
@@ -26,150 +31,83 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  deploy:
-    name: deploy
+  installer:
+    name: installer
+    # Pages builds no previews for pull requests from forks, and a merge group deploys nothing.
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    environment:
-      name: ${{ github.event_name == 'push' && 'site' || 'site-preview' }}
-      url: ${{ steps.deploy.outputs.url }}
+    timeout-minutes: 20
     permissions:
       contents: read
-      pull-requests: write
+      checks: read
     env:
-      PROJECT: koidrive-site
-      WRANGLER_VERSION: 4.160.0
-      ENVIRONMENT: ${{ github.event_name == 'push' && 'site' || 'site-preview' }}
+      SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
-      - name: Check for the Cloudflare credentials
-        id: credentials
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          missing=()
-          [ -n "$CLOUDFLARE_API_TOKEN" ] || missing+=(CLOUDFLARE_API_TOKEN)
-          [ -n "$CLOUDFLARE_ACCOUNT_ID" ] || missing+=(CLOUDFLARE_ACCOUNT_ID)
-          if [ ${#missing[@]} -gt 0 ]; then
-            message="Deploy skipped: the $ENVIRONMENT environment has no ${missing[*]} secret. Add it under Settings > Environments > $ENVIRONMENT, then re-run this job."
-            echo "::notice title=Site deploy skipped::$message"
-            echo "$message" >> "$GITHUB_STEP_SUMMARY"
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          fi
-      - if: steps.credentials.outputs.ready == 'true'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
           sparse-checkout: |
-            /site/
-            /scripts/
             /install.sh
           sparse-checkout-cone-mode: false
-      - if: steps.credentials.outputs.ready == 'true'
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 24
-      - name: Create the Pages project if it is missing and set its production branch to main
-        if: steps.credentials.outputs.ready == 'true'
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/$PROJECT"
-          project="$RUNNER_TEMP/pages-project.json"
-          status="$(curl --silent --show-error --output "$project" --write-out '%{http_code}' \
-            --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$api")"
-          case "$status" in
-            200)
-              branch="$(jq -r '.result.production_branch' "$project")"
-              if [ "$branch" = main ]; then
-                echo "Pages project $PROJECT exists, production branch main."
-              else
-                curl --silent --show-error --fail-with-body --output /dev/null --request PATCH \
-                  --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" --header "Content-Type: application/json" \
-                  --data '{"production_branch":"main"}' "$api"
-                echo "Pages project $PROJECT production branch changed from $branch to main."
-              fi
-              ;;
-            404) npx --yes "wrangler@$WRANGLER_VERSION" pages project create "$PROJECT" --production-branch main ;;
-            *) echo "::error::Looking up Pages project $PROJECT returned HTTP $status."; exit 1 ;;
-          esac
-      - name: Deploy site/ and install.sh to Cloudflare Pages
-        id: deploy
-        if: steps.credentials.outputs.ready == 'true'
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          BRANCH: ${{ github.head_ref || github.ref_name }}
-          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler-output.json
-        run: |
-          out="$RUNNER_TEMP/site"
-          cp -R site "$out"
-          cp install.sh "$out/install.sh"
-          npx --yes "wrangler@$WRANGLER_VERSION" pages deploy "$out" \
-            --project-name "$PROJECT" --branch "$BRANCH" --commit-hash "$SHA"
-          deployment="$(jq -r 'select(.type == "pages-deploy-detailed") | .url // empty' "$WRANGLER_OUTPUT_FILE_PATH" | tail -n 1)"
-          url="$(jq -r 'select(.type == "pages-deploy-detailed") | .alias // .url // empty' "$WRANGLER_OUTPUT_FILE_PATH" | tail -n 1)"
-          if [ -z "$deployment" ] || [ -z "$url" ]; then
-            echo "::error::wrangler reported no deployment URL in $WRANGLER_OUTPUT_FILE_PATH:"
-            cat "$WRANGLER_OUTPUT_FILE_PATH"
-            exit 1
-          fi
-          echo "Deployed $SHA from $BRANCH to $url"
-          echo "Deployed \`$SHA\` from \`$BRANCH\` to $url" >> "$GITHUB_STEP_SUMMARY"
-          echo "url=$url" >> "$GITHUB_OUTPUT"
-          echo "deployment=$deployment" >> "$GITHUB_OUTPUT"
-      - name: Check that the deployment serves install.sh unchanged
-        if: steps.deploy.outputs.deployment != ''
-        env:
-          URL: ${{ steps.deploy.outputs.deployment }}
-        run: |
-          served="$RUNNER_TEMP/served-install.sh"
-          headers="$RUNNER_TEMP/served-install.headers"
-          for attempt in 1 2 3 4 5 6; do
-            status="$(curl --silent --show-error --dump-header "$headers" --output "$served" --write-out '%{http_code}' "$URL/install.sh")" || status=000
-            [ "$status" != 200 ] || break
-            [ "$attempt" -lt 6 ] || { echo "::error::$URL/install.sh returned HTTP $status, not 200, after 6 attempts."; exit 1; }
-            sleep 10
-          done
-          if ! cmp install.sh "$served"; then
-            echo "::error::$URL/install.sh ($(wc -c <"$served") bytes) differs from install.sh at this commit ($(wc -c <install.sh) bytes)."
-            exit 1
-          fi
-          type="$(tr -d '\r' <"$headers" | awk 'tolower($1) == "content-type:" { $1 = ""; sub(/^ /, ""); print }' | tail -n 1)"
-          media="$(printf '%s' "${type%%;*}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
-          if [ "$media" != text/plain ]; then
-            echo "::error::$URL/install.sh is served as '$type', not text/plain. Check site/_headers."
-            exit 1
-          fi
-          echo "$URL/install.sh matches install.sh ($(wc -c <install.sh) bytes, sha256 $(sha256sum install.sh | cut -d' ' -f1)) and is served as $type."
-          grep -i '^cache-control:' "$headers" || true
-      - name: Attach koidrive.com, its DNS records and the www redirect
-        if: github.event_name == 'push' && steps.deploy.outputs.url != ''
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: scripts/site-setup.sh
-      - name: Post the preview URL on the pull request
-        if: github.event_name == 'pull_request' && steps.deploy.outputs.url != ''
+      - name: Wait for the Cloudflare Pages deployment of this commit
+        id: pages
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          PR: ${{ github.event.pull_request.number }}
-          SHA: ${{ github.event.pull_request.head.sha }}
-          URL: ${{ steps.deploy.outputs.url }}
         run: |
-          marker='<!-- site-preview -->'
-          body="$(printf '%s\nSite preview for %s: %s\n' "$marker" "$SHA" "$URL")"
-          id="$(gh api --paginate "repos/$REPO/issues/$PR/comments" \
-            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" | sed -n 1p)"
-          if [ -n "$id" ]; then
-            gh api --method PATCH "repos/$REPO/issues/comments/$id" -f body="$body" --jq .html_url
-          else
-            gh api --method POST "repos/$REPO/issues/$PR/comments" -f body="$body" --jq .html_url
+          for attempt in $(seq 1 60); do
+            runs="$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
+              --jq '[.check_runs[] | select(.app.slug == "cloudflare-workers-and-pages")]')"
+            count="$(jq 'length' <<<"$runs")"
+            if [ "$count" -gt 1 ]; then
+              echo "::error::Commit $SHA has $count Cloudflare check runs; expected one Pages project."
+              exit 1
+            fi
+            if [ "$count" = 1 ] && [ "$(jq -r '.[0].status' <<<"$runs")" = completed ]; then
+              conclusion="$(jq -r '.[0].conclusion' <<<"$runs")"
+              if [ "$conclusion" != success ]; then
+                echo "::error::The Cloudflare Pages build of $SHA ended with '$conclusion': $(jq -r '.[0].details_url' <<<"$runs")"
+                exit 1
+              fi
+              url="$(jq -r '.[0].output.summary' <<<"$runs" | grep -oE "href='https://[0-9a-f]{8}\.[a-z0-9-]+\.pages\.dev'" | head -n 1 | sed "s/^href='//; s/'$//")"
+              if [ -z "$url" ]; then
+                echo "::error::The Cloudflare Pages check run for $SHA names no deployment URL:"
+                jq -r '.[0].output.summary' <<<"$runs"
+                exit 1
+              fi
+              echo "Cloudflare Pages deployed $SHA to $url"
+              echo "url=$url" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::No completed Cloudflare Pages check run for $SHA after 15 minutes. Check the project's build watch paths and branch controls."
+          exit 1
+      - name: Check that the deployment serves install.sh unchanged
+        env:
+          DEPLOYMENT: ${{ steps.pages.outputs.url }}
+          PRODUCTION: ${{ github.event_name == 'push' && 'https://koidrive.com' || '' }}
+        run: |
+          check() {
+            local url=$1/install.sh served="$RUNNER_TEMP/served-install.sh" headers="$RUNNER_TEMP/served-install.headers" status type media
+            for attempt in $(seq 1 36); do
+              status="$(curl --silent --show-error --dump-header "$headers" --output "$served" --write-out '%{http_code}' "$url")" || status=000
+              [ "$status" != 200 ] || cmp -s install.sh "$served" || status="200 with other bytes"
+              [ "$status" != 200 ] || break
+              [ "$attempt" -lt 36 ] || { echo "::error::$url returned HTTP $status, not 200 with install.sh at $SHA, after 36 attempts."; return 1; }
+              sleep 10
+            done
+            type="$(tr -d '\r' <"$headers" | awk 'tolower($1) == "content-type:" { $1 = ""; sub(/^ /, ""); print }' | tail -n 1)"
+            media="$(printf '%s' "${type%%;*}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
+            if [ "$media" != text/plain ]; then
+              echo "::error::$url is served as '$type', not text/plain. Check site/_headers."
+              return 1
+            fi
+            echo "$url matches install.sh ($(wc -c <install.sh) bytes, sha256 $(sha256sum install.sh | cut -d' ' -f1)) and is served as $type."
+            grep -i '^cache-control:' "$headers" || true
+          }
+          check "$DEPLOYMENT"
+          if [ -n "$PRODUCTION" ]; then
+            check "$PRODUCTION"
           fi
