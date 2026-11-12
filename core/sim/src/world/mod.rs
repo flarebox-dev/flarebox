@@ -688,6 +688,7 @@ impl World {
         note(&mut self.seen, "server rewound");
         let writes = |space: &SpaceDo| -> BTreeSet<i64> {
             (space.nodes().into_iter())
+                .filter(|node| node.status == NodeStatus::Live as i32)
                 .filter_map(|node| Some(node.current?.content?.mtime_ns))
                 .collect()
         };
