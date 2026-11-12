@@ -597,9 +597,10 @@ impl Engine {
 
     /// Puts `changes` into L and returns the nodes whose L entry changed. Paths a change names in the previous state
     /// (`Removed::path`, `Renamed::from`) are resolved before any change applies. The changes apply in batch order,
-    /// except that a change waits for the change of the batch that creates or moves its folder into place, and for
-    /// the rename that moves the entry at its path away. A scan lists renames before creations, so otherwise a file
-    /// moved into a new folder would find no folder. A cycle of such waits, as in a swap or a file moved into a new
+    /// except that a change waits for the change of the batch that creates or moves the nearest folder above it into
+    /// place, and for the rename that moves the entry at its path away. A scan lists renames before creations and
+    /// reports a moved folder without what moves with it, so otherwise a file moved into a new folder, or into a folder
+    /// below a moved one, would find no folder. A cycle of such waits, as in a swap or a file moved into a new
     /// folder that takes its name, goes on in batch order with a change whose folder is in place. The waits for folders
     /// follow paths toward the root, so such a change is always left. A node whose rename is still to come is set aside
     /// while another entry takes its name, with what is under it, until its own rename places it. A renamed or
@@ -656,19 +657,18 @@ impl Engine {
                 }
             })
             .collect();
+        let folder = |path: &Path| path.ancestors().skip(1).find_map(|dir| arrival.get(dir));
         let mut waits = vec![0; changes.len()];
         let mut arrivals = vec![0; changes.len()];
         let mut unblocks: Vec<Vec<(usize, bool)>> = vec![Vec::new(); changes.len()];
         for (at, change) in changes.iter().enumerate() {
             let firsts = match change {
-                Observed::Created { path, .. } | Observed::Renamed { to: path, .. } => [
-                    (path.parent().and_then(|dir| arrival.get(dir)), true),
-                    (leaving.get(path.as_path()), false),
-                ],
-                Observed::Modified { path, .. } => [
-                    (path.parent().and_then(|dir| arrival.get(dir)), true),
-                    (arrival.get(path.as_path()), true),
-                ],
+                Observed::Created { path, .. } | Observed::Renamed { to: path, .. } => {
+                    [(folder(path), true), (leaving.get(path.as_path()), false)]
+                }
+                Observed::Modified { path, .. } => {
+                    [(folder(path), true), (arrival.get(path.as_path()), true)]
+                }
                 Observed::Removed { .. } => [(None, false), (None, false)],
             };
             for (first, arrives) in firsts {
