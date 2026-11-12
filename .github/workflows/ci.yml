@@ -244,21 +244,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Use Homebrew's rustup with rustup and Cargo homes private to this self-hosted runner
+      - name: Use Homebrew's rustup with rustup and Cargo homes and a target directory private to this self-hosted runner
         if: runner.environment == 'self-hosted'
-        run: |
-          printf 'RUSTUP_HOME=%s\nCARGO_HOME=%s\n' "$RUNNER_TOOL_CACHE/rustup" "$RUNNER_TOOL_CACHE/cargo" >> "$GITHUB_ENV"
-          echo "Runner $RUNNER_NAME uses RUSTUP_HOME=$RUNNER_TOOL_CACHE/rustup and CARGO_HOME=$RUNNER_TOOL_CACHE/cargo."
-          proxies=/opt/homebrew/opt/rustup/bin
-          if [ ! -x "$proxies/cargo" ] || [ ! -x "$proxies/rustc" ]; then
-            echo "::error::Runner $RUNNER_NAME has no cargo or rustc in $proxies. Install rustup with Homebrew (brew install rustup) on the Mac that hosts the runners."
-            exit 1
-          fi
-          echo "$proxies" >> "$GITHUB_PATH"
-          echo "Runner $RUNNER_NAME takes cargo and rustc from $proxies."
+        uses: ./.github/actions/self-hosted-rust
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: runner.environment != 'self-hosted'
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
@@ -498,23 +490,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Use Homebrew's rustup with rustup and Cargo homes private to this self-hosted runner
+      - name: Use Homebrew's rustup with rustup and Cargo homes and a target directory private to this self-hosted runner
         if: runner.environment == 'self-hosted'
-        run: |
-          printf 'RUSTUP_HOME=%s\nCARGO_HOME=%s\n' "$RUNNER_TOOL_CACHE/rustup" "$RUNNER_TOOL_CACHE/cargo" >> "$GITHUB_ENV"
-          echo "Runner $RUNNER_NAME uses RUSTUP_HOME=$RUNNER_TOOL_CACHE/rustup and CARGO_HOME=$RUNNER_TOOL_CACHE/cargo."
-          proxies=/opt/homebrew/opt/rustup/bin
-          if [ ! -x "$proxies/cargo" ] || [ ! -x "$proxies/rustc" ]; then
-            echo "::error::Runner $RUNNER_NAME has no cargo or rustc in $proxies. Install rustup with Homebrew (brew install rustup) on the Mac that hosts the runners."
-            exit 1
-          fi
-          echo "$proxies" >> "$GITHUB_PATH"
-          echo "Runner $RUNNER_NAME takes cargo and rustc from $proxies."
+        uses: ./.github/actions/self-hosted-rust
       - name: Test notarize.sh against a stub notarytool
         run: scripts/test-notarize.sh
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: runner.environment != 'self-hosted'
       - name: Show Xcode and Swift versions
         run: xcodebuild -version && swift --version
       - name: Build the Rust core, the Swift bindings and the app (unsigned)
