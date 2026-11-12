@@ -104,7 +104,7 @@ You need a Cloudflare account with R2 turned on, and a Mac or a Linux machine.
    curl -fsSL https://raw.githubusercontent.com/koidrive/koidrive/main/install.sh | sh
    ```
 
-   On Linux with systemd, install the user service too:
+   On Linux with systemd, run this instead to install the user service as well:
 
    ```sh
    curl -fsSL https://raw.githubusercontent.com/koidrive/koidrive/main/install.sh | sh -s -- --systemd
