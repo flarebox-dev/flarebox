@@ -3809,3 +3809,18 @@ fn an_edit_the_other_device_deleted_gives_way_to_the_folder_it_made_at_that_name
     ];
     run_cut(&seed, &local, &[], 1, false, &during, Cut::None).unwrap();
 }
+
+#[test]
+fn a_version_restore_of_a_file_deleted_here_waits_while_its_s_update_waits() {
+    let seed = [act(0, 0, 0, 1, 0), act(0, 0, 1, 2, 0), act(0, 0, 2, 3, 3)];
+    let local = [act(4, 2, 0, 2, 3), act(1, 0, 1, 2, 2)];
+    let remote = [act(3, 2, 0, 0, 3)];
+    let during = [
+        (true, vec![act(0, 0, 0, 4, 1)]),
+        (true, vec![act(6, 0, 0, 0, 1)]),
+        (true, vec![act(4, 0, 0, 1, 3)]),
+    ];
+    for cut in CUTS {
+        run_cut(&seed, &local, &remote, 1, false, &during, cut).unwrap();
+    }
+}
