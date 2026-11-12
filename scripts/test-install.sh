@@ -56,7 +56,7 @@ printf '\t}\n\n\tunmanaged processes = {\n\t\t     105      - \tdev.koidrive.koi
 EOF
 cat > "$tmp/services/ps" <<'EOF'
 #!/bin/sh
-if [ "$1 $2" = '-o cgroup=' ] && [ -e "$HOME/cgroup" ]; then
+if [ "$1 $2 $3" = '-ww -o cgroup=' ] && [ -e "$HOME/cgroup" ]; then
     cat "$HOME/cgroup"
     exit 0
 fi
@@ -203,7 +203,7 @@ if [ "$(uname -s)" = Linux ]; then
     perl -e '$0 = "/opt/custom bin/koi _daemon"; sleep 300' &
     daemon=$!
     touch "$HOME/unreachable"
-    sh "$root/install.sh" 2> "$tmp/nobus.log"
+    COLUMNS=20 sh "$root/install.sh" 2> "$tmp/nobus.log"
     if ! grep -F "the koi daemon with process ID $daemon still runs the old koi" "$tmp/nobus.log"; then
         cat "$tmp/nobus.log"
         printf 'Expected an upgrade without a systemd user manager to name the daemon that still runs the old koi\n' >&2
