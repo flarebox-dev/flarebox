@@ -57,7 +57,7 @@ import {
 import type { SessionCheck } from "./account-do";
 import { type Identity, verifyAccessToken } from "./auth";
 import { type ChunkObject, sha256, signChunkGrant, verifyChunkGrant } from "./crypto";
-import type { Database, Sql } from "./host";
+import type { Database, ObjectStore, Sql } from "./host";
 import { fromHex, isUuidV7, toHex, uuidv7 } from "./ids";
 import { policy } from "./policy";
 import { quotaRefusal } from "./quota";
@@ -307,6 +307,10 @@ export class SpaceDO extends DurableObject<Env> {
   private exporting: Promise<void> | undefined;
   /** A stored commit could not set the alarm, so the next commit sets it. */
   private alarmStale = false;
+
+  private get objects(): ObjectStore {
+    return this.env.BUCKET;
+  }
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -981,7 +985,7 @@ export class SpaceDO extends DurableObject<Env> {
     }
     const checked: ChunkObject[] = [];
     for (const { object, size } of unconfirmed.slice(0, MAX_HEAD_CHECKS)) {
-      const head = await this.env.BUCKET.head(chunkKey(spaceId, object.hashHex, object.incarnation));
+      const head = await this.objects.head(chunkKey(spaceId, object.hashHex, object.incarnation));
       if (head?.size !== size) continue;
       confirmed.set(object.hashHex, object.incarnation);
       checked.push(object);
@@ -1228,7 +1232,7 @@ export class SpaceDO extends DurableObject<Env> {
     let sweptChunks = 0;
     let sweeping = false;
     if (nowMs >= Number(getMeta(this.sql, "orphan_sweep_due_ms") ?? 0)) {
-      const listed = await this.env.BUCKET.list({
+      const listed = await this.objects.list({
         prefix: `spaces/${spaceId}/chunks/`,
         cursor: String(getMeta(this.sql, "orphan_sweep_cursor") ?? "") || undefined,
         limit: GC_BATCH,
@@ -1269,7 +1273,7 @@ export class SpaceDO extends DurableObject<Env> {
       if (objects.length > 0) {
         const retired = await this.account().retireChunks(spaceId, objects);
         if (!retired.ok) throw new Error(`chunk retirement refused: ${retired.message}`);
-        await this.env.BUCKET.delete(objects.map((object) => chunkKey(spaceId, object.hashHex, object.incarnation)));
+        await this.objects.delete(objects.map((object) => chunkKey(spaceId, object.hashHex, object.incarnation)));
       }
       this.db.transactionSync(() => {
         for (const { hash } of rows) this.sql.exec("DELETE FROM chunks WHERE hash = ? AND state = 3", hash);
@@ -1418,7 +1422,7 @@ export class SpaceDO extends DurableObject<Env> {
 
   /** Runs the R2 export now, or joins the run already in progress. */
   private runExport(): Promise<void> {
-    this.exporting ??= new Exporter(this.db, this.env.BUCKET, this.snapshotPageNodes).run(this.clock()).finally(() => {
+    this.exporting ??= new Exporter(this.db, this.objects, this.snapshotPageNodes).run(this.clock()).finally(() => {
       this.exporting = undefined;
     });
     return this.exporting;

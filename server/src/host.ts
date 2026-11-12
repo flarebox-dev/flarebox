@@ -32,3 +32,36 @@ export interface Database {
   /** Runs closure in one transaction: it commits when closure returns and rolls back when closure throws. */
   transactionSync<T>(closure: () => T): T;
 }
+
+/** Metadata of a stored object. */
+export interface StoredObject {
+  readonly key: string;
+  readonly size: number;
+  readonly uploaded: Date;
+  /** Checksums the store computed or was given at upload; sha256 is absent when it has none. */
+  readonly checksums: { readonly sha256?: ArrayBuffer };
+}
+
+/** A stored object and its contents, read once from body. */
+export interface StoredObjectBody extends StoredObject {
+  readonly body: ReadableStream<Uint8Array>;
+}
+
+/** One page of a listing in key order. A truncated page names the cursor of the next. */
+export type ObjectList = { objects: StoredObject[] } & ({ truncated: true; cursor: string } | { truncated: false });
+
+export interface PutOptions {
+  /** The SHA-256 the body must have, in hex; a body with another digest is refused with an error that says "checksum". */
+  sha256?: string;
+  /** With etagDoesNotMatch "*", the put writes only when no object has the key and otherwise leaves the stored object. */
+  onlyIf?: { etagDoesNotMatch: string };
+}
+
+/** An object store with a flat key space: the chunks of every space and the metadata export (RFC 0004). */
+export interface ObjectStore {
+  head(key: string): Promise<StoredObject | null>;
+  get(key: string): Promise<StoredObjectBody | null>;
+  put(key: string, value: ReadableStream | ArrayBuffer | ArrayBufferView | string | null, options?: PutOptions): Promise<unknown>;
+  list(options: { prefix: string; cursor?: string; limit: number }): Promise<ObjectList>;
+  delete(keys: string | string[]): Promise<void>;
+}

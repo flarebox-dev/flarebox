@@ -5,6 +5,7 @@ import type { Identity } from "../auth";
 import { Error_Code, ErrorSchema } from "../gen/koidrive/v1/rpc_pb";
 import { CreateShareLinkRequestSchema, ShareInfoSchema, ShareLinkListSchema, ShareLinkSchema, ShareListingSchema, ShareUnlockRequestSchema } from "../gen/koidrive/v1/share_pb";
 import { BadRequest, errorReply, readMessage, reply } from "../http";
+import type { ObjectStore } from "../host";
 import { isUuidV7, toHex } from "../ids";
 import { clientKey } from "./limiter";
 import { LINK_ID, SESSION_MS, type ShareOutcome } from "./links";
@@ -86,8 +87,8 @@ class ChunkCheckFailed extends Error {}
  * Opens one chunk object in R2 after checking that it exists, has the chunk's size, and, when R2 holds a SHA-256
  * checksum for it, that the checksum is the chunk's hash (RFC 0005 section 7).
  */
-async function openChunk(env: Env, chunk: ShareFile["chunks"][number]): Promise<ReadableStream<Uint8Array>> {
-  const object = await env.BUCKET.get(chunk.key);
+async function openChunk(objects: ObjectStore, chunk: ShareFile["chunks"][number]): Promise<ReadableStream<Uint8Array>> {
+  const object = await objects.get(chunk.key);
   if (!object) throw new ChunkCheckFailed(`chunk object ${chunk.key} is missing`);
   const stored = object.checksums.sha256;
   const problem =
@@ -120,7 +121,7 @@ async function download(request: Request, env: Env, file: ShareFile, fenceCheck:
   if (file.chunks.length === 0) return new Response(new Uint8Array(0), { headers: { ...attachmentHeaders(file.name), "Content-Length": "0" } });
   let current: ReadableStreamDefaultReader<Uint8Array>;
   try {
-    current = (await openChunk(env, file.chunks[0]!)).getReader();
+    current = (await openChunk(env.BUCKET, file.chunks[0]!)).getReader();
   } catch (error) {
     if (!(error instanceof ChunkCheckFailed)) throw error;
     console.error("share download refused", error.message);
@@ -147,7 +148,7 @@ async function download(request: Request, env: Env, file: ShareFile, fenceCheck:
             return;
           }
           try {
-            current = (await openChunk(env, file.chunks[next++]!)).getReader();
+            current = (await openChunk(env.BUCKET, file.chunks[next++]!)).getReader();
           } catch (error) {
             console.error("share download aborted", error instanceof Error ? error.message : String(error));
             controller.error(error);

@@ -21,6 +21,7 @@ import {
 } from "./gen/koidrive/v1/auth_pb";
 import { UploadReceiptSchema } from "./gen/koidrive/v1/commit_pb";
 import { Error_Code, ErrorSchema } from "./gen/koidrive/v1/rpc_pb";
+import type { ObjectStore } from "./host";
 import { BadRequest, errorReply, readMessage, reply } from "./http";
 import { type ChunkObject, deriveSpaceKey, signChunkGrant, verifyChunkGrant } from "./crypto";
 import { fromHex, isUuidV7 } from "./ids";
@@ -152,7 +153,7 @@ async function spaceKey(env: Env, spaceId: string): Promise<Uint8Array> {
  * only credential; it names the key incarnation to read or write (RFC 0003 section 5). R2 checks the SHA-256 of an
  * upload, and the receipt lets the Space DO accept it in a commit for that incarnation only.
  */
-async function chunk(request: Request, env: Env, spaceId: string, hex: string): Promise<Response> {
+async function chunk(request: Request, env: Env, objects: ObjectStore, spaceId: string, hex: string): Promise<Response> {
   const params = new URL(request.url).searchParams;
   const ticket = params.get("ticket") ?? "";
   const incarnation = params.get("inc") ?? "";
@@ -165,7 +166,7 @@ async function chunk(request: Request, env: Env, spaceId: string, hex: string): 
     if (!(await verifyChunkGrant(await spaceKey(env, spaceId), "get", object, 0, ticket, nowMs))) {
       return errorReply(request, Error_Code.FORBIDDEN, "invalid or expired download ticket");
     }
-    const stored = await env.BUCKET.get(key);
+    const stored = await objects.get(key);
     if (!stored) return errorReply(request, Error_Code.INVALID_ARGUMENT, "chunk not found", 404);
     return new Response(stored.body, {
       headers: { "Content-Type": "application/octet-stream", "Content-Length": String(stored.size), "Cache-Control": "private, max-age=3600" },
@@ -182,7 +183,7 @@ async function chunk(request: Request, env: Env, spaceId: string, hex: string): 
     return errorReply(request, Error_Code.FORBIDDEN, "invalid or expired upload ticket, or a size the ticket does not cover");
   }
   try {
-    await env.BUCKET.put(key, request.body, { sha256: hex, onlyIf: { etagDoesNotMatch: "*" } });
+    await objects.put(key, request.body, { sha256: hex, onlyIf: { etagDoesNotMatch: "*" } });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error("chunk upload failed", spaceId, hex, message);
@@ -257,7 +258,7 @@ async function route(request: Request, env: Env): Promise<Response> {
   }
 
   const chunkRoute = /^\/v1\/spaces\/([0-9a-f-]{36})\/chunks\/([0-9a-f]{64})$/.exec(path);
-  if (chunkRoute && isUuidV7(chunkRoute[1]!)) return chunk(request, env, chunkRoute[1]!, chunkRoute[2]!);
+  if (chunkRoute && isUuidV7(chunkRoute[1]!)) return chunk(request, env, env.BUCKET, chunkRoute[1]!, chunkRoute[2]!);
 
   const rewindRoute = /^\/v1\/spaces\/([0-9a-f-]{36})\/rewind$/.exec(path);
   if (rewindRoute && method === "POST" && isUuidV7(rewindRoute[1]!)) return rewind(request, env, rewindRoute[1]!);
