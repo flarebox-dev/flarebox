@@ -1488,8 +1488,15 @@ fn update_synced(
         }
         let mut fitting = left.clone();
         let mut out = Vec::new();
-        while let Some(at) = (0..fitting.len()).find(|&at| blocked(trees, &fitting, at)) {
-            out.push(fitting.remove(at));
+        loop {
+            let batch: BTreeMap<NodeId, Option<Shape>> = fitting.iter().cloned().collect();
+            let (stuck, rest): (Vec<_>, Vec<_>) = (fitting.into_iter())
+                .partition(|(id, shape)| blocked(trees, &batch, id, shape.as_ref()));
+            fitting = rest;
+            if stuck.is_empty() {
+                break;
+            }
+            out.extend(stuck);
         }
         if !out.is_empty() && !fitting.is_empty() && set_synced_together(trees, &fitting) {
             left = out;
@@ -1522,27 +1529,28 @@ fn set_synced_together(trees: &mut Trees, updates: &[(NodeId, Option<Shape>)]) -
     false
 }
 
-/// Whether a node outside `batch` keeps the update at `at` from fitting, whatever else the batch
-/// makes: S gives the name it takes to a node the batch does not update, or neither S nor the batch
-/// holds its folder, or S holds a node the batch does not update under the node it removes.
-fn blocked(trees: &Trees, batch: &[(NodeId, Option<Shape>)], at: usize) -> bool {
-    let updated = |id: &str| batch.iter().any(|(other, _)| other == id);
-    let (id, shape) = &batch[at];
+/// Whether a node outside `batch` keeps the update of `id` to `shape` from fitting, whatever else
+/// the batch makes: S gives the name it takes to a node the batch does not update, or neither S nor
+/// the batch holds its folder, or S holds a node the batch does not update under the node it
+/// removes.
+fn blocked(
+    trees: &Trees,
+    batch: &BTreeMap<NodeId, Option<Shape>>,
+    id: &str,
+    shape: Option<&Shape>,
+) -> bool {
     let Some(shape) = shape else {
-        return trees.synced_children(id).any(|child| !updated(child));
+        return trees
+            .synced_children(id)
+            .any(|child| !batch.contains_key(child));
     };
-    let placed = batch.iter().any(|(other, next)| {
-        *other == shape.parent && next.as_ref().is_some_and(|next| next.kind == Kind::Dir)
-    });
-    let held = !updated(&shape.parent)
+    let placed = (batch.get(&shape.parent))
+        .is_some_and(|next| next.as_ref().is_some_and(|next| next.kind == Kind::Dir));
+    let held = !batch.contains_key(&shape.parent)
         && (trees.synced().live(&shape.parent)).is_some_and(|parent| parent.kind == Kind::Dir);
     let root = shape.parent == trees.synced().root;
-    let key = name_key(&shape.name);
-    let taken = trees.synced_children(&shape.parent).any(|child| {
-        child != id
-            && !updated(child)
-            && (trees.synced().live(child)).is_some_and(|other| name_key(&other.name) == key)
-    });
+    let taken = (trees.synced_holders(&shape.parent, &shape.name))
+        .any(|child| child != id && !batch.contains_key(child));
     !(root || placed || held) || taken
 }
 

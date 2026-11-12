@@ -346,6 +346,15 @@ impl Trees {
         self.s_names.children(parent)
     }
 
+    /// The nodes of S under `parent` whose name has the `name_key` of `name`.
+    pub(crate) fn synced_holders<'a>(
+        &'a self,
+        parent: &str,
+        name: &str,
+    ) -> impl Iterator<Item = &'a NodeId> + 'a {
+        self.s_names.holders(parent, name)
+    }
+
     /// The placed node of L under `parent` named exactly `name`.
     pub fn local_child(&self, parent: &str, name: &str) -> Option<&NodeId> {
         (self.l_names.holders(parent, name))
