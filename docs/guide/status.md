@@ -108,3 +108,25 @@ Sync asks before it deletes many files at once. It holds this device's deletions
 Deletions made on your other devices are applied here without asking, and the removed files go to this folder's [local trash](folders.md#the-local-trash). When they cross the same limits, `koi status` and `koi resolve` show a notice once enough files are removed, which can be before a removed folder is gone. Its counts grow while more deletions arrive, and it waits until you answer `dismiss`, which only closes it. The rest of a deletion it counted, such as the rest of that folder, opens no new notice. To bring the files back, [restore](history.md#restore-a-deleted-file-or-folder) them from the space's trash.
 
 Sync also asks after the first link of a folder to a space that already held live files or folders, when the comparison holds some of the folder's files, as [Link a folder](folders.md#link-a-folder) describes. `koi status` and `koi resolve` show that decision as "files on this device that the space does not hold", and it takes `publish` or `discard`.
+
+When two devices change the same file, the server keeps both changes as two files (see [Conflicts](conflicts.md)). The device whose change got the conflict name also opens a decision. `koi status` and `koi resolve` show both files and the device that wrote each one:
+
+```
+  019c...: Reports/report.txt has a conflict copy
+    Original: Reports/report.txt, written by device 019a...
+    Conflict copy: 'Reports/report (conflict from laptop 2026-11-10).txt', written by device 019b...
+  Keep Reports/report.txt and move 'Reports/report (conflict from laptop 2026-11-10).txt' to the trash:
+    koi resolve 019c... keep-node:019d...
+  Give Reports/report.txt the content of 'Reports/report (conflict from laptop 2026-11-10).txt', keeping the old content in its version history, and move 'Reports/report (conflict from laptop 2026-11-10).txt' to the trash:
+    koi resolve 019c... keep-node:019e...
+  Keep both files:
+    koi resolve 019c... keep-both
+```
+
+The answer names the file to keep by its node ID, so it means the same file on every device.
+
+- `keep-node:<id>` with the original's ID keeps the original and moves the copy to the space's trash.
+- `keep-node:<id>` with the copy's ID gives the original the copy's content and moves the copy to the trash. The original's old content stays in its [versions](history.md#see-the-versions-of-a-file).
+- `keep-both` keeps both files and closes the decision.
+
+Paths with spaces or other characters a shell reads specially are in single quotes. Both files keep syncing while the decision waits. If the content of either file changes, a new decision with a new ID replaces it. If you rename, move or delete either file yourself, the decision closes. With `--json`, the decision's `answers` have the tokens `keep-node:<id>` and `keep-both`, each with its `argv`.

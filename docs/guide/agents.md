@@ -58,7 +58,7 @@ A failed command can still carry `data`. For example, `koi space usage` returns 
 }
 ```
 
-`kind` is `mass_delete`, `remote_mass_delete`, `ambiguous_disappearance` or `recovery`. A `recovery` decision also has a `group`. A `remote_mass_delete` notice has `requires_choice: false`. It only takes `dismiss` and holds nothing back. Don't pick an answer that deletes files on your own. Ask the person.
+`kind` is `mass_delete`, `remote_mass_delete`, `ambiguous_disappearance`, `recovery` or `conflict`. A `recovery` decision also has a `group`. A `conflict` decision's `items` are its two files, and its answers are `keep-node:<id>` for each file's node ID and `keep-both` (see [Decisions](status.md#decisions)). A `remote_mass_delete` notice has `requires_choice: false`. It only takes `dismiss` and holds nothing back. Don't pick an answer that deletes files on your own. Ask the person.
 
 ## Exit status
 
