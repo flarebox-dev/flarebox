@@ -1140,7 +1140,8 @@ impl Trees {
     }
 
     pub fn kept_original(&self, id: &str) -> Option<&NodeId> {
-        (self.kept_originals.get(id)).filter(|kept| self.l.get(kept).is_some())
+        (self.kept_originals.get(id))
+            .filter(|kept| self.l.get(kept).is_some() || self.s.get(kept).is_none())
     }
 
     /// Records that an edit of this device, in the commit at `seq`, set the content of `id`, if R
@@ -1293,13 +1294,15 @@ impl Trees {
             .filter(|(_, seq)| *seq > held_through)
             .map(|(id, _)| id.clone())
             .collect();
+        let deleted_here: BTreeSet<NodeId> =
+            (trashed.iter()).map(|deleted| deleted.id.clone()).collect();
         let mut deletes: Vec<(NodeId, Shape, Option<NodeId>)> = (trashed.into_iter())
             .filter(|deleted| {
                 self.l.get(&deleted.id).is_none() && self.s.get(&deleted.id).is_none()
             })
             .filter(|deleted| {
                 (deleted.kept.as_ref())
-                    .is_none_or(|kept| self.l.get(kept).is_none() || self.r.live(kept).is_some())
+                    .is_none_or(|kept| deleted_here.contains(kept) || self.r.live(kept).is_some())
             })
             .filter_map(|deleted| {
                 let remote = (self.r.get(&deleted.id))
@@ -1313,7 +1316,7 @@ impl Trees {
             self.fits_synced(id, Some(shape))
         }) {
             let (id, shape, kept) = deletes.swap_remove(at);
-            if let Some(kept) = kept {
+            if let Some(kept) = kept.filter(|kept| !deleted_here.contains(kept)) {
                 self.kept_originals.insert(id.clone(), kept);
             }
             self.set_synced(id, Some(shape));

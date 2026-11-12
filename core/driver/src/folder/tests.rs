@@ -8411,8 +8411,7 @@ fn a_lost_keep_original_moved_out_of_a_folder_the_person_removed_keeps_only_the_
     );
 }
 
-#[test]
-fn a_lost_keep_original_whose_original_both_devices_deleted_brings_nothing_back() {
+fn keep_original_lost_after_the_original_was_deleted(deleted_on_b: bool) -> (Remote, Site) {
     let mut remote = Remote::new();
     let ((site_a, mut a), (site_b, mut b)) = edited_on_both(&mut remote);
     let mut chunks = Server::default();
@@ -8426,10 +8425,11 @@ fn a_lost_keep_original_whose_original_both_devices_deleted_brings_nothing_back(
     let step = b.folder.requested();
     b.take(step).unwrap();
     sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
-    fs::remove_file(site_b.root.join("main.go")).unwrap();
-    b.scan_until(|b| !b.work.is_empty());
-    b.run(&mut remote);
+    let site = if deleted_on_b { &site_b } else { &site_a };
+    fs::remove_file(site.root.join("main.go")).unwrap();
+    sync(&mut remote, (&site_a, &mut a), (&site_b, &mut b));
     assert_eq!(remote.names(), Vec::<String>::new());
+    assert_eq!(names(&site_b.root), Vec::<String>::new());
 
     let (site_c, mut c) = linked(&mut restored, "c");
     c.settle();
@@ -8445,6 +8445,21 @@ fn a_lost_keep_original_whose_original_both_devices_deleted_brings_nothing_back(
         b.run(&mut restored);
         b.settle();
     }
+    (restored, site_b)
+}
+
+#[test]
+fn a_lost_keep_original_whose_original_both_devices_deleted_brings_nothing_back() {
+    let (restored, site_b) = keep_original_lost_after_the_original_was_deleted(true);
+
     assert_eq!(restored.names(), Vec::<String>::new());
     assert_eq!(names(&site_b.root), Vec::<String>::new());
+}
+
+#[test]
+fn a_lost_keep_original_whose_original_only_other_devices_deleted_keeps_the_copy() {
+    let (restored, site_b) = keep_original_lost_after_the_original_was_deleted(false);
+
+    assert_eq!(restored.names(), [COPY]);
+    assert_eq!(names(&site_b.root), [COPY]);
 }

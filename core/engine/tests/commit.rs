@@ -7258,3 +7258,30 @@ fn a_kept_original_waiting_to_be_sent_again_is_forgotten_once_another_device_tra
     trees.set_remote("y".into(), in_trash);
     assert_eq!(kept_originals(&trees), []);
 }
+
+#[test]
+fn a_resent_answer_delete_keeps_its_precondition_when_another_device_removed_the_kept_file_here() {
+    let mut trees = trees(&[
+        ("f", None, None, Some(remote(file(ROOT, "f", 1)))),
+        (
+            "y",
+            None,
+            Some(file(ROOT, "y", 2)),
+            Some(remote(file(ROOT, "y", 2))),
+        ),
+    ]);
+    let mut state = trees.state();
+    state.kept_originals.insert("y".into(), "f".into());
+    trees.restore(state).unwrap();
+    trees.set_rules::<&str>(&[], None);
+    trees.rules_scanned();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    trees.set_local("f".into(), local(file(ROOT, "f", 1), 1));
+    trees.set_synced("f".into(), Some(file(ROOT, "f", 1)));
+    trees.settle();
+    let held = trees.remote().get("f").unwrap();
+    let required = delete_copy_requiring(held.content_rev, held.meta_rev);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [required]);
+}
