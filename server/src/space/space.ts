@@ -1187,7 +1187,6 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       return { historyId: String(getMeta(this.sql, "history_id")), headSeq: this.headSeq, earlier: args.bookmark < marked };
     }
 
-    /** Restarts the object, so the call always ends in an error. */
     async rewindArm(bookmark: string): Promise<void> {
       await this.pitr.restoreOnNextStart(bookmark);
       this.state.abort("restarting to restore the space");
