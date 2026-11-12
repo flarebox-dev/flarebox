@@ -1170,6 +1170,7 @@ mod tests {
             &mut space,
             op::Op::Delete(Delete {
                 node_id: dir.clone(),
+                requires: None,
             }),
         );
         let stored = space.state.nodes.get_mut(&dir).unwrap();

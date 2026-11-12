@@ -150,6 +150,7 @@ fn run(actions: &[Action]) -> Vec<NodeState> {
             }),
             Kind::Delete => op::Op::Delete(Delete {
                 node_id: pick(a.target),
+                requires: None,
             }),
             Kind::Restore => op::Op::Restore(Restore {
                 node_id: pick(a.target),

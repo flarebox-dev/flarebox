@@ -548,6 +548,20 @@ pub struct Move {
 pub struct Delete {
     #[prost(string, tag="1")]
     pub node_id: ::prost::alloc::string::String,
+    /// When set, the delete applies only while this node is live at these revisions; otherwise it is answered with
+    /// CODE_SUPERSEDED and trashes nothing (RFC 0015).
+    #[prost(message, optional, tag="2")]
+    pub requires: ::core::option::Option<NodeRevisions>,
+}
+/// A node at the revisions of its NodeState.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NodeRevisions {
+    #[prost(string, tag="1")]
+    pub node_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag="2")]
+    pub content_rev: u64,
+    #[prost(uint64, tag="3")]
+    pub meta_rev: u64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Restore {

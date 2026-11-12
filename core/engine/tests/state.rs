@@ -175,6 +175,7 @@ fn restore(n: u128) -> RestoreIntent {
 fn commits_state() -> CommitsState {
     let delete = Delete {
         node_id: "d".into(),
+        requires: None,
     };
     let moved = Move {
         node_id: "m".into(),
