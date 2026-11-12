@@ -690,7 +690,11 @@ describe("space rewind (RFC 0003)", () => {
       expect((await rewind(token, spaceId, { restorePointMs: point, expectedHistoryId: history, rewindId })).status).toBe(503);
       expect(await rewindRecord(rewindId)).toMatchObject({ phase: "admitted" });
       release();
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await vi.waitFor(() =>
+        runInDurableObject(space(spaceId), (instance: SpaceDO) => {
+          expect((instance as unknown as { renewing?: unknown }).renewing).toBeUndefined();
+        }),
+      );
       expect(await listTree(3n)).toBe(Close.SPACE_REWOUND);
       expect(received(3n)).toBeUndefined();
     } finally {

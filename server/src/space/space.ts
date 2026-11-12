@@ -437,16 +437,14 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       this.renewing = renewal;
       this.account()
         .checkSessions(deviceIds, String(getMeta(this.sql, "space_id")))
-        .then(
-          (answers) => {
-            if (generation !== this.leaseGeneration) return;
-            for (const [deviceId, check] of Object.entries(answers)) {
-              if (check.revoked) this.recordRevoked(deviceId);
-              this.storeLease(deviceId, check, askedAtMs);
-            }
-          },
-          (error) => console.error("account lease renewal failed", error),
-        )
+        .then((answers) => {
+          if (generation !== this.leaseGeneration) return;
+          for (const [deviceId, check] of Object.entries(answers)) {
+            if (check.revoked) this.recordRevoked(deviceId);
+            this.storeLease(deviceId, check, askedAtMs);
+          }
+        })
+        .catch((error) => console.error("account lease renewal failed", error))
         .finally(() => {
           if (this.renewing === renewal) this.renewing = undefined;
         });

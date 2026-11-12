@@ -1027,6 +1027,14 @@ describe("RFC 0014 session leases", () => {
     };
   }
 
+  function renewalSettled(spaceId: string) {
+    return vi.waitFor(() =>
+      runInDurableObject(env.SPACE.get(env.SPACE.idFromName(spaceId)), (instance: SpaceDO) => {
+        expect((instance as unknown as { renewing?: unknown }).renewing).toBeUndefined();
+      }),
+    );
+  }
+
   async function connected(name: string) {
     const owner = await getOwner();
     const device = await pairDevice(owner, name);
@@ -1049,7 +1057,7 @@ describe("RFC 0014 session leases", () => {
     } finally {
       renewal.restore();
     }
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await renewalSettled(spaceId);
     await ageLeases(spaceId, SESSION_LEASE_MS * 0.6);
     vi.spyOn(console, "error").mockImplementation(() => {});
     const prototype = await runInDurableObject(account(), (instance: AccountDO) => Object.getPrototypeOf(instance) as AccountDO);
@@ -1093,7 +1101,7 @@ describe("RFC 0014 session leases", () => {
       await new Promise((resolve) => setTimeout(resolve, 100));
       expect(renewal.asked).toHaveLength(1);
       renewal.release();
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await renewalSettled(spaceId);
       await ageLeases(spaceId, SESSION_LEASE_MS * 0.6);
       expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
       await vi.waitFor(() => expect(renewal.asked).toHaveLength(2));
@@ -1118,7 +1126,7 @@ describe("RFC 0014 session leases", () => {
       expect(await listTree(sb)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
       expect(await listTree(sc)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
       renewal.release();
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await renewalSettled(spaceId);
       expect(await listTree(sb)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
       await vi.waitFor(() => expect(renewal.asked).toHaveLength(2));
       expect([...(renewal.asked[1] as string[])].sort()).toEqual([b.deviceId, c.deviceId].sort());
@@ -1139,7 +1147,7 @@ describe("RFC 0014 session leases", () => {
       await vi.waitFor(() => expect(renewal.asked).toHaveLength(1));
       expect(await listTree(sx)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
       renewal.release();
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await renewalSettled(spaceId);
       await ageLeases(spaceId, SESSION_LEASE_MS * 0.6);
       expect(await listTree(socket)).toMatchObject({ case: "rpc", value: { result: { case: "tree" } } });
       await vi.waitFor(() => expect(renewal.asked).toHaveLength(2));
@@ -1228,7 +1236,7 @@ describe("RFC 0014 session leases", () => {
       expect((await send("/v1/devices/" + device.deviceId, { method: "DELETE", token: owner.access!.token })).status).toBe(204);
       expect((await socket.waitClosed()).code).toBe(Close.DEVICE_REVOKED);
       renewal.release();
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await renewalSettled(spaceId);
       expect(await ask()).toMatchObject({ case: "error", value: { code: Error_Code.UNAUTHENTICATED } });
     } finally {
       renewal.restore();
@@ -1251,7 +1259,7 @@ describe("RFC 0014 session leases", () => {
       await ageLeases(spaceId, SESSION_LEASE_MS * 0.5);
       expect(await listTree(socket)).toMatchObject({ case: "goodbye", value: { code: Close.DEVICE_REVOKED } });
       renewal.release();
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await renewalSettled(spaceId);
       expect(await ask()).toMatchObject({ case: "error", value: { code: Error_Code.UNAUTHENTICATED } });
     } finally {
       renewal.restore();
@@ -1270,7 +1278,7 @@ describe("RFC 0014 session leases", () => {
         const sentAtMs = Date.now();
         expect((await send("/v1/devices/" + device.deviceId, { method: "DELETE", token: owner.access!.token })).status).toBe(204);
         renewal.release();
-        await new Promise((resolve) => setTimeout(resolve, 50));
+        await renewalSettled(spaceId);
         await ageLeases(spaceId, Date.now() - sentAtMs);
         expect(socket.closed).toBeUndefined();
         expect(await listTree(socket)).toMatchObject({ case: "goodbye", value: { code: Close.DEVICE_REVOKED } });
