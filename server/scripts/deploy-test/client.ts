@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// A small client for a deployed Koidrive server over HTTPS and WebSocket, built on the generated protobuf code. It
-// counts every request for the cost summary. Error messages name the method and path only: chunk targets carry
-// their tickets in the query string.
-
 import { create, type DescMessage, fromBinary, fromJson, type MessageInitShape, type MessageShape, toBinary, toJson } from "@bufbuild/protobuf";
 import { AccessTokenSchema, DeviceCredentialsSchema, PairStartResponseSchema, TokenRequestSchema } from "../../src/gen/koidrive/v1/auth_pb";
 import { type CommitResult, type Op, OpSchema, type UploadReceipt, UploadReceiptSchema } from "../../src/gen/koidrive/v1/commit_pb";
@@ -37,7 +33,6 @@ export async function sha256(bytes: Uint8Array): Promise<Uint8Array> {
 
 export { toHex, uuidv7 };
 
-/** Sends a request, counting it, and returns the response whatever its status. */
 export async function send(url: string, init: RequestInit = {}): Promise<Response> {
   const body = init.body;
   stats.requests++;
@@ -70,14 +65,12 @@ async function failure(what: string, response: Response): Promise<HttpError> {
   return new HttpError(what + " returned HTTP " + response.status + ": " + message, response.status, code);
 }
 
-/** A deployed server at base, for example https://koidrive-test-1-1.example.workers.dev. */
 export class Server {
   readonly base: string;
   constructor(base: string) {
     this.base = base.replace(/\/$/, "");
   }
 
-  /** A JSON request with a protobuf message body; returns the reply parsed with schema. Throws HttpError otherwise. */
   async json<O extends DescMessage>(
     method: string,
     path: string,
@@ -103,7 +96,6 @@ export class Server {
   }
 }
 
-/** One device of the deployment's owner, refreshing its access token before it expires. */
 export class Device {
   readonly server: Server;
   readonly credentials: Credentials;
@@ -124,7 +116,6 @@ export class Device {
     return this.access.token;
   }
 
-  /** Pairs a new device of the same owner (spec v0 section 15.2). */
   async pair(deviceName: string): Promise<Device> {
     const started = await this.server.json("POST", "/v1/pair/start", PairStartResponseSchema, { token: await this.token() });
     const credentials = await this.server.json("POST", "/v1/pair/complete", DeviceCredentialsSchema, {
@@ -134,7 +125,6 @@ export class Device {
   }
 }
 
-/** A file's bytes split into chunks, and the Content that describes them. */
 export interface FileData {
   parts: Uint8Array[];
   content: Content;
@@ -188,7 +178,6 @@ export const op = {
 
 type Call = MessageInitShape<typeof RpcRequestSchema>["call"];
 
-/** One device working in one space: Welcome over the WebSocket, everything else over the HTTP RPC endpoint. */
 export class SpaceClient {
   readonly device: Device;
   readonly spaceId: string;
@@ -202,7 +191,6 @@ export class SpaceClient {
     this.spaceId = spaceId;
   }
 
-  /** Opens the space's WebSocket, sends Hello and returns Welcome, which carries the current history_id. */
   async welcome(): Promise<Welcome> {
     const url = this.device.server.base.replace(/^http/, "ws") + "/v1/spaces/" + this.spaceId + "/ws";
     const token = await this.device.token();
@@ -244,7 +232,6 @@ export class SpaceClient {
     }
   }
 
-  /** Reads the whole log of the history with Resume from seq 0 over the WebSocket, up to CaughtUp (spec v0 section 7.3). */
   async log(historyId: string): Promise<CommitRecord[]> {
     const url = this.device.server.base.replace(/^http/, "ws") + "/v1/spaces/" + this.spaceId + "/ws";
     stats.requests++;
@@ -297,7 +284,6 @@ export class SpaceClient {
     return result;
   }
 
-  /** Asks which chunks are missing, uploads them to the targets the server returns, and returns the receipts. */
   async upload(...files: FileData[]): Promise<{ receipts: UploadReceipt[]; uploaded: number }> {
     const byHash = new Map<string, Uint8Array>();
     for (const file of files) file.content.chunks.forEach((chunk, i) => byHash.set(toHex(chunk.hash), file.parts[i]!));
@@ -316,7 +302,6 @@ export class SpaceClient {
     return { receipts, uploaded: receipts.length };
   }
 
-  /** Commits in the current history with the next device slot; throws when the commit is refused. */
   async commit(ops: Op[], receipts: UploadReceipt[] = []): Promise<CommitResult> {
     const deviceSeq = this.acceptedSeq + 1n;
     const result = await this.rpc({
@@ -329,7 +314,6 @@ export class SpaceClient {
     return result.value;
   }
 
-  /** The live tree, node_id to state, read page by page. */
   async tree(): Promise<Map<string, NodeState>> {
     const nodes = new Map<string, NodeState>();
     let cursor = "";
@@ -342,7 +326,6 @@ export class SpaceClient {
     return nodes;
   }
 
-  /** Downloads a version's chunks from the targets the server returns and returns the SHA-256 of the whole file. */
   async download(content: Content): Promise<string> {
     const result = await this.rpc({ case: "getDownloadTargets", value: { hashes: content.chunks.map((chunk) => chunk.hash) } });
     if (result.case !== "downloadTargets") throw new Error("getDownloadTargets answered " + result.case);

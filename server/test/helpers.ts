@@ -59,12 +59,10 @@ export const op = {
     create(OpSchema, { op: { case: "restore", value: { nodeId, ...init } } }),
 };
 
-/** The key incarnation an upload or download target names. */
 export function targetIncarnation(url: string): string {
   return new URL(url).searchParams.get("inc")!;
 }
 
-/** The R2 keys stored for a chunk, one per incarnation. */
 export async function storedObjects(spaceId: string, hash: Uint8Array | string): Promise<string[]> {
   const hex = typeof hash === "string" ? hash : toHex(hash);
   const listed = await env.BUCKET.list({ prefix: `spaces/${spaceId}/chunks/${hex.slice(0, 2)}/${hex}/` });
@@ -73,10 +71,6 @@ export async function storedObjects(spaceId: string, hash: Uint8Array | string):
 
 type Stub = Awaited<ReturnType<typeof newSpace>>["stub"];
 
-/**
- * Runs a Space DO's alarm at atMs, which takes the export steps due by then. pageNodes sets the nodes per snapshot
- * page. When intercept is given, every R2 put of the run goes through it, with the real put as its second argument.
- */
 export function runSpaceAlarm(
   stub: Stub,
   atMs: number,
@@ -99,7 +93,6 @@ export function runSpaceAlarm(
   });
 }
 
-/** An intercept for runSpaceAlarm that fails the first put whose key matches, after the write landed when landed is set. */
 export function unknownOutcome(match: (key: string) => boolean, landed: boolean) {
   let failed = false;
   return async (key: string, put: () => Promise<unknown>) => {
@@ -121,15 +114,11 @@ export interface CommitInit {
   baseCommittedAtMs?: bigint;
 }
 
-/** A device talking to one space through the binary RPC entry point. */
 export class TestClient {
   baseSeq = 0n;
-  /** The highest device_seq the server accepted from this device, and the slot each commit_id was sent with (RFC 0002 section 2). */
   acceptedSeq = 0n;
   private readonly slots = new Map<string, bigint>();
-  /** The base_seq each commit_id was first sent with, so a retry sends the same request (RFC 0006 section 8). */
   private readonly bases = new Map<string, bigint>();
-  /** Time the receipts are signed for; set it when the Space DO clock is moved. */
   nowMs: number | undefined;
   private nextReq = 1n;
 
@@ -146,7 +135,6 @@ export class TestClient {
     return response.result;
   }
 
-  /** Prepares the chunks, stores the ones the server asks for in R2 the way the Worker would, and returns receipts. */
   async upload(...contents: Content[]): Promise<UploadReceipt[]> {
     return this.uploadBytes(contents.flatMap((c) => c.chunks), new Map());
   }
@@ -172,15 +160,10 @@ export class TestClient {
     return receipts;
   }
 
-  /** The space's current history_id. */
   history(): Promise<string> {
     return runInDurableObject(this.stub, (_instance, state) => String(state.storage.sql.exec("SELECT value FROM meta WHERE key = 'history_id'").one().value));
   }
 
-  /**
-   * Sends a commit in the current history. A new commit_id takes the next device slot and the current base, and a
-   * repeated one keeps both, as a client does; init overrides either field.
-   */
   async commitRaw(ops: Op[], init: CommitInit = {}): Promise<RpcResponse["result"]> {
     const commitId = init.commitId ?? uuidv7();
     const slot = this.slots.get(commitId) ?? this.acceptedSeq + 1n;
@@ -206,7 +189,6 @@ export class TestClient {
     return result;
   }
 
-  /** Commits and advances baseSeq; throws when the call fails. */
   async commit(ops: Op[], init: CommitInit = {}): Promise<CommitResult> {
     const result = await this.commitRaw(ops, init);
     if (result.case !== "commit") throw new Error(`commit failed: ${JSON.stringify((result.value as RpcError | undefined)?.message)}`);

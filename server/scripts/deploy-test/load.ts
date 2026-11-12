@@ -1,11 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The load test (docs/load-test.md), a Vitest suite in Node like smoke.ts. It commits to a deployed, claimed server from
-// many paired devices over the WebSocket, each device with one commit in flight, in steps of rising load, and reads what
-// the server's Durable Objects did from the Analytics API. The LOAD_* variables configure it (load-model.ts). It writes
-// load-results.json to the runner's temporary directory and a table to the job summary. It prints no credential and no
-// chunk ticket.
-
 import { appendFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -48,9 +42,7 @@ const state = readState();
 const server = new Server(state.url ?? "http://unset.invalid");
 const account = accountFromEnv();
 
-/** The step being measured, or undefined between measuring windows. Connections record into it. */
 let measuring: StepCounts | undefined;
-/** Commits accepted from the writers since the run started, calibration included. */
 let committed = 0;
 let budget = Number.POSITIVE_INFINITY;
 let stopping = false;
@@ -65,7 +57,6 @@ class Timeout extends Error {}
 type ClientMsg = MessageInitShape<typeof ClientMessageSchema>["msg"];
 type Answer = (response: RpcResponse | Error) => void;
 
-/** One device's WebSocket to one space. A live session sends Resume and then receives every commit as a push. */
 class Session {
   readonly device: Device;
   readonly spaceId: string;
@@ -90,7 +81,6 @@ class Session {
     return this.socket?.readyState === WebSocket.OPEN;
   }
 
-  /** Opens the WebSocket and sends Hello; resolves at Welcome, or for a live session at CaughtUp after Resume. */
   async connect(): Promise<void> {
     const token = await this.device.token();
     const socket = new WebSocket(server.base.replace(/^http/, "ws") + "/v1/spaces/" + this.spaceId + "/ws", { headers: { Authorization: "Bearer " + token } });
@@ -150,7 +140,6 @@ class Session {
     });
   }
 
-  /** Sends Reauth with a fresh token when the device has refreshed it, so the server does not close the session. */
   async keepToken(): Promise<void> {
     if (Date.now() - this.tokenCheckedAtMs < TOKEN_CHECK_MS) return;
     this.tokenCheckedAtMs = Date.now();
@@ -160,7 +149,6 @@ class Session {
     this.sentToken = token;
   }
 
-  /** Sends one commit that sets a node's content in the device's next slot and waits for its answer. */
   commit(nodeId: string, content: Content): Promise<RpcResponse> {
     const socket = this.socket;
     if (!socket || socket.readyState !== WebSocket.OPEN) return Promise.reject(new Error("not connected"));
@@ -199,7 +187,6 @@ class Session {
 
 interface SpaceRun {
   spaceId: string;
-  /** The two contents each writer's file switches between; both chunks are already stored. */
   contents: [Content, Content];
   nodeIds: string[];
   setupCommits: number;
@@ -213,7 +200,6 @@ interface Writer {
   loop?: Promise<void>;
 }
 
-/** Commits as fast as one commit in flight allows until the writer is stopped or the budget is spent. */
 async function write(writer: Writer): Promise<void> {
   const { session } = writer;
   let next = 0;
@@ -275,7 +261,6 @@ async function write(writer: Writer): Promise<void> {
   }
 }
 
-/** Keeps a live session open; its pushes give the push lag. */
 async function subscribe(session: Session): Promise<void> {
   while (!stopping) {
     try {
@@ -289,7 +274,6 @@ async function subscribe(session: Session): Promise<void> {
   }
 }
 
-/** Times GET /v1/spaces, which asks only the Account DO, as a gauge of how long it queues requests. */
 async function probe(owner: Device): Promise<void> {
   while (!stopping) {
     const started = performance.now();
@@ -308,7 +292,6 @@ function applied(result: CommitResult): void {
   if (codes.some((code) => code !== "APPLIED")) throw new Error("a setup commit was not applied: " + codes.join(", "));
 }
 
-/** A space with one small file per writer, and two stored chunks the writers' commits switch between. */
 async function makeSpace(owner: Device, index: number, files: number): Promise<SpaceRun> {
   const created = await server.json("POST", "/v1/spaces", SpaceInfoSchema, { body: { name: "Load test " + (index + 1) + " " + uuidv7().slice(-8) }, token: await owner.token(), status: 201 });
   const client = new SpaceClient(owner, created.spaceId);
@@ -334,7 +317,6 @@ async function pairMany(owner: Device, n: number, label: string): Promise<Device
   return devices;
 }
 
-/** Runs the writers given for ms milliseconds, or until the budget is spent, and stops them again. */
 async function runFor(writers: Writer[], ms: number): Promise<number> {
   const started = Date.now();
   start(writers);
@@ -358,7 +340,7 @@ async function stop(writers: Writer[]): Promise<void> {
   await Promise.all(writers.map((writer) => writer.loop));
 }
 
-// Analytics. Figures for a window are read after the run, because the Analytics API lags by minutes.
+// Figures for a window are read after the run, because the Analytics API lags by minutes.
 
 interface ClassUsage {
   requests: number;
@@ -366,7 +348,6 @@ interface ClassUsage {
   wallTimeP50Ms?: number;
   wallTimeP99Ms?: number;
   cpuMs: number;
-  /** CPU time of the busiest object of the class. */
   busiestObjectCpuMs: number;
   objects: number;
   rowsRead: number;
@@ -393,7 +374,6 @@ async function accountQuery<T>(account: Account, inner: string, vars: Record<str
   return data.viewer.accounts[0]!;
 }
 
-/** What each Durable Object class did in one window, by class name. */
 async function usage(account: Account, namespaces: Namespace[], window: Window): Promise<Record<string, ClassUsage>> {
   const vars = { ids: namespaces.map((namespace) => namespace.id), start: iso(window.startMs), end: iso(window.endMs) };
   const filter = "filter: { namespaceId_in: $ids, datetime_geq: $start, datetime_leq: $end }";
@@ -457,8 +437,6 @@ async function storageSamples(account: Account, namespaces: Namespace[], startMs
   );
   return data.durableObjectsSqlStorageGroups.map((row) => ({ namespaceId: row.dimensions.namespaceId, datetime: row.dimensions.datetime, storedBytes: row.max.storedBytes }));
 }
-
-// The run.
 
 const runs: SpaceRun[] = [];
 const writers: Writer[][] = [];
@@ -654,7 +632,6 @@ describe("load test " + config.scenario, () => {
   });
 });
 
-/** Writes load-results.json and the summary table; partial says why they are incomplete, or is empty. */
 function writeResults(partial: string): void {
   written = true;
   results.partial = partial || null;

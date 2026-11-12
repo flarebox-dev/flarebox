@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The parts of e2e.ts that need no server: matching a folder against a scenario's tree, checking the space after
-// a rewind against the log before it, and sealing the macOS device's pairing code.
-
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";

@@ -9,18 +9,14 @@ import { AccessTokenSchema, type DeviceCredentials, TokenRequestSchema } from ".
 import { Error_Code } from "../src/gen/koidrive/v1/rpc_pb";
 import { base64url } from "../src/crypto";
 
-// RFC 0011 section 1: refresh credential rotation on POST /v1/token.
-
 const MINUTE = 60_000;
 
-/** A credential as a device generates one: 32 random bytes, base64url without padding. */
 function newCredential(): string {
   return base64url(crypto.getRandomValues(new Uint8Array(32)));
 }
 
 type Row = { refresh_hash: ArrayBuffer; last_seen_ms: number | null; rotation_clock_ms: number };
 
-/** Runs `body` in a fresh Account DO with one claimed device and a clock the test sets. */
 function withDevice(
   name: string,
   body: (instance: AccountDO, device: DeviceCredentials, row: () => Row, setClock: (ms: number) => void, sql: SqlStorage) => Promise<void>,
@@ -196,8 +192,6 @@ describe("refresh credential rotation (RFC 0011 section 1)", () => {
   });
 
   it("never answers an earlier time after the clock moves back, so a delayed proposal is stored only if no later time was answered", async () => {
-    // The client saw a time later than its deadline and cleared its staged credential; the delayed proposal then arrives
-    // while the clock reads a time before the deadline.
     await withDevice("rotation-clock-cleared", async (instance, device, row, setClock) => {
       const start = await instance.refreshAccess({ deviceId: device.deviceId, refreshCredential: device.refreshCredential, rotation: true });
       if (!start.ok) throw new Error(start.message);
@@ -221,9 +215,6 @@ describe("refresh credential rotation (RFC 0011 section 1)", () => {
       expect(hex(row().refresh_hash)).toBe(before);
     });
 
-    // The proposal was dropped before it reached the server and the clock moved back: the answers carry the rotation
-    // clock, so the same staged credential proposed again is stored, and a copy of the first proposal arriving later
-    // presents a credential that is no longer stored.
     await withDevice("rotation-clock-retried", async (instance, device, _row, setClock) => {
       const start = await instance.refreshAccess({ deviceId: device.deviceId, refreshCredential: device.refreshCredential, rotation: true });
       if (!start.ok) throw new Error(start.message);

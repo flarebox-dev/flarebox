@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Tests the parts of the load test that need no server (load-model.ts).
-
 import { describe, expect, it } from "vitest";
 import { commitBudget, commitsAt, emptyCounts, layout, percentile, readConfig, saturated, summarize, workersPlan } from "./load-model.ts";
 

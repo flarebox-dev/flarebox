@@ -18,7 +18,6 @@ const DAY = 24 * 60 * MINUTE;
 
 type Space = Awaited<ReturnType<typeof newSpace>>;
 
-/** Moves the Space DO's clock, and the time the device signs its receipts for, to atMs. */
 function setClock(space: Space, device: TestClient, atMs: number) {
   device.nowMs = atMs;
   return runInDurableObject(space.stub, (instance: SpaceDO) => {
@@ -40,7 +39,6 @@ async function manifests(prefix: string): Promise<Manifest[]> {
   return out;
 }
 
-/** Restores the space from R2 alone and checks that it matches the Space DO's state. */
 async function expectRestorable(space: Space) {
   const restored = await restoreFromR2(space.spaceId);
   const server = await serverState(space.stub);
@@ -49,10 +47,6 @@ async function expectRestorable(space: Space) {
   return restored;
 }
 
-/**
- * Turns the space into one that a server without the export created, with the given meta, and reopens its object: no
- * export state, no export task and nothing in R2.
- */
 async function forgetExport(space: Space, meta: Record<string, number> = {}) {
   await runInDurableObject(space.stub, (_instance, state) => {
     const { sql } = state.storage;
@@ -65,8 +59,8 @@ async function forgetExport(space: Space, meta: Record<string, number> = {}) {
 }
 
 /**
- * Runs what opening the Space DO runs, as a new instance over the same storage does after a restart. It opens a minute
- * ahead, so that a deadline it sets is not already past, which setAlarm would move to the moment of the call.
+ * Opens a minute ahead, so that a deadline it sets is not already past, which setAlarm would move to the moment of the
+ * call.
  */
 function reopen(space: Space) {
   return runInDurableObject(space.stub, (_instance, state) => {
@@ -76,7 +70,6 @@ function reopen(space: Space) {
   });
 }
 
-/** The alarm the Space DO has set, and the earliest deadline in its schedule. */
 function alarmState(space: Space) {
   return runInDurableObject(space.stub, async (_instance, state) => ({
     alarm: await state.storage.getAlarm(),
@@ -86,17 +79,12 @@ function alarmState(space: Space) {
   }));
 }
 
-/** Makes the Space DO's next setAlarm fail. */
 function failNextAlarm(space: Space) {
   return runInDurableObject(space.stub, (_instance, state) => {
     vi.spyOn(state.storage, "setAlarm").mockRejectedValueOnce(new Error("the alarm write failed"));
   });
 }
 
-/**
- * Records the seq of every commit record that an RPC hands to its caller, which the WebSocket and HTTP paths push to
- * the space's live connections.
- */
 async function recordPushes(space: Space): Promise<bigint[]> {
   const seqs: bigint[] = [];
   await runInDurableObject(space.stub, (instance: SpaceDO) => {
@@ -162,8 +150,8 @@ describe("R2 metadata export (spec v0 section 11, RFC 0004)", () => {
     await setClock(space, a, (now += DAY));
     const [f4, f5] = [uuidv7(), uuidv7()];
     await a.commit([op.create(f4, dir, "d.txt", c5!), op.mkdir(f5, spaceId, "e")], { receipts: await a.upload(c5!) });
-    // The alarm pauses while it writes the first page, and a commit lands in between. Each side polls a flag, because a
-    // promise resolved inside the Durable Object would carry its I/O context back into the test.
+    // Each side polls a flag, because a promise resolved inside the Durable Object would carry its I/O context back
+    // into the test.
     const receipts = await a.upload(c2!);
     const pause = { reached: false, released: false };
     const until = async (flag: () => boolean) => {

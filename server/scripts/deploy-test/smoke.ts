@@ -1,10 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Smoke test of a deployed server over HTTPS (docs/deploy-test.md): pairing, a space, commits with chunk uploads,
-// share links with and without a password, the R2 metadata export (RFC 0004) and one point-in-time rewind (RFC 0003)
-// on the real Durable Object. run.ts deploys and claims the server first. The tests build on each other and run in
-// order; the first failure stops the rest.
-
 import { create, toJson } from "@bufbuild/protobuf";
 import { afterAll, describe, expect, it } from "vitest";
 import { RewindRequestSchema, RewindResultSchema, ServerInfo_DataPath, ServerInfoSchema, SpaceInfoSchema, SpaceListSchema } from "../../src/gen/koidrive/v1/auth_pb";
@@ -22,14 +17,12 @@ const account: Account = requireAccount();
 const server = new Server(state.url);
 const owner = new Device(server, state.owner);
 const encoder = new TextEncoder();
-/** Spec v0 section 11: a log segment is written five minutes after the first commit not yet exported. */
 const SEGMENT_WAIT_MS = 9 * 60_000;
 const SNAPSHOT_WAIT_MS = 5 * 60_000;
 const REWIND_WAIT_MS = 5 * 60_000;
 
 afterAll(() => addStats(stats));
 
-/** What the tests share, filled in as they run. */
 const run = {
   second: undefined as Device | undefined,
   spaceId: "",

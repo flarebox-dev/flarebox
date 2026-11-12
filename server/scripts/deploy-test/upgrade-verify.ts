@@ -1,10 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The second half of the upgrade test (docs/deploy-test.md), after the commit under test replaced the earlier release
-// on the same Worker, Durable Objects and bucket. Each Durable Object runs its missing schema steps when it first
-// starts on the new code and refuses every request if a step fails (docs/design/deploy-and-upgrade.md section 3.1), so
-// objects written by the earlier release answering correctly here is the evidence that their migrations ran.
-
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { ServerInfoSchema, SpaceListSchema } from "../../src/gen/koidrive/v1/auth_pb";

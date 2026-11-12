@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// The first half of the upgrade test (docs/deploy-test.md): on the release deployed before the upgrade, pairs a second
-// device, writes a space with files and creates a share link, and records what it wrote for upgrade-verify.ts.
-
 import { afterAll, expect, it } from "vitest";
 import { SpaceInfoSchema } from "../../src/gen/koidrive/v1/auth_pb";
 import { OpResult_Code } from "../../src/gen/koidrive/v1/commit_pb";

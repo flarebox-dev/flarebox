@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Checks that pack-bundle.mjs replaces nothing in its output, including a file that appears there during the dry run,
-// and refuses an output inside the assets it copies.
-// Usage: node --test scripts/check-pack-bundle.mjs
-
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -16,7 +12,6 @@ const packer = join(dirname(fileURLToPath(import.meta.url)), "pack-bundle.mjs");
 const DRY_RUN = "$ wrangler deploy --dry-run";
 const assets = join(dirname(packer), "..", "web", "dist");
 
-/** Packs into an empty output directory and calls `during` once the dry run has started. */
 async function packWhile(during) {
   const dir = mkdtempSync(join(tmpdir(), "pack-bundle-test-"));
   const output = join(dir, "out");

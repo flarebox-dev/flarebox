@@ -1,10 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Runs run.ts against MockCloudflare: teardown deletes only resources whose identity this run recorded, a name that is
-// already taken stops the deploy before it creates anything, a Worker is recorded only when this run's own deploy
-// created it, and the claim code read through the pinned Wrangler's tail ends up in no file and no output, whether the
-// claim succeeds or fails.
-
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -45,7 +40,6 @@ function readState(): State {
   return JSON.parse(readFileSync(join(work, "state.json"), "utf8")) as State;
 }
 
-/** Runs a command to completion without blocking this process, which serves the mock API. */
 function exec(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv): Promise<{ status: number | null; output: string }> {
   return new Promise((resolve) => {
     const child = spawn(command, args, { cwd, env });
@@ -78,18 +72,11 @@ function runTs(...args: string[]): Promise<{ status: number | null; output: stri
 }
 
 interface Step {
-  /** Uploads a version of the run's Worker through the mock, creating the Worker if needed. */
   createsWorker: boolean;
-  /** Whether that upload carries the deploy's --tag, as Wrangler's does; a concurrent creator's never does. */
   tagged?: boolean;
   status: number;
 }
 
-/**
- * Puts a pnpm on run.ts's PATH that logs its arguments without --tag, uploads the run's Worker through the mock when a
- * step says so (as a concurrent creator during install, or as Wrangler during deploy), and exits with the step's status.
- * A deploy that exits 0 prints what wrangler deploy prints.
- */
 function fakePnpm(steps: { install: Step; deploy: Step }): void {
   const script = `#!${process.execPath}
 const { appendFileSync } = require("node:fs");
@@ -115,7 +102,6 @@ function pnpmCalls(): string[] {
   return existsSync(join(work, "pnpm.log")) ? readFileSync(join(work, "pnpm.log"), "utf8").trim().split("\n") : [];
 }
 
-/** Files under root whose bytes contain text. */
 function filesContaining(root: string, text: string): string[] {
   const found: string[] = [];
   for (const entry of readdirSync(root, { withFileTypes: true, recursive: true })) {

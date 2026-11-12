@@ -3,8 +3,6 @@
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
 
-// The deploy test's suites run in Node against a deployed server, one file at a time and in order, and stop at the
-// first failure because each test builds on the one before. Waiting for R2 export segments takes minutes.
 export default defineConfig({
   root: fileURLToPath(new URL(".", import.meta.url)),
   test: {

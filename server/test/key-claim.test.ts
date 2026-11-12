@@ -10,7 +10,6 @@ import { Error_Code, ErrorSchema } from "../src/gen/koidrive/v1/rpc_pb";
 
 const BASE = "https://koidrive.test";
 const ADDRESS = "198.51.100.7";
-/** The key vitest.config.ts gives the Worker as KOIDRIVE_RECOVERY_KEY. */
 const RECOVERY_KEY = "test-recovery-key-for-local-workerd-only";
 const request = { userName: "Owner", deviceName: "Laptop", platform: "macos" };
 
@@ -43,7 +42,6 @@ async function claimed(): Promise<boolean> {
   return fromBinary(ServerInfoSchema, new Uint8Array(await response.arrayBuffer())).claimed;
 }
 
-/** Opens /setup and returns the claim code it wrote to the log. */
 async function setupCode(): Promise<string | undefined> {
   const log = vi.spyOn(console, "log");
   await exports.default.fetch(BASE + "/setup").then((response) => response.text());
@@ -52,7 +50,6 @@ async function setupCode(): Promise<string | undefined> {
   return line?.split(": ")[1];
 }
 
-/** Storage is shared by the tests in this file, and they run in order on one unclaimed deployment. */
 describe("claim with the recovery key on a deployment without an owner", () => {
   it("ignores a key that is too short, and does not count it as a wrong code", async () => {
     const outcome = await account().claim({ ...request, code: "short-key" }, ADDRESS, "short-key");

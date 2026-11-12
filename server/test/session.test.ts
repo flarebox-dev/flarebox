@@ -74,7 +74,6 @@ function body<S extends DescMessage>(schema: S, init: MessageInitShape<S>): Uint
   return toBinary(schema, create(schema, init));
 }
 
-/** A request's status, and the error code of a refusal that carries an Error. */
 async function send(path: string, init: { method?: string; token?: string; body?: Uint8Array }) {
   const headers: Record<string, string> = { "Content-Type": "application/x-protobuf" };
   if (init.token) headers.Authorization = "Bearer " + init.token;
@@ -86,10 +85,6 @@ async function send(path: string, init: { method?: string; token?: string; body?
 
 let owner: DeviceCredentials | undefined;
 
-/**
- * Durable Object storage is shared by the tests in this file, so the deployment is claimed once (by the first
- * test) and the owner's credentials are reused.
- */
 async function getOwner(): Promise<DeviceCredentials> {
   owner ??= await claimOwner();
   return owner;
@@ -116,7 +111,6 @@ async function createSpace(owner: DeviceCredentials): Promise<string> {
   return created.message!.spaceId;
 }
 
-/** Moves the Space DO's clock past every lease it holds, so it asks the Account DO again (RFC 0014 section 1). */
 function passLeases(spaceId: string) {
   return runInDurableObject(env.SPACE.get(env.SPACE.idFromName(spaceId)), (instance: SpaceDO) => {
     const offsetMs = instance.clock() - Date.now() + SESSION_LEASE_MS + 1000;
@@ -124,7 +118,6 @@ function passLeases(spaceId: string) {
   });
 }
 
-/** The commit_id and committed_at_ms of the commit at a seq (RFC 0013). */
 interface CommitToken {
   commitId: string;
   committedAtMs: bigint;
@@ -134,14 +127,12 @@ function tokenOf(record: CommitRecord): CommitToken {
   return { commitId: record.commitId, committedAtMs: record.committedAtMs };
 }
 
-/** A WebSocket client speaking the binary session protocol. */
 class Socket {
   private readonly queue: ServerMessage[] = [];
   private readonly texts: string[] = [];
   private wake: (() => void) | undefined;
   private nextReq = 1n;
   closed: { code: number; reason: string } | undefined;
-  /** From the last Welcome: the space's history and this device's highest accepted device_seq (RFC 0002 section 2). */
   historyId = "";
   acceptedSeq = 0n;
 
@@ -212,7 +203,6 @@ class Socket {
     return msg.value;
   }
 
-  /** Sends Resume and collects the backlog until CaughtUp. */
   async resume(
     historyId: string,
     sinceSeq: bigint,
@@ -238,7 +228,6 @@ class Socket {
     return msg.value.result;
   }
 
-  /** The history and the next device slot for a new commit. */
   slot() {
     return { historyId: this.historyId, deviceSeq: this.acceptedSeq + 1n };
   }
@@ -257,7 +246,6 @@ class Socket {
     return msg.value.commits;
   }
 
-  /** Hello and a full Resume from seq 0. */
   async start(): Promise<Welcome> {
     const welcome = await this.hello();
     await this.resume(welcome.historyId, 0n);
@@ -269,7 +257,6 @@ async function put(target: Target, bytes: Uint8Array): Promise<Response> {
   return exports.default.fetch(target.url, { method: target.method, body: bytes, headers: { "Content-Type": "application/x-protobuf" } });
 }
 
-/** PrepareUpload over the socket, then PUT each requested chunk to its relay target and collect the receipts. */
 async function prepared(socket: Socket, text: string) {
   const parts = await content(text);
   const plan = await socket.rpc({ case: "prepareUpload", value: { chunks: parts.content.chunks } });
@@ -787,7 +774,6 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
     expect(await send("/v1/pair/complete", { body: pairBody })).toEqual({ status: 403, code: Error_Code.FORBIDDEN });
   });
 
-  /** Commits one folder as the owner over HTTP, so that the space pushes it to every other live connection. */
   async function commitAsOwner(owner: DeviceCredentials, spaceId: string, historyId: string) {
     const deviceSeq = BigInt(Number((await runInDurableObject(env.SPACE.get(env.SPACE.idFromName(spaceId)), (_instance, state) =>
       state.storage.sql.exec("SELECT COALESCE(MAX(device_seq), 0) AS seq FROM device_commits WHERE device_id = ?", owner.deviceId).one().seq)))) + 1n;
@@ -978,7 +964,6 @@ describe("RFC 0006 principals, capabilities and device routes", () => {
 });
 
 describe("RFC 0014 session leases", () => {
-  /** Runs body with the Account DO granting leases of leaseMs, so a test waits for one in about a second. */
   async function withLease<T>(leaseMs: number, body: () => Promise<T>): Promise<T> {
     const set = (value: number) => runInDurableObject(account(), (instance: AccountDO) => {
       instance.sessionLeaseMs = value;
@@ -991,7 +976,6 @@ describe("RFC 0014 session leases", () => {
     }
   }
 
-  /** Makes every Space DO refuse revocation notices until the returned function runs. */
   async function loseNotices(spaceId: string): Promise<() => void> {
     vi.spyOn(console, "error").mockImplementation(() => {});
     const prototype = await runInDurableObject(env.SPACE.get(env.SPACE.idFromName(spaceId)), (instance: SpaceDO) => Object.getPrototypeOf(instance) as SpaceDO);
@@ -1004,7 +988,6 @@ describe("RFC 0014 session leases", () => {
     };
   }
 
-  /** Revokes the device in the Account DO's row alone, as a revocation whose notice never reaches the space. */
   function revokeRowOnly(deviceId: string) {
     return runInDurableObject(account(), (_instance, state) => {
       state.storage.sql.exec("UPDATE devices SET revoked_at_ms = ? WHERE device_id = ?", Date.now(), deviceId);
@@ -1113,7 +1096,6 @@ describe("RFC 0014 session leases", () => {
 
 describe("RFC 0007 name limits and space list pages", () => {
   const refused = { status: 400, code: Error_Code.INVALID_ARGUMENT };
-  /** 255 bytes of UTF-8 in 85 three-byte characters. */
   const longest = "가".repeat(85);
   const tooLong = longest + "a";
 
@@ -1864,7 +1846,6 @@ describe("chunk relay", () => {
     expect(await env.BUCKET.head(key)).toBeNull();
   });
 
-  /** An Account DO binding whose serverKey calls go through `serverKey`, so a test can count or fail them. */
   function accountBinding(serverKey: () => Promise<ServerKey>) {
     return { idFromName: (name: string) => env.ACCOUNT.idFromName(name), get: () => ({ serverKey }) };
   }
@@ -1990,10 +1971,8 @@ describe("platform limits", () => {
   const DAILY = "Exceeded allowed rows written in Durable Objects free tier.";
   const DAILY_MESSAGE = "the server reached a Workers Free daily limit; it resets at 00:00 UTC";
   const HOUR_MS = 3_600_000;
-  /** The wait RFC 0001 section 9 gives at nowMs: 5 minutes in the first 30 minutes after 00:00 UTC, else until the next one. */
   const wait = (nowMs: number) => BigInt(nowMs % DAY_MS < HOUR_MS / 2 ? 300_000 : DAY_MS - (nowMs % DAY_MS));
 
-  /** A started session whose Space DO clock reads sinceMidnightMs after yesterday's 00:00 UTC, so it is never ahead of the token. */
   async function connected(sinceMidnightMs = HOUR_MS) {
     const a = await getOwner();
     const spaceId = await createSpace(a);

@@ -14,10 +14,6 @@ import type { SpaceDO } from "../src/space-do";
 import { MIGRATIONS as SPACE_MIGRATIONS } from "../src/space/schema";
 import { client, op, OWNER, SPACE_KEY } from "./helpers";
 
-/**
- * The schema digest after each step. A merged step must never change, so a mismatch at an existing index is a bug;
- * a new step appends the digest this test prints for it.
- */
 const SPACE_SCHEMA_DIGESTS = [
   "f0dd32ba05d33cf9fb7f49c7d88d2e31834c31e90d2c04b67f4ff0a13b4308fe",
   "bb60e374153c4e445e5b82b2048364ba560f7bf665698c1e73d8d6c974fe088a",
@@ -66,7 +62,6 @@ const ACCOUNT: StorageKind = {
   stub: (name) => env.ACCOUNT.get(env.ACCOUNT.idFromName(name)),
 };
 
-/** A storage state an older build left behind: the first `applied` steps, with or without a recorded version. */
 interface OldState {
   label: string;
   applied: number;
@@ -104,7 +99,6 @@ function versionOf(sql: SqlStorage, kind: StorageKind): number {
   return Number(sql.exec(`SELECT value FROM ${kind.versionTable} WHERE key = 'schema_version'`).one().value);
 }
 
-/** Replaces the object's tables with the state an older build left behind. */
 function rewrite(sql: SqlStorage, kind: StorageKind, state: OldState, version = state.applied): void {
   for (const table of userTables(sql)) sql.exec(`DROP TABLE "${table}"`);
   for (const step of kind.steps.slice(0, state.applied)) {
@@ -123,7 +117,6 @@ function columnsOf(sql: SqlStorage, table: string): { name: string; type: string
     .map((row) => ({ name: String(row.name), type: String(row.type) }));
 }
 
-/** The rows of a table, leaving out the schema version that migrations maintain. */
 function readRows(sql: SqlStorage, table: string, columns: string[]): Rows {
   const list = columns.map((column) => `"${column}"`).join(", ");
   return sql
@@ -133,7 +126,6 @@ function readRows(sql: SqlStorage, table: string, columns: string[]): Rows {
     .map((row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, value instanceof ArrayBuffer ? toHex(new Uint8Array(value)) : value])));
 }
 
-/** Puts one row in every table, so that a migration that drops or rewrites data shows up. Returns what each table holds. */
 function seed(sql: SqlStorage): Map<string, { columns: string[]; rows: Rows }> {
   const seeded = new Map<string, { columns: string[]; rows: Rows }>();
   for (const table of userTables(sql)) {

@@ -2,10 +2,6 @@
 
 import { type Pitr, pitrBackend } from "../src/space/pitr";
 
-// Local workerd does not implement point-in-time recovery, so the rewind tests replace it with snapshots of the Space
-// DO's SQLite tables that the tests take at chosen times. A restore armed for the next start applies when the object
-// starts again, as PITR does.
-
 type Row = Record<string, SqlStorageValue>;
 
 export interface Dump {
@@ -75,9 +71,7 @@ function simulated(state: DurableObjectState): Simulated {
 }
 
 export const simulatedPitr = {
-  /** When set, an armed restore is dropped, as if the object restarted before PITR recorded it. */
   dropArms: false,
-  /** When set, replaces the bookmark chosen for a time. */
   bookmarkFor: undefined as ((timestampMs: number) => string) | undefined,
 
   install(): void {
@@ -104,7 +98,6 @@ export const simulatedPitr = {
     };
   },
 
-  /** Records the object's current storage as its state at atMs. */
   snapshot(state: DurableObjectState, atMs: number): string {
     const bookmark = nextBookmark();
     simulated(state).snapshots.push({ bookmark, atMs, dump: dump(state.storage.sql) });

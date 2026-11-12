@@ -20,7 +20,6 @@ import { Error_Code, ErrorSchema } from "../src/gen/koidrive/v1/rpc_pb";
 const BASE = "https://koidrive.test";
 const OWNER_ADDRESS = "198.51.100.7";
 const STRANGER_ADDRESS = "203.0.113.9";
-/** The key vitest.config.ts gives the Worker as KOIDRIVE_RECOVERY_KEY. */
 const RECOVERY_KEY = "test-recovery-key-for-local-workerd-only";
 const WRONG_CODE = "AAAA-BBBB-CCCC";
 
@@ -55,7 +54,6 @@ function claim(code: string, address: string | undefined, deviceName = "Laptop",
   return call("/v1/claim", body, DeviceCredentialsSchema, address);
 }
 
-/** Sends wrong codes from one address until it is throttled, and checks the responses on the way. */
 async function throttle(address: string | undefined, wrongCode: string): Promise<void> {
   const left = CLAIM_FAILURES_PER_WINDOW - (await failuresOf(address ?? "(no address)"));
   for (let i = 0; i < left; i++) expect((await claim(wrongCode + i, address)).status).toBe(403);
@@ -66,7 +64,6 @@ function failuresOf(client: string): Promise<number> {
   return inAccount((sql) => Number(sql.exec("SELECT COALESCE(SUM(failures), 0) AS n FROM claim_failures WHERE client = ?", client).one().n));
 }
 
-/** Opens /setup and returns the claim code it wrote to the log, if it wrote one. */
 async function setup(): Promise<{ text: string; code: string | undefined }> {
   const log = vi.spyOn(console, "log");
   const text = await exports.default.fetch(BASE + "/setup").then((response) => response.text());
@@ -83,7 +80,6 @@ async function claimed(): Promise<boolean> {
 let owner: DeviceCredentials | undefined;
 let firstCode = "";
 
-/** Storage is shared by the tests in this file, and they run in order: unclaimed, claimed, then recovery. */
 describe("first owner claim", () => {
   it("refuses a claim before /setup has issued a code", async () => {
     expect(await claimed()).toBe(false);

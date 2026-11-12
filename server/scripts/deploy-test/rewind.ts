@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// What the deploy test's rewind scenario expects of the server, from the server's own log: rewind-check.ts reads the
-// log and the tree, and these functions compare them.
-
 import { type CommitRecord, NodeKind, type NodeState, NodeStatus } from "../../src/gen/koidrive/v1/model_pb";
 
-/** The space's nodes as the server's log has them at seq: each node as the last record up to seq wrote it, without purged nodes. */
 export function replay(log: CommitRecord[], seq: bigint): Map<string, NodeState> {
   const nodes = new Map<string, NodeState>();
   for (const commit of log) {
@@ -18,7 +14,6 @@ export function replay(log: CommitRecord[], seq: bigint): Map<string, NodeState>
   return nodes;
 }
 
-/** One line per live node but the root, which no commit writes: id, parent, name, kind and current version. */
 function liveNodes(nodes: Map<string, NodeState>): string {
   return [...nodes.values()]
     .filter((node) => node.status === NodeStatus.LIVE && node.parentId !== "")
@@ -27,11 +22,6 @@ function liveNodes(nodes: Map<string, NodeState>): string {
     .join("");
 }
 
-/**
- * Why the space after a rewind to restoreSeq is not the state its old history held at that seq, or undefined when it is:
- * the new history's log must be the old log up to restoreSeq and end there, and the server's live tree must be that log's
- * tree at restoreSeq.
- */
 export function rewindMismatch(before: CommitRecord[], after: CommitRecord[], tree: Map<string, NodeState>, restoreSeq: bigint): string | undefined {
   const head = (log: CommitRecord[]) => log.at(-1)?.seq ?? 0n;
   if (head(before) < restoreSeq) return "the rewind reports restore_seq " + restoreSeq + ", but the log before it ends at seq " + head(before);
@@ -45,7 +35,6 @@ export function rewindMismatch(before: CommitRecord[], after: CommitRecord[], tr
   return undefined;
 }
 
-/** The live files of the tree by path, with / separators, in byte order. */
 export function filePaths(tree: Map<string, NodeState>): [string, NodeState][] {
   const path = (node: NodeState): string => {
     const parent = tree.get(node.parentId);
