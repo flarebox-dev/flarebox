@@ -21,9 +21,11 @@ import {
   layout,
   readConfig,
   saturated,
+  settledRows,
   type StepCounts,
   type StepSummary,
   summarize,
+  type UsageReading,
 } from "./load-model.ts";
 import { addStats, readState } from "./state.ts";
 
@@ -33,7 +35,7 @@ const PROBE_EVERY_MS = 2_000;
 const CALIBRATION_WRITERS = 5;
 const CALIBRATION_MS = 120_000;
 const ANALYTICS_LAG_MS = 3 * 60_000;
-const CALIBRATION_WAIT_MS = ANALYTICS_LAG_MS + 10 * 60_000;
+const CALIBRATION_WAIT_MS = ANALYTICS_LAG_MS + 20 * 60_000;
 const CALIBRATION_READ_EVERY_MS = 60_000;
 const STORAGE_WAIT_MS = 20 * 60_000;
 
@@ -508,20 +510,25 @@ describe("load test " + config.scenario, () => {
     const namespaces = await namespacesOf(account, state.name);
     const deadline = Date.now() + CALIBRATION_WAIT_MS;
     await sleep(ANALYTICS_LAG_MS);
-    const readings: number[] = [];
+    const readings: UsageReading[] = [];
+    let rows = 0;
     while (Date.now() < deadline) {
       try {
-        readings.push(rowsWritten(await usage(account, namespaces, calibration)));
+        const used = await usage(account, namespaces, calibration);
+        readings.push({ requests: used.SpaceDO?.requests ?? 0, rowsWritten: rowsWritten(used) });
       } catch (error) {
         console.log("Analytics API: " + (error instanceof Error ? error.message : String(error)).slice(0, 200));
       }
-      const last = readings.slice(-3);
-      if (last.length === 3 && last[0]! > 0 && last.every((reading) => reading === last[0])) break;
+      rows = settledRows(readings, commits) ?? 0;
+      if (rows > 0) break;
       await sleep(CALIBRATION_READ_EVERY_MS);
     }
-    const settled = readings.slice(-3);
-    const rows = settled.length === 3 && settled[0]! > 0 && settled.every((reading) => reading === settled[0]) ? settled[0]! : 0;
-    if (rows === 0 && readings.length > 0) console.log("Rows written did not settle at a positive count in three readings a minute apart: " + readings.join(", "));
+    if (rows === 0 && readings.length > 0) {
+      console.log(
+        "Analytics did not report SpaceDO requests and rows written of at least the " + commits + " commits, unchanged a minute apart, within " + CALIBRATION_WAIT_MS / 60_000 + " minutes. Requests / rows written per reading: " +
+          readings.map((reading) => reading.requests + "/" + reading.rowsWritten).join(", "),
+      );
+    }
     const rowsPerCommit = rows > 0 ? rows / commits : FALLBACK_ROWS_PER_COMMIT;
     budget = commitBudget(config.maxRowsWritten, rowsPerCommit);
     results.calibration = { commits, ranMs, rowsWritten: rows, rowsPerCommit: rows > 0 ? rowsPerCommit : null, assumed: rows > 0 ? null : FALLBACK_ROWS_PER_COMMIT, budget };

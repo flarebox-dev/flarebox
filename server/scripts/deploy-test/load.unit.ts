@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { describe, expect, it } from "vitest";
-import { commitBudget, commitsAt, emptyCounts, layout, percentile, readConfig, saturated, summarize, workersPlan } from "./load-model.ts";
+import { commitBudget, commitsAt, emptyCounts, layout, percentile, readConfig, saturated, settledRows, summarize, workersPlan } from "./load-model.ts";
 
 describe("the load test's configuration", () => {
   it("runs the plan's steps by default", () => {
@@ -79,6 +79,22 @@ describe("the run's limits", () => {
   it("leaves headroom in the commit budget", () => {
     expect(commitBudget(40_000_000, 32)).toBe(1_000_000);
     expect(commitBudget(1000, 0)).toBe(800);
+  });
+
+  it("calibrates only from Analytics readings that cover every commit and stopped changing", () => {
+    const commits = 1480;
+    const seen = [
+      { requests: 0, rowsWritten: 0 },
+      { requests: 900, rowsWritten: 8235 },
+      { requests: 900, rowsWritten: 8235 },
+      { requests: 1490, rowsWritten: 16324 },
+    ];
+    expect(settledRows(seen.slice(0, 1), commits)).toBeUndefined();
+    expect(settledRows(seen.slice(0, 3), commits)).toBeUndefined();
+    expect(settledRows(seen, commits)).toBeUndefined();
+    expect(settledRows([...seen, { requests: 1490, rowsWritten: 18100 }], commits)).toBeUndefined();
+    expect(settledRows([...seen, { requests: 1490, rowsWritten: 18100 }, { requests: 1490, rowsWritten: 18100 }], commits)).toBe(18100);
+    expect(settledRows([{ requests: 1490, rowsWritten: 33 }, { requests: 1490, rowsWritten: 33 }], commits)).toBeUndefined();
   });
 
   it("interpolates commits from the timeline", () => {

@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { emptyBucket } from "./cloudflare.ts";
+import { emptyBucket, LISTING_MS, newestDeployment, serves, workerTag } from "./cloudflare.ts";
 import { MockCloudflare } from "./mock-cloudflare.ts";
 import type { State } from "./state.ts";
 
@@ -230,6 +230,62 @@ describe("teardown", () => {
     const { status } = await runTs("teardown");
     expect(status).toBe(1);
     expect(mock.deletes()).toEqual([]);
+  });
+});
+
+describe("reading what the API lists late", () => {
+  const account = { id: "dummy-account", token: "dummy-token" };
+
+  async function withFetch<T>(fetchStub: (url: string) => Promise<Response>, read: () => Promise<T>, advanceMs: number): Promise<T> {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", fetchStub);
+    try {
+      const result = read();
+      await vi.advanceTimersByTimeAsync(advanceMs);
+      return await result;
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  }
+
+  it("reads the deployments again until the new version takes all traffic", async () => {
+    const deployment = { created_on: "2026-11-12T10:00:00Z", versions: [{ version_id: "v2", percentage: 100 }] };
+    const listings = [[], [{ created_on: "2026-11-12T09:00:00Z", versions: [{ version_id: "v1", percentage: 100 }] }]];
+    const fetchStub = vi.fn(async () => Response.json({ result: { deployments: listings.shift() ?? [deployment] } }));
+    expect(await withFetch(fetchStub, () => newestDeployment(account, NAME, "v2"), 10_000)).toEqual(deployment);
+    expect(fetchStub).toHaveBeenCalledTimes(3);
+  });
+
+  it("gives up after 60 s and returns what the newest deployment serves", async () => {
+    const split = { created_on: "2026-11-12T10:00:00Z", versions: [{ version_id: "v1", percentage: 50 }, { version_id: "v2", percentage: 50 }] };
+    const fetchStub = vi.fn(async () => Response.json({ result: { deployments: [split] } }));
+    const newest = await withFetch(fetchStub, () => newestDeployment(account, NAME, "v2"), LISTING_MS);
+    expect(newest).toEqual(split);
+    expect(serves(newest, "v2")).toBe(false);
+    expect(fetchStub).toHaveBeenCalledTimes(13);
+  });
+
+  it("reads a new Worker's versions again until they are listed", async () => {
+    let emptyListings = 2;
+    const fetchStub = vi.fn(async (url: string) =>
+      url.includes("/versions/")
+        ? Response.json({ result: { id: "v1", annotations: { "workers/tag": "this-runs-tag" } } })
+        : Response.json({ result: { items: emptyListings-- > 0 ? [] : [{ id: "v1" }] } }),
+    );
+    expect(await withFetch(fetchStub, () => workerTag(account, NAME, "this-runs-tag"), 10_000)).toBe("tagged");
+    expect(fetchStub).toHaveBeenCalledTimes(4);
+  });
+
+  it("tells a listed Worker without the run's tag apart at once, and one whose versions stay unlisted for 60 s", async () => {
+    const untagged = vi.fn(async (url: string) =>
+      url.includes("/versions/") ? Response.json({ result: { id: "v9", annotations: {} } }) : Response.json({ result: { items: [{ id: "v9" }] } }),
+    );
+    expect(await withFetch(untagged, () => workerTag(account, NAME, "this-runs-tag"), 0)).toBe("untagged");
+    expect(untagged).toHaveBeenCalledTimes(2);
+    const unlisted = vi.fn(async () => Response.json({ result: { items: [] } }));
+    expect(await withFetch(unlisted, () => workerTag(account, NAME, "this-runs-tag"), LISTING_MS)).toBe("unlisted");
+    expect(unlisted).toHaveBeenCalledTimes(13);
   });
 });
 

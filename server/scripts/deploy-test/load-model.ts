@@ -141,6 +141,19 @@ export function saturated(summary: StepSummary): string | undefined {
   return undefined;
 }
 
+export interface UsageReading {
+  requests: number;
+  rowsWritten: number;
+}
+
+export function settledRows(readings: UsageReading[], commits: number): number | undefined {
+  const [previous, last] = readings.slice(-2);
+  if (!previous || !last) return undefined;
+  const complete = last.requests >= commits && last.rowsWritten >= commits;
+  const unchanged = last.requests === previous.requests && last.rowsWritten === previous.rowsWritten;
+  return complete && unchanged ? last.rowsWritten : undefined;
+}
+
 export function commitBudget(maxRowsWritten: number, rowsPerCommit: number): number {
   return Math.floor(maxRowsWritten / (Math.max(rowsPerCommit, 1) * BUDGET_MARGIN));
 }

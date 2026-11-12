@@ -8,7 +8,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   type Account,
-  activeVersion,
+  LISTING_MS,
+  newestDeployment,
   createBucket,
   deleteBucket,
   deleteObject,
@@ -21,7 +22,8 @@ import {
   type Namespace,
   namespacesOf,
   requireAccount,
-  workerHasTag,
+  serves,
+  workerTag,
 } from "./cloudflare.ts";
 import { readState, type State, testName, writeState } from "./state.ts";
 
@@ -180,7 +182,7 @@ async function deploy(account: Account, ref: string): Promise<void> {
     state.owned.bucketCreationDate = (await getBucket(account, state.name) ?? fail("the bucket " + state.name + " was created but cannot be read back")).creationDate;
     writeState(state);
     console.log("Created the R2 bucket " + state.name + " (created " + state.owned.bucketCreationDate + ")");
-  } else if (!state.owned.workerTag || !(await workerHasTag(account, state.name, state.owned.workerTag))) {
+  } else if (!state.owned.workerTag || (await workerTag(account, state.name, state.owned.workerTag)) !== "tagged") {
     fail("the Worker " + state.name + " is no longer the one this run created; refusing to deploy over it");
   }
 
@@ -200,8 +202,11 @@ async function deploy(account: Account, ref: string): Promise<void> {
   const url = /https:\/\/[a-z0-9.-]+\.workers\.dev/.exec(deployed)?.[0];
   if (!url) fail("wrangler deploy printed no workers.dev address; the account needs a workers.dev subdomain (docs/deploy-test.md)");
   const versionId = /Current Version ID: ([0-9a-f-]{36})/.exec(deployed)?.[1] ?? fail("wrangler deploy printed no version ID");
-  const active = await activeVersion(account, state.name);
-  if (active !== versionId) fail("the newest deployment of " + state.name + " serves " + (active ?? "a split of versions") + ", not " + versionId);
+  const newest = await newestDeployment(account, state.name, versionId);
+  if (!serves(newest, versionId)) {
+    const listedAs = newest ? "sends " + newest.versions.map((version) => version.percentage + "% to " + version.version_id).join(" and ") : "is not listed";
+    fail("after " + LISTING_MS / 1000 + " s the newest deployment of " + state.name + " " + listedAs + ", not 100% to " + versionId);
+  }
   console.log("Deployment of " + state.name + " sends all traffic to version " + versionId);
   state.url = url;
   state.deployments.push({ ref, sha, dir, versionId, atMs: Date.now() });
@@ -432,18 +437,18 @@ async function teardown(account: Account): Promise<void> {
   let namespaces: Namespace[] = [];
   const worker = await attempt("reading the Worker", () => getWorker(account, name));
   const tag = state.owned.workerTag;
-  const tagged = worker && tag ? await attempt("reading the Worker's version tags", () => workerHasTag(account, name, tag)) : false;
-  if (worker && tagged) {
+  const found = worker && tag ? await attempt("reading the Worker's version tags", () => workerTag(account, name, tag)) : undefined;
+  if (worker && found === "tagged") {
     namespaces = (await attempt("listing the Durable Object namespaces", () => namespacesOf(account, name))) ?? [];
     const deleted = await attempt("deleting the Worker", () => deleteWorker(account, name));
     if (deleted) console.log("Deleted the Worker " + name + " (id " + worker.id + "), which carries the tag of this run's deploy");
     const left = await attempt("checking the Durable Object namespaces", () => namespacesOf(account, name));
     if (left?.length) problems.push("Durable Object namespaces of " + name + " remain: " + left.map((namespace) => namespace.class + " " + namespace.id).join(", "));
     else if (left) console.log("No Durable Object namespace of " + name + " remains (" + (namespaces.map((namespace) => namespace.class).join(", ") || "none") + " deleted with the Worker)");
-  } else if (worker && tag && tagged === false) {
+  } else if (worker && (found === "untagged" || found === "unlisted")) {
     problems.push(
-      "a Worker named " + name + " (id " + worker.id + ") exists, but none of its versions carries the tag of this run's deploy, so this run cannot prove it created the Worker and left it alone. " +
-        "If this run's deploy created it, delete the Worker " + name + " by hand under Workers & Pages, which also deletes its Durable Objects",
+      "a Worker named " + name + " (id " + worker.id + ") exists, but " + (found === "untagged" ? "none of its versions carries the tag of this run's deploy" : "it listed no versions within " + LISTING_MS / 1000 + " s") +
+        ", so this run cannot prove it created the Worker and left it alone. If this run's deploy created it, delete the Worker " + name + " by hand under Workers & Pages, which also deletes its Durable Objects",
     );
   } else if (worker && !tag) {
     problems.push("a Worker named " + name + " (id " + worker.id + ") exists, but this run did not record creating it, so it was left alone");

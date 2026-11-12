@@ -44,6 +44,18 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+export const LISTING_MS = 60_000;
+const LISTING_EVERY_MS = 5_000;
+
+async function listed<T>(read: () => Promise<T | undefined>): Promise<T | undefined> {
+  const deadline = Date.now() + LISTING_MS;
+  for (;;) {
+    const value = await read();
+    if (value !== undefined || Date.now() >= deadline) return value;
+    await sleep(LISTING_EVERY_MS);
+  }
+}
+
 function keyPath(key: string): string {
   return key.split("/").map(encodeURIComponent).join("/");
 }
@@ -117,17 +129,23 @@ export async function getWorker(account: Account, name: string): Promise<{ id: s
   return { id: worker.id };
 }
 
-export async function workerHasTag(account: Account, name: string, tag: string): Promise<boolean> {
-  for (let page = 1; ; page++) {
-    const response = await send(account, "GET", `/accounts/${account.id}/workers/scripts/${name}/versions?per_page=100&page=${page}`, { allowMissing: true });
-    if (!response) return false;
-    const items = ((await response.json()) as Envelope<{ items?: { id: string }[] }>).result?.items ?? [];
-    for (const item of items) {
-      const version = await call<{ annotations?: Record<string, string> }>(account, "GET", `/accounts/${account.id}/workers/scripts/${name}/versions/${item.id}`);
-      if (version.result?.annotations?.["workers/tag"] === tag) return true;
+export type WorkerTag = "tagged" | "untagged" | "unlisted";
+
+export async function workerTag(account: Account, name: string, tag: string): Promise<WorkerTag> {
+  const found = await listed(async (): Promise<WorkerTag | undefined> => {
+    for (let page = 1; ; page++) {
+      const response = await send(account, "GET", `/accounts/${account.id}/workers/scripts/${name}/versions?per_page=100&page=${page}`, { allowMissing: true });
+      if (!response) return page === 1 ? undefined : "untagged";
+      const items = ((await response.json()) as Envelope<{ items?: { id: string }[] }>).result?.items ?? [];
+      if (page === 1 && items.length === 0) return undefined;
+      for (const item of items) {
+        const version = await call<{ annotations?: Record<string, string> }>(account, "GET", `/accounts/${account.id}/workers/scripts/${name}/versions/${item.id}`);
+        if (version.result?.annotations?.["workers/tag"] === tag) return "tagged";
+      }
+      if (items.length < 100) return "untagged";
     }
-    if (items.length < 100) return false;
-  }
+  });
+  return found ?? "unlisted";
 }
 
 export async function listObjects(account: Account, bucket: string, prefix = ""): Promise<R2Object[] | undefined> {
@@ -202,14 +220,23 @@ export async function namespacesOf(account: Account, script: string): Promise<Na
   }
 }
 
-export async function activeVersion(account: Account, name: string): Promise<string | undefined> {
-  const listed = await call<{ deployments: { created_on: string; versions: { version_id: string; percentage: number }[] }[] }>(
-    account,
-    "GET",
-    `/accounts/${account.id}/workers/scripts/${name}/deployments`,
-  );
-  const newest = [...(listed.result?.deployments ?? [])].sort((a, b) => b.created_on.localeCompare(a.created_on))[0];
-  return newest?.versions.find((version) => version.percentage === 100)?.version_id;
+export interface Deployment {
+  created_on: string;
+  versions: { version_id: string; percentage: number }[];
+}
+
+export function serves(deployment: Deployment | undefined, versionId: string): boolean {
+  return deployment?.versions.some((version) => version.version_id === versionId && version.percentage === 100) ?? false;
+}
+
+export async function newestDeployment(account: Account, name: string, versionId: string): Promise<Deployment | undefined> {
+  let newest: Deployment | undefined;
+  await listed(async () => {
+    const response = await call<{ deployments: Deployment[] }>(account, "GET", `/accounts/${account.id}/workers/scripts/${name}/deployments`);
+    newest = [...(response.result?.deployments ?? [])].sort((a, b) => b.created_on.localeCompare(a.created_on))[0];
+    return serves(newest, versionId) ? newest : undefined;
+  });
+  return newest;
 }
 
 export interface Subscription {
