@@ -9,7 +9,7 @@
 //! refuses a state. `devices_converge_once_the_faults_stop` also asks that every disk reaches the
 //! server's tree and that no commit makes a change the user of its device never made.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use koidrive_proto::v1::error;
 use koidrive_sim::world::disk::Place;
@@ -155,7 +155,7 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "a write can stay off the server after several server restores (GUN-480)"]
+    #[ignore = "after a server loss, a device can move a node back to a position it never set (GUN-531)"]
     fn devices_converge_across_server_restores(devices in 2..=3usize, phases in phases(Losses::Restores)) {
         converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
@@ -1044,6 +1044,131 @@ fn a_copy_of_a_rolled_back_write_after_the_recovery_is_refused() {
         failure.to_string().contains("is in more than one file"),
         "{failure}"
     );
+}
+
+#[test]
+fn an_edit_back_to_the_bytes_a_restore_left_keeps_its_file_and_the_lost_edit_beside_it() {
+    let world = converge(
+        2,
+        &[
+            vec![(0, file("a"))],
+            vec![(0, BACKUP), (1, overwrite(0))],
+            vec![(0, RESTORE), (0, overwrite(0))],
+        ],
+    )
+    .unwrap();
+    for device in &world.devices {
+        let disk = &device.disk;
+        let write = |ino: u128| disk.entries()[&ino].content.as_ref().map(|c| c.mtime_ns);
+        let a = disk.child(&Place::Root, "a").unwrap();
+        assert_eq!(write(a), Some(3));
+        let writes: BTreeSet<Option<i64>> = disk.entries().keys().map(|ino| write(*ino)).collect();
+        assert_eq!(writes, BTreeSet::from([Some(2), Some(3)]));
+    }
+}
+
+fn created_again_by_both_and_deleted_by_one(made: Step, edit: bool) -> World {
+    let mut lost = vec![
+        (0, RESTORE),
+        (0, Step::Connect),
+        (1, Step::Connect),
+        (0, DELIVER),
+        (1, DELIVER),
+    ];
+    lost.extend(edit.then_some((1, overwrite(0))));
+    lost.extend([
+        (1, SCAN),
+        (1, COMMIT),
+        (0, SCAN),
+        (0, COMMIT),
+        (0, COMMIT),
+        (0, DELIVER),
+        (0, DELIVER),
+        (0, delete(0)),
+        (0, SCAN),
+        (0, COMMIT),
+        (0, COMMIT),
+        (0, DELIVER),
+        (0, DELIVER),
+        (1, COMMIT),
+        (1, DELIVER),
+        (1, DELIVER),
+        (1, DELIVER),
+    ]);
+    converge(2, &[Vec::new(), vec![(0, BACKUP), (0, made)], lost]).unwrap()
+}
+
+#[test]
+fn a_lost_folder_another_device_creates_again_and_deletes_first_is_deleted_on_both() {
+    let world = created_again_by_both_and_deleted_by_one(folder("a"), false);
+    assert!(
+        world
+            .devices
+            .iter()
+            .all(|device| device.disk.entries().is_empty())
+    );
+}
+
+#[test]
+fn a_lost_file_another_device_creates_again_and_deletes_first_is_deleted_on_both() {
+    let world = created_again_by_both_and_deleted_by_one(file("a"), false);
+    assert!(
+        world
+            .devices
+            .iter()
+            .all(|device| device.disk.entries().is_empty())
+    );
+}
+
+#[test]
+fn an_edit_of_a_lost_file_another_device_creates_again_and_deletes_first_revives_it() {
+    let world = created_again_by_both_and_deleted_by_one(file("a"), true);
+    for device in &world.devices {
+        let disk = &device.disk;
+        let a = disk.child(&Place::Root, "a").unwrap();
+        assert_eq!(disk.entries().len(), 1);
+        assert_eq!(
+            disk.entries()[&a].content.as_ref().map(|c| c.mtime_ns),
+            Some(2)
+        );
+    }
+}
+
+#[test]
+fn a_swap_after_a_restore_passes_through_the_pending_name_of_a_name_a_lost_commit_gave() {
+    let u = |kind, target, parent, name, text| {
+        Step::User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text,
+        })
+    };
+    let phases = vec![
+        vec![
+            (1, u(0, 0, 0, 2, 0)),
+            (1, u(1, 0, 6892790594048859264, 0, 0)),
+        ],
+        vec![
+            (0, u(2, 0, 0, 0, 0)),
+            (0, BACKUP),
+            (0, u(1, 0, 1923514285381434823, 0, 0)),
+            (2, u(1, 0, 0, 1, 0)),
+            (0, u(1, 0, 13397848212569861839, 2, 0)),
+            (0, u(1, 0, 0, 3, 0)),
+        ],
+        vec![
+            (2, u(0, 0, 3443233485426864259, 1, 0)),
+            (0, Step::Work(0)),
+            (0, Step::Work(0)),
+            (0, Step::Work(0)),
+            (1, DELIVER),
+            (0, RESTORE),
+            (1, Step::Effect(Outcome::Crash(Cut::Placed))),
+        ],
+    ];
+    converge(2, &phases).unwrap();
 }
 
 /// Once the devices are quiet after a restore that lost a rename, the old name is refused like

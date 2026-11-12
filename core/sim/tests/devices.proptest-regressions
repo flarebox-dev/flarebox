@@ -6,3 +6,6 @@ cc ae76abea073527eab51ca096ef936678eb7677bf965c8408e9750db7dad389a9 # shrinks to
 cc df28ce18a0081c648c7b5ada0d365c6ce045dedd5016abba8fa7fa3d29132ef7 # shrinks to devices = 3: a delete trashed a write on the server before a rewind that a disk still held in quarantine
 cc fd0198b0926c32bd0fd723a838c8af7cf166e9747e8145d995d032921b0eb52d
 cc 3d7a911e43099d9129a897f09e299ac5fd36bb916a6e167535a78935f8322349
+cc 6b80451b109c26e88ad938b5c9962db0b7d9bed62e330787c06168959891961f # shrinks to devices = 2, an edit back to the bytes a restore left on the server (GUN-480)
+cc f3dbd10dc7a1ac36f355b9d63633c6dc805ceaed4e5c48b270e00789b744cf9b # shrinks to devices = 2, a lost folder both devices create again and one deletes first (GUN-480)
+cc c1f3704f98d7c7262d5ef050182104b1effaddd226a1af67a768e71c158ba710 # shrinks to devices = 2, a swap through the pending name of a name a lost commit gave (GUN-480)
