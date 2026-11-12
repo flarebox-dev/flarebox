@@ -6329,3 +6329,30 @@ fn a_rename_another_device_makes_once_a_pending_create_lands_ends_the_owed_renam
         next.as_ref().map(ops)
     );
 }
+
+#[test]
+fn an_owed_rename_sent_through_a_name_cycle_still_brings_the_disk_to_its_name() {
+    let (mut commits, mut trees, mut ids) = owing_its_name(&[
+        synced("a", dir(ROOT, "a (pending)")),
+        (
+            "b",
+            Some(dir(ROOT, "A (pending)")),
+            Some(dir(ROOT, "a")),
+            Some(remote(dir(ROOT, "a"))),
+        ),
+    ]);
+    let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(sent.ops.len(), 3);
+    trees.set_remote("a".into(), remote_at(dir(ROOT, "a"), 8));
+    trees.set_remote("b".into(), remote_at(dir(ROOT, "A (pending)"), 8));
+    commits
+        .received(result(8, vec![outcome(op_result::Code::Applied); 3]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 8));
+    trees.settle();
+    effects_for(&mut trees, &mut ids, "a");
+    assert_eq!(
+        trees.local().live("a").map(|shape| shape.name.as_str()),
+        Some("a")
+    );
+}

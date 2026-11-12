@@ -999,6 +999,7 @@ impl Commits {
             return false;
         };
         let result = flight.result.expect("taken with a result");
+        let sent_under = self.pending.clone();
         let mut synced = Synced::default();
         let mut merged: BTreeMap<NodeId, NodeId> = BTreeMap::new();
         let mut agreed: BTreeMap<NodeId, Agreed> = BTreeMap::new();
@@ -1121,7 +1122,7 @@ impl Commits {
                         agreed.extend(agree(trees, id, result.seq));
                         synced.set(id, Some(shape));
                     }
-                    let owed = self.pending.get(id).is_some_and(|pending| {
+                    let owed = sent_under.get(id).is_some_and(|pending| {
                         nfc(&moved.new_name) == nfc(&pending.name)
                             && trees.local().get(id).is_some_and(|local| {
                                 local.shape.parent == moved.new_parent_id
@@ -1132,7 +1133,7 @@ impl Commits {
                         trees.revert(id.clone());
                     }
                     if applied
-                        && (self.pending.get(id))
+                        && (sent_under.get(id))
                             .is_some_and(|pending| nfc(&moved.new_name) != nfc(&pending.sent))
                     {
                         self.pending.remove(id);
