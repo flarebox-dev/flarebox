@@ -1801,12 +1801,6 @@ fn agree(trees: &Trees, id: &str, seq: u64) -> Option<(NodeId, Agreed)> {
     (trees.position_after(id, seq)).map(|at| (id.to_owned(), at.clone()))
 }
 
-/// Whether L changed a node whose S update waits: L edited it, or moved it away from or deleted it
-/// at the waiting position while R still holds it there. Such a node is planned and rebased against
-/// the waiting shape. An edit is uploaded while only the position waits, wherever R holds the node,
-/// and a move or a delete is planned because the update may never fit while L holds the node
-/// elsewhere or not at all, as when a folder R trashed takes its name key in S and L cannot remove
-/// that folder while the node is inside it.
 fn changed_locally(trees: &Trees, id: &str) -> bool {
     let Some(Waiting {
         shape: Some(waiting),
