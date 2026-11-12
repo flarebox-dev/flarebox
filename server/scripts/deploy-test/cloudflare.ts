@@ -58,20 +58,22 @@ function keyPath(key: string): string {
  * One API request, retried on network errors, 429 and 5xx. Returns the response for a 2xx status, or undefined for a 404
  * when allowMissing is set, and throws ApiError otherwise with Cloudflare's error codes and messages.
  */
-async function send(account: Account, method: string, path: string, init: { body?: unknown; allowMissing?: boolean } = {}): Promise<Response | undefined> {
+async function send(account: Account, method: string, path: string, init: { body?: unknown; allowMissing?: boolean; deadline?: number; retry?: boolean } = {}): Promise<Response | undefined> {
   const what = method + " " + path.split("?")[0];
   for (let attempt = 1; ; attempt++) {
+    const remaining = init.deadline === undefined ? REQUEST_MS : init.deadline - Date.now();
+    if (remaining <= 0) throw new ApiError("bucket-emptying job exceeded its six-minute deadline", 0);
     let response: Response;
     try {
       response = await fetch(API + path, {
         method,
         headers: { Authorization: "Bearer " + account.token, ...(init.body === undefined ? {} : { "Content-Type": "application/json" }) },
         body: init.body === undefined ? undefined : JSON.stringify(init.body),
-        signal: AbortSignal.timeout(REQUEST_MS),
+        signal: AbortSignal.timeout(Math.min(REQUEST_MS, remaining)),
       });
     } catch (error) {
-      if (attempt >= ATTEMPTS) throw new ApiError(what + " failed: " + (error instanceof Error ? error.message : String(error)), 0);
-      await sleep(2000 * attempt);
+      if (init.retry === false || attempt >= ATTEMPTS) throw new ApiError(what + " failed: " + (error instanceof Error ? error.message : String(error)), 0);
+      await sleep(Math.max(0, Math.min(2000 * attempt, init.deadline === undefined ? Infinity : init.deadline - Date.now())));
       continue;
     }
     if (response.ok) return response;
@@ -79,9 +81,9 @@ async function send(account: Account, method: string, path: string, init: { body
       await response.body?.cancel();
       return undefined;
     }
-    if ((response.status === 429 || response.status >= 500) && attempt < ATTEMPTS) {
+    if ((response.status === 429 || response.status >= 500) && init.retry !== false && attempt < ATTEMPTS) {
       await response.body?.cancel();
-      await sleep(2000 * attempt);
+      await sleep(Math.max(0, Math.min(2000 * attempt, init.deadline === undefined ? Infinity : init.deadline - Date.now())));
       continue;
     }
     const text = await response.text();
@@ -153,6 +155,37 @@ export async function listObjects(account: Account, bucket: string, prefix = "")
     for (const object of page.result ?? []) objects.push({ key: object.key, size: Number(object.size) });
     cursor = page.result_info?.cursor ?? "";
     if (!page.result_info?.is_truncated || !cursor) return objects;
+  }
+}
+
+function bucketJob(value: unknown): { id: string; status: "ENQUEUED" | "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED" } {
+  if (!value || typeof value !== "object" || !("result" in value) || !value.result || typeof value.result !== "object") {
+    throw new ApiError("bucket-emptying job returned an invalid response", 200);
+  }
+  const job = value.result;
+  if (!("id" in job) || typeof job.id !== "string" || !job.id || !("status" in job)) {
+    throw new ApiError("bucket-emptying job returned no id or status", 200);
+  }
+  const status = job.status;
+  if (status !== "ENQUEUED" && status !== "RUNNING" && status !== "COMPLETED" && status !== "FAILED" && status !== "CANCELLED") {
+    throw new ApiError("bucket-emptying job returned an unknown status", 200);
+  }
+  return { id: job.id, status };
+}
+
+export async function emptyBucket(account: Account, bucket: string): Promise<void> {
+  const path = `/accounts/${account.id}/r2/buckets/${bucket}/jobs`;
+  const deadline = Date.now() + 6 * 60_000;
+  const created = await send(account, "POST", path, { body: { jobType: "prefixDelete", prefix: "" }, deadline, retry: false });
+  let job = bucketJob(await created!.json());
+  const id = job.id;
+  while (job.status !== "COMPLETED") {
+    if (job.status === "FAILED" || job.status === "CANCELLED") throw new ApiError("bucket-emptying job " + job.status, 200);
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new ApiError("bucket-emptying job exceeded its six-minute deadline", 0);
+    await sleep(Math.min(5000, remaining));
+    const response = await send(account, "GET", path + "/" + encodeURIComponent(id), { deadline });
+    job = bucketJob(await response!.json());
   }
 }
 

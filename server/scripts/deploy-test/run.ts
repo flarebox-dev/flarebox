@@ -22,6 +22,7 @@ import {
   deleteBucket,
   deleteObject,
   deleteWorker,
+  emptyBucket,
   getBucket,
   getWorker,
   graphql,
@@ -353,6 +354,10 @@ async function emptyAndDeleteBucket(account: Account, name: string): Promise<Sto
     }
   }
   let objects = first;
+  if (first.length > 1000) {
+    await emptyBucket(account, name);
+    objects = (await listObjects(account, name)) ?? [];
+  }
   for (let attempt = 1; ; attempt++) {
     for (let i = 0; i < objects.length; i += 8) await Promise.all(objects.slice(i, i + 8).map((object) => deleteObject(account, name, object.key)));
     try {

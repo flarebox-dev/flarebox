@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { emptyBucket } from "./cloudflare.ts";
 import { MockCloudflare } from "./mock-cloudflare.ts";
 import type { State } from "./state.ts";
 
@@ -125,6 +126,95 @@ function filesContaining(root: string, text: string): string[] {
 }
 
 describe("teardown", () => {
+  it("empties 3072 chunk objects across four listing pages with one prefix-delete job and one status poll", async () => {
+    const bucket = mock.addBucket(NAME, undefined, Array.from({ length: 3072 }, (_, i) => "spaces/bench/chunks/aa/bb/" + i));
+    for (const key of bucket.objects.keys()) bucket.objects.set(key, 4 * 1024 * 1024);
+    writeState({ owned: { bucketCreationDate: bucket.creationDate } });
+    mock.bucketJobStatuses = ["RUNNING", "COMPLETED"];
+    const started = performance.now();
+    const { status, output } = await runTs("teardown");
+    expect({ status, errors: output.includes("::error::") }).toEqual({ status: 0, errors: false });
+    expect(mock.buckets.has(NAME)).toBe(false);
+    expect(mock.requests.filter((request) => request.startsWith("GET ") && request.endsWith("/objects"))).toHaveLength(5);
+    expect(mock.deletes().filter((request) => request.includes("/objects/"))).toEqual([]);
+    expect(mock.bucketJobBodies).toEqual([{ jobType: "prefixDelete", prefix: "" }]);
+    expect(mock.requests.filter((request) => request.includes("/jobs/"))).toHaveLength(1);
+    expect(mock.requests).toHaveLength(10);
+    expect(output).toContain("3072 objects");
+    console.info("3072-object teardown mock: " + (performance.now() - started).toFixed(0) + " ms, " + mock.requests.length + " API requests, four initial listing pages, one fresh listing, one job and one poll, no network retries or analytics wait");
+  });
+
+  it("accepts a prefix-delete job that completes synchronously", async () => {
+    const bucket = mock.addBucket(NAME, undefined, Array.from({ length: 1001 }, (_, i) => "chunk-" + i));
+    writeState({ owned: { bucketCreationDate: bucket.creationDate } });
+    expect((await runTs("teardown")).status).toBe(0);
+    expect(mock.bucketJobBodies).toHaveLength(1);
+    expect(mock.requests.filter((request) => request.includes("/jobs/"))).toEqual([]);
+    expect(mock.buckets.has(NAME)).toBe(false);
+  });
+
+  it("retries deleting the bucket when it still appears nonempty after the emptying job", async () => {
+    const bucket = mock.addBucket(NAME, undefined, Array.from({ length: 1001 }, (_, i) => "chunk-" + i));
+    writeState({ owned: { bucketCreationDate: bucket.creationDate } });
+    mock.bucketDeleteFailures = 1;
+    const leftover = "chunk-0";
+    mock.bucketJobLeftovers = [leftover];
+    const { status, output } = await runTs("teardown");
+    expect({ status, errors: output.includes("::error::") }).toEqual({ status: 0, errors: false });
+    expect(mock.bucketJobBodies).toEqual([{ jobType: "prefixDelete", prefix: "" }]);
+    expect(mock.deletes()).toHaveLength(3);
+    expect(mock.deletes()[0]).toContain("/objects/" + leftover);
+    expect(mock.deletes().slice(1).every((request) => request.endsWith("/r2/buckets/" + NAME))).toBe(true);
+    expect(mock.bucketDeleteFailures).toBe(0);
+    expect(mock.buckets.has(NAME)).toBe(false);
+  });
+
+  it.each(["FAILED", "CANCELLED", "unexpected"])("leaves the bucket and reports a prefix-delete job with status %s", async (jobStatus) => {
+    const bucket = mock.addBucket(NAME, undefined, Array.from({ length: 1001 }, (_, i) => "chunk-" + i));
+    writeState({ owned: { bucketCreationDate: bucket.creationDate } });
+    mock.bucketJobStatuses = ["RUNNING", jobStatus];
+    const { status, output } = await runTs("teardown");
+    expect(status).toBe(1);
+    expect(output).toContain("bucket-emptying job");
+    expect(mock.bucketJobBodies).toHaveLength(1);
+    expect(mock.buckets.get(NAME)?.objects.size).toBe(1001);
+    expect(mock.deletes()).toEqual([]);
+  });
+
+  it("does not retry an ambiguous prefix-delete creation failure", async () => {
+    const bucket = mock.addBucket(NAME, undefined, Array.from({ length: 1001 }, (_, i) => "chunk-" + i));
+    writeState({ owned: { bucketCreationDate: bucket.creationDate } });
+    mock.bucketJobCreateStatus = 503;
+    expect((await runTs("teardown")).status).toBe(1);
+    expect(mock.bucketJobBodies).toHaveLength(1);
+    expect(mock.buckets.get(NAME)?.objects.size).toBe(1001);
+    expect(mock.deletes()).toEqual([]);
+  });
+
+  it.each([undefined, "2020-01-01T00:00:00.000Z"])("does not start a bulk job for a large bucket with unproven ownership %s", async (recordedDate) => {
+    mock.addBucket(NAME, "2026-01-01T00:00:00.000Z", Array.from({ length: 1001 }, (_, i) => "chunk-" + i));
+    writeState({ owned: { bucketCreationDate: recordedDate } });
+    expect((await runTs("teardown")).status).toBe(1);
+    expect(mock.bucketJobBodies).toEqual([]);
+    expect(mock.buckets.get(NAME)?.objects.size).toBe(1001);
+    expect(mock.deletes()).toEqual([]);
+  });
+
+  it("stops polling a running bucket-emptying job at six minutes", async () => {
+    vi.useFakeTimers();
+    const fetchJob = vi.fn(async () => Response.json({ result: { id: "empty-1", status: "RUNNING" } }));
+    vi.stubGlobal("fetch", fetchJob);
+    try {
+      const finished = expect(emptyBucket({ id: "dummy-account", token: "dummy-token" }, NAME)).rejects.toThrow("six-minute deadline");
+      await vi.advanceTimersByTimeAsync(6 * 60_000);
+      await finished;
+      expect(fetchJob).toHaveBeenCalledTimes(72);
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("leaves a Worker and a bucket alone that this run did not record creating", async () => {
     mock.addWorker(NAME);
     mock.addBucket(NAME, "2026-01-01T00:00:00.000Z", ["preexisting-user-data.txt"]);

@@ -12,14 +12,22 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "smoke: deploy this commit and test it. upgrade: deploy from_ref, write data, upgrade to this commit and check the data. e2e: deploy this commit and sync a macOS and a Linux device through it."
+        description: "smoke: test HTTPS. upgrade: check earlier data. e2e: sync Linux and macOS. bench: measure Rust chunk uploads."
         type: choice
-        options: [smoke, upgrade, e2e]
+        options: [smoke, upgrade, e2e, bench]
         default: smoke
       from_ref:
         description: "upgrade only: the commit or tag to upgrade from. Empty means the newest tag before this commit."
         type: string
         required: false
+      bench_ns:
+        description: "bench only: comma-separated supported concurrency values. This build accepts only 1; other values fail before deployment."
+        type: string
+        default: '1'
+      bench_repetitions:
+        description: "bench only: repetitions per concurrency value, integer 1 through 3. Each measurement uploads 1 GiB."
+        type: string
+        default: '3'
 
 permissions:
   contents: read
@@ -78,13 +86,23 @@ jobs:
           policies="$(gh api "repos/$REPOSITORY/environments/deploy-test/deployment-branch-policies" --jq '[.branch_policies[] | (.type // "branch") + ":" + .name] | sort | join(",")')" || refuse "The deploy-test environment's branch policies cannot be read."
           [ "$policies" = "branch:main" ] || refuse "The deploy-test environment must allow the main branch only, but allows: ${policies:-nothing}."
           echo "The deploy-test environment lists gunwooterry as its only required reviewer, allows main only, and does not report administrator bypass as allowed. These checks are defence in depth: the boundary is the required reviewer's approval of each run, with administrator bypass turned off by hand as docs/deploy-test.md describes."
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: inputs.mode == 'bench'
+        with:
+          node-version: 24
+      - name: Validate benchmark inputs before deployment
+        if: inputs.mode == 'bench'
+        env:
+          KOIDRIVE_BENCH_NS: ${{ inputs.bench_ns }}
+          KOIDRIVE_BENCH_REPETITIONS: ${{ inputs.bench_repetitions }}
+        run: node server/scripts/deploy-test/bench.ts validate
 
   deploy-test:
     name: deploy test (${{ inputs.mode }})
     needs: trusted
     runs-on: ubuntu-latest
     environment: deploy-test
-    timeout-minutes: ${{ inputs.mode == 'e2e' && 90 || 60 }}
+    timeout-minutes: ${{ (inputs.mode == 'e2e' || inputs.mode == 'bench') && 90 || 60 }}
     permissions:
       contents: read
       actions: read
@@ -126,7 +144,7 @@ jobs:
           cache-dependency-path: server/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - name: Install the pinned Rust toolchain
-        if: inputs.mode == 'e2e'
+        if: inputs.mode == 'e2e' || inputs.mode == 'bench'
         working-directory: .
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -137,6 +155,10 @@ jobs:
         if: inputs.mode == 'e2e'
         working-directory: .
         run: cargo build -p koidrive-cli --locked
+      - name: Build the release upload benchmark
+        if: inputs.mode == 'bench'
+        working-directory: .
+        run: cargo test -p koidrive-net --release --locked --test upload_bench --no-run
 
       - name: Resolve the release to upgrade from
         id: from
@@ -167,6 +189,13 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: pnpm exec vitest run --config scripts/deploy-test/vitest.config.ts --reporter=verbose smoke
+      - name: Benchmark Rust chunk uploads
+        if: inputs.mode == 'bench'
+        timeout-minutes: 30
+        env:
+          KOIDRIVE_BENCH_NS: ${{ inputs.bench_ns }}
+          KOIDRIVE_BENCH_REPETITIONS: ${{ inputs.bench_repetitions }}
+        run: node scripts/deploy-test/bench.ts
 
       - name: Write data on the earlier release
         if: inputs.mode == 'upgrade'

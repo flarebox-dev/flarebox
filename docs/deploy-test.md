@@ -88,9 +88,20 @@ Open **Actions**, **Deploy test**, **Run workflow**, keep `main` under "Use work
 gh workflow run deploy-test.yml --ref main -f mode=smoke
 gh workflow run deploy-test.yml --ref main -f mode=upgrade -f from_ref=<commit or tag>
 gh workflow run deploy-test.yml --ref main -f mode=e2e
+gh workflow run deploy-test.yml --ref main -f mode=bench -f bench_ns=1 -f bench_repetitions=3
 ```
 
 For `upgrade`, `from_ref` is the release to upgrade from. Left empty, it is the newest tag before the commit under test; there is no release tag yet, so until the first release the run needs `from_ref`, an ancestor of the commit under test at or after `8c9bf4a`, the first commit whose `server/` deploys on its own. For `e2e`, approve the deployment within about 45 minutes: the macOS job builds `koi` while it waits and fails if the deploy job has not sent its pairing code by then. Runs never overlap: a second run waits for the first.
+
+## Benchmark chunk uploads
+
+Choose `bench` as shown above to deploy, claim, and run the Rust release test `upload_benchmark` in target `upload_bench`. `bench_ns` defaults to `1`. This build accepts only N=1; the trusted job rejects unsupported values before deployment. The concurrency follow-up will enable the four-value sweep of `1,2,4,8`. `bench_repetitions` defaults to `3` and accepts integers from `1` through `3`. Each measurement uploads 1 GiB, so the default uploads 3 GiB before retries. The future four-value sweep is bounded at 12 GiB. `KOIDRIVE_BENCH_MIB` reduces the payload for local runs only.
+
+Each measurement keeps its fresh payload in memory as 256 chunks of 4 MiB and uses a fresh space. The order of N values rotates between repetitions. Generation, initial hashing, space creation, session setup, and commit happen outside the timer. `Transfer::upload`, including hash validation, upload planning, PUTs, and retry waits, runs inside it. MB/s uses decimal megabytes. Upload timing includes Worker and R2 work and cannot isolate R2 latency.
+
+Rust writes results and runner metadata to the log and summary page. Upload HTTP versions come from HTTP-client handshake trace events during upload. The separate RTT probe reports its own HTTP version. Retry debug events report status and distinct chunk hashes, but omit expired-ticket renewals and terminal failures. Zero observed retries is not a zero-error guarantee. The existing test-client usage counter excludes Rust requests and bytes. Use the transfer figures with R2 storage and the potentially delayed analytics figures.
+
+The child reads owner credentials from private deploy-test state and receives no Cloudflare token or account ID. No Rust cache is saved. Teardown still runs after failure. After verifying ownership, it uses a [prefix-delete job](https://developers.cloudflare.com/api/resources/r2/subresources/buckets/subresources/jobs/methods/create/) above 1000 objects, avoiding thousands of calls against the [1200 requests per five minutes limit](https://developers.cloudflare.com/fundamentals/api/reference/limits/), accessed 2026-11-12. Smaller buckets keep batches of eight deletes. Job polling stops after six minutes, but the overall ten-minute teardown limit is not a live-network guarantee. See [If teardown fails](#if-teardown-fails) for leftovers.
 
 ## If teardown fails
 
