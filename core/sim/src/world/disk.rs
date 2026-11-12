@@ -95,9 +95,20 @@ pub struct Disk {
     pub(super) quarantine: Option<Entry>,
     /// The effects whose displaced entry is in the local trash.
     trash: BTreeSet<String>,
+    marker: u64,
 }
 
 impl Disk {
+    /// The root marker's effect counter (section 2.8).
+    pub fn marker(&self) -> u64 {
+        self.marker
+    }
+
+    /// Writes the effect's counter to the root marker, which ending an effect does first.
+    pub fn begin(&mut self, record: &EffectRecord) {
+        self.marker = record.counter;
+    }
+
     pub fn entries(&self) -> &BTreeMap<u64, Entry> {
         &self.entries
     }

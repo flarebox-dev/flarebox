@@ -30,10 +30,11 @@ pub struct Engine {
     /// The server lost commits that R holds, so R waits for a listing of the server's tree and
     /// nothing is planned until it comes (section 4.4).
     pub behind: bool,
+    pub history: String,
 }
 
 impl Engine {
-    pub fn new(root: &str, seed: u64) -> Self {
+    pub fn new(root: &str, history: &str, seed: u64) -> Self {
         Self {
             trees: Trees::new(root),
             commits: Commits::default(),
@@ -41,6 +42,7 @@ impl Engine {
             ids: IdGen::new(seed),
             cursor: Base::default(),
             behind: false,
+            history: history.to_owned(),
         }
     }
 
@@ -70,6 +72,7 @@ impl Engine {
             ids: IdGen::new(self.ids.state),
             cursor: self.cursor.clone(),
             behind: self.behind,
+            history: self.history.clone(),
         };
         if loaded != *self {
             return Err(Failure::Broken(
@@ -199,6 +202,10 @@ pub struct Device {
     /// Crashed and not restarted yet.
     pub down: bool,
     pub link: Option<Link>,
+    /// Why the device stopped for recovery (section 6.4).
+    pub recovering: Option<String>,
+    pub store_copy: Option<Engine>,
+    pub rolled_back: bool,
 }
 
 impl Device {

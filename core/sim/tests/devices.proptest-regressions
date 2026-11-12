@@ -2,3 +2,4 @@ cc 2936fd00d84922bbdb486fdcd6dff5c25e985beb371ff0025123b539db529758
 cc cb0291493f7ab4f7b57d13276b68745632b5a549377ac5c30e83fdee6e8ad945
 cc 424d4a6bc5f2605f190c978de615336332668e83c4f91c9e9059e3c9a55746f1 # shrinks to devices = 3, a removal recovered after the user moved its file (GUN-443)
 cc dae21fe9b6de87797e464824115a468d7d114351ff9cf727f16e0acc8ffb9789
+cc ae76abea073527eab51ca096ef936678eb7677bf965c8408e9750db7dad389a9 # shrinks to devices = 2, phases = [[(1, User(Action { kind: 0, target: 0, parent: 0, name: 0, text: 0 })), (1, Work(0)), (1, Commit(Served)), (1, Commit(Served)), (2, Work(0)), (0, User(Action { kind: 0, target: 0, parent: 0, name: 0, text: 0 })), (2, Work(4846756201620249228)), (0, Crash), (0, Work(0)), (2, CopyStore), (0, RollBack)]]

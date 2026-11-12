@@ -1,0 +1,298 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use koidrive_proto::v1::{Commit, NodeStatus, error};
+use koidrive_sim::world::{Action, NAMES, Outcome, Reply, Step, World};
+
+fn user(kind: u8, target: usize, parent: usize, name: &str) -> Step {
+    let name = NAMES.iter().position(|other| *other == name).unwrap();
+    Step::User(Action {
+        kind,
+        target,
+        parent,
+        name,
+        text: 0,
+    })
+}
+
+fn file(name: &str) -> Step {
+    user(1, 0, 0, name)
+}
+
+fn overwrite(target: usize) -> Step {
+    user(2, target, 0, "a")
+}
+
+fn rename(target: usize, name: &str) -> Step {
+    user(3, target, 0, name)
+}
+
+fn delete(target: usize) -> Step {
+    user(4, target, 0, "a")
+}
+
+const SCAN: Step = Step::Scan;
+const EFFECT: Step = Step::Effect(Outcome::Run);
+const COMMIT: Step = Step::Commit(Reply::Served);
+const DELIVER: Step = Step::Deliver(0);
+
+fn commit(device: usize) -> Vec<(usize, Step)> {
+    vec![
+        (device, SCAN),
+        (device, COMMIT),
+        (device, COMMIT),
+        (device, DELIVER),
+    ]
+}
+
+fn synced(devices: usize, phases: &[Vec<(usize, Step)>]) -> World {
+    let mut world = World::new(devices);
+    world.trace = std::env::var_os("KOIDRIVE_SIM_TRACE").is_some();
+    for (phase, schedule) in phases.iter().enumerate() {
+        world.phase(phase, schedule).unwrap();
+    }
+    world
+}
+
+fn live(world: &World) -> Vec<String> {
+    let root = world.space().space_id().to_owned();
+    let mut names: Vec<String> = (world.space().nodes().into_iter())
+        .filter(|node| node.node_id != root && node.status == NodeStatus::Live as i32)
+        .map(|node| node.name)
+        .collect();
+    names.sort();
+    names
+}
+
+fn refusal(world: &World, d: usize, commit: &Commit) -> Option<error::Code> {
+    let mut space = world.space().clone();
+    let refused = space.commit(&world.devices[d].session, 0, commit).err()?;
+    error::Code::try_from(refused.code).ok()
+}
+
+fn recovering(world: &World, d: usize) -> &str {
+    (world.devices[d].recovering.as_deref())
+        .unwrap_or_else(|| panic!("device {d} did not start recovery"))
+}
+
+#[test]
+fn pitr_replay() {
+    let mut world = synced(2, &[vec![(0, file("a"))]]);
+    world
+        .run(
+            1,
+            &[
+                (0, Step::Backup),
+                (0, delete(0)),
+                (0, SCAN),
+                (0, COMMIT),
+                (0, COMMIT),
+                (0, Step::Drop),
+                (0, Step::Rewind),
+                (0, Step::Connect),
+            ],
+        )
+        .unwrap();
+    assert_eq!(recovering(&world, 0), "the server's history changed");
+    let k = (world.devices[0].engine.commits.in_flight())
+        .expect("K is kept as evidence")
+        .commit
+        .clone();
+    assert_eq!(refusal(&world, 0, &k), Some(error::Code::HistoryMismatch));
+    world.phase(2, &[]).unwrap();
+    recovering(&world, 1);
+    assert_eq!(live(&world), ["a"]);
+    assert!(world.devices[0].disk.entries().is_empty());
+}
+
+#[test]
+fn history_change_on_connect() {
+    let mut world = synced(
+        2,
+        &[
+            vec![(0, Step::Backup), (0, file("a"))],
+            vec![(1, file("b"))],
+        ],
+    );
+    world.run(2, &[(0, Step::Rewind)]).unwrap();
+    let before = world.devices[1].engine.clone();
+    world
+        .run(2, &[(1, Step::Connect), (1, Step::Work(0))])
+        .unwrap();
+    recovering(&world, 1);
+    assert_eq!(world.devices[1].engine, before);
+    world.phase(3, &[]).unwrap();
+    assert!(live(&world).is_empty());
+    assert_eq!(world.devices[0].disk.entries().len(), 2);
+}
+
+#[test]
+fn stale_store_replay() {
+    let mut world = synced(1, &[]);
+    world
+        .run(
+            0,
+            &[
+                (0, file("a")),
+                (0, SCAN),
+                (0, COMMIT),
+                (0, Step::CopyStore),
+                (0, COMMIT),
+                (0, DELIVER),
+                (0, file("b")),
+            ],
+        )
+        .unwrap();
+    world.run(0, &commit(0)).unwrap();
+    world.truncate_log();
+    world
+        .run(
+            0,
+            &[(0, Step::RollBack), (0, Step::Connect), (0, Step::Connect)],
+        )
+        .unwrap();
+    assert!(recovering(&world, 0).contains("cannot account for"));
+    let k = (world.devices[0].engine.commits.in_flight())
+        .expect("K is in flight in the copied store")
+        .commit
+        .clone();
+    assert_eq!(refusal(&world, 0, &k), Some(error::Code::StaleDeviceState));
+    world.phase(1, &[]).unwrap();
+    assert_eq!(live(&world), ["a", "b"]);
+}
+
+#[test]
+fn remote_rename_then_store_rollback() {
+    let mut world = synced(2, &[vec![(0, file("a"))]]);
+    world
+        .run(1, &[(1, Step::CopyStore), (0, rename(0, "b"))])
+        .unwrap();
+    world.run(1, &commit(0)).unwrap();
+    world
+        .run(
+            1,
+            &[
+                (1, DELIVER),
+                (1, EFFECT),
+                (1, EFFECT),
+                (1, Step::RollBack),
+                (1, Step::Connect),
+            ],
+        )
+        .unwrap();
+    assert!(recovering(&world, 1).contains("root marker"));
+    world.phase(2, &[]).unwrap();
+    assert_eq!(live(&world), ["b"]);
+    let disk = world.devices[1].disk.entries();
+    assert_eq!(disk.len(), 1);
+    assert!(disk.values().all(|entry| entry.name == "b"));
+}
+
+#[test]
+fn remote_rename_then_store_rollback_and_a_delete() {
+    let mut world = synced(2, &[vec![(0, file("a"))]]);
+    world
+        .run(1, &[(1, Step::CopyStore), (0, rename(0, "b"))])
+        .unwrap();
+    world.run(1, &commit(0)).unwrap();
+    world
+        .run(
+            1,
+            &[(1, DELIVER), (1, EFFECT), (1, EFFECT), (1, Step::RollBack)],
+        )
+        .unwrap();
+    world.run(1, &[(0, delete(0))]).unwrap();
+    world.run(1, &commit(0)).unwrap();
+    world.phase(2, &[]).unwrap();
+    recovering(&world, 1);
+    assert!(live(&world).is_empty());
+    assert_eq!(world.devices[1].disk.entries().len(), 1);
+}
+
+fn four_commits() -> World {
+    let world = synced(
+        2,
+        &[
+            vec![(0, file("a"))],
+            vec![(0, file("b"))],
+            vec![(0, overwrite(0))],
+            vec![(0, overwrite(1))],
+        ],
+    );
+    assert_eq!(world.space().device_seq("device-0"), 4);
+    world
+}
+
+#[test]
+fn accepted_response_lost() {
+    let mut world = four_commits();
+    world
+        .run(
+            4,
+            &[
+                (0, overwrite(0)),
+                (0, SCAN),
+                (0, COMMIT),
+                (0, COMMIT),
+                (0, Step::Drop),
+            ],
+        )
+        .unwrap();
+    assert_eq!(world.space().device_seq("device-0"), 5);
+    world.phase(4, &[]).unwrap();
+    assert!(
+        world
+            .devices
+            .iter()
+            .all(|device| device.recovering.is_none())
+    );
+    assert!(
+        world
+            .seen
+            .contains_key("reconnect resends a commit the server applied")
+    );
+    assert!(
+        world
+            .seen
+            .contains_key("commit answered from the stored result")
+    );
+    assert_eq!(world.space().device_seq("device-0"), 5);
+}
+
+#[test]
+fn refused_then_replan() {
+    let mut world = four_commits();
+    world
+        .run(4, &[(0, overwrite(0)), (0, SCAN), (0, COMMIT)])
+        .unwrap();
+    let k = (world.devices[0].engine.commits.in_flight())
+        .expect("K is in flight")
+        .commit
+        .clone();
+    assert_eq!(k.device_seq, 5);
+    world
+        .run(
+            4,
+            &[
+                (0, overwrite(0)),
+                (0, Step::Commit(Reply::NoChunks)),
+                (0, DELIVER),
+                (0, SCAN),
+                (0, COMMIT),
+            ],
+        )
+        .unwrap();
+    let replanned = (world.devices[0].engine.commits.in_flight())
+        .expect("the changes are planned again")
+        .commit
+        .clone();
+    assert_eq!(replanned.device_seq, 5);
+    assert_ne!(replanned.commit_id, k.commit_id);
+    world.phase(4, &[]).unwrap();
+    assert!(
+        world
+            .devices
+            .iter()
+            .all(|device| device.recovering.is_none())
+    );
+    assert_eq!(world.space().device_seq("device-0"), 5);
+}
