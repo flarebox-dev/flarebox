@@ -619,7 +619,10 @@ impl Engine {
     /// new one. So is a created entry with the path and identity a node had before an earlier change of the batch took
     /// it out of L, unless the batch placed that node again. That keeps a child's node when its folder is replaced
     /// around it. Any other created entry is a new node. An entry that another path also links is a hard link, a file
-    /// of its own (design §5.6), so its identity never takes a node from another path.
+    /// of its own (design §5.6), so its identity never takes a node from another path, except a node L keeps recorded
+    /// outside what this device syncs: no included path holds that node, so a created entry with its identity is that
+    /// node placed again, as when a file with a link in an ignored folder comes back after a scan found it only through
+    /// that link.
     ///
     /// A node that held the name a change puts an entry at is gone from there, so it leaves L with everything under
     /// it. A file that arrives over a file keeps the node of the file it replaces when L's own node for the arriving
@@ -823,7 +826,7 @@ impl Engine {
                     let node = (self.trees.local_with_identity(&identity))
                         .filter(|node| !staying.contains(*node))
                         .or_else(|| self.trees.displaced_with_identity(&identity))
-                        .filter(|_| !linked)
+                        .filter(|node| !linked || self.trees.recorded_local(node))
                         .cloned()
                         .or_else(|| {
                             (gone.get(path))
