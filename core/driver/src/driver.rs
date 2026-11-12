@@ -107,7 +107,10 @@ pub enum DriverError {
     UnsupportedFileSystem,
     #[error("{} is not a linked folder", koidrive_fs::quoted(.0))]
     NotLinked(PathBuf),
-    #[error("unlinking {0} did not finish; unlink it again to finish")]
+    #[error(
+        "unlinking {} did not finish; unlink it again to finish",
+        koidrive_fs::quoted(.0)
+    )]
     UnlinkUnfinished(PathBuf),
     #[error("no unanswered question has the id {0:?}")]
     QuestionNotFound(String),

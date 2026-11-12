@@ -376,7 +376,7 @@ fn a_path_echoed_in_an_error_reaches_stderr_escaped() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert_eq!(stdout.lines().count(), 1, "{stdout:?}");
     assert!(!stdout.contains('\u{1b}'), "{stdout:?}");
-    assert!(stdout.contains("x\\u{1b}[31m\\nFORGED"), "{stdout:?}");
+    assert!(stdout.contains("x\\u{1b}[31m\\u{a}FORGED"), "{stdout:?}");
 
     for args in [
         &["status", "--bad\nFORGED\u{1b}[2J"][..],

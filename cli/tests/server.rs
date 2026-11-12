@@ -203,7 +203,6 @@ impl Machine {
         self.envelope(args)["data"].clone()
     }
 
-    /// The command's JSON envelope, after checking that the command succeeded.
     fn envelope(&self, args: &[&str]) -> Value {
         let args: Vec<&str> = args.iter().copied().chain(["--json"]).collect();
         let envelope: Value = serde_json::from_str(&self.run(&args)).unwrap();
