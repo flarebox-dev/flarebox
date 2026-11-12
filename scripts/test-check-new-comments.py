@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 
 CHECK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check-new-comments.py")
@@ -249,6 +250,42 @@ class NewComments(unittest.TestCase):
             {"core/a/src/lib.rs": "fn f() { a && b; }\n"},
         )
         self.assertEqual(code, 1, out)
+
+
+class WorkflowBase(unittest.TestCase):
+    def run_workflow(self, event):
+        workflow = os.path.join(os.path.dirname(CHECK), "..", ".github", "workflows", "ci.yml")
+        with open(workflow) as f:
+            job = f.read().split("\n  comments:\n", 1)[1].split("\n  ci-report:\n", 1)[0]
+        script = textwrap.dedent(job.rsplit("        run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, body in {
+                "git": 'printf "%s\\n" "$*" >> "$TRACE"\nif [ "$1" = rev-parse ]; then printf "%s\\n" actual-parent; fi\n',
+                "python3": 'printf "%s\\n" "$*" > "$CHECK_ARGS"\n',
+            }.items():
+                path = os.path.join(tmp, name)
+                with open(path, "w") as f:
+                    f.write("#!/bin/sh\n" + body)
+                os.chmod(path, 0o755)
+            env = dict(os.environ, PATH=tmp + os.pathsep + os.environ["PATH"], EVENT=event, BASE="stale-event-base",
+                       TRACE=os.path.join(tmp, "trace"), CHECK_ARGS=os.path.join(tmp, "check-args"))
+            subprocess.run(["bash", "-e", "-c", script], cwd=tmp, env=env, check=True, capture_output=True, text=True)
+            with open(env["TRACE"]) as f:
+                trace = f.read().splitlines()
+            with open(env["CHECK_ARGS"]) as f:
+                args = f.read().strip()
+            return trace, args, job
+
+    def test_pull_request_uses_actual_merge_parent_not_stale_event_base(self):
+        trace, args, job = self.run_workflow("pull_request")
+        self.assertEqual(args, "scripts/check-new-comments.py actual-parent HEAD")
+        self.assertEqual(trace, ["rev-parse HEAD^1"])
+        self.assertIn("fetch-depth: 2", job)
+
+    def test_merge_group_keeps_event_base(self):
+        trace, args, _ = self.run_workflow("merge_group")
+        self.assertEqual(args, "scripts/check-new-comments.py stale-event-base HEAD")
+        self.assertEqual(trace, ["fetch --no-tags --depth=1 origin stale-event-base"])
 
 
 if __name__ == "__main__":
