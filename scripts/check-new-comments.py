@@ -43,7 +43,9 @@ def comment_spans(src, lang, tokens=None):
     tokens_end = [None]
 
     def add_token(start, end):
-        tokens.append((src[start:end], lang == "js" and tokens_end[0] is not None and "\n" in src[tokens_end[0]:start]))
+        text = src[start:end]
+        joint = bool(tokens and tokens_end[0] == start)
+        tokens.append((text, lang == "js" and tokens_end[0] is not None and "\n" in src[tokens_end[0]:start], joint))
         tokens_end[0] = end
 
     def block(i):

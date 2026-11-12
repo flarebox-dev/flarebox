@@ -233,5 +233,23 @@ class NewComments(unittest.TestCase):
         self.assertEqual(code, 1, out)
 
 
+    def test_comments_only_preserves_operator_boundaries(self):
+        for before, after in [
+            ("const x = a + ++b;\n", "const x = a++ + b;\n"),
+            ("const x = a - --b;\n", "const x = a-- - b;\n"),
+            ("const x = a + /* separated */ +b;\n", "const x = a++b;\n"),
+            ("const x = 1 .toString();\n", "const x = 1.toString();\n"),
+            ("const x = \x60" + "$" + "{a + ++b}\x60;\n", "const x = \x60" + "$" + "{a++ + b}\x60;\n"),
+        ]:
+            with self.subTest(before=before):
+                code, out = self.comments_only({"server/src/a.ts": before}, {"server/src/a.ts": after})
+                self.assertEqual(code, 1, out)
+        code, out = self.comments_only(
+            {"core/a/src/lib.rs": "fn f() { a & &b; }\n"},
+            {"core/a/src/lib.rs": "fn f() { a && b; }\n"},
+        )
+        self.assertEqual(code, 1, out)
+
+
 if __name__ == "__main__":
     unittest.main()
