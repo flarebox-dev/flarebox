@@ -197,6 +197,22 @@ private final class Fetches {
         #expect(model.telemetry == TelemetrySetting(enabled: false, decided: true, locked: true))
     }
 
+    @Test func onlyAVariableThatTurnsUsageReportsOffIsExplained() throws {
+        let cases: [(TelemetrySetting, Bool)] = [
+            (TelemetrySetting(enabled: false, decided: false, locked: false), false),
+            (TelemetrySetting(enabled: true, decided: true, locked: false), false),
+            (TelemetrySetting(enabled: false, decided: true, locked: false), false),
+            (TelemetrySetting(enabled: false, decided: false, locked: true), true),
+            (TelemetrySetting(enabled: true, decided: true, locked: true), false),
+        ]
+        for (setting, explained) in cases {
+            let model = AppModel.fake(scenario: .upToDate)
+            try #require(model.session.fakeCore()).setTelemetrySetting(setting: setting)
+            model.start()
+            #expect(model.usageReportsTurnedOffByVariable == explained, "\(setting)")
+        }
+    }
+
     @Test func unansweredQuestionsAreUnseenAtLaunch() throws {
         var model = AppModel.fake(scenario: .recovery)
         model.markQuestionsSeen()

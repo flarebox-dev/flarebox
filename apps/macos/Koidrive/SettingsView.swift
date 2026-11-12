@@ -648,6 +648,11 @@ struct GeneralSettings: View {
                         Text("It never shares file names, paths or contents.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                        if app.usageReportsTurnedOffByVariable {
+                            Text("Turned off by an environment variable.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                         if let telemetryError {
                             Text(telemetryError)
                                 .font(.caption)

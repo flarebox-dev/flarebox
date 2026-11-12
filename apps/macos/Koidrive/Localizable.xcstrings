@@ -395,6 +395,7 @@
     "Too many wrong codes. Try again in a few minutes." : {},
     "Total" : {},
     "Trash" : {},
+    "Turned off by an environment variable." : {},
     "Unlink" : {},
     "Unlink %@?" : {},
     "Unlink…" : {},
