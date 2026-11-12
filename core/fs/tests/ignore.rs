@@ -593,6 +593,57 @@ fn a_watcher_started_from_the_snapshot_of_another_reports_the_removal_it_held() 
 }
 
 #[test]
+fn a_new_file_at_a_held_path_after_a_watcher_handover_keeps_the_move() {
+    for (native, before) in [(false, true), (false, false), (true, true), (true, false)] {
+        let dir = large_ignored_tree();
+        let root = dir.path();
+        write(root, "d/f.txt", "old");
+        let mut held = rules().with_search_budget(100);
+        let start = Snapshot::scan_with_rules(root, &mut held).unwrap();
+        let id = start.entries[Path::new("d/f.txt")].id;
+        let mut a = RescanWatcher::with_rules(root, start, Duration::ZERO, held).unwrap();
+        fs::rename(root.join("d/f.txt"), root.join("ig/zz/deep/f.txt")).unwrap();
+        let poll = a.poll(Duration::ZERO).unwrap();
+        assert_eq!(poll.pending, [PathBuf::from("d/f.txt")]);
+        if before {
+            write(root, "d/f.txt", "new");
+        }
+        let seed = a.snapshot().clone();
+        let fresh = rules().with_search_budget(100);
+        let mut b: Box<dyn Watcher> = match native {
+            true => Box::new(NativeWatcher::start_with_rules(root, seed, fresh).unwrap()),
+            false => {
+                Box::new(RescanWatcher::with_rules(root, seed, Duration::ZERO, fresh).unwrap())
+            }
+        };
+        if !before {
+            write(root, "d/f.txt", "new");
+        }
+        let mut changes = Vec::new();
+        for _ in 0..50 {
+            let poll = b.poll(Duration::from_millis(200)).unwrap();
+            changes.extend(poll.changes);
+            if poll.pending.is_empty() && changes.len() >= 2 {
+                break;
+            }
+        }
+        let expected = [
+            Change::Ignored {
+                from: "d/f.txt".into(),
+                to: "ig/zz/deep/f.txt".into(),
+                kind: File,
+                id,
+            },
+            created("d/f.txt", File),
+        ];
+        assert_eq!(
+            changes, expected,
+            "native {native}, new file before {before}"
+        );
+    }
+}
+
+#[test]
 fn a_folder_removed_while_the_search_for_its_file_runs_is_removed() {
     let dir = large_ignored_tree();
     let root = dir.path();
