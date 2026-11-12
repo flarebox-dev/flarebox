@@ -223,5 +223,15 @@ class NewComments(unittest.TestCase):
         self.assertEqual((code, out.splitlines()[0].split(":")[0]), (1, "core/a/src/lib.rs"))
 
 
+    def test_comments_only_strips_comments_inside_template_interpolations(self):
+        before = "const t = \x60prefix ${ /* why */ 1 + DB_NEST } suffix\x60;\n"
+        before = before.replace("DB_NEST", "\x60inner ${ /* nested */ 2}\x60")
+        after = before.replace("/* why */", "").replace("/* nested */", "")
+        code, out = self.comments_only({"server/src/a.ts": before}, {"server/src/a.ts": after})
+        self.assertEqual(code, 0, out)
+        code, out = self.comments_only({"server/src/a.ts": before}, {"server/src/a.ts": after.replace("2}", "3}")})
+        self.assertEqual(code, 1, out)
+
+
 if __name__ == "__main__":
     unittest.main()

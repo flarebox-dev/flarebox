@@ -42,6 +42,10 @@ def comment_spans(src, lang, tokens=None):
     n = len(src)
     tokens_end = [None]
 
+    def add_token(start, end):
+        tokens.append((src[start:end], lang == "js" and tokens_end[0] is not None and "\n" in src[tokens_end[0]:start]))
+        tokens_end[0] = end
+
     def block(i):
         depth, j = 1, i + 2
         while j < n and depth:
@@ -56,15 +60,23 @@ def comment_spans(src, lang, tokens=None):
 
     def quoted(i, quote, multiline, interpolation):
         j = i + len(quote)
+        segment, interpolated = i, False
         while j < n and not src.startswith(quote, j):
             if src[j] == "\n" and not multiline:
                 return j
             if interpolation and src.startswith(interpolation, j):
+                if tokens is not None:
+                    add_token(segment, j + len(interpolation))
                 j = code(j + len(interpolation), interpolation[-1].translate(str.maketrans("({", ")}")))
+                if tokens is not None:
+                    add_token(j - 1, j)
+                segment, interpolated = j, True
             elif src[j] == "\\":
                 j += 2
             else:
                 j += 1
+        if tokens is not None and interpolated:
+            add_token(segment, j + len(quote))
         return j + len(quote)
 
     def regex(i):
@@ -136,11 +148,11 @@ def comment_spans(src, lang, tokens=None):
                 elif c in ")]}":
                     depth -= 1
                 start = i
+                before = len(tokens) if tokens is not None else 0
                 i = token(i, prev)
                 prev = src[start:i]
-                if tokens is not None:
-                    tokens.append((prev, lang == "js" and tokens_end[0] is not None and "\n" in src[tokens_end[0]:start]))
-                    tokens_end[0] = i
+                if tokens is not None and len(tokens) == before:
+                    add_token(start, i)
         return i
 
     code(src.find("\n") if src.startswith("#!") and not src.startswith("#![") else 0, None)
