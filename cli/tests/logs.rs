@@ -81,6 +81,10 @@ fn the_daemon_under_json_prints_its_lifecycle_as_json_lines() {
         (envelope["data"]["help"].as_str().unwrap()).contains("_daemon"),
         "{envelope}"
     );
+    assert_eq!(
+        envelope["data"]["commands"][0]["output"], "lines",
+        "{envelope}"
+    );
 
     let busy = daemon(true).output().unwrap();
     assert_eq!(busy.status.code(), Some(1), "{busy:?}");

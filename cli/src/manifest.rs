@@ -41,13 +41,22 @@ fn name(arg: &clap::Arg) -> String {
 }
 
 fn sample(arg: &clap::Arg) -> String {
-    let possible = arg
-        .get_possible_values()
-        .first()
-        .map(|value| value.get_name().to_owned());
+    let possible = (arg.get_possible_values().first()).map(|value| value.get_name().to_owned());
     let default =
         (arg.get_default_values().first()).map(|value| value.to_string_lossy().into_owned());
-    possible.or(default).unwrap_or_else(|| "x".to_owned())
+    let parses = |value: &&str| {
+        let value_arg = clap::Arg::new("value").value_parser(arg.get_value_parser().clone());
+        let probe = clap::Command::new("probe")
+            .no_binary_name(true)
+            .arg(value_arg);
+        probe.try_get_matches_from([value]).is_ok()
+    };
+    let fits = ["x", "1", "0190f0a0-0000-7000-8000-00000000000a"]
+        .into_iter()
+        .find(parses);
+    (possible.or(default))
+        .or(fits.map(str::to_owned))
+        .unwrap_or_else(|| "x".to_owned())
 }
 
 fn words(arg: &clap::Arg) -> Vec<String> {
@@ -326,5 +335,33 @@ mod tests {
         let delete = find(&all, "server delete");
         let jurisdiction = (delete.options.iter()).find(|option| option.long == "jurisdiction");
         assert_eq!(jurisdiction.unwrap().requires, ["--bucket"]);
+    }
+
+    #[test]
+    fn every_probe_value_passes_its_arguments_parser() {
+        let mut root = crate::Cli::command();
+        root.build();
+        let mut stack = vec![&root];
+        while let Some(command) = stack.pop() {
+            stack.extend(command.get_subcommands());
+            for arg in command
+                .get_arguments()
+                .filter(|arg| arg.get_action().takes_values())
+            {
+                let value_arg =
+                    clap::Arg::new("value").value_parser(arg.get_value_parser().clone());
+                let probe = clap::Command::new("probe")
+                    .no_binary_name(true)
+                    .arg(value_arg);
+                let sample = sample(arg);
+                let parsed = probe.try_get_matches_from([&sample]);
+                assert!(
+                    parsed.is_ok(),
+                    "{} --{:?} {sample}",
+                    command.get_name(),
+                    arg.get_long()
+                );
+            }
+        }
     }
 }

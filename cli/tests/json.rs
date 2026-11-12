@@ -125,14 +125,9 @@ fn errors_are_envelopes_with_their_code_and_exit_status() {
     assert_eq!(envelope["error"]["code"], "usage");
 
     let (code, envelope) = profile.json(&["history", "versions", "a.txt", "--json"]);
-    assert_eq!(code, 2, "{envelope:#}");
-    assert!(
-        envelope["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("not in a linked folder"),
-        "{envelope:#}"
-    );
+    assert_eq!(code, 4, "{envelope:#}");
+    assert_eq!(envelope["error"]["code"], "auth_required");
+    assert_eq!(argv(&envelope["next_commands"][0]), ["koi", "setup"]);
 
     let (code, envelope) = profile.json(&["status", "--json=2"]);
     assert_eq!(code, 2, "{envelope:#}");
@@ -360,7 +355,7 @@ fn owner_login_commands_never_log_in_under_json_or_without_their_flags() {
 fn a_path_echoed_in_an_error_reaches_stderr_escaped() {
     let profile = Profile::new();
     let typed = profile.home.path().join("\u{1b}]0;owned\u{7}notes\n.txt");
-    let output = profile.output(&["history", "versions", typed.to_str().unwrap()]);
+    let output = profile.output(&["folder", "restart", typed.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
@@ -368,7 +363,7 @@ fn a_path_echoed_in_an_error_reaches_stderr_escaped() {
         "{stderr:?}"
     );
     assert!(
-        stderr.contains("\\u{1b}]0;owned\\u{7}notes\\u{a}.txt is not in a linked folder"),
+        stderr.contains("\\u{1b}]0;owned\\u{7}notes\\n.txt\" is not a linked folder"),
         "{stderr:?}"
     );
     assert_eq!(stderr.lines().count(), 1, "{stderr:?}");
@@ -587,35 +582,82 @@ fn every_command_prints_its_help_as_an_envelope_its_schema_takes() {
 #[test]
 fn the_help_manifest_names_each_command_its_schema_and_the_sign_in_it_needs() {
     let profile = Profile::new();
-    std::fs::create_dir(profile.home.path().join("docs")).unwrap();
+    std::fs::create_dir(profile.home.path().join("x")).unwrap();
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/json-schema/v1");
     let (_, help) = profile.json(&["help", "--json"]);
     let mut checked = Vec::new();
     for info in help["data"]["commands"].as_array().unwrap() {
         let command = info["command"].as_str().unwrap();
-        let schema = info["schema"].as_str().unwrap();
-        assert!(dir.join(schema).is_file(), "{info:#}");
-        let samples: &[&str] = match command {
-            "space create" => &["Work"],
-            "folder link" => &["docs", "--space", "Work"],
-            "folder unlink" | "folder restart" => &["docs"],
-            "folder retry" => &["docs", "--resend"],
-            "" | "help" | "service start" | "_daemon" | "history trash" => continue,
-            _ if info["subcommands"].as_array().unwrap().is_empty() => &[],
-            _ => continue,
-        };
-        let needs_values = info["arguments"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|arg| arg["required"] == true);
-        if needs_values && samples.is_empty() {
+        assert!(
+            dir.join(info["schema"].as_str().unwrap()).is_file(),
+            "{info:#}"
+        );
+        let group = !info["subcommands"].as_array().unwrap().is_empty();
+        if group || matches!(command, "help" | "service start" | "_daemon") {
             continue;
         }
-        let mut args: Vec<&str> = command.split_whitespace().collect();
-        args.extend(samples);
-        args.push("--json");
-        let (_, envelope) = profile.json(&args);
+        assert_eq!(info["output"], "envelope", "{info:#}");
+        let named = |list: &str| -> Vec<(String, Value)> {
+            let key = match list {
+                "arguments" => "name",
+                _ => "long",
+            };
+            (info[list].as_array().unwrap().iter())
+                .map(|item| match list {
+                    "arguments" => (item[key].as_str().unwrap().to_owned(), item.clone()),
+                    _ => (format!("--{}", item[key].as_str().unwrap()), item.clone()),
+                })
+                .collect()
+        };
+        let all: Vec<(String, Value)> = [named("arguments"), named("options")].concat();
+        let mut wanted: Vec<String> = (all.iter())
+            .filter(|(_, item)| item["required"] == true)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for group in info["groups"].as_array().unwrap() {
+            if group["required"] == true {
+                wanted.push(group["members"][0].as_str().unwrap().to_owned());
+            }
+        }
+        let mut next = 0;
+        while next < wanted.len() {
+            let item = &all
+                .iter()
+                .find(|(name, _)| *name == wanted[next])
+                .unwrap()
+                .1;
+            for name in item["requires"].as_array().unwrap() {
+                let name = name.as_str().unwrap().to_owned();
+                if !wanted.contains(&name) {
+                    wanted.push(name);
+                }
+            }
+            next += 1;
+        }
+        let mut envelope = Value::Null;
+        for value in ["x", "1", "0190f0a0-0000-7000-8000-00000000000a"] {
+            let mut args: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
+            for (name, item) in all.iter().filter(|(name, _)| wanted.contains(name)) {
+                let sample = (item["values"].as_array())
+                    .and_then(|values| values.first())
+                    .and_then(Value::as_str)
+                    .unwrap_or(value)
+                    .to_owned();
+                match (name.starts_with("--"), item["value"].is_string()) {
+                    (false, _) => args.push(sample),
+                    (true, false) => args.push(name.clone()),
+                    (true, true) => args.extend([name.clone(), sample]),
+                }
+            }
+            args.push("--json".to_owned());
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let (code, printed) = profile.json(&args);
+            envelope = printed;
+            let message = envelope["error"]["message"].as_str().unwrap_or_default();
+            if !(code == 2 && message.contains("invalid value")) {
+                break;
+            }
+        }
         let next = envelope["next_commands"].as_array().unwrap();
         match info["auth"].as_str().unwrap() {
             "device" => {
@@ -640,6 +682,8 @@ fn the_help_manifest_names_each_command_its_schema_and_the_sign_in_it_needs() {
         "folder link",
         "server deploy",
         "telemetry on",
+        "history versions",
+        "device revoke",
     ] {
         assert!(
             checked.iter().any(|checked| checked == command),
