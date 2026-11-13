@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use koidrive_engine::tree::Content;
 use koidrive_proto::v1::error;
 use koidrive_sim::world::disk::Place;
 use koidrive_sim::world::{Action, Cut, Failure, NAMES, Outcome, Reply, Step, TEXTS, World};
@@ -2634,4 +2635,186 @@ fn an_idle_device_sends_nothing_over_a_resend_it_pulled() {
 #[test]
 fn an_idle_device_whose_user_once_deleted_an_older_write_sends_nothing_over_a_resend() {
     an_idle_device_over_a_resend_it_pulled(true);
+}
+
+fn files_on(world: &World, device: usize) -> Vec<(String, Option<Content>)> {
+    let mut files: Vec<_> = (world.devices[device].disk.entries().values())
+        .map(|entry| (entry.name.clone(), entry.content.clone()))
+        .collect();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
+}
+
+fn content_on(world: &World, device: usize, name: &str) -> Content {
+    (world.devices[device].disk.entries().values())
+        .find(|entry| entry.name == name)
+        .and_then(|entry| entry.content.clone())
+        .unwrap()
+}
+
+fn reconnect(steps: &mut Vec<(usize, Step)>, device: usize, commits: bool) {
+    steps.push((device, Step::Connect));
+    steps.extend([(device, DELIVER); 8]);
+    if commits {
+        steps.extend(commit(device));
+        steps.extend([(device, DELIVER); 4]);
+    }
+}
+
+fn every_device_holds(world: &World, contents: &[&Content]) {
+    for device in 0..world.devices.len() {
+        let files = files_on(world, device);
+        for content in contents {
+            assert!(
+                files
+                    .iter()
+                    .any(|(_, held)| held.as_ref() == Some(*content)),
+                "device {device} lost a write: {files:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_authors_lost_edit_over_another_devices_version_is_sent_again_at_its_name() {
+    let mut world = converge(
+        2,
+        &[
+            vec![(1, file("a"))],
+            vec![(0, BACKUP), (1, overwrite(0))],
+            vec![(0, overwrite(0))],
+        ],
+    )
+    .unwrap();
+    let edit = content_on(&world, 0, "a");
+    let mut steps = vec![(0, RESTORE)];
+    reconnect(&mut steps, 0, true);
+    reconnect(&mut steps, 1, true);
+    world.phase(3, &steps).unwrap();
+    for device in 0..2 {
+        assert_eq!(
+            files_on(&world, device),
+            [("a".to_owned(), Some(edit.clone()))]
+        );
+    }
+}
+
+#[test]
+fn the_authors_lost_edit_is_sent_again_at_its_name_after_each_of_three_losses() {
+    let mut world = converge(
+        2,
+        &[vec![(1, file("a"))], vec![(0, BACKUP), (0, overwrite(0))]],
+    )
+    .unwrap();
+    let edit = content_on(&world, 0, "a");
+    for phase in 2..5 {
+        let mut steps = vec![(0, RESTORE)];
+        reconnect(&mut steps, 0, true);
+        reconnect(&mut steps, 1, false);
+        world.phase(phase, &steps).unwrap();
+        for device in 0..2 {
+            assert_eq!(
+                files_on(&world, device),
+                [("a".to_owned(), Some(edit.clone()))],
+                "after loss {}",
+                phase - 1
+            );
+        }
+    }
+}
+
+#[test]
+fn an_edit_made_between_two_losses_is_sent_again_at_its_name_after_the_second() {
+    let mut world = converge(
+        2,
+        &[vec![(1, file("a"))], vec![(0, BACKUP), (0, overwrite(0))]],
+    )
+    .unwrap();
+    let mut steps = vec![(0, RESTORE)];
+    reconnect(&mut steps, 0, true);
+    reconnect(&mut steps, 1, false);
+    world.phase(2, &steps).unwrap();
+    world.phase(3, &[(1, overwrite(0))]).unwrap();
+    let edit = content_on(&world, 1, "a");
+    let mut steps = vec![(0, RESTORE)];
+    reconnect(&mut steps, 0, true);
+    reconnect(&mut steps, 1, true);
+    world.phase(4, &steps).unwrap();
+    for device in 0..2 {
+        assert_eq!(
+            files_on(&world, device),
+            [("a".to_owned(), Some(edit.clone()))]
+        );
+    }
+}
+
+#[test]
+fn the_authors_lost_edit_is_sent_again_at_its_name_after_a_restore_to_an_earlier_backup() {
+    let mut world = converge(
+        2,
+        &[
+            vec![(1, file("a"))],
+            vec![(0, BACKUP), (1, overwrite(0))],
+            vec![(0, BACKUP), (0, overwrite(0))],
+        ],
+    )
+    .unwrap();
+    let edit = content_on(&world, 0, "a");
+    for (phase, restore) in [(3, RESTORE), (4, Step::RestoreEarlier)] {
+        let mut steps = vec![(0, restore)];
+        reconnect(&mut steps, 0, true);
+        reconnect(&mut steps, 1, true);
+        world.phase(phase, &steps).unwrap();
+        for device in 0..2 {
+            assert_eq!(
+                files_on(&world, device),
+                [("a".to_owned(), Some(edit.clone()))],
+                "phase {phase}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_author_that_edits_again_before_it_reconnects_keeps_the_lost_edit_beside_the_new_one() {
+    let mut world = converge(
+        2,
+        &[vec![(1, file("a"))], vec![(0, BACKUP), (0, overwrite(0))]],
+    )
+    .unwrap();
+    let lost = content_on(&world, 0, "a");
+    world.run(2, &[(0, RESTORE), (0, overwrite(0))]).unwrap();
+    let edit = content_on(&world, 0, "a");
+    let mut steps = Vec::new();
+    reconnect(&mut steps, 0, true);
+    reconnect(&mut steps, 1, false);
+    world.phase(3, &steps).unwrap();
+    every_device_holds(&world, &[&lost, &edit]);
+    for device in 0..2 {
+        let files = files_on(&world, device);
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert_eq!(content_on(&world, device, "a"), edit);
+    }
+}
+
+#[test]
+fn an_author_that_crashes_while_it_sends_a_lost_edit_again_sends_it_at_its_name() {
+    let mut world = converge(
+        2,
+        &[vec![(1, file("a"))], vec![(0, BACKUP), (0, overwrite(0))]],
+    )
+    .unwrap();
+    let edit = content_on(&world, 0, "a");
+    let mut steps = vec![(0, RESTORE), (0, Step::Connect)];
+    steps.extend([(0, DELIVER); 8]);
+    steps.extend([(0, SCAN), (0, COMMIT), (0, Step::Crash), (0, RESTORE)]);
+    reconnect(&mut steps, 0, true);
+    reconnect(&mut steps, 1, false);
+    world.phase(2, &steps).unwrap();
+    for device in 0..2 {
+        assert_eq!(
+            files_on(&world, device),
+            [("a".to_owned(), Some(edit.clone()))]
+        );
+    }
 }
