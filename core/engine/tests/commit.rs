@@ -5,7 +5,9 @@
 
 use std::collections::BTreeMap;
 
-use koidrive_engine::classify::{Class, Origin, REPLACED_VERSIONS_KEPT, Trees, Waiting};
+use koidrive_engine::classify::{
+    Class, Origin, PAST_POSITIONS_KEPT, REPLACED_VERSIONS_KEPT, Trees, Waiting,
+};
 use koidrive_engine::commit::{
     Commits, Failure, Halt, Lift, LiftError, MAX_COMMIT_BYTES, MAX_OPS, Reconnect,
 };
@@ -7953,4 +7955,42 @@ fn a_lost_folder_move_keeps_its_childs_remote_move_when_its_old_name_is_held_in_
     let sent = build(&mut commits, &mut trees, &mut ids).map(|commit| ops(&commit));
     assert_eq!(sent, Some(vec![mv("p", ROOT, "y")]));
     assert_eq!(trees.class("n"), Class::Remote);
+}
+
+#[test]
+fn r_keeps_the_newest_positions_a_node_held() {
+    let (mut trees, _, _) = n_at_x();
+    for rev in 2..=(PAST_POSITIONS_KEPT as u64 + 2) {
+        trees.set_remote(
+            "n".into(),
+            remote_at(file(ROOT, &format!("p{rev}"), 1), rev),
+        );
+    }
+    let kept = &trees.state().past_positions["n"];
+    assert_eq!(kept.len(), PAST_POSITIONS_KEPT);
+    assert_eq!(kept.first().map(|past| past.rev), Some(2));
+}
+
+#[test]
+fn a_lost_move_is_sent_again_when_the_loss_also_took_a_delete_made_after_it() {
+    let (mut trees, mut commits, mut ids) = n_at_x();
+    trees.set_local("n".into(), local(file(ROOT, "y", 1), 1));
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "y")]);
+    trees.set_remote("n".into(), remote_at(file(ROOT, "y", 1), 2));
+    commits
+        .received(result(2, vec![outcome(op_result::Code::Applied)]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 2));
+    trees.settle();
+    let trashed_at_3 = RemoteNode {
+        meta_rev: 3,
+        ..trashed(file(ROOT, "y", 1))
+    };
+    trees.set_remote("n".into(), trashed_at_3);
+    trees.settle();
+    let n = remote(file(ROOT, "x", 1));
+    let sent = lose_with_n_at(n, 0, &mut trees, &mut commits, &mut ids);
+    assert_eq!(sent, [mv("n", ROOT, "y")]);
 }

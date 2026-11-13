@@ -23,6 +23,13 @@ pub const SETTLE_GROUP_LIMIT: usize = 12;
 /// proven, and the file's content is kept beside R's as a conflict copy.
 pub const REPLACED_VERSIONS_KEPT: usize = 64;
 
+/// How many of the earlier live records R held of one node [`TreesState::past_positions`] keeps.
+/// A restore that takes a node back further than that does not prove a move of this device lost,
+/// and R's position is taken as a remote move.
+///
+/// [`TreesState::past_positions`]: crate::state::TreesState::past_positions
+pub const PAST_POSITIONS_KEPT: usize = 64;
+
 /// An S update of an acknowledged op that waits until S stays a valid tree with it
 /// ([`Trees::waiting`]).
 #[derive(Clone, Debug, PartialEq)]
@@ -517,6 +524,9 @@ impl Trees {
             let earlier = self.past_positions.entry(id.clone()).or_default();
             if !earlier.contains(&past) {
                 earlier.push(past);
+            }
+            if earlier.len() > PAST_POSITIONS_KEPT {
+                earlier.remove(0);
             }
         }
         if node.is_live() && node.shape.kind == Kind::File && is_rules_file(&node.shape.name) {
@@ -1249,12 +1259,15 @@ impl Trees {
     }
 
     /// The nodes whose position a create or a move of this device set, and whose position S and R
-    /// still hold, for [`Trees::forget_lost`] once a bootstrap has replaced R.
+    /// still hold, R live or in the trash, for [`Trees::forget_lost`] once a bootstrap has replaced
+    /// R.
     pub fn moved_here(&self) -> Vec<(NodeId, MovedHere)> {
         (self.moved_here.iter())
             .filter(|(id, _)| {
-                let (remote, synced) = (self.r.live(id), self.s.live(id));
-                remote.zip(synced).is_some_and(|(r, s)| r.same_position(s))
+                let remote = self.r.get(id).map(|remote| &remote.shape);
+                remote
+                    .zip(self.s.live(id))
+                    .is_some_and(|(r, s)| r.same_position(s))
             })
             .map(|(id, moved)| (id.clone(), moved.clone()))
             .collect()

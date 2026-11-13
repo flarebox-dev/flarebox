@@ -78,7 +78,8 @@ pub struct TreesState {
     /// The nodes whose position a create or a move of this device set, while R holds them at that
     /// position, also after a delete and a restore of the node.
     pub moved_here: BTreeMap<NodeId, MovedHere>,
-    /// The earlier live records R held of each node, oldest first.
+    /// The earlier live records R held of each node, oldest first, the newest
+    /// [`PAST_POSITIONS_KEPT`](crate::classify::PAST_POSITIONS_KEPT).
     pub past_positions: BTreeMap<NodeId, Vec<Agreed>>,
     /// The files whose content in L is an edit of this device that the server does not hold,
     /// although S and R may hold the same bytes (section 4.4).
