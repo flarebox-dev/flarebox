@@ -3368,3 +3368,30 @@ fn an_entry_a_rule_left_out_in_an_unreadable_folder_is_created_once_included_and
     assert!(snapshot.entries.contains_key(Path::new("sub/b.txt")));
     assert!(snapshot.left_out.is_empty());
 }
+
+#[test]
+fn an_entry_a_rule_left_out_in_a_renamed_unreadable_folder_is_created_once_included() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, mut snapshot, mut rules) = tree_without_rules();
+    let root = dir.path();
+    write(root, RULES_FILE, "b.txt\n");
+    snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    fs::set_permissions(root.join("sub"), fs::Permissions::from_mode(0o000)).unwrap();
+    fs::rename(root.join("sub"), root.join("moved")).unwrap();
+    write(root, RULES_FILE, "c.txt\n");
+    let blocked = snapshot.rescan_with_rules(root, whole(), &mut rules);
+    fs::set_permissions(root.join("moved"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(blocked.unwrap().unreadable, [PathBuf::from("moved")]);
+    assert!(!snapshot.entries.contains_key(Path::new("moved/b.txt")));
+    assert!(snapshot.left_out.contains_key(Path::new("moved/b.txt")));
+    assert!(!snapshot.left_out.contains_key(Path::new("sub/b.txt")));
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert!(
+        rescan.changes.contains(&created("moved/b.txt", File)),
+        "{rescan:?}"
+    );
+}
