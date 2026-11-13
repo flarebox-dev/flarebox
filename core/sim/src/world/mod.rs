@@ -2323,6 +2323,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_restore_matches_placement_commits_even_when_their_sequence_is_reused() {
+        let mut world = World::new(2);
+        let action = |kind, name| {
+            Step::User(Action {
+                kind,
+                target: 0,
+                parent: 0,
+                name,
+                text: 0,
+            })
+        };
+        world.phase(0, &[(0, action(0, 0))]).unwrap();
+        world.step(0, &Step::Backup).unwrap();
+        world.phase(1, &[(0, action(3, 2))]).unwrap();
+        world.step(0, &Step::Backup).unwrap();
+        let head = world.space.head_seq();
+        let token = world.space.token_at(head).unwrap();
+        world.restore(true);
+        world.phase(2, &[]).unwrap();
+        assert_eq!(world.space.head_seq(), head);
+        assert_ne!(world.space.token_at(head).unwrap(), token);
+        let node = world
+            .space
+            .nodes()
+            .into_iter()
+            .find(|node| node.name == "b")
+            .unwrap()
+            .node_id;
+        world.restore(false);
+        assert_eq!(
+            world.restored_names[0],
+            BTreeMap::from([(node, BTreeSet::from(["b".into()]))])
+        );
+        assert!(world.restored_names[1].is_empty());
+        world.phase(3, &[]).unwrap();
+        assert!(world.restored_names.iter().all(BTreeMap::is_empty));
+        world.restore(false);
+        assert!(world.restored_names.iter().all(BTreeMap::is_empty));
+    }
+
+    #[test]
     fn a_completed_phase_retires_only_live_devices_rollback_evidence() {
         let mut world = World::new(2);
         world.step(0, &Step::CopyStore).unwrap();
