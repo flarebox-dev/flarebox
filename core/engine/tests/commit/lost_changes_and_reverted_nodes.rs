@@ -1774,7 +1774,7 @@ fn a_lost_move_and_edit_are_sent_again_when_another_file_held_the_old_name() {
         let synced = trees.taken_from_others(|seq| commits.lost_here(seq));
         let moved = trees.moved_here();
         let untaken = trees.untaken_edits(|seq| commits.lost_here(seq));
-        let versions = trees.remote_versions();
+        let records = trees.remote_records();
         trees.set_listed_remote("n".into(), version(remote(file(ROOT, "x", 1)), "v1"));
         trees.set_listed_remote("q".into(), version(remote(file(ROOT, "z", 2)), "vq"));
         trees.forget_lost(
@@ -1783,7 +1783,7 @@ fn a_lost_move_and_edit_are_sent_again_when_another_file_held_the_old_name() {
             synced,
             moved,
             untaken,
-            versions,
+            records,
             commits.held_through(),
             commits.accepted(),
         );

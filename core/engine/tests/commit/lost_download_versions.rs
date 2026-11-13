@@ -220,7 +220,7 @@ fn a_change_another_device_made_to_a_version_the_server_kept_is_taken_after_a_lo
         };
         trees.set_remote("a".into(), deleted);
         trees.settle();
-        let versions = trees.remote_versions();
+        let records = trees.remote_records();
         let synced = trees.taken_from_others(|_| false);
         trees.set_listed_remote("a".into(), edited);
         trees.forget_lost(
@@ -229,7 +229,7 @@ fn a_change_another_device_made_to_a_version_the_server_kept_is_taken_after_a_lo
             synced,
             Vec::new(),
             Vec::new(),
-            versions,
+            records,
             0,
             0,
         );
@@ -238,3 +238,35 @@ fn a_change_another_device_made_to_a_version_the_server_kept_is_taken_after_a_lo
         assert!(trees.unsent_edits().is_empty(), "at {name}");
     }
 }
+
+#[test]
+fn a_change_another_device_made_after_a_loss_to_content_from_before_it_is_taken() {
+    for name in ["a", "b"] {
+        let mut trees = trees(&[synced("a", file(ROOT, "a", 1))]);
+        trees.set_remote("a".into(), version(remote(file(ROOT, "a", 1)), "v1"));
+        trees.settle();
+        let records = trees.remote_records();
+        let synced = trees.taken_from_others(|_| false);
+        let edited = RemoteNode {
+            content_rev: 3,
+            edit_rev: 3,
+            meta_rev: 3,
+            ..version(remote(file(ROOT, name, 3)), "v3")
+        };
+        trees.set_listed_remote("a".into(), edited);
+        trees.forget_lost(
+            Vec::new(),
+            Vec::new(),
+            synced,
+            Vec::new(),
+            Vec::new(),
+            records,
+            1,
+            1,
+        );
+        trees.settle();
+        assert_eq!(trees.class("a"), Class::Remote, "at {name}");
+        assert!(trees.unsent_edits().is_empty(), "at {name}");
+    }
+}
+

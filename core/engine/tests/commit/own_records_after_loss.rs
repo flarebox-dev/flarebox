@@ -47,6 +47,7 @@ fn served_at_5_then_lost(
     );
     let synced = trees.taken_from_others(|seq| commits.lost_here(seq));
     let untaken = trees.untaken_edits(|seq| commits.lost_here(seq));
+    let records = trees.remote_records();
     let p = RemoteNode {
         content_rev: 2,
         edit_rev: 2,
@@ -73,6 +74,7 @@ fn served_at_5_then_lost(
         synced,
         moved,
         untaken,
+        records,
         commits.held_through(),
         commits.accepted(),
     );
