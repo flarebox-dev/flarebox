@@ -630,6 +630,8 @@ jobs:
         uses: ./.github/actions/self-hosted-rust
       - name: Test notarize.sh against a stub notarytool
         run: scripts/test-notarize.sh
+      - name: Test release verification rejects missing tickets and unnotarized artifacts
+        run: nice -n 10 bash scripts/test-verify-release.sh
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -646,6 +648,8 @@ jobs:
         run: plutil -p build/release/Koidrive.app/Contents/Info.plist
       - name: Sign the app ad hoc (pull requests are never signed with the Developer ID)
         run: scripts/sign-app.sh build/release/Koidrive.app -
+      - name: Test login-item lifecycle commands without starting the UI
+        run: nice -n 10 bash scripts/test-login-item-lifecycle.sh build/release/Koidrive.app
       - name: Package the disk image
         run: scripts/make-dmg.sh build/release/Koidrive.app build/release/Koidrive-unsigned.dmg
       - name: Verify the disk image

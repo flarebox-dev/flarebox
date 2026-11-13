@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -17,17 +18,14 @@ use tokio::process::Command;
 use url::Url;
 
 use crate::error::CliError;
-use crate::report::{Done, UpdateResult, UpdatedData, Via};
+use crate::report::{Done, UpdateNoticeData, UpdateResult, UpdatedData, Via};
 use crate::service;
 
-const BREW: Duration = Duration::from_secs(15 * 60);
 const INSTALLER: Duration = Duration::from_secs(5 * 60);
 const RECONCILE: Duration = Duration::from_secs(7 * 60);
 const SCAN: Duration = Duration::from_secs(60 * 60);
 const INSTALL_SCRIPT: &str = "https://koidrive.com/install.sh";
 const INSTALL_SCRIPT_VARIABLE: &str = "KOIDRIVE_INSTALL_SCRIPT_URL";
-
-const BREW_BUSY: [&str; 2] = ["process is already running", "process has already locked"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Installs {
@@ -92,46 +90,6 @@ impl Installs {
         all.extend(self.apps.iter().cloned());
         all
     }
-
-    fn pick(&self, exists: impl Fn(&Path) -> bool, running: &[&Path]) -> Option<Install> {
-        let homebrew = running
-            .iter()
-            .filter_map(|koi| homebrew_link(koi))
-            .chain(self.homebrew.iter().cloned());
-        if let Some(koi) = homebrew.into_iter().find(|koi| exists(koi)) {
-            let prefix = koi.ancestors().nth(4)?.to_path_buf();
-            return Some(Install::Homebrew { prefix });
-        }
-        let by_script = (self.script.iter().map(PathBuf::as_path))
-            .filter(|koi| exists(koi))
-            .chain(running.iter().copied().filter(|koi| !self.owned(koi)))
-            .next();
-        if let Some(dir) = by_script.and_then(Path::parent) {
-            return Some(Install::Script {
-                dir: dir.to_path_buf(),
-            });
-        }
-        self.apps
-            .iter()
-            .map(PathBuf::as_path)
-            .chain(
-                running
-                    .iter()
-                    .copied()
-                    .filter(|koi| crate::app::bundled(koi)),
-            )
-            .find(|koi| exists(koi))
-            .map(|koi| Install::App {
-                binary: koi.to_path_buf(),
-            })
-    }
-
-    fn owned(&self, koi: &Path) -> bool {
-        self.apps.iter().any(|app| app == koi)
-            || self.homebrew.iter().any(|homebrew| homebrew == koi)
-            || homebrew_link(koi).is_some()
-            || (koi.components()).any(|part| part.as_os_str().to_string_lossy().ends_with(".app"))
-    }
 }
 
 pub fn homebrew_link(binary: &Path) -> Option<PathBuf> {
@@ -151,28 +109,255 @@ pub fn homebrew_link(binary: &Path) -> Option<PathBuf> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Install {
-    Homebrew { prefix: PathBuf },
-    Script { dir: PathBuf },
-    App { binary: PathBuf },
+enum Method {
+    Cask { brew: PathBuf },
+    Formula { brew: PathBuf },
+    Installer,
+    App,
+    AppDownload,
+    Development,
+}
+
+impl Method {
+    fn via(&self) -> Option<Via> {
+        match self {
+            Method::Cask { .. } | Method::Formula { .. } => Some(Via::Homebrew),
+            Method::Installer => Some(Via::Installer),
+            Method::App | Method::AppDownload => Some(Via::App),
+            Method::Development => None,
+        }
+    }
+}
+
+pub(crate) struct Install {
+    binary: PathBuf,
+    method: Method,
 }
 
 impl Install {
-    fn koi(&self) -> PathBuf {
-        match self {
-            Install::Homebrew { prefix } => prefix.join("opt/koidrive/bin/koi"),
-            Install::Script { dir } => dir.join("koi"),
-            Install::App { binary } => binary.clone(),
+    pub(crate) fn current() -> Result<Self, CliError> {
+        let installs = Installs::of_this_machine();
+        let mut prefixes: Vec<PathBuf> = installs
+            .homebrew
+            .iter()
+            .filter_map(|koi| koi.ancestors().nth(4).map(Path::to_path_buf))
+            .collect();
+        #[cfg(feature = "test-install-inventory")]
+        let isolated = std::env::var_os("KOIDRIVE_TEST_INSTALL_INVENTORY").is_some();
+        #[cfg(not(feature = "test-install-inventory"))]
+        let isolated = false;
+        if !isolated && let Some(path) = std::env::var_os("PATH") {
+            prefixes.extend(
+                std::env::split_paths(&path)
+                    .filter(|bin| {
+                        bin.is_absolute() && bin.file_name().is_some_and(|name| name == "bin")
+                    })
+                    .filter_map(|bin| bin.parent().map(Path::to_path_buf)),
+            );
+        }
+        let binary = std::env::current_exe()
+            .map_err(|error| failed(format!("Cannot locate this koi: {error}")))?;
+        let invoked = std::env::args_os()
+            .next()
+            .and_then(|arg| Self::invoked(&binary, &arg, std::env::var_os("PATH").as_deref()));
+        let install = Self::resolve(
+            invoked.as_deref().unwrap_or(&binary),
+            env!("CARGO_PKG_VERSION"),
+            &prefixes,
+            &installs.apps,
+        )?;
+        if invoked.is_none()
+            && matches!(
+                install.method,
+                Method::Installer | Method::App | Method::AppDownload
+            )
+        {
+            return Err(failed(
+                "Cannot identify the invoked koi; run its full path to update".to_owned(),
+            ));
+        }
+        Ok(install)
+    }
+
+    fn invoked(binary: &Path, arg: &OsStr, path: Option<&OsStr>) -> Option<PathBuf> {
+        if arg.is_empty() {
+            return None;
+        }
+        let invoked = Path::new(arg);
+        let invoked = if invoked.is_absolute() || invoked.components().count() > 1 {
+            invoked.to_path_buf()
+        } else {
+            on_path(arg, path)?
+        };
+        (fs::canonicalize(&invoked).ok()? == fs::canonicalize(binary).ok()?).then_some(invoked)
+    }
+
+    fn resolve(
+        binary: &Path,
+        version: &str,
+        prefixes: &[PathBuf],
+        apps: &[PathBuf],
+    ) -> Result<Self, CliError> {
+        if update::is_development_version(version) {
+            return Ok(Install {
+                binary: binary.to_path_buf(),
+                method: Method::Development,
+            });
+        }
+        let resolved = fs::canonicalize(binary)
+            .map_err(|error| failed(format!("Cannot resolve {}: {error}", binary.display())))?;
+        let mut candidates = Vec::new();
+        let mut link = binary.to_path_buf();
+        for _ in 0..40 {
+            if let Some(prefix) =
+                homebrew_link(&link).and_then(|opt| opt.ancestors().nth(4).map(Path::to_path_buf))
+            {
+                candidates.push(prefix);
+            }
+            if let Some(prefix) = link
+                .parent()
+                .filter(|bin| bin.ends_with("bin"))
+                .and_then(Path::parent)
+            {
+                candidates.push(prefix.to_path_buf());
+            }
+            let Ok(target) = fs::read_link(&link) else {
+                break;
+            };
+            link = match target.is_absolute() {
+                true => target,
+                false => link.parent().unwrap_or(Path::new("/")).join(target),
+            };
+        }
+        candidates.extend_from_slice(prefixes);
+        let formula = candidates.iter().find(|prefix| {
+            fs::canonicalize(prefix.join("opt/koidrive/bin/koi"))
+                .is_ok_and(|helper| helper == resolved)
+        });
+        let method = if let Some(prefix) = formula {
+            Method::Formula {
+                brew: fs::canonicalize(prefix)
+                    .map_err(|error| {
+                        failed(format!(
+                            "Cannot resolve Homebrew at {}: {error}",
+                            prefix.display()
+                        ))
+                    })?
+                    .join("bin/brew"),
+            }
+        } else if let Some(opt) = homebrew_link(&resolved) {
+            Method::Formula {
+                brew: opt
+                    .ancestors()
+                    .nth(4)
+                    .expect("a formula path has a prefix")
+                    .join("bin/brew"),
+            }
+        } else if resolved.ends_with("Koidrive.app/Contents/Helpers/koi") {
+            let owned = candidates.iter().find(|prefix| {
+                fs::read_dir(prefix.join("Caskroom/koidrive")).is_ok_and(|entries| {
+                    entries.flatten().any(|entry| {
+                        fs::canonicalize(entry.path().join("Koidrive.app/Contents/Helpers/koi"))
+                            .is_ok_and(|helper| helper == resolved)
+                    })
+                })
+            });
+            match owned {
+                Some(prefix) => Method::Cask {
+                    brew: fs::canonicalize(prefix)
+                        .map_err(|error| {
+                            failed(format!(
+                                "Cannot resolve Homebrew at {}: {error}",
+                                prefix.display()
+                            ))
+                        })?
+                        .join("bin/brew"),
+                },
+                None if apps.iter().any(|helper| {
+                    fs::canonicalize(helper).is_ok_and(|helper| helper == resolved)
+                }) =>
+                {
+                    Method::App
+                }
+                None => Method::AppDownload,
+            }
+        } else if resolved.ends_with("bin/koi")
+            && resolved
+                .ancestors()
+                .nth(2)
+                .is_some_and(|keg| keg.join("INSTALL_RECEIPT.json").is_file())
+        {
+            return Err(failed("Cannot locate the Homebrew that owns this koi; set its HOMEBREW_PREFIX or put its bin directory on PATH".to_owned()));
+        } else if resolved.file_name().is_some_and(|name| name == "koi")
+            && !resolved
+                .components()
+                .any(|part| part.as_os_str().to_string_lossy().ends_with(".app"))
+        {
+            Method::Installer
+        } else {
+            return Err(failed(format!(
+                "{} is not a recognized Koidrive installation",
+                resolved.display()
+            )));
+        };
+        Ok(Install {
+            binary: resolved,
+            method,
+        })
+    }
+
+    fn command(&self) -> Option<Vec<&str>> {
+        match &self.method {
+            Method::Cask { brew } | Method::Formula { brew } => {
+                let path = std::env::var_os("PATH");
+                let selected = on_path(OsStr::new("brew"), path.as_deref()).and_then(|selected| {
+                    selected.parent().and_then(|bin| fs::canonicalize(bin).ok())
+                });
+                let owned = brew.parent().and_then(|bin| fs::canonicalize(bin).ok());
+                let executable = if owned.is_some() && selected == owned {
+                    "brew"
+                } else {
+                    brew.to_str()?
+                };
+                let mut command = vec![executable, "upgrade"];
+                if matches!(self.method, Method::Cask { .. }) {
+                    command.push("--cask");
+                }
+                command.push("koidrive");
+                Some(command)
+            }
+            Method::Installer | Method::App => Some(vec![self.binary.to_str()?, "update"]),
+            Method::AppDownload | Method::Development => None,
         }
     }
 
-    fn via(&self) -> Via {
-        match self {
-            Install::Homebrew { .. } => Via::Homebrew,
-            Install::Script { .. } => Via::Installer,
-            Install::App { .. } => Via::App,
-        }
+    pub(crate) fn notice(&self, update: &update::Update, version: &str) -> UpdateNoticeData {
+        let command = self.command().map(|command| command_text(&command));
+        let update = if self.method == Method::Development {
+            &update::Update::Off
+        } else {
+            update
+        };
+        UpdateNoticeData::of(update, version, command.as_deref())
     }
+}
+
+fn command_text(command: &[&str]) -> String {
+    command
+        .iter()
+        .map(|word| crate::pairing::shell_word(word))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn on_path(name: &OsStr, path: Option<&OsStr>) -> Option<PathBuf> {
+    std::env::split_paths(path?)
+        .map(|bin| bin.join(Path::new(name)))
+        .find(|candidate| {
+            fs::metadata(candidate).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
 }
 
 fn refuse_root(root: bool) -> Result<(), CliError> {
@@ -289,48 +474,6 @@ fn failed(why: String) -> CliError {
 
 fn minutes(within: Duration) -> u64 {
     within.as_secs().div_ceil(60)
-}
-
-async fn homebrew(prefix: &Path, echo: &mut Echo) -> Result<(), CliError> {
-    let brew = prefix.join("bin/brew");
-    if !brew.is_file() {
-        return Err(failed(format!(
-            "Homebrew is not at {}, where koi expected it",
-            brew.display()
-        )));
-    }
-    let path = format!(
-        "{}:/usr/bin:/bin:/usr/sbin:/sbin",
-        prefix.join("bin").display()
-    );
-    for args in [&["update"][..], &["upgrade", "koidrive/tap/koidrive"]] {
-        let mut command = Command::new(&brew);
-        command
-            .args(args)
-            .env("PATH", &path)
-            .env("HOMEBREW_NO_AUTO_UPDATE", "1")
-            .env("HOMEBREW_NO_ENV_HINTS", "1")
-            .env("HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK", "1");
-        let shown = format!("brew {}", args.join(" "));
-        let (status, _, errors) = (echo.run(command, BREW, Child::Progress).await)
-            .map_err(|error| failed(format!("{shown} did not run: {error}")))?
-            .ok_or_else(|| {
-                failed(format!(
-                    "{shown} did not finish within {} minutes",
-                    minutes(BREW)
-                ))
-            })?;
-        if status.success() {
-            continue;
-        }
-        if BREW_BUSY.iter().any(|busy| errors.contains(busy)) {
-            return Err(failed(
-                "Homebrew is busy with another command; try again when it finishes.".to_owned(),
-            ));
-        }
-        return Err(failed(format!("{shown} failed ({})", exit(status))));
-    }
-    Ok(())
 }
 
 fn exit(status: ExitStatus) -> String {
@@ -493,7 +636,8 @@ async fn select_app_helper(
 
 pub async fn run(paths: &Paths, json: bool) -> Result<Done, CliError> {
     refuse_root(rustix::process::geteuid().is_root())?;
-    if update::is_development_version(env!("CARGO_PKG_VERSION")) {
+    let install = Install::current()?;
+    if install.method == Method::Development {
         return Ok(Done::ok(
             UpdatedData {
                 from: env!("CARGO_PKG_VERSION").to_owned(),
@@ -507,6 +651,27 @@ pub async fn run(paths: &Paths, json: bool) -> Result<Done, CliError> {
         )
         .unchanged());
     }
+    if matches!(install.method, Method::Cask { .. } | Method::Formula { .. }) {
+        let command = install.command().ok_or_else(|| {
+            failed("Homebrew's path cannot be represented as a shell command".to_owned())
+        })?;
+        return Ok(Done::ok(
+            UpdatedData {
+                from: env!("CARGO_PKG_VERSION").to_owned(),
+                to: env!("CARGO_PKG_VERSION").to_owned(),
+                via: install.method.via(),
+                app: None,
+                result: UpdateResult::Unchanged,
+                service: None,
+            },
+            format!(
+                "Koidrive is managed by Homebrew. To update, run: {}\n",
+                command_text(&command)
+            ),
+        )
+        .unchanged()
+        .then(&command));
+    }
     let release = update::check_now(paths)
         .await
         .map_err(|error| CliError::new(Code::Unavailable, error.to_string()))?
@@ -517,22 +682,30 @@ pub async fn run(paths: &Paths, json: bool) -> Result<Done, CliError> {
             "GitHub names the release {version}, which is not a version"
         ))
     })?;
+    if install.method == Method::AppDownload {
+        let from = service::this_version();
+        if to.cmp_precedence(&from).is_gt() {
+            return Err(failed(format!("Download Koidrive {to} from {url}")));
+        }
+        return Ok(Done::ok(
+            UpdatedData {
+                from: from.to_string(),
+                to: from.to_string(),
+                via: install.method.via(),
+                app: None,
+                result: UpdateResult::Unchanged,
+                service: None,
+            },
+            format!("Koidrive {from} is the newest release.\n"),
+        )
+        .unchanged());
+    }
     let manager = service::system();
     let service = service::this_service(paths);
-    let installed = (service.as_ref().ok())
-        .and_then(|service| manager.installed(service))
-        .map(PathBuf::from);
-    let this_koi = std::env::current_exe().ok();
-    let running: Vec<&Path> = installed
-        .iter()
-        .chain(&this_koi)
-        .map(PathBuf::as_path)
-        .collect();
-    let installs = Installs::of_this_machine();
-    let install = installs.pick(Path::is_file, &running);
     let app_deadline = tokio::time::Instant::now() + RECONCILE;
     #[cfg(target_os = "macos")]
-    let existing_app = if let Some(Install::App { binary }) = &install {
+    let existing_app = if install.method == Method::App {
+        let binary = &install.binary;
         let discovered = async {
             let helper = crate::app_install::verify_existing(binary, app_deadline)
                 .await
@@ -554,28 +727,27 @@ pub async fn run(paths: &Paths, json: bool) -> Result<Done, CliError> {
     } else {
         None
     };
-    let from = match &install {
+    let from = match install.method {
         #[cfg(target_os = "macos")]
-        Some(Install::App { .. }) => existing_app.as_ref().unwrap().1.clone(),
+        Method::App => existing_app.as_ref().unwrap().1.clone(),
         #[cfg(not(target_os = "macos"))]
-        Some(Install::App { .. }) => service::this_version(),
-        Some(install) => service::version_of(&install.koi()).unwrap_or_else(service::this_version),
-        None => service::this_version(),
+        Method::App => service::this_version(),
+        _ => service::version_of(&install.binary).unwrap_or_else(service::this_version),
     };
     let upgrading = to.cmp_precedence(&from).is_gt();
     let download = || failed(format!("Download Koidrive {to} from {url}"));
     let mut echo = Echo::open(&log_path(paths), json);
-    let koi = install.as_ref().and_then(|install| match install {
-        Install::App { .. } => None,
-        _ => Some(UpdateBinary::Other(install.koi())),
-    });
+    let koi = match install.method {
+        Method::App => None,
+        _ => Some(UpdateBinary::Other(install.binary.clone())),
+    };
     #[cfg(target_os = "macos")]
     let mut koi = koi;
     let prepared_app: Option<crate::app::Prepared> = None;
     #[cfg(target_os = "macos")]
     let mut prepared_app = prepared_app;
-    match &install {
-        Some(Install::App { .. }) => {
+    match install.method {
+        Method::App => {
             let prepared =
                 crate::app::prepare(&to, crate::app_install::AppLaunch::Preserve, app_deadline)
                     .await;
@@ -619,28 +791,16 @@ pub async fn run(paths: &Paths, json: bool) -> Result<Done, CliError> {
             #[cfg(not(target_os = "macos"))]
             return Err(app_not_updated(paths, &from, &to, &url, prepared, app_deadline).await);
         }
-        Some(Install::Homebrew { prefix }) if upgrading => homebrew(prefix, &mut echo).await?,
-        Some(Install::Script { dir }) if upgrading => {
+        Method::Installer if upgrading => {
+            let dir = install.binary.parent().ok_or_else(download)?;
             installer(script_url()?, dir, &to, &mut echo).await?
         }
-        None if upgrading => return Err(download()),
-        _ => (),
+        Method::Installer => (),
+        Method::Cask { .. }
+        | Method::Formula { .. }
+        | Method::AppDownload
+        | Method::Development => unreachable!(),
     }
-    let Some(install) = install else {
-        let text = format!("Koidrive {from} is the newest release.\n");
-        return Ok(Done::ok(
-            UpdatedData {
-                from: from.to_string(),
-                to: from.to_string(),
-                via: None,
-                result: UpdateResult::Unchanged,
-                service: None,
-                app: None,
-            },
-            text,
-        )
-        .unchanged());
-    };
     let koi = koi.expect("an installation has a koi path");
     let changed = prepared_app
         .as_ref()
@@ -661,7 +821,17 @@ pub async fn run(paths: &Paths, json: bool) -> Result<Done, CliError> {
     .await;
     let (actual, report, app) =
         finish_reconciliation(paths, prepared_app, &from, reconciled, app_deadline).await?;
-    updated(&from, actual, install.via(), report, app, changed)
+    updated(
+        &from,
+        actual,
+        install
+            .method
+            .via()
+            .expect("a release installation has a source"),
+        report,
+        app,
+        changed,
+    )
 }
 
 fn updated(
@@ -970,8 +1140,11 @@ pub async fn follow_newest(paths: Paths) {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/executable.rs"]
+mod fixture;
+
+#[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -980,86 +1153,93 @@ mod tests {
     use super::*;
 
     fn executable(path: &Path, script: &str) {
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, script).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        super::fixture::executable(path, script.as_bytes());
     }
 
     #[test]
-    fn the_install_to_upgrade_is_homebrew_then_install_sh_then_the_app() {
-        let installs = Installs::under(None, Some(Path::new("/home/ada")));
-        let pick = |present: &[&str], running: &[&str]| {
-            let running: Vec<&Path> = running.iter().map(Path::new).collect();
-            installs.pick(
-                |path| present.iter().any(|item| Path::new(item) == path),
-                &running,
-            )
-        };
-        let app = "/Applications/Koidrive.app/Contents/Helpers/koi";
-        let script = "/home/ada/.local/bin/koi";
-        assert_eq!(
-            pick(&["/usr/local/opt/koidrive/bin/koi", script, app], &[app]),
-            Some(Install::Homebrew {
-                prefix: "/usr/local".into()
-            })
-        );
-        assert_eq!(
-            pick(&["/home/linuxbrew/.linuxbrew/opt/koidrive/bin/koi"], &[]),
-            Some(Install::Homebrew {
-                prefix: "/home/linuxbrew/.linuxbrew".into()
-            })
-        );
-        assert_eq!(
-            pick(&[script, app], &["/srv/tools/koi"]),
-            Some(Install::Script {
-                dir: "/home/ada/.local/bin".into()
-            })
-        );
-        assert_eq!(
-            pick(&[app], &[app, "/srv/tools/koi"]),
-            Some(Install::Script {
-                dir: "/srv/tools".into()
-            }),
-            "a koi the service or this command runs outside Homebrew and the app is install.sh's"
-        );
-        for owned in [
-            app,
-            "/opt/homebrew/Cellar/koidrive/0.1.0/bin/koi",
-            "/opt/homebrew/opt/koidrive/bin/koi",
-            "/Users/ada/Applications/Koidrive.app/Contents/Helpers/koi",
+    fn the_running_binary_determines_its_installation_method() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("standalone/koi");
+        let app = dir
+            .path()
+            .join("Applications/Koidrive.app/Contents/Helpers/koi");
+        let custom = dir
+            .path()
+            .join("Custom Apps/Koidrive.app/Contents/Helpers/koi");
+        let formula = dir.path().join("brew/Cellar/koidrive/0.1.0/bin/koi");
+        executable(&script, "#!/bin/sh\nexit 0\n");
+        executable(&app, "#!/bin/sh\nexit 0\n");
+        let script_command = format!("{} update", fs::canonicalize(&script).unwrap().display());
+        let app_command = format!("{} update", fs::canonicalize(&app).unwrap().display());
+        let formula_brew = fs::canonicalize(dir.path()).unwrap().join("brew/bin/brew");
+        let formula_command = format!("{} upgrade koidrive", formula_brew.display());
+        for (binary, method, command) in [
+            (&script, Method::Installer, Some(script_command.as_str())),
+            (&app, Method::App, Some(app_command.as_str())),
+            (&custom, Method::AppDownload, None),
+            (
+                &formula,
+                Method::Formula { brew: formula_brew },
+                Some(formula_command.as_str()),
+            ),
         ] {
+            executable(binary, "#!/bin/sh\nexit 0\n");
+            let install =
+                Install::resolve(binary, "0.1.0", &[], std::slice::from_ref(&app)).unwrap();
+            assert_eq!(install.method, method);
+            assert_eq!(install.binary, fs::canonicalize(binary).unwrap());
             assert_eq!(
-                pick(&[app], &[owned]),
-                Some(Install::App { binary: app.into() }),
-                "{owned}"
+                install.command().map(|args| args.join(" ")).as_deref(),
+                command
+            );
+            let available = update::Update::Available {
+                latest: "0.2.0".into(),
+                url: "https://github.com/koidrive/koidrive/releases/tag/v0.2.0".into(),
+                checked_at_ms: 1,
+            };
+            assert_eq!(
+                install.notice(&available, "0.1.0").command.as_deref(),
+                command
+            );
+            let dev =
+                Install::resolve(binary, "0.0.0-dev", &[], std::slice::from_ref(&app)).unwrap();
+            assert_eq!(dev.method, Method::Development);
+            assert_eq!(dev.command(), None);
+            assert_eq!(dev.method.via(), None);
+            assert_eq!(
+                dev.notice(&available, "0.0.0-dev").state,
+                crate::report::UpdateState::Off
             );
         }
-        let user_app = "/Users/ada/Applications/Koidrive.app/Contents/Helpers/koi";
-        let selected = pick(&[user_app], &[user_app]).unwrap();
-        assert_eq!(
-            selected,
-            Install::App {
-                binary: user_app.into()
-            }
-        );
-        assert_eq!(selected.koi(), PathBuf::from(user_app));
-        assert_eq!(pick(&[], &[]), None);
-
-        let custom = Installs::under(Some(Path::new("/srv/brew")), None);
-        assert_eq!(
-            custom.pick(
-                |path| path == Path::new("/srv/brew/opt/koidrive/bin/koi"),
-                &[]
-            ),
-            Some(Install::Homebrew {
-                prefix: "/srv/brew".into()
-            })
-        );
         assert_eq!(
             Installs::under(Some(Path::new("/opt/homebrew")), None)
                 .homebrew
                 .len(),
             3
+        );
+    }
+
+    #[test]
+    fn an_app_update_notice_names_the_resolved_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("My Apps/Koidrive.app/Contents/Helpers/koi");
+        executable(&binary, "#!/bin/sh\nexit 0\n");
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&binary, &alias).unwrap();
+        let install =
+            Install::resolve(&alias, "0.1.0", &[], std::slice::from_ref(&binary)).unwrap();
+        let available = update::Update::Available {
+            latest: "0.2.0".into(),
+            url: "https://github.com/koidrive/koidrive/releases/tag/v0.2.0".into(),
+            checked_at_ms: 1,
+        };
+        let resolved = fs::canonicalize(binary).unwrap();
+        assert_eq!(
+            install.notice(&available, "0.1.0").command,
+            Some(format!(
+                "{} update",
+                crate::pairing::shell_word(resolved.to_str().unwrap())
+            ))
         );
     }
 
@@ -1105,30 +1285,25 @@ mod tests {
         assert!(refuse_root(false).is_ok());
     }
 
-    const BREW: &str = r#"#!/bin/sh
-printf '%s\n' "$*" >> "$0.calls"
-printf 'PATH=%s AUTO=%s HINTS=%s DEPENDENTS=%s\n' "$PATH" "$HOMEBREW_NO_AUTO_UPDATE" "$HOMEBREW_NO_ENV_HINTS" "$HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK" >> "$0.env"
-echo "==> brew $1"
-"#;
-
     fn echo(dir: &Path) -> Echo {
         Echo::open(&dir.join("logs/update.log"), true)
     }
 
     #[test]
     fn user_applications_are_discovered_without_treating_their_helper_as_install_sh() {
-        let home = Path::new("/fixture/home");
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
         let user = home.join("Applications/Koidrive.app/Contents/Helpers/koi");
+        executable(&user, "#!/bin/sh\nexit 0\n");
         let installs = Installs::under(None, Some(home));
         assert!(installs.all().contains(&user));
-        assert!(matches!(
-            installs.pick(|path| path == user, &[&user]),
-            Some(Install::App { binary }) if binary == user
-        ));
-        assert!(matches!(
-            installs.pick(|path| path == user, &[]),
-            Some(Install::App { binary }) if binary == user
-        ));
+        let alias = home.join("koi");
+        std::os::unix::fs::symlink(&user, &alias).unwrap();
+        for binary in [&user, &alias] {
+            let install = Install::resolve(binary, "0.1.0", &[], &installs.apps).unwrap();
+            assert_eq!(install.method, Method::App);
+            assert_eq!(install.binary, fs::canonicalize(&user).unwrap());
+        }
         assert_eq!(
             installs.all().iter().filter(|path| **path == user).count(),
             1
@@ -1233,8 +1408,11 @@ echo "==> brew $1"
             script: None,
             apps: vec![system.path().to_path_buf(), invoking.path().to_path_buf()],
         };
-        let selected = installs.pick(Path::is_file, &[invoking.path()]).unwrap();
-        assert_eq!(selected.koi(), system.path());
+        assert!(installs.all().contains(&system.path().to_path_buf()));
+        assert!(installs.all().contains(&invoking.path().to_path_buf()));
+        let selected = Install::resolve(system.path(), "98.2.0", &[], &installs.apps).unwrap();
+        assert_eq!(selected.method, Method::App);
+        assert_eq!(selected.binary, fs::canonicalize(system.path()).unwrap());
         assert!(system.version().is_none());
         let deadline = tokio::time::Instant::now() + RECONCILE;
         system.check(deadline).await.unwrap();
@@ -1273,11 +1451,10 @@ echo "==> brew $1"
                 serde_json::to_string(state).unwrap(),
                 serde_json::to_string(&problem).unwrap()
             );
-            fs::write(
+            executable(
                 helper.path(),
-                original.replace("\"state\":\"running\"", &fields),
-            )
-            .unwrap();
+                &original.replace("\"state\":\"running\"", &fields),
+            );
             let deadline = tokio::time::Instant::now() + RECONCILE;
             let from = discover_app_version(&helper, deadline).await.unwrap();
             assert_eq!(from, version);
@@ -1414,13 +1591,21 @@ echo "==> brew $1"
                     fs::rename(&binary, binary.with_extension("old")).unwrap();
                     executable(&binary, "#!/bin/sh\necho unsafe > \"$0.calls\"\n");
                 }
-                "during_version" => fs::write(&binary, format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\nprintf OTHERTEAM > '{}/Signer'\necho 'koi 98.0.0'\n", bundle.display()
-                )).unwrap(),
-                "during_helper" => fs::write(&binary,
-                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\n/bin/mv \"$0\" \"$0.old\"\n/bin/cp \"$0.old\" \"$0\"\necho 'koi 98.0.0'\n"
-                ).unwrap(),
-                _ => fs::write(&binary, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\necho 'not-a-version'\n").unwrap(),
+                "during_version" => executable(
+                    &binary,
+                    &format!(
+                        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\nprintf OTHERTEAM > '{}/Signer'\necho 'koi 98.0.0'\n",
+                        bundle.display()
+                    ),
+                ),
+                "during_helper" => executable(
+                    &binary,
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\n/bin/mv \"$0\" \"$0.old\"\n/bin/cp \"$0.old\" \"$0\"\necho 'koi 98.0.0'\n",
+                ),
+                _ => executable(
+                    &binary,
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\necho 'not-a-version'\n",
+                ),
             }
             let error = discover_app_version(&helper, tokio::time::Instant::now() + RECONCILE)
                 .await
@@ -1494,7 +1679,7 @@ echo "==> brew $1"
             let (_fixture, helper) = crate::app_install::verified_helper_fixture("99.0.0").await;
             let binary = helper.path().to_path_buf();
             let bundle = binary.ancestors().nth(3).unwrap().to_path_buf();
-            fs::write(&binary, format!("#!/bin/sh\necho 'koi {actual}'\n")).unwrap();
+            executable(&binary, &format!("#!/bin/sh\necho 'koi {actual}'\n"));
             let committed = if committed {
                 serde_json::json!([{"path":bundle, "version":"99.0.0", "change":"replaced"}])
             } else {
@@ -1550,9 +1735,13 @@ echo "==> brew $1"
             let prepared = crate::app::Prepared::fixture(serde_json::from_value(serde_json::json!({
                 "state":"present", "path":bundle, "version":"99.0.0", "change":"unchanged", "launch":"not_requested"
             })).unwrap());
-            fs::write(&binary, format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\nprintf OTHERTEAM > '{}/Signer'\necho 'koi {actual}'\n", bundle.display()
-            )).unwrap();
+            executable(
+                &binary,
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\nprintf OTHERTEAM > '{}/Signer'\necho 'koi {actual}'\n",
+                    bundle.display()
+                ),
+            );
             let dir = tempfile::tempdir().unwrap();
             let paths = Paths::under(dir.path());
             let manager = service::system();
@@ -1656,9 +1845,13 @@ echo "==> brew $1"
                     fs::rename(&binary, binary.with_extension("old")).unwrap();
                     executable(&binary, "#!/bin/sh\necho unsafe > \"$0.calls\"\n");
                 }
-                "during_version" => fs::write(&binary, format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\ncase \"$1\" in\n--version) printf OTHERTEAM > '{}/Signer'; echo 'koi 99.0.0' ;;\n_reconcile) echo unsafe >> \"$0.calls\" ;;\nesac\n", bundle.display()
-                )).unwrap(),
+                "during_version" => executable(
+                    &binary,
+                    &format!(
+                        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\ncase \"$1\" in\n--version) printf OTHERTEAM > '{}/Signer'; echo 'koi 99.0.0' ;;\n_reconcile) echo unsafe >> \"$0.calls\" ;;\nesac\n",
+                        bundle.display()
+                    ),
+                ),
                 _ => {
                     fs::rename(&bundle, bundle.with_extension("displaced")).unwrap();
                     fs::create_dir_all(binary.parent().unwrap()).unwrap();
@@ -2168,80 +2361,121 @@ echo "==> brew $1"
         }
     }
 
-    #[tokio::test]
-    async fn homebrew_upgrades_only_the_koidrive_formula_with_its_own_brew() {
+    #[test]
+    fn a_cask_helper_requires_a_matching_homebrew_registration() {
         let dir = tempfile::tempdir().unwrap();
         let prefix = dir.path().join("brew");
-        let brew = prefix.join("bin/brew");
-        executable(&brew, BREW);
-        homebrew(&prefix, &mut echo(dir.path())).await.unwrap();
+        let app = dir.path().join("custom apps/Koidrive.app");
+        let helper = app.join("Contents/Helpers/koi");
+        executable(&helper, "#!/bin/sh\nexit 0\n");
+        let prefixes = [prefix.clone()];
+        let classify = || Install::resolve(&helper, "0.1.0", &prefixes, &[]).unwrap();
+        assert_eq!(classify().method, Method::AppDownload);
+        assert_eq!(classify().method.via(), Some(Via::App));
+        assert_eq!(classify().command(), None);
         assert_eq!(
-            fs::read_to_string(brew.with_extension("calls")).unwrap(),
-            "update\nupgrade koidrive/tap/koidrive\n"
+            Install::resolve(&helper, "0.1.0", &prefixes, std::slice::from_ref(&helper))
+                .unwrap()
+                .method,
+            Method::App
         );
-        let env = format!(
-            "PATH={}/bin:/usr/bin:/bin:/usr/sbin:/sbin AUTO=1 HINTS=1 DEPENDENTS=1\n",
-            prefix.display()
+        let registration = prefix.join("Caskroom/koidrive/0.1.0/Koidrive.app");
+        let other = dir.path().join("other/Koidrive.app");
+        executable(&other.join("Contents/Helpers/koi"), "#!/bin/sh\nexit 0\n");
+        fs::create_dir_all(registration.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&other, &registration).unwrap();
+        assert_eq!(classify().method, Method::AppDownload);
+        fs::remove_file(&registration).unwrap();
+        std::os::unix::fs::symlink(&app, &registration).unwrap();
+        let cask = classify();
+        let brew = fs::canonicalize(&prefix).unwrap().join("bin/brew");
+        assert_eq!(cask.method, Method::Cask { brew: brew.clone() });
+        assert_eq!(
+            Install::resolve(&helper, "0.1.0", &prefixes, std::slice::from_ref(&helper))
+                .unwrap()
+                .method,
+            cask.method
         );
         assert_eq!(
-            fs::read_to_string(brew.with_extension("env")).unwrap(),
-            env.repeat(2)
+            cask.command().as_deref(),
+            Some([brew.to_str().unwrap(), "upgrade", "--cask", "koidrive"].as_slice())
         );
-        let log = fs::read_to_string(dir.path().join("logs/update.log")).unwrap();
-        assert!(
-            log.contains("==> brew update\n") && log.contains("==> brew upgrade\n"),
-            "{log}"
+        let available = update::Update::Available {
+            latest: "0.2.0".into(),
+            url: "https://github.com/koidrive/koidrive/releases/tag/v0.2.0".into(),
+            checked_at_ms: 1,
+        };
+        assert_eq!(
+            cask.notice(&available, "0.1.0").command.as_deref(),
+            Some(format!("{} upgrade --cask koidrive", brew.display()).as_str())
         );
+        assert!(!prefix.join("bin/koi").exists());
     }
 
-    #[tokio::test]
-    async fn homebrew_without_brew_names_the_path_it_expected() {
+    #[test]
+    fn cask_and_installer_aliases_resolve_without_changing_their_links() {
         let dir = tempfile::tempdir().unwrap();
-        let prefix = dir.path().join("brew");
-        let error = homebrew(&prefix, &mut echo(dir.path())).await.unwrap_err();
+        let prefix = dir.path().join("custombrew");
+        let app = dir.path().join("custom apps/Koidrive.app");
+        let helper = app.join("Contents/Helpers/koi");
+        executable(&helper, "#!/bin/sh\nexit 0\n");
+        let link = prefix.join("bin/koi");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&helper, &link).unwrap();
         assert_eq!(
-            error.message,
-            format!(
-                "Homebrew is not at {}/bin/brew, where koi expected it",
-                prefix.display()
-            )
+            Install::resolve(&link, "0.1.0", &[], &[]).unwrap().method,
+            Method::AppDownload
         );
+        let registration = prefix.join("Caskroom/koidrive/0.1.0/Koidrive.app");
+        fs::create_dir_all(registration.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&app, registration).unwrap();
+        let cask = Install::resolve(&link, "0.1.0", &[], &[]).unwrap();
+        assert_eq!(
+            cask.method,
+            Method::Cask {
+                brew: fs::canonicalize(&prefix).unwrap().join("bin/brew")
+            }
+        );
+        assert_eq!(cask.binary, fs::canonicalize(&helper).unwrap());
+        let other_prefix = dir.path().join("otherbrew");
+        let other_registration = other_prefix.join("Caskroom/koidrive/0.1.0/Koidrive.app");
+        fs::create_dir_all(other_registration.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&app, other_registration).unwrap();
+        assert_eq!(
+            Install::resolve(&link, "0.1.0", &[other_prefix], &[])
+                .unwrap()
+                .method,
+            cask.method,
+        );
+        let script = dir.path().join("standalone/koi");
+        executable(&script, "#!/bin/sh\nexit 0\n");
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink("standalone/koi", &alias).unwrap();
+        let second = dir.path().join("second");
+        std::os::unix::fs::symlink("alias", &second).unwrap();
+        let install = Install::resolve(&second, "0.1.0", &[], &[]).unwrap();
+        assert_eq!(install.method, Method::Installer);
+        assert_eq!(
+            install.binary.parent(),
+            fs::canonicalize(script.parent().unwrap()).ok().as_deref()
+        );
+        assert_eq!(fs::read_link(second).unwrap(), Path::new("alias"));
+        assert_eq!(fs::read_link(link).unwrap(), helper);
     }
 
-    #[tokio::test]
-    async fn homebrew_busy_with_another_command_says_to_try_again() {
-        let busy = [
-            (
-                "update",
-                "Error: Another \u{60}brew update\u{60} process is already running.\nPlease wait for it to finish or terminate it to continue.",
-            ),
-            (
-                "upgrade",
-                "Error: A \u{60}brew upgrade koidrive/tap/koidrive\u{60} process has already locked /opt/homebrew/var/homebrew/locks/koidrive.formula.lock.\nPlease wait for it to finish or terminate it to continue.",
-            ),
-        ];
-        for (command, message) in busy {
-            let dir = tempfile::tempdir().unwrap();
-            let prefix = dir.path().join("brew");
-            let script = format!(
-                "#!/bin/sh\n[ \"$1\" = {command} ] || exit 0\nprintf '%s\\n' '{}' >&2\nexit 1\n",
-                message.replace('\'', "'\\''")
-            );
-            executable(&prefix.join("bin/brew"), &script);
-            let error = homebrew(&prefix, &mut echo(dir.path())).await.unwrap_err();
-            assert_eq!(
-                error.message, "Homebrew is busy with another command; try again when it finishes.",
-                "{command}"
-            );
+    #[test]
+    fn unresolved_or_unrecognized_binaries_are_never_installer_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing/koi");
+        assert!(Install::resolve(&missing, "0.1.0", &[], &[]).is_err());
+        let cycle = dir.path().join("koi");
+        std::os::unix::fs::symlink("koi", &cycle).unwrap();
+        assert!(Install::resolve(&cycle, "0.1.0", &[], &[]).is_err());
+        for relative in ["different-name", "Other.app/Contents/Helpers/koi"] {
+            let binary = dir.path().join(relative);
+            executable(&binary, "#!/bin/sh\nexit 0\n");
+            assert!(Install::resolve(&binary, "0.1.0", &[], &[]).is_err());
         }
-        let dir = tempfile::tempdir().unwrap();
-        let prefix = dir.path().join("brew");
-        executable(
-            &prefix.join("bin/brew"),
-            "#!/bin/sh\necho 'Error: koidrive: no bottle' >&2\nexit 1\n",
-        );
-        let error = homebrew(&prefix, &mut echo(dir.path())).await.unwrap_err();
-        assert_eq!(error.message, "brew update failed (exit status 1)");
     }
 
     async fn serve_once(listener: TcpListener, body: &'static str) {
@@ -2351,19 +2585,12 @@ echo "==> brew $1"
         );
 
         let later = |seconds| SystemTime::now() + Duration::from_secs(seconds);
-        fs::write(&brew, "#!/bin/sh\necho 'koi 0.2.0'\n").unwrap();
-        File::options()
-            .write(true)
-            .open(&brew)
-            .unwrap()
-            .set_modified(later(60))
-            .unwrap();
+        executable(&brew, "#!/bin/sh\necho 'koi 0.2.0'\n");
+        File::open(&brew).unwrap().set_modified(later(60)).unwrap();
         assert_eq!(scan(&mut seen, &candidates, &runs), Some(brew.clone()));
 
-        fs::write(&script, "#!/bin/sh\necho 'koi 0.0.9'\n").unwrap();
-        File::options()
-            .write(true)
-            .open(&script)
+        executable(&script, "#!/bin/sh\necho 'koi 0.0.9'\n");
+        File::open(&script)
             .unwrap()
             .set_modified(later(120))
             .unwrap();
@@ -2411,43 +2638,120 @@ echo "==> brew $1"
     #[test]
     fn homebrew_without_an_environment_prefix_is_found_from_the_running_koi() {
         let dir = tempfile::tempdir().unwrap();
-        let opt = dir.path().join("custom/opt/koidrive/bin/koi");
-        executable(&opt, "#!/bin/sh\nexit 0\n");
-        let installs = Installs::under(None, None);
-        for running in [
-            opt.clone(),
-            dir.path().join("custom/Cellar/koidrive/0.1.0/bin/koi"),
-        ] {
+        let prefix = dir.path().join("custom");
+        let keg = prefix.join("Cellar/koidrive/0.1.0/bin/koi");
+        executable(&keg, "#!/bin/sh\nexit 0\n");
+        let opt = prefix.join("opt/koidrive");
+        fs::create_dir_all(opt.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(keg.ancestors().nth(2).unwrap(), &opt).unwrap();
+        let link = prefix.join("bin/koi");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("../opt/koidrive/bin/koi", &link).unwrap();
+        for binary in [&keg, &opt.join("bin/koi"), &link] {
+            let install = Install::resolve(binary, "0.1.0", &[], &[]).unwrap();
+            let brew = fs::canonicalize(&prefix).unwrap().join("bin/brew");
+            assert_eq!(install.method, Method::Formula { brew: brew.clone() });
             assert_eq!(
-                installs.pick(|path| path == opt && path.is_file(), &[&running]),
-                Some(Install::Homebrew {
-                    prefix: dir.path().join("custom")
-                })
+                install.command().as_deref(),
+                Some([brew.to_str().unwrap(), "upgrade", "koidrive"].as_slice())
             );
         }
-        fs::remove_file(&opt).unwrap();
+        fs::remove_file(keg).unwrap();
+        assert!(Install::resolve(&link, "0.1.0", &[], &[]).is_err());
+    }
+
+    #[test]
+    fn another_install_never_changes_the_running_binarys_installation_method() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("brew");
+        executable(&prefix.join("opt/koidrive/bin/koi"), "#!/bin/sh\nexit 0\n");
+        let script = dir.path().join("standalone/koi");
+        executable(&script, "#!/bin/sh\nexit 0\n");
+        let install = Install::resolve(&script, "0.1.0", &[prefix], &[]).unwrap();
+        assert_eq!(install.method, Method::Installer);
+        assert_eq!(install.binary, fs::canonicalize(script).unwrap());
+    }
+
+    #[test]
+    fn formula_ownership_survives_a_linked_cellar_and_invocation_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("brew");
+        let version = dir.path().join("external store/koidrive/0.1.0");
+        let binary = version.join("bin/koi");
+        executable(&binary, "#!/bin/sh\nexit 0\n");
+        let opt = prefix.join("opt/koidrive");
+        fs::create_dir_all(opt.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&version, &opt).unwrap();
+        let link = prefix.join("bin/koi");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("../opt/koidrive/bin/koi", &link).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&link, &alias).unwrap();
+        for invoked in [&alias, &link, &opt.join("bin/koi")] {
+            let install = Install::resolve(invoked, "0.1.0", &[], &[]).unwrap();
+            assert_eq!(
+                install.method,
+                Method::Formula {
+                    brew: fs::canonicalize(&prefix).unwrap().join("bin/brew")
+                }
+            );
+            assert_eq!(install.binary, fs::canonicalize(&binary).unwrap());
+        }
+    }
+
+    #[test]
+    fn invocation_hints_must_resolve_to_the_running_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("actual/koi");
+        executable(&binary, "#!/bin/sh\nexit 0\n");
+        let kernel = fs::canonicalize(&binary).unwrap();
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let alias = bin.join("koi");
+        std::os::unix::fs::symlink(&binary, &alias).unwrap();
         assert_eq!(
-            installs.pick(
-                |path| path.starts_with(dir.path()) && path.is_file(),
-                &[&opt]
-            ),
+            Install::invoked(&kernel, alias.as_os_str(), None),
+            Some(alias.clone())
+        );
+        assert_eq!(
+            Install::invoked(&kernel, OsStr::new("koi"), Some(bin.as_os_str())),
+            Some(alias)
+        );
+        let other = dir.path().join("other/koi");
+        executable(&other, "#!/bin/sh\nexit 0\n");
+        assert_eq!(Install::invoked(&kernel, other.as_os_str(), None), None);
+        let shadowed = std::env::join_paths([other.parent().unwrap(), &bin]).unwrap();
+        assert_eq!(
+            Install::invoked(&kernel, OsStr::new("koi"), Some(&shadowed)),
             None
+        );
+        assert_eq!(
+            Install::invoked(&kernel, OsStr::new(""), Some(&shadowed)),
+            None
+        );
+        let cwd = std::env::current_dir().unwrap();
+        let relative_dir = tempfile::tempdir_in(&cwd).unwrap();
+        let binary = relative_dir.path().join("koi");
+        executable(&binary, "#!/bin/sh\nexit 0\n");
+        let relative = Path::new(".").join(binary.strip_prefix(&cwd).unwrap());
+        assert_eq!(
+            Install::invoked(&binary, relative.as_os_str(), None),
+            Some(relative)
         );
     }
 
     #[test]
-    fn the_owned_custom_homebrew_wins_over_an_unrelated_standard_install() {
-        let installs = Installs::under(None, None);
-        let custom = Path::new("/srv/custombrew/opt/koidrive/bin/koi");
-        let standard = Path::new("/opt/homebrew/opt/koidrive/bin/koi");
-        assert_eq!(
-            installs.pick(
-                |path| path == custom || path == standard,
-                &[Path::new("/srv/custombrew/Cellar/koidrive/0.1.0/bin/koi")]
-            ),
-            Some(Install::Homebrew {
-                prefix: "/srv/custombrew".into()
-            })
-        );
+    fn a_homebrew_receipt_blocks_installer_fallback_without_an_owning_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let keg = dir.path().join("external/package/0.1.0");
+        let binary = keg.join("bin/koi");
+        executable(&binary, "#!/bin/sh\nexit 0\n");
+        fs::write(keg.join("INSTALL_RECEIPT.json"), "{}").unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&binary, &alias).unwrap();
+        for invoked in [&binary, &alias] {
+            let error = Install::resolve(invoked, "0.1.0", &[], &[]).err().unwrap();
+            assert!(error.message.contains("Homebrew"), "{}", error.message);
+        }
     }
 }

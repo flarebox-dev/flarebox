@@ -31,7 +31,10 @@ if [ ! -e "$formula" ]; then
     echo bump
     exit 0
 fi
-current=$(sed -nE 's#^ *url ".*/download/v([^/]+)/koidrive-[^/]+\.tar\.gz"$#\1#p' "$formula" | sort -u)
+current=$({
+    sed -nE 's#^ *url ".*/download/v([^/]+)/koidrive-[^/]+\.tar\.gz"$#\1#p' "$formula"
+    sed -n 's|^ *url ".*/download/v\([^/]*\)/Koidrive-#{version}-arm64\.dmg"$|\1|p' "$formula"
+} | sort -u)
 key=$(version_key "v$current") || { echo "::error::$formula names the release '$current', which is not one X.Y.Z, X.Y.Z-alpha.N or X.Y.Z-rc.N." >&2; exit 1; }
 if [[ $own > $key ]]; then
     echo "The formula has $current and $tag is higher, so the formula moves to $tag." >&2

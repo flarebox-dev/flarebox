@@ -14,13 +14,48 @@ The installer downloads the latest [GitHub release](https://github.com/koidrive/
 
 If the installer warns that `~/.local/bin` is not on `PATH`, add it to your shell profile. If it warns that `koi` on `PATH` runs another program, such as the Koi theme switcher for KDE, put `~/.local/bin` before it. The installer never replaces a `koi` in the install directory that is another program.
 
+## Install with Homebrew
+
+On macOS 26 or later with Apple silicon and [Homebrew](https://brew.sh), install the app and its bundled CLI:
+
+```sh
+brew install --cask koidrive/tap/koidrive
+```
+
+The cask links the app's `koi` into Homebrew's `bin`, so the app and command share a version. Upgrade both with `brew update && brew upgrade --cask koidrive/tap/koidrive`.
+
+The cask and CLI-only formula are alternatives. Before switching from the formula, run `brew uninstall --formula koidrive/tap/koidrive`. To switch to the formula, uninstall the cask first.
+
+After switching, run `koi service start` with the newly installed `koi`. This updates the background service to the new executable.
+
+For full removal of the app and its settings:
+
+```sh
+brew uninstall --zap --cask koidrive
+```
+
+This quits the app, unregisters its login item, removes the app and CLI link, and deletes `~/Library/Application Support/Koidrive` and `~/Library/Preferences/dev.koidrive.Koidrive.plist`. It keeps synced folders and CLI state.
+
+For the CLI only on macOS or Linux:
+
+```sh
+brew install --formula koidrive/tap/koidrive
+koi setup
+```
+
+To upgrade:
+
+```sh
+brew update && brew upgrade --formula koidrive/tap/koidrive
+```
+
 ## Update Koidrive
 
 ```sh
 koi update
 ```
 
-`koi update` asks GitHub for the newest release and upgrades the `koi` on this computer. For a `koi` from the installer, it runs the installer again for the folder that holds `koi`. The new `koi` then takes over the [background service](#background-sync). When this computer already runs the newest release, it prints `Koidrive 0.1.0-alpha.1 is the newest release.` and changes nothing. Running the install command again also upgrades `koi`, and restarts the background service of every profile that runs one.
+`koi update` follows links to identify the running installation. For Homebrew, it prints an upgrade command for the owning cask or formula without changing files. For an installer copy, it asks GitHub for the newest release and runs the installer again in the executable's real folder. The new `koi` then takes over the [background service](#background-sync). When the installer copy already runs the newest release, it reports that version and changes nothing. Running the install command again also upgrades `koi`, and restarts the background service of every profile that runs one.
 
 `koi status` shows an `Update:` line when a newer release is out. [Updates](service.md#updates) covers which install `koi update` upgrades, the daily update check and how to turn it off.
 

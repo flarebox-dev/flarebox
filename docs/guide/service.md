@@ -59,11 +59,12 @@ The daemon logs at the `info` level. Set `KOIDRIVE_LOG` to change it, for exampl
 
 ### koi update upgrades one install
 
-`koi update` asks GitHub for the newest release and compares it with the `koi` it would upgrade. It picks that `koi` in this order:
+`koi update` follows links to identify the running executable and its installation method:
 
-1. A `koi` from a Homebrew formula named `koidrive`, under `$HOMEBREW_PREFIX`, `/opt/homebrew`, `/usr/local` or `/home/linuxbrew/.linuxbrew`, or the Homebrew that the service's or this command's `koi` comes from. `koi update` runs that Homebrew's `brew update` and `brew upgrade koidrive/tap/koidrive`.
-2. `~/.local/bin/koi`, or else the `koi` that the service or this command runs when it is outside Homebrew and the app. `koi update` downloads the installer from `https://koidrive.com/install.sh` and runs it with `KOIDRIVE_INSTALL_DIR` set to the folder that holds that `koi` and `KOIDRIVE_VERSION` set to the release. A build from source in `~/.cargo/bin` counts here.
-3. The `koi` inside `/Applications/Koidrive.app` or `~/Applications/Koidrive.app`. `koi update` downloads and verifies that release's app, then replaces the older copy.
+- For the Homebrew cask, it prints `brew upgrade --cask koidrive`. For the formula, it prints `brew upgrade koidrive`. If PATH selects a different Homebrew, the command names the owning brew executable. It does not run Homebrew, replace its files or change the service.
+- For an installer copy, it asks GitHub for the newest release and runs `https://koidrive.com/install.sh` with `KOIDRIVE_INSTALL_DIR` set to the executable's real folder and `KOIDRIVE_VERSION` set to the release.
+- For a manually installed app in `/Applications` or `~/Applications`, it downloads and verifies the release's app, then replaces the older copy. Other app locations get the release's download link.
+- Development builds do not update to releases.
 
 After an upgrade, the new `koi` takes over the background service. When the `koi` already runs the newest release, `koi update` changes nothing and reports `unchanged`. It upgrades Koidrive for one user, so it refuses to run as root. Each run writes what it ran and printed to `update.log`, in `~/Library/Logs/Koidrive/` on macOS and in the state folder on Linux.
 
@@ -76,8 +77,10 @@ The daemon also looks every hour for a newer `koi` from Homebrew, the installer 
 The daemon asks GitHub once a day whether a newer release is out, and keeps the answer in `update-check.json` in the state folder. When one is out, `koi status` shows it after the background service:
 
 ```
-Update: Koidrive 0.1.2 is out (this device runs 0.1.0). Run: koi update
+Update: Koidrive 0.1.2 is out (this device runs 0.1.0). Run: /home/ada/.local/bin/koi update
 ```
+
+The command matches the running executable's installation method. An installer copy names its resolved executable, with shell quoting when needed. A Homebrew cask shows `brew upgrade --cask koidrive`, and a formula shows `brew upgrade koidrive`.
 
 Each check reads Koidrive's public list of releases, `https://api.github.com/repos/koidrive/koidrive/releases`, following its pages with ordinary GitHub requests. It sends the user agent `koidrive` and, for a cached single-page list, the list's ETag, a hash that is the same for everyone. It sends no version, device, account or server address. GitHub sees your IP address, as it does for any download. The check isn't a [usage report](telemetry.md): nothing goes to Koidrive, and turning reports off leaves the check on.
 
@@ -90,7 +93,7 @@ To turn the check off, set this in `config.toml` and restart the daemon:
 check = false
 ```
 
-`KOIDRIVE_UPDATE_CHECK` wins over the file: `0`, `off` or `false` turns the check off, and `1`, `on` or `true` turns it on. With the check off, the daemon sends nothing and deletes `update-check.json`. `koi update` still asks GitHub when you run it.
+`KOIDRIVE_UPDATE_CHECK` wins over the file: `0`, `off` or `false` turns the check off, and `1`, `on` or `true` turns it on. With the check off, the daemon sends nothing and deletes `update-check.json`. An installer copy's `koi update` still asks GitHub when you run it.
 
 ## Files on this machine
 

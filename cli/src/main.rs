@@ -37,7 +37,7 @@ use clap::error::ErrorKind;
 use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use koidrive_driver::{
     Answer, Credential, Driver, DriverError, FolderState, FolderStatus, Limit, MAX_DELETIONS,
-    Paths, Question, QuestionKind, RecoveryGroup, Status, Update,
+    Paths, Question, QuestionKind, RecoveryGroup, Status,
 };
 use koidrive_ipc::{Code, Key, Request, RequestId, Response};
 use koidrive_net::{ApiError, Auth, Reload};
@@ -54,8 +54,8 @@ use crate::error::CliError;
 use crate::report::{
     AccountData, AnsweredData, Decision, DeviceData, DevicesData, Done, Empty, Envelope,
     FolderData, HelpData, InvitationData, LeftData, Lifecycle, NotRemovedData, RefusedSpace,
-    RevokedData, SpaceData, SpacesData, StatusData, UPDATE_COMMAND, UnlinkedData, UpdateNoticeData,
-    UsageData, UsagesData, VersionInfoData, WithService,
+    RevokedData, SpaceData, SpacesData, StatusData, UnlinkedData, UpdateNoticeData, UsageData,
+    UsagesData, VersionInfoData, WithService,
 };
 use crate::request::Begun;
 
@@ -1164,8 +1164,12 @@ async fn status(paths: &Paths, check: bool) -> Result<Done, CliError> {
         0
     };
     let service = service::inspect(paths, status.running).await;
-    let text = status_text(&status, &questions, &service.status_line());
     let version = (status.version.as_deref()).unwrap_or(env!("CARGO_PKG_VERSION"));
+    let notice = match update::Install::current() {
+        Ok(install) => install.notice(&status.update, version),
+        Err(_) => UpdateNoticeData::of(&status.update, version, None),
+    };
+    let text = status_text(&status, &questions, &service.status_line(), &notice);
     let data = StatusData {
         account: status.account.as_ref().map(AccountData::of),
         running: status.running,
@@ -1173,7 +1177,7 @@ async fn status(paths: &Paths, check: bool) -> Result<Done, CliError> {
         folders: status.folders.iter().map(FolderData::of).collect(),
         conditions,
         service,
-        update: UpdateNoticeData::of(&status.update, version),
+        update: notice,
     };
     let mut done = Done::ok(data, text);
     done.decisions = questions.iter().map(Decision::of).collect();
@@ -1943,7 +1947,12 @@ fn absolute(folder: &Path) -> Result<PathBuf, CliError> {
     })
 }
 
-fn status_text(status: &Status, questions: &[Question], service: &str) -> String {
+fn status_text(
+    status: &Status,
+    questions: &[Question],
+    service: &str,
+    notice: &UpdateNoticeData,
+) -> String {
     let mut text = match &status.account {
         Some(account) => format!(
             "Device: {} ({}) on {}\n",
@@ -1962,17 +1971,19 @@ fn status_text(status: &Status, questions: &[Question], service: &str) -> String
         }
     ));
     text.push_str(service);
-    if let Update::Available { latest, .. } = &status.update {
+    if let Some(latest) = &notice.latest {
         text.push_str(&format!(
-            "Update: Koidrive {} is out (this device runs {}). Run: {UPDATE_COMMAND}\n",
+            "Update: Koidrive {} is out (this device runs {}).",
             printable(latest),
-            printable(
-                status
-                    .version
-                    .as_deref()
-                    .unwrap_or(env!("CARGO_PKG_VERSION"))
-            )
+            printable(&notice.version),
         ));
+        if let Some(command) = &notice.command {
+            text.push_str(&format!(" Run: {}\n", printable(command)));
+        } else if let Some(url) = &notice.url {
+            text.push_str(&format!(" Download: {}\n", printable(url)));
+        } else {
+            text.push('\n');
+        }
     }
     if status.paused {
         text.push_str("Sync: paused. To sync again, run: koi resume\n");
@@ -2554,7 +2565,8 @@ mod tests {
             folders: vec![folder],
             ..Status::default()
         };
-        let text = status_text(&status, &[], "");
+        let notice = UpdateNoticeData::of(&status.update, "0.1.0", Some("koi update"));
+        let text = status_text(&status, &[], "", &notice);
         for raw in ['\u{1b}', '\u{7}', '\u{9b}', '\u{202e}', '\r'] {
             assert!(
                 !text.contains(raw),
@@ -3319,6 +3331,8 @@ mod tests {
 
     #[test]
     fn status_names_a_newer_release_after_the_service_line_only_while_one_is_out() {
+        use koidrive_driver::Update;
+
         let service = "Background service: running (koidrive.service)\n";
         let status = |update| Status {
             running: true,
@@ -3331,7 +3345,22 @@ mod tests {
             url: "https://github.com/koidrive/koidrive/releases/tag/v0.1.2".into(),
             checked_at_ms: 1,
         });
-        let text = status_text(&available, &[], service);
+        let notice = |status: &Status, command| {
+            UpdateNoticeData::of(
+                &status.update,
+                status
+                    .version
+                    .as_deref()
+                    .unwrap_or(env!("CARGO_PKG_VERSION")),
+                command,
+            )
+        };
+        let text = status_text(
+            &available,
+            &[],
+            service,
+            &notice(&available, Some("koi update")),
+        );
         assert!(
             text.contains(&format!(
                 "{service}Update: Koidrive 0.1.2 is out (this device runs 0.1.0). Run: koi update\n"
@@ -3343,18 +3372,38 @@ mod tests {
             Update::Unknown,
             Update::Off,
         ] {
-            let text = status_text(&status(quiet), &[], service);
+            let quiet = status(quiet);
+            let text = status_text(&quiet, &[], service, &notice(&quiet, Some("koi update")));
             assert!(!text.contains("Update:"), "{text}");
         }
         let unversioned = Status {
             version: None,
-            ..available
+            ..available.clone()
         };
-        assert!(status_text(&unversioned, &[], service).contains(concat!(
-            "(this device runs ",
-            env!("CARGO_PKG_VERSION"),
-            ")"
-        )));
+        assert!(
+            status_text(
+                &unversioned,
+                &[],
+                service,
+                &notice(&unversioned, Some("koi update"))
+            )
+            .contains(concat!(
+                "(this device runs ",
+                env!("CARGO_PKG_VERSION"),
+                ")"
+            ))
+        );
+        for command in ["brew upgrade --cask koidrive", "brew upgrade koidrive"] {
+            let text = status_text(&available, &[], service, &notice(&available, Some(command)));
+            assert!(text.contains(&format!("Run: {command}\n")), "{text}");
+            assert!(!text.contains("koi update"), "{text}");
+        }
+        let text = status_text(&available, &[], service, &notice(&available, None));
+        assert!(
+            text.contains("Download: https://github.com/koidrive/koidrive/releases/tag/v0.1.2"),
+            "{text}"
+        );
+        assert!(!text.contains("Run:"), "{text}");
     }
 
     #[test]
