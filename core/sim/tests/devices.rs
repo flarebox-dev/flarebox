@@ -3270,3 +3270,52 @@ fn a_file_made_at_the_name_of_a_deleted_folder_whose_file_moved_into_a_new_folde
         assert_eq!(names, ["a", "b", "c.txt"], "device {d}");
     }
 }
+
+fn a_lost_create_its_author_sends_again_under_a_new_name(download: Step) -> World {
+    let u = |kind, target, parent, name, text| {
+        Step::User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text,
+        })
+    };
+    let phases = vec![
+        vec![(0, BACKUP)],
+        vec![
+            (2, u(1, 0, 0, 2, 0)),
+            (0, Step::Work(0)),
+            (0, u(3, 0, 0, 0, 0)),
+            (0, Step::Work(1130995114980569936)),
+            (2, Step::Work(9668427609435895111)),
+            (0, Step::Work(0)),
+            (2, DELIVER),
+            (1, DELIVER),
+            (1, download),
+            (2, Step::Work(0)),
+            (0, COMMIT),
+            (0, RESTORE),
+        ],
+    ];
+    let world = converge(2, &phases).unwrap();
+    for device in &world.devices {
+        let names: Vec<&str> = (device.disk.entries().values())
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["a"]);
+    }
+    world
+}
+
+#[test]
+fn a_lost_create_sent_again_under_a_new_name_is_taken_by_a_device_that_downloaded_it() {
+    a_lost_create_its_author_sends_again_under_a_new_name(EFFECT);
+}
+
+#[test]
+fn a_lost_create_sent_again_under_a_new_name_is_taken_by_a_device_whose_download_a_crash_cut() {
+    a_lost_create_its_author_sends_again_under_a_new_name(Step::Effect(Outcome::Crash(
+        Cut::Placed,
+    )));
+}

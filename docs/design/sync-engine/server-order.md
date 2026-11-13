@@ -103,6 +103,7 @@ Another device that held the lost content sends it again when it can show the re
 A delete made after the loss beats a resend that holds no change of this device's user (the content resend above, or the create or move of a node S forgot that L holds as S did):
 
 - The engine records each such node, unless one of its own commits made R's record of it, until the server takes the resend, S takes L's shape, or L changes the node. When R holds the node, or a folder L holds it under, trashed before then, S takes L's shape and the file's unsent-edit record ends, so the delete reaches L.
+- Another device sending the node again first ends a resend too. When R lacked the node and a record or a later listing gives it back live with the content L holds, S takes L's shape, so R's position is a remote move, as when the bootstrap's listing holds the node there.
 - A commit that carries such a resend sets `require_head` (RFC 0002 §4), so a delete the server takes first refuses it with `HEAD_MOVED`, also when the commit was built before the delete reached this device. The device plans again once R holds the delete.
 - A content resend carries `resend` on its `UpdateContent` (RFC 0018). The author's send of its own lost edit never does.
 - Each node has an edit revision, `NodeState.edit_rev`: the seq of the newest commit that created it, changed its content other than by a resend, or carried a user's edit of content a resend brought. A resend moves `content_rev` and leaves the edit revision. An `edit_rev` of 0, from a server before RFC 0018, reads as `content_rev`.

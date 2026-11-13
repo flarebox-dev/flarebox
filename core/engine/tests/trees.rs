@@ -685,6 +685,42 @@ fn a_remote_delete_below_a_folder_the_server_lost_stays_a_remote_delete() {
     );
 }
 
+fn forgotten_after_a_loss() -> Trees {
+    let mut trees = Trees::new(ROOT);
+    let shape = file(ROOT, "b", 1);
+    trees.set_local("a".into(), local(shape.clone(), 1));
+    trees.set_synced("a".into(), Some(shape.clone()));
+    trees.set_remote("a".into(), remote(shape));
+    trees.remove_remote("a");
+    trees.forget_lost(Vec::new(), Vec::new(), vec!["a".into()], Vec::new(), 0, 0);
+    assert_eq!(trees.class("a"), Class::Local);
+    trees
+}
+
+#[test]
+fn a_node_another_device_creates_again_after_a_loss_takes_its_position() {
+    let mut trees = forgotten_after_a_loss();
+    trees.set_remote("a".into(), remote(file(ROOT, "c", 1)));
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(trees.class("a"), Class::Remote);
+}
+
+#[test]
+fn a_node_a_later_listing_holds_again_after_a_loss_takes_its_position() {
+    let mut trees = forgotten_after_a_loss();
+    trees.set_listed_remote("a".into(), remote(file(ROOT, "c", 1)));
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(trees.class("a"), Class::Remote);
+}
+
+#[test]
+fn a_node_another_device_creates_again_after_a_loss_with_other_content_is_not_taken() {
+    let mut trees = forgotten_after_a_loss();
+    trees.set_remote("a".into(), remote(file(ROOT, "c", 2)));
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(trees.class("a"), Class::Concurrent);
+}
+
 fn spaces() -> impl Strategy<Value = Vec<(bool, Change, Change)>> {
     proptest::collection::vec((any::<bool>(), changes(), changes()), 1..9)
 }
