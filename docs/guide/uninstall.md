@@ -12,7 +12,7 @@ Your files stay where they are.
 
 2. Revoke the device from another device with `koi device revoke <id>`.
 3. Delete Koidrive's files on this machine: `~/.local/state/koidrive` and `~/.config/koidrive`, or the `koidrive` folders under `$XDG_STATE_HOME` and `$XDG_CONFIG_HOME` when those are set to absolute paths, and the `.koidrive/` folder in each folder it linked. `.koidrive/trash/` holds files that sync replaced in the last 7 days, so look through it first.
-4. Remove the command: delete `~/.local/bin/koi`, or run `cargo uninstall koidrive-cli` for a build from source.
+4. Remove the command: delete `~/.local/bin/koi`, run `brew uninstall koidrive` for Homebrew, or run `cargo uninstall koidrive-cli` for a build from source.
 
 The macOS app is a separate device with its own profile. To remove it, quit the app, revoke its device from another device, and delete the app, `~/Library/Application Support/Koidrive`, and the `.koidrive/` folder in each folder the app linked. Look through each folder's `.koidrive/trash/` before you delete it. Until that folder is gone, another device can't link the folder.
 

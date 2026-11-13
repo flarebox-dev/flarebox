@@ -24,6 +24,7 @@ jobs:
       targets: ${{ steps.targets.outputs.targets }}
       count: ${{ steps.targets.outputs.count }}
       macos: ${{ steps.targets.outputs.macos }}
+      homebrew: ${{ steps.targets.outputs.homebrew }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -47,7 +48,7 @@ jobs:
             changed="$(tr '\0' '\n' < "$RUNNER_TEMP/changed")"
             echo "Files this pull request changes against $BASE:"
             printf '%s\n' "$changed"
-            pattern='^(cli/|core/|server/|\.cargo/|install\.sh$|scripts/test-install\.sh$|scripts/(test-)?publish-release\.sh$|\.github/workflows/release-cli\.yml$|Cargo\.[^/]*$|rust-toolchain\.toml$)'
+            pattern='^(cli/|core/|server/|\.cargo/|install\.sh$|scripts/test-install\.sh$|scripts/(test-)?publish-release\.sh$|scripts/(test-)?homebrew-[a-z-]+\.sh$|\.github/workflows/release-cli\.yml$|Cargo\.[^/]*$|rust-toolchain\.toml$)'
             if grep -Eq "$pattern" <<<"$changed"; then
               echo "Linux targets: build, because a changed file matches $pattern"
             else
@@ -59,7 +60,7 @@ jobs:
               echo "::error::Listing the macOS-specific files between $BASE and HEAD failed (see the error above)."
               exit 1
             fi
-            pattern='^(install\.sh$|scripts/test-install\.sh$|scripts/(test-)?publish-release\.sh$|scripts/(test-)?macos-changes\.sh$|\.github/workflows/release-cli\.yml$)'
+            pattern='^(install\.sh$|scripts/test-install\.sh$|scripts/(test-)?publish-release\.sh$|scripts/(test-)?homebrew-[a-z-]+\.sh$|scripts/(test-)?macos-changes\.sh$|\.github/workflows/release-cli\.yml$)'
             reasons="$(cut -f1 <<<"$platform" | grep -Ev '^(apps/macos|core/ffi)/' || true)"$'\n'"$(grep -E "$pattern" <<<"$changed" || true)"
             if [ -n "$(tr -d '[:space:]' <<<"$reasons")" ]; then
               echo "macOS targets: build, because of $(tr '\n' ' ' <<<"$reasons")"
@@ -76,6 +77,7 @@ jobs:
             echo "targets=$targets"
             echo "count=$(jq length <<<"$targets")"
             echo "macos=$macos"
+            echo "homebrew=$(jq -c 'map(select(.target == "x86_64-unknown-linux-musl" or .target == "aarch64-apple-darwin"))' <<<"$targets")"
           } >> "$GITHUB_OUTPUT"
 
   release-ref:
@@ -155,9 +157,12 @@ jobs:
         run: |
           shellcheck -s sh install.sh scripts/test-install.sh
           shellcheck scripts/publish-release.sh scripts/test-publish-release.sh
+          shellcheck scripts/homebrew-formula.sh scripts/homebrew-track.sh scripts/test-homebrew-formula.sh scripts/test-homebrew-install.sh
       - name: Test publishing a release against a stub gh
         if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: bash scripts/test-publish-release.sh
+        run: |
+          bash scripts/test-publish-release.sh
+          bash scripts/test-homebrew-formula.sh
       - name: Build the CLI with its server bundle
         env:
           TARGET: ${{ matrix.target }}
@@ -215,6 +220,42 @@ jobs:
           name: cli-${{ matrix.target }}
           path: dist/*.tar.gz
           if-no-files-found: error
+
+  homebrew-install:
+    name: Homebrew install (${{ matrix.target }})
+    needs: [changes, build]
+    if: needs.changes.outputs.homebrew != '[]'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.changes.outputs.homebrew) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist
+      - name: Install the CLI from a local tap in the Homebrew image
+        if: runner.os == 'Linux'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir package
+          tar -xzf "dist/koidrive-$TARGET.tar.gz" -C package
+          docker run --rm -v "$PWD:/src:ro" ghcr.io/homebrew/brew@sha256:63be5353975c43bce2c885742370ab320b3c57541de72fd1458a26a8e35d7d8e \
+            bash /src/scripts/test-homebrew-install.sh /src/package/koi "$TARGET"
+      - name: Install the CLI from a local tap
+        if: runner.os == 'macOS'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir package
+          tar -xzf "dist/koidrive-$TARGET.tar.gz" -C package
+          bash scripts/test-homebrew-install.sh package/koi "$TARGET"
 
   sign-macos:
     name: Sign and notarize the macOS CLI
@@ -372,18 +413,19 @@ jobs:
   cli-report:
     name: cli-report
     if: always()
-    needs: [changes, build, checksums]
+    needs: [changes, build, homebrew-install, checksums]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Fail unless every CLI target the change needs built and was checksummed
+      - name: Fail unless every CLI target the change needs built, installed from Homebrew and was checksummed
         env:
           CHANGES: ${{ needs.changes.result }}
           COUNT: ${{ needs.changes.outputs.count }}
           BUILD: ${{ needs.build.result }}
+          HOMEBREW: ${{ needs.homebrew-install.result }}
           CHECKSUMS: ${{ needs.checksums.result }}
         run: |
-          echo "CLI targets: $CHANGES (${COUNT:-unknown} targets), build: $BUILD, checksums: $CHECKSUMS"
+          echo "CLI targets: $CHANGES (${COUNT:-unknown} targets), build: $BUILD, Homebrew install: $HOMEBREW, checksums: $CHECKSUMS"
           if [ "$CHANGES" != success ]; then
             echo "::error::The CLI targets job is $CHANGES, so which targets this change needs is unknown. Open that job's log for the cause."
             exit 1
@@ -396,7 +438,11 @@ jobs:
             echo "::error::$COUNT CLI targets had to build, but build is $BUILD and checksums is $CHECKSUMS. Open the failed job's log for the cause."
             exit 1
           fi
-          echo "All $COUNT CLI targets built and their checksums verified."
+          if [ "$HOMEBREW" != success ] && [ "$HOMEBREW" != skipped ]; then
+            echo "::error::Installing the built CLI from a local Homebrew tap is $HOMEBREW. Open the Homebrew install job's log for the cause."
+            exit 1
+          fi
+          echo "All $COUNT CLI targets built and their checksums verified. Homebrew install: $HOMEBREW."
 
   publish:
     name: Publish the release
@@ -428,3 +474,75 @@ jobs:
           # prerelease: it becomes a GitHub prerelease, which install.sh skips unless KOIDRIVE_VERSION names it.
           PRERELEASE_TAGS_PUBLISH_AS: latest
         run: scripts/publish-release.sh "$TAG" dist
+
+  homebrew:
+    name: Update the Homebrew formula
+    needs: [publish, homebrew-install]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: homebrew-tap
+    concurrency:
+      group: release-cli-homebrew
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Write the tap's deploy key and GitHub's SSH host keys
+        env:
+          DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          if [ -z "$DEPLOY_KEY" ]; then
+            echo "::error::Pushing to koidrive/homebrew-tap needs the secret HOMEBREW_TAP_DEPLOY_KEY in the homebrew-tap environment."
+            exit 1
+          fi
+          ssh_dir="$RUNNER_TEMP/homebrew-tap-ssh"
+          (umask 077 && mkdir -p "$ssh_dir" && printf '%s\n' "$DEPLOY_KEY" > "$ssh_dir/key")
+          cat > "$ssh_dir/known_hosts" <<'EOF'
+          github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+          github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+          github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+          EOF
+      - name: Render the formula from the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          release="$RUNNER_TEMP/release"
+          gh release download "$TAG" --dir "$release" --pattern SHA256SUMS --pattern 'koidrive-*.tar.gz'
+          scripts/homebrew-formula.sh "$TAG" "$release/SHA256SUMS" > "$RUNNER_TEMP/koidrive.rb"
+          (cd "$release" && grep -E '  koidrive-[^ ]+\.tar\.gz$' SHA256SUMS | sha256sum --strict -c -) || { echo "::error::A tarball of the $TAG release does not match its SHA256SUMS entry."; exit 1; }
+      - name: Push the formula to koidrive/homebrew-tap
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          GIT_AUTHOR_NAME: Koidrive release
+          GIT_AUTHOR_EMAIL: noreply@koidrive.com
+          GIT_COMMITTER_NAME: Koidrive release
+          GIT_COMMITTER_EMAIL: noreply@koidrive.com
+        run: |
+          ssh_dir="$RUNNER_TEMP/homebrew-tap-ssh"
+          export GIT_SSH_COMMAND="ssh -i $ssh_dir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$ssh_dir/known_hosts -o StrictHostKeyChecking=yes"
+          tap="$RUNNER_TEMP/homebrew-tap"
+          git clone --depth 1 git@github.com:koidrive/homebrew-tap.git "$tap"
+          decision=$(scripts/homebrew-track.sh "$TAG" "$tap/Formula/koidrive.rb")
+          if [ "$decision" = skip ]; then
+            exit 0
+          fi
+          mkdir -p "$tap/Formula"
+          cp "$RUNNER_TEMP/koidrive.rb" "$tap/Formula/koidrive.rb"
+          git -C "$tap" add Formula/koidrive.rb
+          if git -C "$tap" diff --cached --quiet; then
+            echo "Formula/koidrive.rb already matches $TAG, so there is nothing to push."
+            exit 0
+          fi
+          git -C "$tap" commit -q -m "koidrive ${TAG#v}"
+          git -C "$tap" push origin HEAD
+          echo "Pushed koidrive ${TAG#v} to koidrive/homebrew-tap."
+      - name: Remove the deploy key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/homebrew-tap-ssh"
