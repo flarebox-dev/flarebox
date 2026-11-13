@@ -4,7 +4,8 @@
 # Builds Koidrive.app in the Release configuration without signing it and copies it to
 # build/release/Koidrive.app. scripts/sign-app.sh signs it afterwards.
 # Optional environment:
-#   VERSION       the marketing version (CFBundleShortVersionString), for example 0.1.0
+#   VERSION       the version, for example 0.1.0 or 0.1.0-alpha.2. It becomes KoidriveVersion, and
+#                 its X.Y.Z part the marketing version (CFBundleShortVersionString).
 #   BUILD_NUMBER  the build number (CFBundleVersion)
 set -euo pipefail
 
@@ -15,7 +16,7 @@ scripts/build-ffi.sh
 scripts/generate-project.sh
 
 overrides=()
-if [ -n "${VERSION:-}" ]; then overrides+=("MARKETING_VERSION=$VERSION"); fi
+if [ -n "${VERSION:-}" ]; then overrides+=("MARKETING_VERSION=${VERSION%%-*}" "KOIDRIVE_VERSION=$VERSION"); fi
 if [ -n "${BUILD_NUMBER:-}" ]; then overrides+=("CURRENT_PROJECT_VERSION=$BUILD_NUMBER"); fi
 
 xcodebuild -project Koidrive.xcodeproj -scheme Koidrive -configuration Release \
@@ -31,4 +32,4 @@ rm -rf build/release
 mkdir -p build/release
 ditto "$built" build/release/Koidrive.app
 echo "Built $macos_dir/build/release/Koidrive.app:"
-plutil -p build/release/Koidrive.app/Contents/Info.plist | grep -E 'CFBundle(ShortVersionString|Version|Identifier)"'
+plutil -p build/release/Koidrive.app/Contents/Info.plist | grep -E '"(CFBundleShortVersionString|CFBundleVersion|CFBundleIdentifier|KoidriveVersion)"'

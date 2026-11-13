@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Publishes the GitHub release for a CLI tag with the files in a directory, then checks the result.
+# Publishes the GitHub release for a version tag with the files in a directory, then checks the result.
+# The directory holds the CLI tarballs, the app's disk image Koidrive-<version>-arm64.dmg and SHA256SUMS,
+# which lists each of them; the script refuses to publish anything else.
 # The release becomes Latest only when no published release that can be Latest (not a draft and not a
 # prerelease) has a higher version, so a rerun or an older tag leaves Latest where it is.
 # Usage: publish-release.sh <tag> <directory>
@@ -27,6 +29,27 @@ version_key() {
 }
 
 own=$(version_key "$tag") || { echo "::error::$tag is not a vX.Y.Z, vX.Y.Z-alpha.N or vX.Y.Z-rc.N tag."; exit 1; }
+
+dmg="Koidrive-${tag#v}-arm64.dmg"
+sums="$files/SHA256SUMS"
+[ -f "$files/$dmg" ] || { echo "::error::$files has no $dmg, and a release needs the signed app."; exit 1; }
+[ -f "$sums" ] || { echo "::error::$files has no SHA256SUMS."; exit 1; }
+assets=0
+for path in "$files"/*; do
+    name=${path##*/}
+    [ "$name" != SHA256SUMS ] || continue
+    case $name in
+        koidrive-*.tar.gz | "$dmg") ;;
+        *) echo "::error::$files has $name, which is neither a CLI tarball nor $dmg."; exit 1 ;;
+    esac
+    listed=$(awk -v name="$name" '$2 == name { count++ } END { print count + 0 }' "$sums")
+    [ "$listed" = 1 ] || { echo "::error::SHA256SUMS lists $name $listed times, expected once."; exit 1; }
+    assets=$((assets + 1))
+done
+entries=$(awk 'NF { count++ } END { print count + 0 }' "$sums")
+[ "$entries" = "$assets" ] || { echo "::error::SHA256SUMS has $entries entries, but $files has $assets files to publish."; exit 1; }
+(cd "$files" && sha256sum --strict -c SHA256SUMS) || { echo "::error::A file in $files does not match its SHA256SUMS entry."; exit 1; }
+
 before=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name 2>/dev/null) || before=none
 
 if [ "$PRERELEASE" = true ] && [ "$PRERELEASE_TAGS_PUBLISH_AS" = prerelease ]; then
@@ -46,7 +69,7 @@ else
 fi
 
 if ! gh release view "$tag" >/dev/null 2>&1; then
-    gh release create "$tag" --draft --verify-tag --title "$tag" --notes 'Koidrive CLI for Linux and macOS. See docs/guide/install.md for installation.'
+    gh release create "$tag" --draft --verify-tag --title "$tag" --notes 'Koidrive CLI for Linux and macOS, and the Koidrive app for macOS. See docs/guide/install.md for installation.'
 fi
 gh release upload "$tag" "$files"/* --clobber
 gh release edit "$tag" --draft=false --prerelease="$prerelease" --latest="$latest"
