@@ -2125,6 +2125,7 @@ enum Fit {
     NameTaken,
     Cycle,
     Wait,
+    Merged,
 }
 
 type Planned = (
@@ -2485,9 +2486,20 @@ fn plan(
             }
             continue;
         }
+        let held: Vec<NodeId> = (wants.iter().flatten())
+            .filter_map(|want| match want {
+                Want::Delete { id, .. } if scratch.fit(want, &moving) == Fit::Merged => {
+                    Some(id.clone())
+                }
+                _ => None,
+            })
+            .collect();
         let forced = wants.iter_mut().find(|slot| {
-            slot.as_ref()
-                .is_some_and(|want| scratch.fit(want, &moving) == Fit::NameTaken)
+            slot.as_ref().is_some_and(|want| {
+                scratch.fit(want, &moving) == Fit::NameTaken
+                    && !(scratch.name_holders(want))
+                        .any(|holder| held.iter().any(|id| scratch.inside(holder, id)))
+            })
         });
         let Some(slot) = forced else {
             break false;
@@ -2690,14 +2702,12 @@ impl Scratch {
                 let subtree = self.subtree(id);
                 let merged =
                     |node: &NodeId| self.merges.values().flatten().any(|into| into == node);
-                if !merged(id)
-                    && subtree
-                        .iter()
-                        .all(|node| members.contains(node) && !merged(node))
-                {
-                    Fit::Valid
-                } else {
+                if !subtree.iter().all(|node| members.contains(node)) {
                     Fit::Wait
+                } else if merged(id) || subtree.iter().any(merged) {
+                    Fit::Merged
+                } else {
+                    Fit::Valid
                 }
             }
             Want::Restore { op, .. } if self.unsent.contains_key(&op.node_id) => Fit::Wait,
@@ -2784,6 +2794,15 @@ impl Scratch {
             self.link(&current);
             current = parent;
         }
+    }
+
+    fn name_holders<'a>(&'a self, want: &'a Want) -> impl Iterator<Item = &'a NodeId> + 'a {
+        let (parent, name) = match want {
+            Want::Create { shape, .. } => (shape.parent.as_str(), shape.name.as_str()),
+            Want::Move { parent, name, .. } => (parent.as_str(), name.as_str()),
+            _ => ("", ""),
+        };
+        self.holders(parent, name)
     }
 
     /// The live nodes named `name` under `parent`.

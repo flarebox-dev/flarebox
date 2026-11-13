@@ -3210,3 +3210,63 @@ fn a_file_moved_out_of_a_folder_into_a_new_folder_merged_into_it_stays_live() {
         }
     }
 }
+
+#[test]
+fn a_folder_renamed_onto_a_deleted_folder_whose_file_moved_into_a_new_folder_keeps_its_name() {
+    let world = converge(
+        2,
+        &[
+            vec![
+                (0, folder("b")),
+                (0, user(1, 0, 1, "c.txt")),
+                (0, folder("ss")),
+            ],
+            vec![
+                (0, folder("a")),
+                (0, rename(1, 3, "c.txt")),
+                (0, delete(0)),
+                (0, rename(1, 0, "b")),
+                (0, SCAN),
+                (0, COMMIT),
+                (0, COMMIT),
+                (0, DELIVER),
+            ],
+        ],
+    )
+    .unwrap();
+    for (d, device) in world.devices.iter().enumerate() {
+        let mut names: Vec<String> = (device.disk.entries().values())
+            .map(|entry| entry.name.clone())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a", "b", "c.txt"], "device {d}");
+    }
+}
+
+#[test]
+fn a_file_made_at_the_name_of_a_deleted_folder_whose_file_moved_into_a_new_folder_keeps_its_name() {
+    let world = converge(
+        2,
+        &[
+            vec![(0, folder("b")), (0, user(1, 0, 1, "c.txt"))],
+            vec![
+                (0, folder("a")),
+                (0, rename(1, 2, "c.txt")),
+                (0, delete(0)),
+                (0, file("b")),
+                (0, SCAN),
+                (0, COMMIT),
+                (0, COMMIT),
+                (0, DELIVER),
+            ],
+        ],
+    )
+    .unwrap();
+    for (d, device) in world.devices.iter().enumerate() {
+        let mut names: Vec<String> = (device.disk.entries().values())
+            .map(|entry| entry.name.clone())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a", "b", "c.txt"], "device {d}");
+    }
+}
