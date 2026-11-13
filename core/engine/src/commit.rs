@@ -598,9 +598,10 @@ impl Commits {
     /// the same commit when the commit holds the whole cycle. Otherwise a create or move that only
     /// waits for a name is sent anyway, for the server to rename, except that a folder created
     /// where a moving file or folder still is takes a pending name first. A folder is not deleted
-    /// in a commit that creates a folder beside it, or beside a folder the created folder's parent
-    /// may be merged into, since another device may have renamed it to the created folder's name
-    /// since R, and the server would then merge the created folder into it. A delete waits until
+    /// after a folder created beside it, or beside a folder the created folder's parent may be
+    /// merged into, since another device may have renamed it to the created folder's name since R,
+    /// and the server would then merge the created folder into it: a delete that can go is sent
+    /// before the create, and one that cannot waits for the next commit. A delete waits until
     /// nothing that survives is
     /// left under it, a create or move until its parent exists, and a move that would close a cycle
     /// against R is reverted: the node is marked in [`Trees::reverted`], and the effects move it
@@ -2301,11 +2302,6 @@ fn plan(
             _ => None,
         })
         .collect();
-    wants.sort_by_key(|want| match want {
-        Want::Restore { .. } => 0,
-        Want::Delete { .. } => 1,
-        _ => 2,
-    });
     let mut wants: Vec<Option<Want>> = wants.into_iter().map(Some).collect();
     let mut ops = Vec::new();
     let mut deletes = BTreeMap::new();
@@ -2417,17 +2413,35 @@ fn plan(
     };
     let capped = loop {
         let (mut progress, mut full) = (false, false);
-        for slot in wants.iter_mut() {
-            if slot
-                .as_ref()
-                .is_some_and(|want| scratch.fit(want, &moving) == Fit::Valid)
-            {
-                if !room(&mut emitted, &mut bytes, slot.as_ref().expect("checked")) {
+        for at in 0..wants.len() {
+            if !(wants[at].as_ref()).is_some_and(|want| scratch.fit(want, &moving) == Fit::Valid) {
+                continue;
+            }
+            let mut order = match &wants[at] {
+                Some(Want::Create { shape, .. }) if shape.kind == Kind::Dir => {
+                    deletes_before_create(&wants, &scratch, &moving, &shape.parent)
+                }
+                _ => Vec::new(),
+            };
+            order.push(at);
+            for at in order {
+                if !room(
+                    &mut emitted,
+                    &mut bytes,
+                    wants[at].as_ref().expect("checked"),
+                ) {
                     full = true;
                     break;
                 }
-                emit(slot.take().expect("checked"), &mut scratch, &mut moving);
+                emit(
+                    wants[at].take().expect("checked"),
+                    &mut scratch,
+                    &mut moving,
+                );
                 progress = true;
+            }
+            if full {
+                break;
             }
         }
         if full {
@@ -2516,6 +2530,34 @@ fn plan(
         last == Some(&pending.sent)
     });
     (ops, deletes, reverts, pending)
+}
+
+fn deletes_before_create(
+    wants: &[Option<Want>],
+    scratch: &Scratch,
+    moving: &BTreeSet<NodeId>,
+    parent: &str,
+) -> Vec<usize> {
+    let targets = scratch.merge_targets(parent);
+    let placing: Vec<&NodeId> = (wants.iter().flatten())
+        .filter_map(|want| match want {
+            Want::Create { shape, .. } => Some(&shape.parent),
+            Want::Move { parent, .. } => Some(parent),
+            _ => None,
+        })
+        .collect();
+    (wants.iter().enumerate())
+        .filter_map(|(at, slot)| match slot {
+            Some(want @ Want::Delete { id, .. })
+                if targets.iter().any(|target| scratch.inside(target, id))
+                    && !placing.iter().any(|to| scratch.inside(to, id))
+                    && scratch.fit(want, moving) == Fit::Valid =>
+            {
+                Some(at)
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// A cycle of moves that each wait only for a name held by the node of the next one, as in a swap
