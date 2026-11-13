@@ -13,6 +13,13 @@ publish.workspace = true
 name = "koi"
 path = "src/main.rs"
 
+[features]
+test-install-inventory = []
+
+[[test]]
+name = "update"
+required-features = ["test-install-inventory"]
+
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
 cliclack = "0.5.7"

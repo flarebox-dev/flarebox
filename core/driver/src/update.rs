@@ -29,6 +29,7 @@ pub const URL_VARIABLE: &str = "KOIDRIVE_UPDATE_CHECK_URL";
 const API: &str = "https://api.github.com/";
 const RELEASES: &str = "repos/koidrive/koidrive/releases?per_page=20";
 const TIMEOUT: Duration = Duration::from_secs(10);
+const PAGE_LIMIT: usize = 10;
 const HOUR_MS: i64 = 3_600_000;
 const DAY_MS: i64 = 24 * HOUR_MS;
 
@@ -289,7 +290,12 @@ pub(crate) async fn ask(
         let mut visited = HashSet::new();
         let mut listed = Vec::new();
         let mut single_etag = None;
+        let mut requests = 0;
         loop {
+            if requests == PAGE_LIMIT {
+                return Answer::Refused { until: None };
+            }
+            requests += 1;
             if !visited.insert(page.clone()) {
                 return Answer::Refused { until: None };
             }
@@ -1165,6 +1171,48 @@ mod tests {
             next_page(&url, &headers(&[("link", "not-a-link; rel=next")])),
             Err(())
         );
+    }
+
+    #[tokio::test]
+    async fn a_release_check_refuses_more_than_ten_page_requests_without_using_a_partial_list() {
+        for endless in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}/", listener.local_addr().unwrap());
+            let (url, https) = releases_url(Some(&base)).unwrap();
+            let http = client(https).unwrap();
+            let server = async {
+                for number in 1..=10 {
+                    let next = format!("{}&page={}", url, number + 1);
+                    served(
+                        &listener,
+                        &page(
+                            serde_json::json!([listed("v99.0.0", false, &[ASSET])]),
+                            (endless || number < 10).then_some(next.as_str()),
+                            "\"page\"",
+                        ),
+                    )
+                    .await;
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err(),
+                    "a release check sent an eleventh request"
+                );
+            };
+            let (_, answered) = tokio::join!(server, ask(&http, url.clone(), None, ASSET));
+            assert_eq!(
+                answered,
+                if endless {
+                    Answer::Refused { until: None }
+                } else {
+                    Answer::Releases {
+                        etag: None,
+                        release: release("99.0.0"),
+                    }
+                }
+            );
+        }
     }
 
     #[tokio::test]

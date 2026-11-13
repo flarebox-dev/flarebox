@@ -45,14 +45,19 @@ impl Installs {
         };
         let prefix = absolute("HOMEBREW_PREFIX");
         let home = absolute("HOME");
-        let mut installs = Installs::under(prefix.as_deref(), home.as_deref());
-        if let Some(root) = absolute("KOIDRIVE_TEST_INSTALL_INVENTORY") {
-            installs.homebrew = prefix
-                .into_iter()
-                .map(|prefix| prefix.join("opt/koidrive/bin/koi"))
-                .collect();
-            installs.app = root.join("Applications/Koidrive.app/Contents/Helpers/koi");
-        }
+        let installs = Installs::under(prefix.as_deref(), home.as_deref());
+        #[cfg(feature = "test-install-inventory")]
+        let installs = {
+            let mut installs = installs;
+            if let Some(root) = absolute("KOIDRIVE_TEST_INSTALL_INVENTORY") {
+                installs.homebrew = prefix
+                    .into_iter()
+                    .map(|prefix| prefix.join("opt/koidrive/bin/koi"))
+                    .collect();
+                installs.app = root.join("Applications/Koidrive.app/Contents/Helpers/koi");
+            }
+            installs
+        };
         installs
     }
 
