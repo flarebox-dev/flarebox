@@ -195,6 +195,42 @@ async fn pair_and_claim_read_codes_from_stdin_or_positional_arguments() {
 }
 
 #[test]
+fn app_policy_skips_installation_without_changing_the_service_report() {
+    let profile = Profile::new();
+    let config = profile.home.path().join("config/koidrive");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        "[service]\nbackground = false\n",
+    )
+    .unwrap();
+    for (args, reason) in [
+        (vec!["setup", "--no-app", "--json"], "opt_out"),
+        (vec!["setup", "--json"], "unattended_setup"),
+        (vec!["_reconcile", "--json"], "ci"),
+        (vec!["_reconcile", "--no-app", "--json"], "service_handoff"),
+    ] {
+        let output = profile.command(&args).env("CI", "1").output().unwrap();
+        let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(output.status.success(), "{envelope:#}");
+        schema::check(&envelope);
+        assert_eq!(
+            envelope["data"]["app"],
+            serde_json::json!({"state":"skipped", "reason":reason})
+        );
+        assert_eq!(envelope["data"]["service"]["state"], "off");
+        assert!(
+            !profile
+                .home
+                .path()
+                .join("Library/Caches/dev.koidrive.app-install")
+                .exists()
+        );
+        assert!(!profile.home.path().join("Applications").exists());
+    }
+}
+
+#[test]
 fn interrupt_during_telemetry_upload_prints_one_json_envelope() {
     use std::net::TcpListener;
     use std::time::{Duration, Instant};

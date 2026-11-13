@@ -99,6 +99,14 @@
       ],
       "type": "object"
     },
+    "Change": {
+      "enum": [
+        "unchanged",
+        "installed",
+        "replaced"
+      ],
+      "type": "string"
+    },
     "Code": {
       "description": "What kind of failure an error is. Each code has one exit status.",
       "oneOf": [
@@ -483,6 +491,14 @@
       ],
       "type": "object"
     },
+    "Launch": {
+      "enum": [
+        "not_requested",
+        "requested",
+        "failed"
+      ],
+      "type": "string"
+    },
     "LimitKind": {
       "enum": [
         "deletions",
@@ -694,6 +710,94 @@
       ],
       "type": "object"
     },
+    "Report2": {
+      "oneOf": [
+        {
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "state": {
+              "const": "skipped",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "reason"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "change": {
+              "$ref": "#/$defs/Change"
+            },
+            "launch": {
+              "$ref": "#/$defs/Launch"
+            },
+            "path": {
+              "type": "string"
+            },
+            "problem": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "residue": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "retired": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "state": {
+              "const": "present",
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "path",
+            "version",
+            "change",
+            "launch"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "problem": {
+              "type": "string"
+            },
+            "residue": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "state": {
+              "const": "failed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "problem"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "RevisionsData": {
       "properties": {
         "content_rev": {
@@ -752,15 +856,19 @@
         }
       ]
     },
-    "WithService_Empty": {
+    "WithApp": {
       "description": "The data of a command that brings the background service in line with the profile, with the service's report.",
       "properties": {
+        "app": {
+          "$ref": "#/$defs/Report2"
+        },
         "service": {
           "$ref": "#/$defs/Report"
         }
       },
       "required": [
-        "service"
+        "service",
+        "app"
       ],
       "type": "object"
     }
@@ -793,7 +901,7 @@
           "$ref": "#/$defs/HelpData"
         },
         {
-          "$ref": "#/$defs/WithService_Empty"
+          "$ref": "#/$defs/WithApp"
         }
       ]
     },

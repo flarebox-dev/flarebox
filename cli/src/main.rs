@@ -6,6 +6,8 @@
 //! versions commands talk to the server directly with the credential. With `--json` every command prints one
 //! envelope (see [`report`]) and exits with the status of its [`koidrive_ipc::Code`].
 
+mod app;
+mod app_install;
 mod diagnose;
 mod error;
 mod history;
@@ -113,6 +115,9 @@ enum Command {
         login: setup::LoginArgs,
         #[command(flatten)]
         script: setup::ScriptArgs,
+        /// Skip installing and opening the macOS app.
+        #[arg(long)]
+        no_app: bool,
     },
     /// Add this device with a pairing code from a device that is already paired.
     #[command(group(clap::ArgGroup::new("code_source").required(true).args(["code", "code_stdin"])))]
@@ -194,7 +199,10 @@ enum Command {
     /// Bring the background service in line with the linked folders, as linking a folder does. It leaves koi switched
     /// off in Login Items off and never resumes a pause.
     #[command(name = "_reconcile", hide = true)]
-    Reconcile,
+    Reconcile {
+        #[arg(long, hide = true)]
+        no_app: bool,
+    },
 }
 
 impl Command {
@@ -469,6 +477,7 @@ fn main() -> ExitCode {
             } => done,
             Ok(status) = interrupt => {
                 terminal.cancel().await;
+                app::cancel_active().await;
                 let error = CliError::new(
                     Code::Interrupted,
                     if status == 143 { "stopped by SIGTERM; what the command already did stays done" } else { "interrupted by Ctrl-C; what the command already did stays done" },
@@ -516,7 +525,7 @@ fn telemetry_of(
         Command::Folder { .. } => (Name::Folder, None, None),
         Command::Device { .. } => (Name::Device, None, None),
         Command::History { .. } => (Name::History, None, None),
-        Command::Service { .. } | Command::Reconcile => (Name::Service, None, None),
+        Command::Service { .. } | Command::Reconcile { .. } => (Name::Service, None, None),
         Command::Pause => (Name::Pause, None, None),
         Command::Resume => (Name::Resume, None, None),
         Command::Share { .. } => (Name::Share, None, None),
@@ -535,8 +544,28 @@ async fn run(
     json: bool,
     terminal: Arc<terminal::Terminal>,
 ) -> Result<Done, CliError> {
+    let lifecycle_deadline = matches!(command, Command::Reconcile { .. })
+        .then(|| tokio::time::Instant::now() + std::time::Duration::from_secs(380));
+    let app_policy = match &command {
+        Command::Setup { no_app, .. } => Some(if *no_app {
+            Err("opt_out")
+        } else if !terminal.guided() {
+            Err("unattended_setup")
+        } else {
+            Ok(app_install::AppLaunch::Open)
+        }),
+        Command::Reconcile { no_app } => Some(if *no_app {
+            Err("service_handoff")
+        } else if std::env::current_exe().is_ok_and(|binary| app::bundled(&binary)) {
+            Err("bundled_helper")
+        } else {
+            Ok(app_install::AppLaunch::Preserve)
+        }),
+        _ => None,
+    };
+    let setup_app = matches!(command, Command::Setup { .. });
     let asked = matches!(command, Command::Service { .. });
-    let shows_state = asked || matches!(command, Command::Reconcile);
+    let shows_state = asked || matches!(command, Command::Reconcile { .. });
     let reconciles = shows_state
         || matches!(
             command,
@@ -581,6 +610,35 @@ async fn run(
         }
         done.text.push_str(&text);
     }
+    if let Some(policy) = app_policy {
+        let report = match policy {
+            Ok(launch) => {
+                let deadline = lifecycle_deadline.unwrap_or_else(|| {
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(400)
+                });
+                app::install(&paths, &service::this_version(), launch, deadline)
+                    .await
+                    .0
+            }
+            Err(reason) => app::Report::skipped(reason),
+        };
+        let failed = setup_app && report.failed();
+        done.text.push_str(&report.text());
+        done.data = serde_json::to_value(report::WithApp {
+            data: done.data,
+            app: report,
+        })
+        .expect("the CLI's own types serialize");
+        if failed {
+            return Err(CliError {
+                partial: Some(Box::new(done)),
+                ..CliError::new(
+                    Code::Failed,
+                    "The device is connected, but app setup is incomplete; run koi setup to retry, or use --no-app",
+                )
+            });
+        }
+    }
     Ok(done)
 }
 
@@ -600,6 +658,7 @@ async fn execute(
             device,
             login,
             script,
+            ..
         } => setup::setup(&paths, &device.name(), &login, &script, json, terminal).await,
         Command::Join {
             code,
@@ -646,7 +705,7 @@ async fn execute(
         Command::Service {
             action: ServiceAction::Start,
         }
-        | Command::Reconcile => Ok(Done::ok(Empty {}, "")),
+        | Command::Reconcile { .. } => Ok(Done::ok(Empty {}, "")),
         Command::Pause => pause(&paths).await,
         Command::Resume => resume(&paths).await,
         Command::Device { action } => device(paths, action).await,

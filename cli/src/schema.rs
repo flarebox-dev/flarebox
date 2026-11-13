@@ -10,7 +10,7 @@ use crate::report::{
     Envelope, FolderData, HelpData, InvitationData, LeftData, RequestsData, RestoreAskedData,
     RevokedData, SCHEMA_VERSION, SetupData, ShareLinkData, ShareLinksData, SharedData, SpaceData,
     SpacesData, StatusData, TrashData, UnlinkedData, UpdatedData, UsagesData, VersionInfoData,
-    VersionsData, WithService,
+    VersionsData, WithApp, WithService,
 };
 use crate::telemetry::{ChoiceData, TelemetryStatusData};
 
@@ -29,14 +29,13 @@ fn data(command: &str) -> Option<&'static [Data]> {
         "space" | "folder" | "service" | "device" | "history" | "share" | "telemetry"
         | "_daemon" => &[],
         "setup" => &[
-            of::<WithService<ChoicesData>>,
-            of::<WithService<SetupData>>,
-            of::<WithService<Empty>>,
+            of::<WithApp<WithService<ChoicesData>>>,
+            of::<WithApp<WithService<SetupData>>>,
+            of::<WithApp<WithService<Empty>>>,
         ],
         "join" | "server claim" => &[of::<WithService<AccountData>>],
-        "server deploy" | "server add-device" | "service start" | "_reconcile" => {
-            &[of::<WithService<Empty>>]
-        }
+        "server deploy" | "server add-device" | "service start" => &[of::<WithService<Empty>>],
+        "_reconcile" => &[of::<WithApp<WithService<Empty>>>],
         "pause" => &[of::<Empty>],
         "resume" => &[of::<WithService<Empty>>],
         "space create" => &[of::<SpaceData>],

@@ -63,9 +63,11 @@ The daemon logs at the `info` level. Set `KOIDRIVE_LOG` to change it, for exampl
 
 1. A `koi` from a Homebrew formula named `koidrive`, under `$HOMEBREW_PREFIX`, `/opt/homebrew`, `/usr/local` or `/home/linuxbrew/.linuxbrew`, or the Homebrew that the service's or this command's `koi` comes from. `koi update` runs that Homebrew's `brew update` and `brew upgrade koidrive/tap/koidrive`.
 2. `~/.local/bin/koi`, or else the `koi` that the service or this command runs when it is outside Homebrew and the app. `koi update` downloads the installer from `https://koidrive.com/install.sh` and runs it with `KOIDRIVE_INSTALL_DIR` set to the folder that holds that `koi` and `KOIDRIVE_VERSION` set to the release. A build from source in `~/.cargo/bin` counts here.
-3. The `koi` inside `/Applications/Koidrive.app`. `koi update` doesn't upgrade the app. It fails with `Download Koidrive <version> from <url>`.
+3. The `koi` inside `/Applications/Koidrive.app` or `~/Applications/Koidrive.app`. `koi update` downloads and verifies that release's app, then replaces the older copy.
 
 After an upgrade, the new `koi` takes over the background service. When the `koi` already runs the newest release, `koi update` changes nothing and reports `unchanged`. It upgrades Koidrive for one user, so it refuses to run as root. Each run writes what it ran and printed to `update.log`, in `~/Library/Logs/Koidrive/` on macOS and in the state folder on Linux.
+
+On Apple silicon Macs, reconciliation also ensures that the installed app matches the invoking release, without prompting or downgrading a verified newer app. The app's own bundled helper skips that installation step. The installer keeps a replaced bundle until the new daemon confirms its version, and preserves it if the handoff cannot be verified. An app failure does not change reconciliation's service result or exit status. CI skips app installation for every caller.
 
 The daemon also looks every hour for a newer `koi` from Homebrew, the installer or the app, and hands the service to the newest one. So after another install upgrades `koi`, sync runs the new release within the hour.
 

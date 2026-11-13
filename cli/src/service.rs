@@ -33,7 +33,7 @@ const SPAWN: Duration = Duration::from_secs(5);
 
 const PROBE: Duration = Duration::from_secs(5);
 
-pub const DELEGATED: Duration = Duration::from_secs(60);
+pub const DELEGATED: Duration = Duration::from_secs(7 * 60);
 
 const LOCK_WAIT: Duration = Duration::from_secs(60);
 
@@ -553,7 +553,7 @@ fn newer_installed(manager: &dyn Manager, service: &Service) -> Option<PathBuf> 
         .then_some(binary)
 }
 
-fn delegated(
+async fn delegated(
     manager: &dyn Manager,
     service: &Service,
     binary: &Path,
@@ -562,12 +562,41 @@ fn delegated(
 ) -> Report {
     let args: &[&str] = match asked {
         true => &["service", "start", "--json"],
-        false => &["_reconcile", "--json"],
+        false => &["_reconcile", "--no-app", "--json"],
     };
-    let mut command = Command::new(binary);
+    let mut command = tokio::process::Command::new(binary);
     command.args(args).stderr(Stdio::inherit());
-    let output = output_within(&mut command, within);
+    let output = delegated_output(&mut command, within).await;
     delegated_report(manager, service, binary, args, within, output)
+}
+
+async fn delegated_output(
+    command: &mut tokio::process::Command,
+    within: Duration,
+) -> io::Result<Option<(ExitStatus, Vec<u8>)>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let mut printed = Vec::new();
+    let output = tokio::time::timeout(within, async {
+        tokio::try_join!(child.wait(), stdout.read_to_end(&mut printed))
+    })
+    .await;
+    match output {
+        Ok(Ok((status, _))) => Ok(Some((status, printed))),
+        failed => {
+            child.kill().await?;
+            match failed {
+                Ok(Err(error)) => Err(error),
+                _ => Ok(None),
+            }
+        }
+    }
 }
 
 pub fn delegated_report(
@@ -743,7 +772,7 @@ async fn reconcile_with(
         && let Some(newer) = newer_installed(manager, service)
     {
         drop(lock);
-        return delegated(manager, service, &newer, asked, DELEGATED);
+        return delegated(manager, service, &newer, asked, DELEGATED).await;
     }
     let status = match tokio::time::timeout(PROBE, ipc::run(paths, Request::Status)).await {
         Ok(Ok(Response::Status { status })) => status,
@@ -2122,7 +2151,10 @@ mod tests {
         let fake = Fake::default();
         running_on(&fake, &newer);
         fake.running.set(false);
-        for (asked, args) in [(false, "_reconcile --json"), (true, "service start --json")] {
+        for (asked, args) in [
+            (false, "_reconcile --no-app --json"),
+            (true, "service start --json"),
+        ] {
             let report = reconcile_with(&fake, Ok(service(&[])), &paths, asked).await;
             assert_eq!(
                 (report.state, report.name.as_str(), report.problem),
@@ -2322,8 +2354,187 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_delegated_report_keeps_the_folders_the_newer_koi_counted_and_this_profiles_log() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiting_for_a_delegated_koi_lets_the_interrupt_branch_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let stalled = dir.path().join("stalled-koi");
+        fs::write(&stalled, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        fs::set_permissions(
+            &stalled,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let fake = Fake::default();
+        let service = service(&[]);
+        tokio::select! {
+            biased;
+            _ = delegated(&fake, &service, &stalled, false, Duration::from_millis(200)) => {
+                panic!("the delegated child wait blocked the interrupt branch");
+            }
+            () = tokio::task::yield_now() => {}
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_delegation_kills_and_reaps_the_child_in_the_callers_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let stalled = dir.path().join("stalled-koi");
+        fs::write(
+            &stalled,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(
+            &stalled,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let fake = Fake::default();
+        let service = service(&[]);
+        let mut delegated = Box::pin(delegated(&fake, &service, &stalled, false, DELEGATED));
+        let pid = tokio::select! {
+            biased;
+            report = &mut delegated => panic!("delegation finished before cancellation: {report:?}"),
+            pid = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(pid) = fs::read_to_string(&pid_file)
+                        && let Ok(pid) = pid.trim().parse::<i32>()
+                    {
+                        break rustix::process::Pid::from_raw(pid).unwrap();
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }) => pid.expect("the delegated child started"),
+        };
+        let group = rustix::process::getpgid(Some(pid));
+        drop(delegated);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while rustix::process::test_kill_process(pid) != Err(rustix::io::Errno::SRCH) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancellation killed and reaped the delegated child");
+        assert_eq!(group, Ok(rustix::process::getpgrp()));
+        assert_eq!(
+            rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG).unwrap_err(),
+            rustix::io::Errno::CHILD
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delegated_koi_that_closes_stdout_still_has_to_exit_before_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let stalled = dir.path().join("stalled-koi");
+        fs::write(
+            &stalled,
+            format!(
+                "#!/bin/sh\nexec 1>&-\necho $$ > '{}'\nexec sleep 30\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(
+            &stalled,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let report = delegated(
+            &Fake::default(),
+            &service(&[]),
+            &stalled,
+            false,
+            Duration::from_secs(1),
+        )
+        .await;
+        let pid = rustix::process::Pid::from_raw(
+            fs::read_to_string(pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            rustix::process::test_kill_process(pid),
+            Err(rustix::io::Errno::SRCH)
+        );
+        assert!(
+            report
+                .problem
+                .unwrap()
+                .contains("did not finish within 1 seconds")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delegated_koi_that_exits_cannot_leave_its_stdout_wait_unbounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let holder_file = dir.path().join("holder");
+        let stalled = dir.path().join("stalled-koi");
+        fs::write(
+            &stalled,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nsleep 30 &\necho $! > '{}'\n",
+                pid_file.display(),
+                holder_file.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(
+            &stalled,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let report = tokio::time::timeout(
+            Duration::from_secs(5),
+            delegated(
+                &Fake::default(),
+                &service(&[]),
+                &stalled,
+                false,
+                Duration::from_secs(1),
+            ),
+        )
+        .await;
+        let holder = rustix::process::Pid::from_raw(
+            fs::read_to_string(holder_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap(),
+        )
+        .unwrap();
+        let _ = rustix::process::kill_process(holder, rustix::process::Signal::KILL);
+        let pid = rustix::process::Pid::from_raw(
+            fs::read_to_string(pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG).unwrap_err(),
+            rustix::io::Errno::CHILD
+        );
+        assert!(
+            report
+                .unwrap()
+                .problem
+                .unwrap()
+                .contains("did not finish within 1 seconds")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delegated_report_keeps_the_folders_the_newer_koi_counted_and_this_profiles_log() {
         let dir = tempfile::tempdir().unwrap();
         let newer = dir.path().join("newer-koi");
         fs::write(
@@ -2336,7 +2547,7 @@ echo '{"data":{"service":{"manager":"systemd","name":"koidrive.service","state":
         fs::set_permissions(&newer, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         let fake = Fake::default();
         let service = service(&[]);
-        let report = delegated(&fake, &service, &newer, false, PROBE);
+        let report = delegated(&fake, &service, &newer, false, PROBE).await;
         let text = report.text();
         assert!(text.contains("is installed but not running"), "{text}");
         assert!(
@@ -2345,8 +2556,8 @@ echo '{"data":{"service":{"manager":"systemd","name":"koidrive.service","state":
         );
     }
 
-    #[test]
-    fn a_newer_koi_that_does_not_finish_is_killed_and_reported_after_the_deadline() {
+    #[tokio::test]
+    async fn a_newer_koi_that_does_not_finish_is_killed_and_reported_after_the_deadline() {
         let dir = tempfile::tempdir().unwrap();
         let pid = dir.path().join("pid");
         let stalled = dir.path().join("stalled-koi");
@@ -2367,7 +2578,8 @@ echo '{"data":{"service":{"manager":"systemd","name":"koidrive.service","state":
             &stalled,
             true,
             Duration::from_secs(1),
-        );
+        )
+        .await;
         assert!(began.elapsed() < Duration::from_secs(3));
         let problem = report.problem.unwrap();
         assert!(

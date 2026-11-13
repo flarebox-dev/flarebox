@@ -25,9 +25,13 @@ The daemon checks the folder again before it links it. If the folder was replace
 
 After setup succeeds, it asks whether to send anonymous usage reports, unless you already chose or an environment variable decides it. Press Enter for yes. [Usage reports](telemetry.md) lists what they hold.
 
+On an Apple silicon Mac, attended setup also installs the matching release of Koidrive.app in `/Applications`, or `~/Applications` when `/Applications` is not writable, and requests that it open. It verifies the release checksum, the app's Developer ID and notarization before replacing an older copy. A verified equal or newer app needs no download. Add `--no-app` to skip installation and opening. JSON, unattended setup, CI and other platforms skip this step.
+
+If the app step fails, the device stays connected and its linked folders stay linked. Setup reports the completed work and the app failure separately. The JSON `data.app` field reports `skipped`, `present` or `failed`; an incomplete launch, handoff or cleanup appears as `problem` on a `present` result. A requested launch is not confirmation that the app attached. The `data.service` result describes background sync independently.
+
 ## Run it again to finish or check
 
-If a setup stops halfway, for example because the network dropped, run `koi setup` again. It finishes from where it stopped. On a machine that is already connected, it doesn't log in or pair again. With a linked folder, it lists the linked folders and changes nothing. Without one, it goes on to the folder questions.
+If a setup stops halfway, for example because the network dropped, run `koi setup` again. It finishes from where it stopped. On a machine that is already connected, it doesn't log in or pair again. With a linked folder, it lists the linked folders without changing their links. Without one, it goes on to the folder questions.
 
 ## Options
 
@@ -39,6 +43,7 @@ If a setup stops halfway, for example because the network dropped, run `koi setu
 | `--no-browser` | Prints the login page's address instead of opening a browser. Needs `--interactive` |
 | `--port <port>` | The local port for the login callback, for example to forward it over SSH |
 | `--telemetry on` or `off` | Stores the usage-report choice without asking |
+| `--no-app` | Skips installing and opening the macOS app |
 | `--folder`, `--space`, `--pairing-code-stdin`, `--accept-existing-files` | Run a [scripted setup](#scripted-setup) |
 
 Pairing codes and pasted login callback addresses are hidden while you type.
@@ -70,4 +75,4 @@ With `--folder`, setup asks nothing, with or without a terminal. `--space` takes
 
 On a machine that is already connected, `--pairing-code-stdin` is optional, and setup links the folder without pairing again. A code for another server is refused. A machine that isn't connected needs the code, or setup stops with `auth_required` (exit 4). Running the same command again changes nothing and reports `unchanged`.
 
-With `--json`, `data` holds `account` (the device this machine is connected as), `folder` (the linked folder, with its `space_id`, `space_name` and `state`) and `service` (the background service). [docs/json-schema/v1/koi-setup.json](../json-schema/v1/koi-setup.json) is the schema.
+With `--json`, `data` holds `account` (the device this machine is connected as), `folder` (the linked folder, with its `space_id`, `space_name` and `state`), `service` (the background service) and `app` (the macOS app step). [docs/json-schema/v1/koi-setup.json](../json-schema/v1/koi-setup.json) is the schema.

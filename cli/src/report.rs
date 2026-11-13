@@ -639,6 +639,8 @@ pub struct UpdatedData {
     pub result: UpdateResult,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<crate::service::Report>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<crate::app::Report>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
@@ -1227,6 +1229,13 @@ pub struct WithService<T> {
     #[serde(flatten)]
     pub data: T,
     pub service: crate::service::Report,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(crate) struct WithApp<T> {
+    #[serde(flatten)]
+    pub data: T,
+    pub app: crate::app::Report,
 }
 
 #[derive(Debug, PartialEq, Serialize, JsonSchema)]
