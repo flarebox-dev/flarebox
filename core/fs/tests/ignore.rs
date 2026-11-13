@@ -781,6 +781,34 @@ fn a_link_moved_into_an_ignored_folder_while_another_link_is_renamed_is_ignored(
 }
 
 #[test]
+fn two_links_moved_into_an_ignored_folder_beside_a_new_included_link_are_not_removed() {
+    let (dir, mut snapshot, mut rules) = tree_with_an_ignored_folder();
+    let root = dir.path();
+    write(root, "a", "a");
+    fs::hard_link(root.join("a"), root.join("b")).unwrap();
+    snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    fs::rename(root.join("a"), root.join("ig/a")).unwrap();
+    fs::rename(root.join("b"), root.join("ig/b")).unwrap();
+    fs::hard_link(root.join("ig/a"), root.join("c")).unwrap();
+
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert!(
+        (rescan.changes.iter()).any(|change| matches!(change, Change::Ignored { .. })),
+        "{:?}",
+        rescan.changes
+    );
+    assert!(
+        !(rescan.changes.iter()).any(|change| matches!(change, Change::Removed { .. })),
+        "{:?}",
+        rescan.changes
+    );
+}
+
+#[test]
 fn a_link_removed_while_another_link_stays_included_is_removed() {
     for budget in [usize::MAX, 100] {
         let dir = large_ignored_tree();
