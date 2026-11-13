@@ -1447,6 +1447,7 @@ impl Folder {
             Ok(())
         })?;
         self.flight = Flight::Idle;
+        self.commit_ended();
         self.list_again(work);
         Ok(())
     }

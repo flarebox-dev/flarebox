@@ -156,6 +156,37 @@ fn a_rewound_space_recovers_at_welcome_and_names_the_seq_it_was_rewound_to() {
 }
 
 #[test]
+fn a_recovery_at_welcome_drops_the_wait_of_the_commit_it_abandons() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::write(site.root.join("notes.txt"), b"written on a").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    let Some(upload @ Work::Upload(_)) = a.work.pop_front() else {
+        panic!("the new file is uploaded");
+    };
+    a.perform(upload, &mut remote).unwrap();
+    let Some(Work::Send(_)) = a.work.pop_front() else {
+        panic!("the commit is sent");
+    };
+    let refusal = koidrive_proto::v1::Error {
+        code: Code::Internal as i32,
+        message: "try again".into(),
+        ..Default::default()
+    };
+    let step = a.folder.sent(Err(CallError::Server(ServerError(refusal))));
+    a.take(step).unwrap();
+    assert!(a.folder.view().wait.is_some());
+
+    let welcome = Welcome {
+        history_id: "rewound".into(),
+        ..remote.space.welcome(&a.caller)
+    };
+    a.event(Event::Connected(welcome)).unwrap();
+    assert!(a.folder.view().recovery.is_some());
+    assert_eq!(a.folder.view().wait, None);
+}
+
+#[test]
 fn a_history_changed_resync_on_a_live_session_recovers_through_a_new_connection() {
     let mut remote = Remote::new();
     let (site, mut a) = linked(&mut remote, "a");
