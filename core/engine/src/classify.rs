@@ -1424,32 +1424,41 @@ impl Trees {
         self.removed_here.contains_key(id)
     }
 
-    pub fn forget_removed(&mut self, id: &str) {
-        let group = (self.r.get(id))
-            .filter(|node| node.trashed)
-            .map(|node| node.trash_group.clone());
-        let below = |member: &str| {
+    pub(crate) fn removed_restored(&self, id: &str, target: &str) -> Vec<NodeId> {
+        let Some(node) = self.r.get(id).filter(|node| node.trashed) else {
+            return Vec::new();
+        };
+        let in_group = |member: &str| {
             let mut current = member;
             for _ in 0..=self.r.len() {
                 if current == id {
                     return true;
                 }
                 match self.r.get(current) {
-                    Some(node) if node.trashed && Some(&node.trash_group) == group.as_ref() => {
-                        current = &node.shape.parent
+                    Some(above) if above.trashed && above.trash_group == node.trash_group => {
+                        current = &above.shape.parent
                     }
                     _ => return false,
                 }
             }
             false
         };
-        let restored: Vec<NodeId> = (self.removed_here.keys())
-            .filter(|member| below(member))
-            .cloned()
-            .collect();
-        for member in restored {
-            self.removed_here.remove(&member);
+        let mut parents = BTreeSet::new();
+        let mut current = if target.is_empty() {
+            &node.shape.parent
+        } else {
+            target
+        };
+        while let Some(parent) = self.r.get(current).filter(|parent| parent.trashed) {
+            if !parents.insert(current) {
+                break;
+            }
+            current = &parent.shape.parent;
         }
+        (self.removed_here.keys())
+            .filter(|member| in_group(member) || parents.contains(member.as_str()))
+            .cloned()
+            .collect()
     }
 
     pub fn kept_original(&self, id: &str) -> Option<&NodeId> {

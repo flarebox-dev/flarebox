@@ -370,6 +370,7 @@ impl Tx<'_> {
             "commit_in_flight",
             "commit_in_flight_deletes",
             "commit_in_flight_delete_members",
+            "commit_in_flight_restore_members",
             "watched_contents",
             "watched_positions",
             "trashed_here",
@@ -673,6 +674,7 @@ impl Tx<'_> {
                 "commit_in_flight",
                 "commit_in_flight_deletes",
                 "commit_in_flight_delete_members",
+                "commit_in_flight_restore_members",
             ] {
                 self.0.execute(&format!("DELETE FROM {table}"), [])?;
             }
@@ -694,6 +696,14 @@ impl Tx<'_> {
                     targets.execute([target])?;
                     for (position, node) in nodes.iter().enumerate() {
                         members.execute(params![target, position, node])?;
+                    }
+                }
+                let mut restored = self.0.prepare_cached(
+                    "INSERT INTO commit_in_flight_restore_members (target, position, node_id) VALUES (?1, ?2, ?3)",
+                )?;
+                for (target, nodes) in &flight.restores {
+                    for (position, node) in nodes.iter().enumerate() {
+                        restored.execute(params![target, position, node])?;
                     }
                 }
             }
@@ -873,9 +883,18 @@ impl Tx<'_> {
             };
             nodes.push(row.get(1)?);
         }
+        let mut restores: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
+        let mut stmt = self.0.prepare_cached(
+            "SELECT target, node_id FROM commit_in_flight_restore_members ORDER BY target, position",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            restores.entry(row.get(0)?).or_default().push(row.get(1)?);
+        }
         Ok(Some(InFlight {
             commit: Commit::decode(commit.as_slice())?,
             deletes,
+            restores,
             result: decode(result)?,
         }))
     }

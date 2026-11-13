@@ -88,6 +88,7 @@ fn migrations_apply_from_empty() {
             "commit_in_flight",
             "commit_in_flight_delete_members",
             "commit_in_flight_deletes",
+            "commit_in_flight_restore_members",
             "commit_slots",
             "commit_state",
             "discarded_nodes",
@@ -1311,6 +1312,7 @@ fn engine_state() -> EngineState {
                     ),
                     ("empty".into(), vec![]),
                 ]),
+                restores: BTreeMap::new(),
                 result: Some(CommitResult {
                     seq: 30,
                     results: vec![applied.clone(), applied.clone(), applied],
@@ -1499,7 +1501,7 @@ fn engine_state_survives_a_reopen() {
 }
 
 /// The tables of the engine state besides the nodes of R, L and S.
-const ENGINE_TABLES: [&str; 35] = [
+const ENGINE_TABLES: [&str; 36] = [
     "node_sets",
     "node_maps",
     "waiting_updates",
@@ -1507,6 +1509,7 @@ const ENGINE_TABLES: [&str; 35] = [
     "commit_in_flight",
     "commit_in_flight_deletes",
     "commit_in_flight_delete_members",
+    "commit_in_flight_restore_members",
     "watched_contents",
     "trashed_here",
     "recorded_nodes",
@@ -1766,6 +1769,7 @@ fn a_policy_halt_outlasts_a_restart_and_resends_nothing() {
                     ..Default::default()
                 },
                 deletes: BTreeMap::new(),
+                restores: BTreeMap::new(),
                 result: None,
             }),
             halted: Some(halt),
@@ -3617,7 +3621,9 @@ fn a_store_from_before_removals_here_were_recorded_opens_with_none_recorded() {
 
     let mut store = Store::open(&path).unwrap();
     assert_eq!(applied(&path), all_migrations());
-    let after = before.clone();
+    let mut after = before.clone();
+    let flight = after.commits.in_flight.as_mut().unwrap();
+    flight.restores = BTreeMap::from([("r".into(), vec!["r".into(), "r-child".into()])]);
     before.trees.removed_here.clear();
     assert!(!after.trees.removed_here.is_empty());
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);

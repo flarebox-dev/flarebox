@@ -153,17 +153,6 @@ fn outcome(code: op_result::Code) -> OpResult {
     }
 }
 
-fn live(node: &str) -> proto::ChangeRecord {
-    let state = proto::NodeState {
-        node_id: node.into(),
-        status: proto::NodeStatus::Live as i32,
-        ..Default::default()
-    };
-    proto::ChangeRecord {
-        change: Some(proto::change_record::Change::Node(state)),
-    }
-}
-
 fn rejected(reason: &str) -> OpResult {
     OpResult {
         reject_reason: reason.into(),
@@ -1215,7 +1204,6 @@ fn an_explicit_restore_of_a_file_its_user_removed_is_downloaded() {
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert_eq!(ops(&commit), [restore_op(&intent)]);
 
-    commits.restored(&mut trees, &commit.commit_id, &[live(&n)]);
     let restored = RemoteNode {
         meta_rev: 2,
         ..remote(shape)
@@ -1258,7 +1246,6 @@ fn a_restore_of_a_folder_its_user_removed_downloads_the_files_in_it() {
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert_eq!(ops(&commit), [restore_op(&intent)]);
 
-    commits.restored(&mut trees, &commit.commit_id, &[live(&d), live(&f)]);
     let at_2 = |shape: Shape| RemoteNode {
         meta_rev: 2,
         ..remote(shape)
@@ -1344,33 +1331,212 @@ fn a_restore_the_server_rejects_leaves_the_removal_a_later_move_out_of_the_trash
     assert_eq!(ops(&commit), [delete]);
 }
 
+fn renamed_out_of_the_trash(a: &str, g: &str) -> Trees {
+    let folder = dir(&root(), "a");
+    let inside = file(a, "g", 1);
+    trees(&[
+        (
+            a.to_owned(),
+            Some(dir(&root(), "A")),
+            Some(folder.clone()),
+            Some(trashed(folder)),
+        ),
+        (
+            g.to_owned(),
+            None,
+            Some(inside.clone()),
+            Some(trashed(inside)),
+        ),
+    ])
+}
+
+fn moved(node: &str, parent: &str, name: &str) -> op::Op {
+    op::Op::Move(proto::Move {
+        node_id: node.into(),
+        new_parent_id: parent.into(),
+        new_name: name.into(),
+        from: None,
+    })
+}
+
+fn revived(
+    commits: &mut Commits,
+    trees: &mut Trees,
+    nodes: &[(&str, Shape)],
+    results: Vec<OpResult>,
+) {
+    for (node, shape) in nodes {
+        let node_at_2 = RemoteNode {
+            meta_rev: 2,
+            ..remote(shape.clone())
+        };
+        trees.set_remote_made_here((*node).to_owned(), node_at_2);
+    }
+    let result = CommitResult {
+        seq: 2,
+        results,
+        ..Default::default()
+    };
+    commits.received(result).unwrap();
+    assert!(commits.acknowledge(trees, 2));
+    trees.settle();
+}
+
 #[test]
-fn a_move_out_of_the_trash_waits_for_a_restore_of_a_file_its_user_removed() {
+fn a_rejected_restore_sent_with_a_move_that_brings_its_file_back_leaves_the_file_deleted() {
     let (a, g, missing) = (id(1), id(2), id(3));
+    let mut trees = renamed_out_of_the_trash(&a, &g);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let intent = version(&g, &missing);
+    assert!(commits.restore(id(100), intent.clone()));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [restore_op(&intent), moved(&a, &root(), "A")]);
+
+    let back = [
+        (a.as_str(), dir(&root(), "A")),
+        (g.as_str(), file(&a, "g", 1)),
+    ];
+    let results = vec![rejected("NOT_FOUND"), outcome(op_result::Code::Applied)];
+    revived(&mut commits, &mut trees, &back, results);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    let delete = op::Op::Delete(proto::Delete {
+        node_id: g.clone(),
+        requires: None,
+    });
+    assert_eq!(ops(&commit), [delete]);
+}
+
+#[test]
+fn a_restore_sent_with_a_move_that_already_brought_its_file_back_downloads_the_file() {
+    let (a, g) = (id(1), id(2));
+    let mut trees = renamed_out_of_the_trash(&a, &g);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let intent = from_trash(&g);
+    assert!(commits.restore(id(100), intent.clone()));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [restore_op(&intent), moved(&a, &root(), "A")]);
+
+    let back = [
+        (a.as_str(), dir(&root(), "A")),
+        (g.as_str(), file(&a, "g", 1)),
+    ];
+    let results = vec![outcome(op_result::Code::Applied); 2];
+    revived(&mut commits, &mut trees, &back, results);
+    assert_eq!(trees.class(&g), Class::Remote);
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+}
+
+#[test]
+fn a_restore_of_a_renamed_trashed_folder_with_a_removed_member_is_sent_with_its_rename() {
+    let (a, g) = (id(1), id(2));
+    let mut trees = renamed_out_of_the_trash(&a, &g);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let intent = from_trash(&a);
+    assert!(commits.restore(id(100), intent.clone()));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [moved(&a, &root(), "A"), restore_op(&intent)]);
+
+    let back = [
+        (a.as_str(), dir(&root(), "A")),
+        (g.as_str(), file(&a, "g", 1)),
+    ];
+    let results = vec![outcome(op_result::Code::Applied); 2];
+    revived(&mut commits, &mut trees, &back, results);
+    assert_eq!(trees.class(&g), Class::Remote);
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+}
+
+#[test]
+fn a_restore_of_a_removed_file_under_a_renamed_trashed_folder_is_sent_with_the_rename() {
+    let (p, a, b) = (id(1), id(2), id(3));
+    let parent = dir(&root(), "p");
+    let folder = dir(&p, "a");
+    let inside = file(&a, "b", 1);
+    let mut trees = trees(&[
+        (
+            p.clone(),
+            Some(parent.clone()),
+            Some(parent.clone()),
+            Some(trashed(parent)),
+        ),
+        (
+            a.clone(),
+            Some(dir(&p, "a2")),
+            Some(folder.clone()),
+            Some(trashed(folder)),
+        ),
+        (b.clone(), None, Some(inside.clone()), Some(trashed(inside))),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let intent = from_trash(&b);
+    assert!(commits.restore(id(100), intent.clone()));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [moved(&a, &p, "a2"), restore_op(&intent)]);
+}
+
+#[test]
+fn a_restore_of_a_removed_file_into_a_renamed_trashed_folder_is_sent_with_the_rename() {
+    let (p, a, b, c) = (id(1), id(2), id(3), id(4));
+    let parent = dir(&root(), "p");
+    let folder = dir(&p, "a");
+    let target = dir(&p, "c");
+    let inside = file(&a, "b", 1);
+    let mut trees = trees(&[
+        (
+            p.clone(),
+            Some(parent.clone()),
+            Some(parent.clone()),
+            Some(trashed(parent)),
+        ),
+        (a.clone(), None, Some(folder.clone()), Some(trashed(folder))),
+        (
+            c.clone(),
+            Some(dir(&p, "c2")),
+            Some(target.clone()),
+            Some(trashed(target)),
+        ),
+        (b.clone(), None, Some(inside.clone()), Some(trashed(inside))),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let intent = RestoreIntent::from_trash(b.clone(), Some(c.clone()), None).unwrap();
+    assert!(commits.restore(id(100), intent.clone()));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [moved(&c, &p, "c2"), restore_op(&intent)]);
+}
+
+#[test]
+fn a_restore_of_a_file_in_a_folder_its_user_removed_downloads_the_folder() {
+    let (a, g) = (id(1), id(2));
     let folder = dir(&root(), "a");
     let inside = file(&a, "g", 1);
     let mut trees = trees(&[
         (
             a.clone(),
-            Some(dir(&root(), "A")),
+            None,
             Some(folder.clone()),
-            Some(trashed(folder)),
+            Some(trashed(folder.clone())),
         ),
-        (g.clone(), None, Some(inside.clone()), Some(trashed(inside))),
+        (
+            g.clone(),
+            None,
+            Some(inside.clone()),
+            Some(trashed(inside.clone())),
+        ),
     ]);
     let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
-    let intent = version(&g, &missing);
+    let intent = from_trash(&g);
     assert!(commits.restore(id(100), intent.clone()));
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert_eq!(ops(&commit), [restore_op(&intent)]);
-    acknowledge(&mut commits, &mut trees, vec![rejected("NOT_FOUND")]);
 
-    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
-    let moved = op::Op::Move(proto::Move {
-        node_id: a.clone(),
-        new_parent_id: root(),
-        new_name: "A".into(),
-        from: None,
-    });
-    assert_eq!(ops(&commit), [moved]);
+    let back = [(a.as_str(), folder), (g.as_str(), inside)];
+    revived(
+        &mut commits,
+        &mut trees,
+        &back,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    assert_eq!(trees.class(&a), Class::Remote);
+    assert_eq!(trees.class(&g), Class::Remote);
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
 }
