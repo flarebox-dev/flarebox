@@ -3319,3 +3319,24 @@ fn a_lost_create_sent_again_under_a_new_name_is_taken_by_a_device_whose_download
         Cut::Placed,
     )));
 }
+
+#[test]
+#[ignore = "a device resends the position its disk holds, not the one it knew the server held (GUN-642)"]
+fn a_second_loss_before_the_download_moves_the_file_keeps_the_authors_name() {
+    let mut world = converge(2, &[vec![(0, BACKUP), (0, file("a"))]]).unwrap();
+    let mut steps = vec![(0, RESTORE)];
+    reconnect(&mut steps, 1, false);
+    steps.push((0, rename(0, 0, "b")));
+    reconnect(&mut steps, 0, true);
+    steps.extend([(1, DELIVER); 6]);
+    steps.extend([(1, Step::Effect(Outcome::Fail)), (0, RESTORE)]);
+    reconnect(&mut steps, 1, true);
+    reconnect(&mut steps, 0, true);
+    world.phase(1, &steps).unwrap();
+    for device in 0..2 {
+        let names: Vec<String> = (files_on(&world, device).into_iter())
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["b"], "device {device}");
+    }
+}
