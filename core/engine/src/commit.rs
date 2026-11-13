@@ -717,6 +717,7 @@ impl Commits {
     fn ask_again(&mut self, trees: &mut Trees, ids: &mut IdGen, now_ms: u64) -> Vec<NodeId> {
         let shows = |question: &Question| first_link::asks(question) && !question.shown.is_empty();
         let mut left = Vec::new();
+        let mut published_in: BTreeSet<NodeId> = BTreeSet::new();
         let mut index = 0;
         while index < self.questions.len() {
             if !shows(&self.questions[index]) {
@@ -752,6 +753,14 @@ impl Commits {
                         }
                         trees.reclaim(|id| shown.contains(id));
                     } else {
+                        for id in question.shown.keys() {
+                            let mut at = trees.local().get(id).map(|node| &node.shape.parent);
+                            while let Some(parent) =
+                                at.filter(|p| published_in.insert((*p).clone()))
+                            {
+                                at = trees.local().get(parent).map(|node| &node.shape.parent);
+                            }
+                        }
                         self.published.extend(question.shown.into_keys());
                     }
                 }
@@ -761,6 +770,7 @@ impl Commits {
             }
         }
         self.hold(trees);
+        trees.reclaim(|id| published_in.contains(id));
         left
     }
 
