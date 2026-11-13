@@ -597,8 +597,12 @@ impl Commits {
     /// pending name: one node of the cycle moves to a free name first and to its own name last, in
     /// the same commit when the commit holds the whole cycle. Otherwise a create or move that only
     /// waits for a name is sent anyway, for the server to rename, except that a folder created
-    /// where a moving file or folder still is takes a pending name first, and a folder it may be
-    /// merged into is not deleted in the same commit. A delete waits until nothing that survives is
+    /// where a moving file or folder still is takes a pending name first. A folder is not deleted
+    /// after a folder created beside it, or beside a folder the created folder's parent may be
+    /// merged into, since another device may have renamed it to the created folder's name since R,
+    /// and the server would then merge the created folder into it: a delete that can go is sent
+    /// before the create, and one that cannot waits for the next commit. A delete waits until
+    /// nothing that survives is
     /// left under it, a create or move until its parent exists, and a move that would close a cycle
     /// against R is reverted: the node is marked in [`Trees::reverted`], and the effects move it
     /// back to its R position on disk, bringing back the folders L deleted on its way. A parked or
@@ -2121,6 +2125,7 @@ enum Fit {
     NameTaken,
     Cycle,
     Wait,
+    Merged,
 }
 
 type Planned = (
@@ -2312,6 +2317,11 @@ fn plan(
         }
         let op = match want {
             Want::Create { id, shape } => {
+                if shape.kind == Kind::Dir {
+                    let targets = scratch.merge_targets(&shape.parent);
+                    scratch.protected.extend(targets.iter().cloned());
+                    scratch.merges.insert(id.clone(), targets);
+                }
                 scratch.place(&id, &shape.parent, &shape.name, shape.kind);
                 match shape.kind {
                     Kind::Dir => op::Op::CreateDir(proto::CreateDir {
@@ -2405,17 +2415,35 @@ fn plan(
     };
     let capped = loop {
         let (mut progress, mut full) = (false, false);
-        for slot in wants.iter_mut() {
-            if slot
-                .as_ref()
-                .is_some_and(|want| scratch.fit(want, &moving) == Fit::Valid)
-            {
-                if !room(&mut emitted, &mut bytes, slot.as_ref().expect("checked")) {
+        for at in 0..wants.len() {
+            if !(wants[at].as_ref()).is_some_and(|want| scratch.fit(want, &moving) == Fit::Valid) {
+                continue;
+            }
+            let mut order = match &wants[at] {
+                Some(Want::Create { shape, .. }) if shape.kind == Kind::Dir => {
+                    deletes_before_create(&wants, &scratch, &moving, &shape.parent)
+                }
+                _ => Vec::new(),
+            };
+            order.push(at);
+            for at in order {
+                if !room(
+                    &mut emitted,
+                    &mut bytes,
+                    wants[at].as_ref().expect("checked"),
+                ) {
                     full = true;
                     break;
                 }
-                emit(slot.take().expect("checked"), &mut scratch, &mut moving);
+                emit(
+                    wants[at].take().expect("checked"),
+                    &mut scratch,
+                    &mut moving,
+                );
                 progress = true;
+            }
+            if full {
+                break;
             }
         }
         if full {
@@ -2459,9 +2487,20 @@ fn plan(
             }
             continue;
         }
+        let held: Vec<NodeId> = (wants.iter().flatten())
+            .filter_map(|want| match want {
+                Want::Delete { id, .. } if scratch.fit(want, &moving) == Fit::Merged => {
+                    Some(id.clone())
+                }
+                _ => None,
+            })
+            .collect();
         let forced = wants.iter_mut().find(|slot| {
-            slot.as_ref()
-                .is_some_and(|want| scratch.fit(want, &moving) == Fit::NameTaken)
+            slot.as_ref().is_some_and(|want| {
+                scratch.fit(want, &moving) == Fit::NameTaken
+                    && !(scratch.name_holders(want))
+                        .any(|holder| held.iter().any(|id| scratch.inside(holder, id)))
+            })
         });
         let Some(slot) = forced else {
             break false;
@@ -2471,22 +2510,18 @@ fn plan(
         }
         if let Some(Want::Create { id, shape }) = slot.as_mut()
             && shape.kind == Kind::Dir
+            && (scratch.holders(&shape.parent, &shape.name)).any(|other| moving.contains(other))
         {
-            if (scratch.holders(&shape.parent, &shape.name)).any(|other| moving.contains(other)) {
-                let sent = scratch.free_name(&shape.parent, &shape.name);
-                let name = std::mem::replace(&mut shape.name, sent.clone());
-                pending.insert(
-                    id.clone(),
-                    Pending {
-                        sent,
-                        name,
-                        landed: false,
-                    },
-                );
-            } else {
-                let held = scratch.held(&shape.parent, &shape.name);
-                scratch.merged.extend(held);
-            }
+            let sent = scratch.free_name(&shape.parent, &shape.name);
+            let name = std::mem::replace(&mut shape.name, sent.clone());
+            pending.insert(
+                id.clone(),
+                Pending {
+                    sent,
+                    name,
+                    landed: false,
+                },
+            );
         }
         emit(slot.take().expect("checked"), &mut scratch, &mut moving);
     };
@@ -2508,6 +2543,34 @@ fn plan(
         last == Some(&pending.sent)
     });
     (ops, deletes, reverts, pending)
+}
+
+fn deletes_before_create(
+    wants: &[Option<Want>],
+    scratch: &Scratch,
+    moving: &BTreeSet<NodeId>,
+    parent: &str,
+) -> Vec<usize> {
+    let targets = scratch.merge_targets(parent);
+    let placing: Vec<&NodeId> = (wants.iter().flatten())
+        .filter_map(|want| match want {
+            Want::Create { shape, .. } => Some(&shape.parent),
+            Want::Move { parent, .. } => Some(parent),
+            _ => None,
+        })
+        .collect();
+    (wants.iter().enumerate())
+        .filter_map(|(at, slot)| match slot {
+            Some(want @ Want::Delete { id, .. })
+                if targets.iter().any(|target| scratch.inside(target, id))
+                    && !placing.iter().any(|to| scratch.inside(to, id))
+                    && scratch.fit(want, moving) == Fit::Valid =>
+            {
+                Some(at)
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// A cycle of moves that each wait only for a name held by the node of the next one, as in a swap
@@ -2567,9 +2630,13 @@ struct Scratch {
     nodes: BTreeMap<NodeId, Entry>,
     /// Live children by parent, then by name key.
     children: BTreeMap<NodeId, BTreeMap<String, BTreeSet<NodeId>>>,
-    /// Folders a forced create will be merged into (MERGED_INTO). Deleting one in the same
-    /// commit would trash what the create brings, so their deletes wait for the next commit.
-    merged: BTreeSet<NodeId>,
+    /// For each folder this commit creates, the folders the server may merge it into
+    /// (MERGED_INTO): every folder under its parent or under a folder its parent may be merged
+    /// into, since the server merges by the names it holds when the commit applies, and another
+    /// device may have renamed one of them since R. Deleting one in the same commit would trash
+    /// what the create brings, so their deletes wait for the next commit.
+    merges: BTreeMap<NodeId, Vec<NodeId>>,
+    protected: BTreeSet<NodeId>,
     /// For each node a queued restore names, how many wants that change it are not emitted yet,
     /// and one more while the node is not settled: this build leaves it out, so its changes are
     /// not among the wants, or S has not taken what L and R agree on. The restore waits for all
@@ -2584,7 +2651,8 @@ impl Scratch {
             root: trees.remote().root.clone(),
             nodes: BTreeMap::new(),
             children: BTreeMap::new(),
-            merged: BTreeSet::new(),
+            merges: BTreeMap::new(),
+            protected: BTreeSet::new(),
             unsent: BTreeMap::new(),
         };
         for (id, node) in trees.remote().iter() {
@@ -2635,14 +2703,14 @@ impl Scratch {
             Want::Content { .. } => Fit::Valid,
             Want::Delete { id, members } => {
                 let subtree = self.subtree(id);
-                if !self.merged.contains(id)
-                    && subtree
-                        .iter()
-                        .all(|node| members.contains(node) && !self.merged.contains(node))
-                {
-                    Fit::Valid
-                } else {
+                if !subtree.iter().all(|node| members.contains(node)) {
                     Fit::Wait
+                } else if self.protected.contains(id)
+                    || subtree.iter().any(|node| self.protected.contains(node))
+                {
+                    Fit::Merged
+                } else {
+                    Fit::Valid
                 }
             }
             Want::Restore { op, .. } if self.unsent.contains_key(&op.node_id) => Fit::Wait,
@@ -2731,6 +2799,15 @@ impl Scratch {
         }
     }
 
+    fn name_holders<'a>(&'a self, want: &'a Want) -> impl Iterator<Item = &'a NodeId> + 'a {
+        let (parent, name) = match want {
+            Want::Create { shape, .. } => (shape.parent.as_str(), shape.name.as_str()),
+            Want::Move { parent, name, .. } => (parent.as_str(), name.as_str()),
+            _ => ("", ""),
+        };
+        self.holders(parent, name)
+    }
+
     /// The live nodes named `name` under `parent`.
     fn holders<'a>(&'a self, parent: &str, name: &str) -> impl Iterator<Item = &'a NodeId> + 'a {
         (self.children.get(parent))
@@ -2739,10 +2816,17 @@ impl Scratch {
             .flatten()
     }
 
-    /// The live folders named `name` under `parent`, which a created folder of that name merges
-    /// into.
-    fn held(&self, parent: &str, name: &str) -> Vec<NodeId> {
-        (self.holders(parent, name))
+    fn merge_targets(&self, parent: &str) -> Vec<NodeId> {
+        let parents = std::iter::once(parent).chain(
+            self.merges
+                .get(parent)
+                .into_iter()
+                .flatten()
+                .map(String::as_str),
+        );
+        parents
+            .flat_map(|parent| self.children.get(parent))
+            .flat_map(|keys| keys.values().flatten())
             .filter(|id| self.nodes[*id].kind == Kind::Dir)
             .cloned()
             .collect()
