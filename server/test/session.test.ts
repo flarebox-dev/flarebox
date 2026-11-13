@@ -2440,7 +2440,7 @@ describe("platform limits", () => {
     expect(http.message!.result).toMatchObject(quota);
     expect(await socket.rpc(request)).toMatchObject(quota);
     expect(socket.closed).toBeUndefined();
-    expect(logged.mock.calls.filter(([what]) => what === "space rpc failed").map(([, error]) => (error as Error).message)).toEqual([DAILY, DAILY]);
+    expect(logged.mock.calls.filter(([what]) => what === "space rpc failed").map(([, error]) => error)).toEqual(["Error: " + DAILY, "Error: " + DAILY]);
   });
 
   it.each([
@@ -2488,7 +2488,7 @@ describe("platform limits", () => {
     expect(await socket.next()).toMatchObject({ case: "notice", value: { kind: Notice_Kind.QUOTA_EXCEEDED, message: DAILY_MESSAGE, retryAfterMs } });
     expect(await socket.next()).toMatchObject({ case: "goodbye", value: { code: Close.TRY_AGAIN_LATER, reason: DAILY_MESSAGE } });
     expect((await socket.waitClosed()).code).toBe(Close.TRY_AGAIN_LATER);
-    expect(logged.mock.calls.find(([what]) => what === "space session stopped at a platform limit")?.[1]).toMatchObject({ message: DAILY });
+    expect(logged.mock.calls.find(([what]) => what === "space session stopped at a platform limit")?.[1]).toBe("Error: " + DAILY);
   });
 
   it("sends no Notice for any other error that stops a message before its RPC is read", async () => {
@@ -2536,7 +2536,7 @@ describe("platform limits", () => {
     } finally {
       exec.mockRestore();
     }
-    expect(logged.mock.calls.filter(([what]) => what === "request stopped at a platform limit").map(([, error]) => (error as Error).message)).toEqual([text, text]);
+    expect(logged.mock.calls.filter(([what]) => what === "request stopped at a platform limit").map(([, error]) => error)).toEqual(["Error: " + text, "Error: " + text]);
   });
 
   it("lets any other error of the Account DO escape the Worker as before", async () => {

@@ -39,6 +39,34 @@ function recordLogs(): string[] {
   return lines;
 }
 
+const sources = import.meta.glob<string>("../src/**/*.ts", { query: "?raw", import: "default", eager: true });
+
+function consoleCalls(source: string): { call: string; args: string }[] {
+  return [...source.matchAll(/console\.\w+\(/g)].map((match) => {
+    const start = match.index + match[0].length;
+    let end = start;
+    let depth = 1;
+    let quote: string | undefined;
+    for (; depth > 0 && end < source.length; end++) {
+      const char = source[end]!;
+      if (quote) {
+        if (char === "\\") end++;
+        else if (char === quote) quote = undefined;
+      } else if (char === '"' || char === "'" || char === "`") quote = char;
+      else if (char === "(") depth++;
+      else if (char === ")") depth--;
+    }
+    return { call: source.slice(match.index, end), args: source.slice(start, end - 1) };
+  });
+}
+
+function rawCaughtErrors(source: string): string[] {
+  const caught = [...source.matchAll(/catch\s*\(\s*\(?\s*(\w+)/g)].map((match) => match[1]!);
+  return consoleCalls(source).flatMap(({ call, args }) =>
+    caught.some((name) => new RegExp("\\b" + name + "\\b").test(args.replaceAll("errorText(" + name + ")", ""))) ? [call] : [],
+  );
+}
+
 describe("server logs", () => {
   it("carry no ticket, receipt, token or credential through an upload, a failed upload and a download", async () => {
     const claimLog = vi.spyOn(console, "log");
@@ -101,5 +129,13 @@ describe("server logs", () => {
       expect(lines.filter((line) => line.includes(secret))).toEqual([]);
     }
     expect(lines.filter((line) => /ticket=|Bearer /.test(line))).toEqual([]);
+  });
+
+  it("format every caught error with errorText, so its name and message reach Workers Logs", () => {
+    expect(Object.keys(sources).length).toBeGreaterThan(10);
+    expect(rawCaughtErrors('try {} catch (error) { console.error("x (y) failed", error); }'), "the check finds a raw caught error").toHaveLength(1);
+    expect(rawCaughtErrors('.catch((error) => {\n  console.error(\n    "x failed",\n    error,\n  );\n});'), "the check finds a call wrapped across lines").toHaveLength(1);
+    expect(rawCaughtErrors('try {} catch (error) { console.error("x failed:", errorText(error)); }'), "the check accepts errorText").toEqual([]);
+    expect(Object.entries(sources).flatMap(([path, source]) => rawCaughtErrors(source).map((call) => path + ": " + call))).toEqual([]);
   });
 });

@@ -3,6 +3,7 @@
 import { create, type DescMessage, type MessageShape } from "@bufbuild/protobuf";
 import type { Identity } from "../auth";
 import { Error_Code, ErrorSchema } from "../gen/koidrive/v1/rpc_pb";
+import { errorText } from "../errors";
 import { CreateShareLinkRequestSchema, ShareInfoSchema, ShareLinkListSchema, ShareLinkSchema, ShareListingSchema, ShareUnlockRequestSchema } from "../gen/koidrive/v1/share_pb";
 import { BadRequest, errorReply, readMessage, reply } from "../http";
 import type { ObjectStore } from "../host";
@@ -112,7 +113,7 @@ async function download(request: Request, env: Env, file: ShareFile, fenceCheck:
     current = (await openChunk(env.BUCKET, file.chunks[0]!)).getReader();
   } catch (error) {
     if (!(error instanceof ChunkCheckFailed)) throw error;
-    console.error("share download refused", error.message);
+    console.error("share download refused", errorText(error));
     return textRefusal({ ok: false, code: Error_Code.INTERNAL, message: "This file failed its integrity check and cannot be downloaded.", status: 502 });
   }
   let next = 1;
@@ -138,7 +139,7 @@ async function download(request: Request, env: Env, file: ShareFile, fenceCheck:
           try {
             current = (await openChunk(env.BUCKET, file.chunks[next++]!)).getReader();
           } catch (error) {
-            console.error("share download aborted", error instanceof Error ? error.message : String(error));
+            console.error("share download aborted", errorText(error));
             controller.error(error);
             return;
           }
