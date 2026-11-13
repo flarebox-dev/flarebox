@@ -343,6 +343,51 @@ fn converge(trees: &mut Trees, disk: &mut Disk, budget: usize) -> Result<Vec<Eff
     Err(format!("more than {budget} effects"))
 }
 
+/// As [`converge`], with batches of at most `limit` effects. Each batch goes to the disk in the order it was planned,
+/// rotated by `turn`, and every outcome reaches the engine after the whole batch is on the disk.
+fn converge_in_batches(
+    trees: &mut Trees,
+    disk: &mut Disk,
+    budget: usize,
+    limit: usize,
+    turn: usize,
+) -> Result<usize, String> {
+    let (mut effects, mut ids, mut done) = (Effects::default(), IdGen::new(1), 0);
+    let limit = BatchLimit {
+        effects: limit,
+        bytes: u64::MAX,
+    };
+    while done <= budget {
+        trees.settle();
+        let mut batch = effects.plan(trees, None, &mut ids, NOW, limit).to_vec();
+        if batch.is_empty() {
+            return Ok(done);
+        }
+        let counter = effects.cleared() + batch.len() as u64;
+        if batch.iter().any(|record| record.counter != counter) {
+            return Err(format!(
+                "a batch of {} without the counter {counter}",
+                batch.len()
+            ));
+        }
+        let len = batch.len();
+        batch.rotate_left(turn % len);
+        let mut outcomes = Vec::new();
+        for record in &batch {
+            outcomes.push(disk.apply(&record.effect)?);
+        }
+        for (record, created) in batch.iter().zip(outcomes) {
+            effects
+                .done(trees, None, &record.effect_id, created)
+                .map_err(|e| format!("{e:?}"))?;
+        }
+        trees.check().map_err(|e| format!("{e:?}"))?;
+        disk.matches(trees)?;
+        done += len;
+    }
+    Err(format!("more than {budget} effects"))
+}
+
 fn assert_in_sync(trees: &mut Trees) {
     trees.settle();
     assert_eq!(trees.work(), []);
@@ -1776,6 +1821,100 @@ proptest! {
             prop_assert!(!trees.local().get(id).is_some_and(|node| node.parked));
         }
     }
+
+    /// As above with batches: every effect of a batch applies to the disk in any order before the engine hears of
+    /// any, and the batches end where one effect at a time does.
+    #[test]
+    fn batches_of_effects_bring_the_disk_to_the_remote_tree(
+        nodes in spaces(),
+        limit in 1..8usize,
+        turn in 0..8usize,
+    ) {
+        let in_s: Vec<(bool, u8)> = nodes.iter().map(|n| (n.0, n.1)).collect();
+        let in_r: Vec<(bool, u8)> = nodes.iter().map(|n| (n.0, n.2)).collect();
+        let s = draw_tree(&nodes.iter().map(|n| n.3).collect::<Vec<_>>(), &in_s);
+        let r = draw_tree(&nodes.iter().map(|n| n.4).collect::<Vec<_>>(), &in_r);
+        let ids: Vec<String> = (0..nodes.len()).map(|i| format!("n{i}")).collect();
+        let spec: Vec<(&str, Option<Shape>, Option<Shape>)> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str(), s[i].clone(), r[i].clone()))
+            .collect();
+        let (mut trees, mut disk) = space(&spec);
+        let result = converge_in_batches(&mut trees, &mut disk, 3 * nodes.len(), limit, turn);
+        prop_assert!(result.is_ok(), "{:?}", result);
+        trees.settle();
+        prop_assert_eq!(trees.work(), []);
+        for id in &ids {
+            prop_assert_eq!(trees.class(id), Class::InSync, "{}", id);
+            prop_assert!(!trees.local().get(id).is_some_and(|node| node.parked));
+        }
+    }
+}
+
+#[test]
+fn a_first_download_comes_in_batches_of_independent_effects() {
+    let mut nodes = vec![("d", None, Some(dir(ROOT, "d")))];
+    let names: Vec<String> = (0..6).map(|i| format!("f{i}")).collect();
+    for name in &names {
+        nodes.push((name.as_str(), None, Some(file("d", name, 1))));
+    }
+    let (mut trees, mut disk) = space(&nodes);
+    trees.settle();
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let limit = BatchLimit {
+        effects: 100,
+        bytes: u64::MAX,
+    };
+    let mut sizes = Vec::new();
+    loop {
+        trees.settle();
+        let batch = effects.plan(&trees, None, &mut ids, NOW, limit).to_vec();
+        if batch.is_empty() {
+            break;
+        }
+        let keys: std::collections::BTreeSet<String> = (batch.iter())
+            .filter_map(|record| record.after.as_ref())
+            .map(|after| name_key(&after.name))
+            .collect();
+        assert_eq!(
+            keys.len(),
+            batch.len(),
+            "no two effects of a batch take one name key"
+        );
+        sizes.push(batch.len());
+        for record in &batch {
+            let created = disk.apply(&record.effect).unwrap();
+            effects
+                .done(&mut trees, None, &record.effect_id, created)
+                .unwrap();
+        }
+    }
+    assert_eq!(sizes, [1, 6]);
+    assert_eq!(effects.cleared(), 7);
+    assert_in_sync(&mut trees);
+}
+
+#[test]
+fn a_batch_stops_at_its_bytes_but_always_takes_one_effect() {
+    let nodes: Vec<(&str, Option<Shape>, Option<Shape>)> = ["a", "b", "c"]
+        .iter()
+        .map(|name| (*name, None, Some(file(ROOT, name, 1))))
+        .collect();
+    let (mut trees, _) = space(&nodes);
+    trees.settle();
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let limit = BatchLimit {
+        effects: 100,
+        bytes: 5,
+    };
+    assert_eq!(effects.plan(&trees, None, &mut ids, NOW, limit).len(), 1);
+    let limit = BatchLimit {
+        effects: 100,
+        bytes: 6,
+    };
+    let mut effects = Effects::default();
+    assert_eq!(effects.plan(&trees, None, &mut ids, NOW, limit).len(), 2);
 }
 
 #[test]
