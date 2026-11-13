@@ -464,11 +464,11 @@ impl Effects {
         Ok(())
     }
 
-    /// Recovery found that the effect in flight wrote its file and sent the entry it replaced to the
-    /// local trash, and that the user changed or removed the written file before L heard of it
-    /// (section 5.3). What the user changed is no longer the content S holds, so the node leaves S
-    /// and L: R's content is downloaded again and what the user left is kept beside it, also when R
-    /// returns to the bytes S held.
+    /// The effect in flight sent the entry it replaced to the local trash, and its target does not
+    /// hold R's content: the user changed or removed the written file, or took its name before it
+    /// was placed (section 5.3). S's content is gone from the disk, so the node leaves S and L: R's
+    /// content is downloaded again and what the user left is kept beside it, also when R returns to
+    /// the bytes S held.
     pub fn overtaken(&mut self, trees: &mut Trees, effect_id: &str) -> Result<(), EffectError> {
         let record = self.take(effect_id)?;
         trees.remove_local(&record.node);

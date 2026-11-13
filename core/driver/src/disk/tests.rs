@@ -839,35 +839,53 @@ fn a_crash_at_every_cut_of_every_effect_is_recovered_on_the_next_start() {
 
 #[test]
 fn a_replaced_file_the_user_changed_before_the_start_leaves_s() {
-    let changes: [fn(&Path); 2] = [
-        |file| fs::remove_file(file).unwrap(),
-        |file| fs::write(file, b"edited").unwrap(),
+    let remove: fn(&Path) = |file| fs::remove_file(file).unwrap();
+    let write: fn(&Path) = |file| fs::write(file, b"edited").unwrap();
+    let cases = [
+        (Cut::Step(Step::Quarantined), write),
+        (Cut::Step(Step::Placed), remove),
+        (Cut::Step(Step::Placed), write),
+        (Cut::Step(Step::Trashed), remove),
+        (Cut::Step(Step::Trashed), write),
+        (Cut::BeforeAck, remove),
+        (Cut::BeforeAck, write),
     ];
-    for cut in [
-        Cut::Step(Step::Placed),
-        Cut::Step(Step::Trashed),
-        Cut::BeforeAck,
-    ] {
-        for change in changes {
-            let folder = Folder::new();
-            let mut server = Server::default();
-            (SCENARIOS[2].setup)(&folder, &mut server);
-            let crashed = catch_unwind(AssertUnwindSafe(|| {
-                let mut running = folder.start(crash_at(cut)).unwrap();
-                running.step(&server);
-            }));
-            assert!(
-                crashed.is_err_and(|payload| payload.is::<Crash>()),
-                "{cut:?}: no crash"
-            );
-            change(&folder.root.join("report.txt"));
-            let running = folder.start(no_hook()).unwrap();
-            assert_eq!(running.engine.trees.synced().get(NODE), None, "{cut:?}");
-            let (_, stored) = folder.open();
-            assert_eq!(stored.trees.synced().get(NODE), None, "{cut:?}");
-            assert!(trashed(&folder, SYNCED), "{cut:?}");
-        }
+    for (cut, change) in cases {
+        let folder = Folder::new();
+        let mut server = Server::default();
+        (SCENARIOS[2].setup)(&folder, &mut server);
+        let crashed = catch_unwind(AssertUnwindSafe(|| {
+            let mut running = folder.start(crash_at(cut)).unwrap();
+            running.step(&server);
+        }));
+        assert!(
+            crashed.is_err_and(|payload| payload.is::<Crash>()),
+            "{cut:?}: no crash"
+        );
+        change(&folder.root.join("report.txt"));
+        let running = folder.start(no_hook()).unwrap();
+        assert_eq!(running.engine.trees.synced().get(NODE), None, "{cut:?}");
+        let (_, stored) = folder.open();
+        assert_eq!(stored.trees.synced().get(NODE), None, "{cut:?}");
+        assert!(trashed(&folder, SYNCED), "{cut:?}");
     }
+}
+
+#[test]
+fn a_name_the_user_takes_while_its_replaced_file_is_in_quarantine_leaves_s() {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    (SCENARIOS[2].setup)(&folder, &mut server);
+    let target = folder.root.join("report.txt");
+    let hook: Option<Hook> = Some(Box::new(move |reached| {
+        if reached == Cut::Step(Step::Quarantined) {
+            fs::write(&target, b"saved by the user").unwrap();
+        }
+    }));
+    let mut running = folder.start(hook).unwrap();
+    assert!(matches!(running.step(&server), Some(Settled::Failed(_))));
+    assert_eq!(running.engine.trees.synced().get(NODE), None);
+    assert!(trashed(&folder, SYNCED));
 }
 
 #[test]

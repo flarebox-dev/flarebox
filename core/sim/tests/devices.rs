@@ -468,10 +468,7 @@ fn a_file_overwritten_while_the_device_was_down_after_its_download_is_kept_besid
     racing.extend(commit(0));
     racing.extend([(1, DELIVER), (1, EFFECT), (1, CRASH), (1, overwrite(0))]);
     let world = converge(2, &[synced, racing]).unwrap();
-    assert_eq!(
-        world.seen["restart finds a written file its user changed since"],
-        1
-    );
+    assert_eq!(world.seen["restart finds a write its user overtook"], 1);
     assert_eq!(world.devices[0].disk.entries().len(), 2);
     assert_eq!(world.devices[1].disk.entries().len(), 2);
 }
@@ -498,10 +495,7 @@ fn a_download_a_crash_hid_and_its_user_changed(cut: Cut, change: Step) -> World 
 fn a_download_a_crash_hid_and_its_user_deleted_keeps_an_edit_back_to_the_bytes_it_replaced() {
     for cut in [Cut::Placed, Cut::Done] {
         let world = a_download_a_crash_hid_and_its_user_changed(cut, delete(0));
-        assert_eq!(
-            world.seen["restart finds a written file its user changed since"],
-            1
-        );
+        assert_eq!(world.seen["restart finds a write its user overtook"], 1);
         for device in &world.devices {
             assert_eq!(device.disk.entries().len(), 1);
         }
@@ -509,13 +503,19 @@ fn a_download_a_crash_hid_and_its_user_deleted_keeps_an_edit_back_to_the_bytes_i
 }
 
 #[test]
+fn a_file_made_at_the_name_a_crashed_download_freed_keeps_an_edit_back_to_the_bytes_it_replaced() {
+    let world = a_download_a_crash_hid_and_its_user_changed(Cut::Quarantined, file("a"));
+    assert_eq!(world.seen["restart finds a write its user overtook"], 1);
+    for device in &world.devices {
+        assert_eq!(device.disk.entries().len(), 2);
+    }
+}
+
+#[test]
 fn a_download_a_crash_hid_and_its_user_overwrote_keeps_an_edit_back_to_the_bytes_it_replaced() {
     for cut in [Cut::Placed, Cut::Done] {
         let world = a_download_a_crash_hid_and_its_user_changed(cut, overwrite(0));
-        assert_eq!(
-            world.seen["restart finds a written file its user changed since"],
-            1
-        );
+        assert_eq!(world.seen["restart finds a write its user overtook"], 1);
         for device in &world.devices {
             assert_eq!(device.disk.entries().len(), 2);
         }
@@ -551,10 +551,7 @@ fn a_file_made_at_the_name_of_a_quarantined_file_is_kept() {
     let cut = Step::Effect(Outcome::Crash(Cut::Quarantined));
     racing.extend([(1, DELIVER), (1, EFFECT), (1, cut), (1, file("a"))]);
     let world = converge(2, &[synced, racing]).unwrap();
-    assert_eq!(
-        world.seen["restart finds the effect in flight refused by the disk"],
-        1
-    );
+    assert_eq!(world.seen["restart finds a write its user overtook"], 1);
     assert_eq!(world.devices[0].disk.entries().len(), 2);
     assert_eq!(world.devices[1].disk.entries().len(), 2);
 }

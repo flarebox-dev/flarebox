@@ -54,8 +54,8 @@ pub enum Refused {
     /// Recovery found that the effect stopped before it displaced anything, or that its target
     /// is not in the effect's final state any more.
     Interrupted,
-    /// Recovery found that the effect wrote its file and sent the entry it replaced to the local
-    /// trash, and that the user changed or removed the written file since.
+    /// The effect sent the entry it replaced to the local trash, and its target does not hold the
+    /// new content: the user changed or removed the written file, or took its name first.
     Overtaken,
 }
 
@@ -294,7 +294,11 @@ impl Disk {
                 if until == Cut::Done {
                     *trashed = self.quarantine.take().and_then(|entry| entry.content);
                 }
-                ino.map(|ino| Some(identity(ino))).ok_or(Refused::Taken)
+                let refused = match displaced {
+                    Some(_) if until == Cut::Done => Refused::Overtaken,
+                    _ => Refused::Taken,
+                };
+                ino.map(|ino| Some(identity(ino))).ok_or(refused)
             }
             Effect::Move {
                 from,
@@ -339,9 +343,9 @@ impl Disk {
     /// is done when its target is in the effect's final state, which for a removal also takes its
     /// entry in the local trash. A removal whose name is empty without that entry fails, since the
     /// user moved or deleted the entry before the effect reached it. A write whose replaced entry
-    /// is in the local trash and whose file is not at its target any more is overtaken: the user
-    /// changed the written file. Anything else is an effect that stopped early or whose target the
-    /// user has changed since.
+    /// goes or went to the local trash while its target does not hold the new content is
+    /// overtaken. Anything else is an effect that stopped early or whose target the user has
+    /// changed since.
     pub fn recover(&mut self, record: &EffectRecord) -> Applied {
         self.marker = record.counter;
         let staged = std::mem::take(&mut self.staged);
@@ -356,12 +360,11 @@ impl Disk {
             };
         };
         let outcome = match &record.effect {
-            Effect::WriteFile { at, content, .. } if staged => {
-                self.locate(at).and_then(|(place, name)| {
-                    let ino = self.create(place, &name, Some(content.clone()));
-                    Ok(Some(identity(ino.ok_or(Refused::Taken)?)))
-                })
-            }
+            Effect::WriteFile { at, content, .. } if staged => (self.locate(at))
+                .ok()
+                .and_then(|(place, name)| self.create(place, &name, Some(content.clone())))
+                .map(|ino| Some(identity(ino)))
+                .ok_or(Refused::Overtaken),
             Effect::WriteFile { at, content, .. } => {
                 (self.written(at, content).map(Some)).ok_or(Refused::Overtaken)
             }

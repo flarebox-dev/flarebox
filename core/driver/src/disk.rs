@@ -992,7 +992,9 @@ fn acknowledge(
                     Reason::Changed => failed("the entry changed on this device"),
                     Reason::Taken => failed("another entry holds its name"),
                     Reason::Interrupted => failed("it was interrupted"),
-                    Reason::Overtaken => failed("the file it wrote changed on this device"),
+                    Reason::Overtaken => {
+                        failed("the file it replaced is gone and its name changed on this device")
+                    }
                     Reason::Holds(names) => {
                         let quoted: Vec<_> = (names.iter())
                             .map(|name| koidrive_fs::quoted(name).to_string())

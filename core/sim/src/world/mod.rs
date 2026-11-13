@@ -990,6 +990,7 @@ impl World {
                     },
                 )
             }
+            Some(Err(Refused::Overtaken)) => effects.overtaken(trees, &record.effect_id),
             _ => effects.failed(&record.effect_id).map(|()| {
                 if !applies {
                     effects.unblock(&record.node);
@@ -1108,10 +1109,7 @@ impl World {
                     )
                 }
                 Err(Refused::Overtaken) => {
-                    note(
-                        &mut self.seen,
-                        "restart finds a written file its user changed since",
-                    );
+                    note(&mut self.seen, "restart finds a write its user overtook");
                     if let Some(content) = download.filter(|c| device.disk.holds(c.mtime_ns)) {
                         self.copied.insert(content.mtime_ns);
                     }

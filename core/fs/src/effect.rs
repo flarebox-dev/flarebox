@@ -131,9 +131,9 @@ pub enum Reason {
     Taken,
     /// Recovery found the effect stopped before it displaced anything.
     Interrupted,
-    /// Recovery found that the effect wrote its file and sent the entry it
-    /// replaced to the local trash, and that the user changed or removed the
-    /// written file since.
+    /// The effect sent the entry it replaced to the local trash, and its
+    /// target does not hold the new content: the user changed or removed the
+    /// written file, or took its name before it was placed.
     Overtaken,
     /// The folder a removal acts on holds entries other than platform files,
     /// named here in order. The folder went back as it was.
@@ -144,6 +144,13 @@ fn failed(reason: Reason) -> Outcome {
     Outcome::Failed {
         reason,
         recovered: None,
+    }
+}
+
+fn overtaken(placed: Outcome) -> Outcome {
+    match placed {
+        Outcome::Failed { .. } => failed(Reason::Overtaken),
+        done => done,
     }
 }
 
@@ -356,7 +363,7 @@ impl Space {
         }
         let outcome = match target {
             Some((staging, (target, new_name))) => {
-                self.place(&staging, &effect.id, &target, new_name, hook)?
+                overtaken(self.place(&staging, &effect.id, &target, new_name, hook)?)
             }
             None => Outcome::Done { identity: None },
         };
@@ -485,10 +492,10 @@ impl Space {
                 return Ok(Outcome::Failed { reason, recovered });
             }
             let outcome = match place {
-                Some(at) if staged => match self.parent(at) {
+                Some(at) if staged => overtaken(match self.parent(at) {
                     Ok((target, name)) => self.place(&staging, &effect.id, &target, name, hook)?,
                     Err(err) => unresolved(err)?,
-                },
+                }),
                 Some(at) => match self.written_at(at, contents)? {
                     Some(identity) => Outcome::Done {
                         identity: Some(identity),
