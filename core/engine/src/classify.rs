@@ -445,11 +445,20 @@ impl Trees {
         self.end_change_all_trees_hold(&id);
     }
 
-    fn end_change_all_trees_hold(&mut self, id: &str) {
-        let held = (self.l.get(id).zip(self.s.live(id)).zip(self.r.live(id))).is_some_and(
+    fn all_trees_hold(&self, id: &str) -> bool {
+        (self.l.get(id).zip(self.s.live(id)).zip(self.r.live(id))).is_some_and(
             |((local, synced), remote)| local.shape.same(synced) && synced.same(remote),
-        );
-        if held {
+        )
+    }
+
+    fn record_local_change(&mut self, id: NodeId) {
+        if !self.all_trees_hold(&id) {
+            self.local_changes.insert(id);
+        }
+    }
+
+    fn end_change_all_trees_hold(&mut self, id: &str) {
+        if self.all_trees_hold(id) {
             self.local_changes.remove(id);
         }
     }
@@ -793,7 +802,7 @@ impl Trees {
 
     pub(crate) fn sent_shape(&mut self, id: &str, shape: &Shape) {
         if (self.l.get(id)).is_some_and(|local| !local.shape.same(shape)) {
-            self.local_changes.insert(id.to_owned());
+            self.record_local_change(id.to_owned());
         }
     }
 
@@ -1709,7 +1718,6 @@ impl Trees {
             .filter(|(id, seq)| *seq > held_through && self.l.get(id).is_some())
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
-        self.local_changes.extend(lost_here);
         let lost_moves: BTreeSet<NodeId> = (moved.into_iter())
             .filter(|(id, moved)| moved.seq > held_through && before(id, moved))
             .map(|(id, _)| id)
@@ -1741,6 +1749,9 @@ impl Trees {
                 Some((deleted.id, remote.shape.clone(), deleted.kept))
             })
             .collect();
+        for id in lost_here {
+            self.record_local_change(id);
+        }
         while let Some(at) = (0..deletes.len()).find(|&at| {
             let (id, shape, _) = &deletes[at];
             self.fits_synced(id, Some(shape))
@@ -2560,6 +2571,13 @@ impl Trees {
                 trashed
             }),
             "the kept count of the trashed nodes R holds"
+        );
+        debug_assert_eq!(
+            (self.local_changes.iter())
+                .find(|id| self.all_trees_hold(id))
+                .cloned(),
+            None,
+            "a change of this device's user that L, S and R all hold"
         );
         self.r.check(Names::ByKey).map_err(|e| ('R', e))?;
         self.s.check(Names::ByKey).map_err(|e| ('S', e))?;

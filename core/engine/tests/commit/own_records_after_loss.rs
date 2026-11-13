@@ -202,3 +202,17 @@ fn a_move_the_server_lost_is_sent_again_whether_or_not_its_result_arrived() {
     assert_eq!(effects, []);
     assert_eq!(sent_for(&sent, "n"), [&mv("n", ROOT, "b")]);
 }
+
+#[test]
+fn a_lost_own_move_the_server_holds_again_as_l_and_s_do_is_no_change() {
+    let mut trees = trees(&[synced("n", file(ROOT, "a", 1))]);
+    trees.set_remote("n".into(), remote_at(file(ROOT, "a", 1), 5));
+    trees.record_moved("n", 5);
+    let moved = trees.moved_here();
+    assert_eq!(moved.len(), 1);
+    trees.set_remote("n".into(), remote_at(file(ROOT, "a", 1), 6));
+    trees.forget_lost(vec![], vec![], vec![], moved, vec![], Default::default(), 3, 0);
+    trees.settle();
+    assert_eq!(trees.class("n"), Class::InSync);
+    assert!(trees.state().local_changes.is_empty());
+}
