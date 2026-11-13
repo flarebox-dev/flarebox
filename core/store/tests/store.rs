@@ -407,6 +407,10 @@ fn migrations_that_touch_different_things_commute_and_ones_that_clash_do_not() {
             "CREATE TABLE IF NOT EXISTS z_defaults (v TEXT DEFAULT 'a b');",
         ),
         (
+            "CREATE TABLE IF NOT EXISTS z_notes (v TEXT -- note\nNOT NULL);",
+            "CREATE TABLE IF NOT EXISTS z_notes (v TEXT -- note NOT NULL\n);",
+        ),
+        (
             "CREATE VIEW IF NOT EXISTS z_view (a, b) AS SELECT 1, 2;",
             "CREATE VIEW IF NOT EXISTS z_view (b, a) AS SELECT 1, 2;",
         ),
@@ -831,11 +835,33 @@ fn definitions(sql: &str, sorted: bool) -> Vec<String> {
     let mut pieces = vec![];
     let mut piece = String::new();
     let (mut depth, mut quote, mut closed) = (0, None, false);
-    for c in sql.chars() {
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
         if let Some(end) = quote {
             piece.push(c);
             if c == end {
                 quote = None;
+            }
+            continue;
+        }
+        let blank = match c {
+            '-' if chars.peek() == Some(&'-') => {
+                chars.by_ref().find(|&c| c == '\n');
+                true
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut last = ' ';
+                chars
+                    .by_ref()
+                    .find(|&c| std::mem::replace(&mut last, c) == '*' && c == '/');
+                true
+            }
+            c => c.is_whitespace(),
+        };
+        if blank {
+            if !piece.is_empty() && !piece.ends_with(' ') {
+                piece.push(' ');
             }
             continue;
         }
@@ -847,11 +873,6 @@ fn definitions(sql: &str, sorted: bool) -> Vec<String> {
             '[' => {
                 quote = Some(']');
                 piece.push(c);
-            }
-            c if c.is_whitespace() => {
-                if !piece.is_empty() && !piece.ends_with(' ') {
-                    piece.push(' ');
-                }
             }
             '(' if depth == 0 && !closed => {
                 pieces.push(std::mem::take(&mut piece));
