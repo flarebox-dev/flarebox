@@ -139,6 +139,27 @@ fn a_conflict_copy_takes_the_local_file_and_the_original_is_downloaded_again() {
     assert_eq!(trees.class("f"), Class::Remote);
 }
 
+#[test]
+fn a_conflict_copy_another_device_deleted_before_its_result_is_deleted_here() {
+    let mut trees = trees(&[(
+        "f",
+        Some(file(ROOT, "f", 2)),
+        Some(file(ROOT, "f", 1)),
+        Some(remote(file(ROOT, "f", 1))),
+    )]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    trees.set_remote("f".into(), remote(file(ROOT, "f", 3)));
+    trees.set_remote("y".into(), trashed(file(ROOT, "f (conflict)", 2)));
+    let copy = OpResult {
+        node_id: "y".into(),
+        ..outcome(op_result::Code::ConflictCopy)
+    };
+    acknowledge(&mut commits, &mut trees, vec![copy]);
+    assert_eq!(trees.class("y"), Class::Remote);
+    assert!(build(&mut commits, &mut trees, &mut ids).is_none());
+}
+
 /// The device's own commit makes the conflict copy y, and its answer is lost. A log replay after
 /// the reconnect brings y into R before the stored result arrives, and the effects download y.
 /// The result then finds y on disk already: that entry stays y's, f takes the server's content,
