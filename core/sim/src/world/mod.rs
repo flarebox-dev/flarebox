@@ -390,6 +390,25 @@ struct Backup {
     space: SpaceDo,
     held: Held,
     in_history: Held,
+    spent: Vec<Spent>,
+}
+
+fn unspend(spent: &mut Vec<Spent>, touches: &mut [BTreeMap<u128, BTreeSet<u64>>], backup: &Backup) {
+    let (lost, still): (Vec<Spent>, Vec<Spent>) = std::mem::take(spent)
+        .into_iter()
+        .partition(|spent| !backup.spent.contains(spent));
+    *spent = still;
+    for Spent {
+        device, ino, at, ..
+    } in lost
+    {
+        touches[device].entry(ino).or_default().insert(at);
+    }
+    for kept in &backup.spent {
+        if (touches[kept.device].get_mut(&kept.ino)).is_some_and(|times| times.remove(&kept.at)) {
+            spent.push(kept.clone());
+        }
+    }
 }
 
 fn note(seen: &mut BTreeMap<&'static str, u64>, what: &'static str) {
@@ -441,6 +460,22 @@ pub struct World {
     /// restored server holds, until the devices are quiet again.
     rolled_back: BTreeMap<NodeId, Vec<u8>>,
     rewound: BTreeMap<i64, BTreeSet<usize>>,
+    clock: u64,
+    touches: Vec<BTreeMap<u128, BTreeSet<u64>>>,
+    touched_nodes: Vec<BTreeMap<NodeId, u128>>,
+    actions: Vec<BTreeMap<u64, u128>>,
+    scanned: Vec<u64>,
+    built: Vec<u64>,
+    built_copies: Vec<u64>,
+    spent: Vec<Spent>,
+}
+
+#[derive(Clone, PartialEq)]
+struct Spent {
+    seq: u64,
+    device: usize,
+    ino: u128,
+    at: u64,
 }
 
 impl World {
@@ -469,9 +504,10 @@ impl World {
                 }
             })
             .collect::<Vec<_>>();
+        let count = devices.len();
         Self {
             space,
-            removed: vec![BTreeSet::new(); devices.len()],
+            removed: vec![BTreeSet::new(); count],
             named: vec![BTreeSet::new(); devices.len()],
             restored_names: vec![BTreeMap::new(); devices.len()],
             devices,
@@ -490,6 +526,14 @@ impl World {
             exposed: BTreeMap::new(),
             rolled_back: BTreeMap::new(),
             rewound: BTreeMap::new(),
+            clock: 0,
+            touches: vec![BTreeMap::new(); count],
+            touched_nodes: vec![BTreeMap::new(); count],
+            actions: vec![BTreeMap::new(); count],
+            scanned: vec![0; count],
+            built: vec![0; count],
+            built_copies: vec![0; count],
+            spent: Vec::new(),
         }
     }
 
@@ -566,6 +610,7 @@ impl World {
     }
 
     fn step(&mut self, d: usize, step: &Step) -> Result<(), Failure> {
+        self.clock += 1;
         match step {
             Step::User(action) => self.act(d, action),
             Step::Backup => {
@@ -573,6 +618,7 @@ impl World {
                     space: self.space.clone(),
                     held: self.held.clone(),
                     in_history: self.in_history.clone(),
+                    spent: self.spent.clone(),
                 });
             }
             Step::Restore => self.restore(false),
@@ -581,6 +627,7 @@ impl World {
             Step::CopyStore => {
                 let device = &mut self.devices[d];
                 device.store_copy = Some(device.store.clone());
+                self.built_copies[d] = self.built[d];
             }
             Step::RollBack => {
                 let device = &mut self.devices[d];
@@ -590,6 +637,7 @@ impl World {
                         note(&mut self.seen, "store rolled back during a recovery");
                     }
                     device.store = copy;
+                    self.built[d] = self.built_copies[d];
                     device.rolled_back = true;
                     device.down = true;
                     device.link = None;
@@ -669,19 +717,34 @@ impl World {
         let place = dirs[action.parent % dirs.len()].clone();
         let name = NAMES[action.name % NAMES.len()];
         let target = (!visible.is_empty()).then(|| visible[action.target % visible.len()]);
+        let chain = |mut folder: Place| {
+            let mut inos = Vec::new();
+            while let Place::In(ino) = folder {
+                inos.push(ino);
+                folder = disk.entries()[&ino].place.clone();
+            }
+            inos
+        };
+        let above = chain(place.clone());
+        let itself: Vec<u128> = (target.into_iter())
+            .flat_map(|ino| std::iter::once(ino).chain(chain(disk.entries()[&ino].place.clone())))
+            .collect();
         let write = self.writes + 1;
+        let mut touched: Vec<u128> = Vec::new();
         match (action.kind % 5, target) {
             (0, _) => {
-                if disk.create(place, name, None).is_some() {
+                if let Some(new) = disk.create(place, name, None) {
                     self.named[d].insert(name);
+                    touched = std::iter::once(new).chain(above).collect();
                 }
             }
             (1, _) => {
                 let content = content(d as u8, action.text % TEXTS, write);
-                if disk.create(place, name, Some(content)).is_some() {
+                if let Some(new) = disk.create(place, name, Some(content)) {
                     self.named[d].insert(name);
                     self.writes = write;
                     self.writers.insert(write, d);
+                    touched = std::iter::once(new).chain(above).collect();
                 }
             }
             (2, Some(ino)) => {
@@ -695,11 +758,13 @@ impl World {
                     self.removed[d].insert(old.mtime_ns);
                     self.writes = write;
                     self.writers.insert(write, d);
+                    touched = itself;
                 }
             }
             (3, Some(ino)) => {
                 if disk.rename(ino, place, name).is_ok() {
                     self.named[d].insert(name);
+                    touched = itself.into_iter().chain(above).collect();
                 }
             }
             (4, Some(ino)) => {
@@ -708,6 +773,16 @@ impl World {
             }
             _ => {}
         }
+        let local = self.devices[d].engine.trees.local();
+        if let Some(own) = touched.first() {
+            self.actions[d].insert(self.clock, *own);
+        }
+        for ino in touched {
+            self.touches[d].entry(ino).or_default().insert(self.clock);
+            if let Some((node, _)) = local.iter().find(|(_, node)| node.identity.ino == ino) {
+                self.touched_nodes[d].insert(node.clone(), ino);
+            }
+        }
     }
 
     fn rewind(&mut self) {
@@ -715,6 +790,7 @@ impl World {
             return;
         };
         note(&mut self.seen, "server rewound");
+        unspend(&mut self.spent, &mut self.touches, backup);
         let taken: Vec<i64> = (self.writers.keys())
             .filter(|write| {
                 stored(&self.in_history, **write) && !stored(&backup.in_history, **write)
@@ -778,6 +854,7 @@ impl World {
         if backup.space.head_seq() < self.space.head_seq() {
             note(&mut self.seen, "server restored, commits lost");
         }
+        unspend(&mut self.spent, &mut self.touches, backup);
         type Shape = (String, String, i32, Option<Vec<u8>>);
         let shapes = |space: &SpaceDo| -> BTreeMap<NodeId, Shape> {
             (space.nodes().into_iter())
@@ -899,6 +976,7 @@ impl World {
                 "rescan lets a problem node be planned again",
             );
         }
+        self.scanned[d] = self.clock;
         let changed = device.engine != device.store;
         device.persist()?;
         Ok(changed)
@@ -1019,6 +1097,7 @@ impl World {
         })?;
         device.persist()?;
         device.engine.scan(&device.disk);
+        self.scanned[d] = self.clock;
         device.persist()?;
         Ok(true)
     }
@@ -1146,6 +1225,7 @@ impl World {
                 "rescan lets a problem node be planned again",
             );
         }
+        self.scanned[d] = self.clock;
         device.persist()
     }
 
@@ -1363,6 +1443,7 @@ impl World {
                                 note(&mut self.seen, "commit abandoned, its bytes are gone");
                                 device.engine.commits.abandon();
                                 device.engine.scan(&device.disk);
+                                self.scanned[d] = self.clock;
                             } else {
                                 note(&mut self.seen, "commit refused, sent again");
                             }
@@ -1431,6 +1512,7 @@ impl World {
             } = engine;
             if commits.due(trees) {
                 commits.build(trees, ids, NOW as u64, &history, cursor.clone());
+                self.built[d] = self.scanned[d];
             }
             if commits.in_flight().is_none() && !commits.problems().is_empty() {
                 note(&mut self.seen, "no commit built while a node is a problem");
@@ -1501,9 +1583,104 @@ impl World {
                         )
                     });
                 }
+                let trashed: BTreeSet<NodeId> = (self.space.nodes().into_iter())
+                    .filter(|node| node.status == NodeStatus::Trashed as i32)
+                    .map(|node| node.node_id)
+                    .collect();
                 match self.space.commit(&session, NOW, &sent) {
                     Ok(committed) => {
                         if let Some(record) = committed.record {
+                            let built = self.built[d];
+                            let nodes = self.space.nodes();
+                            let parents: BTreeMap<&str, &str> = (nodes.iter())
+                                .map(|node| (node.node_id.as_str(), node.parent_id.as_str()))
+                                .collect();
+                            let local = self.devices[d].engine.trees.local();
+                            let ino = |node: &str| {
+                                (local.get(node).map(|node| node.identity.ino))
+                                    .or_else(|| self.touched_nodes[d].get(node).copied())
+                            };
+                            let restored: BTreeSet<&str> = (sent.ops.iter())
+                                .filter_map(|op| match &op.op {
+                                    Some(op::Op::Restore(restore)) => {
+                                        Some(restore.node_id.as_str())
+                                    }
+                                    _ => None,
+                                })
+                                .collect();
+                            let asked = |node: &str| {
+                                restored.contains(node)
+                                    || (ino(node).and_then(|ino| self.touches[d].get(&ino)))
+                                        .is_some_and(|at| at.first().is_some_and(|at| *at <= built))
+                            };
+                            fn chain<'a>(
+                                parents: &BTreeMap<&'a str, &'a str>,
+                                node: &'a str,
+                            ) -> Vec<&'a str> {
+                                std::iter::successors(Some(node), |id| parents.get(id).copied())
+                                    .collect()
+                            }
+                            let revived = (nodes.iter()).find(|node| {
+                                node.status == NodeStatus::Live as i32
+                                    && trashed.contains(&node.node_id)
+                                    && !(chain(&parents, &node.node_id).into_iter())
+                                        .take_while(|id| trashed.contains(*id))
+                                        .any(asked)
+                                    && !(nodes.iter()).any(|other| {
+                                        asked(&other.node_id)
+                                            && chain(&parents, &other.node_id)
+                                                .contains(&node.node_id.as_str())
+                                    })
+                            });
+                            if let Some(node) = revived {
+                                return Err(Failure::Broken(format!(
+                                    "a commit of device {d} brought back node {} as {:?}, which a \
+                                     user deleted, and the user of device {d} never changed it or \
+                                     put anything in it since: {:?}",
+                                    node.node_id, node.name, sent.ops
+                                )));
+                            }
+                            let inos: Vec<u128> = (sent.ops.iter())
+                                .zip(&committed.result.results)
+                                .filter(|(_, outcome)| {
+                                    outcome.code != op_result::Code::Rejected as i32
+                                })
+                                .filter_map(|(op, outcome)| match &op.op {
+                                    Some(op::Op::CreateDir(_))
+                                        if outcome.code == op_result::Code::MergedInto as i32 =>
+                                    {
+                                        Some(&outcome.node_id)
+                                    }
+                                    Some(op::Op::CreateDir(op)) => Some(&op.node_id),
+                                    Some(op::Op::CreateFile(op)) => Some(&op.node_id),
+                                    Some(op::Op::UpdateContent(op)) => Some(&op.node_id),
+                                    Some(op::Op::Move(op)) => Some(&op.node_id),
+                                    _ => None,
+                                })
+                                .filter(|node| {
+                                    (nodes.iter()).any(|live| {
+                                        live.node_id == **node
+                                            && live.status == NodeStatus::Live as i32
+                                    })
+                                })
+                                .filter_map(|node| ino(node))
+                                .collect();
+                            let carried: BTreeSet<u64> = (self.actions[d].range(..=built))
+                                .filter(|(_, own)| inos.contains(own))
+                                .map(|(at, _)| *at)
+                                .collect();
+                            for (ino, times) in &mut self.touches[d] {
+                                for at in &carried {
+                                    if times.remove(at) {
+                                        self.spent.push(Spent {
+                                            seq: record.seq,
+                                            device: d,
+                                            ino: *ino,
+                                            at: *at,
+                                        });
+                                    }
+                                }
+                            }
                             let after = live_writes(&self.space);
                             let folders: BTreeSet<&str> = (sent.ops.iter())
                                 .filter_map(|op| match &op.op {
