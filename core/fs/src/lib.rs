@@ -1279,6 +1279,10 @@ fn take_left_out(
 /// a name the rules leave out, it is reported as ignored and the new one as
 /// created. That search looks only at those names and not below them, since
 /// a save by rename takes a path the same way and leaves no old file to find.
+/// On macOS the system also names the path of the old file's identity, and
+/// the old file found that way at or below such a name, as recorded, is
+/// reported the same way. Elsewhere a file moved below such a name while
+/// another took its path is a modification, as a save would be.
 #[allow(clippy::too_many_arguments)]
 fn find_ignored(
     changes: &mut Vec<Change>,
@@ -1527,6 +1531,11 @@ fn hold_back(
         .filter(|(id, _)| !wanted.contains_key(id))
         .collect();
     rules.find(root, &mut swapped);
+    for path in &replaced {
+        if let Some(found @ None) = swapped.get_mut(&key(path)) {
+            *found = rules.locate(root, &old[path]);
+        }
+    }
     wanted.extend(swapped);
     let found = |path: &Path| {
         let entry = &old[path];

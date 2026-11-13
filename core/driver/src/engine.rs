@@ -814,6 +814,7 @@ impl Engine {
                 && let Some(holder) = local_at(&self.trees, path)
                 && moving.contains(&holder)
                 && before.as_ref() != Some(&holder)
+                && !self.trees.recorded_local(&holder)
                 && let Some(node) = self.trees.local().get(&holder).cloned()
             {
                 self.trees.set_local(
