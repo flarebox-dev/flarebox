@@ -115,8 +115,9 @@ jobs:
           decide rust_macos "no macOS-specific Rust input changed" "$(cut -f1 <<<"$macos" | grep -v '^apps/macos/' || true)"$'\n'"$workflow"
           decide macos_app "neither the app nor a macOS-specific input of the core changed" "$(cut -f1 <<<"$macos" | grep -v '^cli/' || true)"$'\n'"$workflow"
           decide runner_hook "neither the runner hook nor ci.yml changed" "$(grep -E '^\.github/(runner/|workflows/ci\.yml$)' <<<"$changed" || true)"
-          echo "server_macos, spec_macos: skipped, because pull requests run the server and spec checks on Linux only. The merge queue runs them on macOS."
-          printf '%s=false\n' server_macos spec_macos >> "$GITHUB_OUTPUT"
+          for job in server_macos spec_macos; do
+            decide "$job" "ci.yml did not change" "$(grep -Fx '.github/workflows/ci.yml' <<<"$changed" || true)"
+          done
 
   pick-macos:
     name: pick-macos
@@ -125,6 +126,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       actions: read
+      contents: read
     outputs:
       macos_app: ${{ steps.pick.outputs.macos_app }}
       rust: ${{ steps.pick.outputs.rust }}
@@ -132,6 +134,11 @@ jobs:
       spec: ${{ steps.pick.outputs.spec }}
       runner_hook: ${{ steps.pick.outputs.runner_hook }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Test the macOS runner picker
+        run: python3 scripts/test-pick-macos.py -v
       - name: Pick a runner for each macOS job
         id: pick
         env:
@@ -143,7 +150,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           WANTED: macos_app=${{ needs.changes.outputs.macos_app }} rust=${{ needs.changes.outputs.rust_macos }} server=${{ needs.changes.outputs.server_macos }} spec=${{ needs.changes.outputs.spec_macos }} runner_hook=${{ needs.changes.outputs.runner_hook }}
         run: |
-          hosted='["xcode-27"]'
+          hosted='["macos-15"]'
           api() {
             if [ "$SECONDS" -ge "$deadline" ]; then
               echo "Counting the hosted macOS jobs took more than 90 seconds." >&2
@@ -167,7 +174,7 @@ jobs:
               p=1
               while :; do
                 page="$(api "runs/$id/jobs?filter=latest&per_page=100&page=$p")" || return 1
-                got="$(jq -er --argjson hosted "$hosted" '.jobs | if type != "array" then error("no jobs") else "\(length) \([.[] | select(.status != "completed") | [.labels[] | ascii_downcase] | select((index("self-hosted") | not) and any(.[]; startswith("macos") or (. as $label | $hosted | index($label)) != null))] | length)" end' <<<"$page")" || return 1
+                got="$(jq -er '.jobs | if type != "array" then error("no jobs") else "\(length) \([.[] | select(.status != "completed") | [.labels[] | ascii_downcase] | select((index("self-hosted") | not) and any(.[]; startswith("macos-") or . == "xcode-27"))] | length)" end' <<<"$page")" || return 1
                 read -r got c <<<"$got"
                 n=$((n + c))
                 [ "$got" = 100 ] || break
@@ -259,7 +266,12 @@ jobs:
               developer_dir=/Applications/Xcode.app/Contents/Developer
               if [ "$wanted" = true ]; then to_self_hosted=$((to_self_hosted + 1)); fi
             else
-              developer_dir=/Applications/Xcode_27.2.app/Contents/Developer
+              runs_on=$hosted
+              developer_dir=""
+              if [ "$job" = macos_app ]; then
+                runs_on='["xcode-27"]'
+                developer_dir=/Applications/Xcode_27.2.app/Contents/Developer
+              fi
               if [ "$wanted" = true ]; then to_hosted=$((to_hosted + 1)); fi
             fi
             echo "$job: runs $wanted, on $runs_on with DEVELOPER_DIR=$developer_dir"
