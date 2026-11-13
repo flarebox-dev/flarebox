@@ -619,7 +619,7 @@
         },
         {
           "const": "switched_off",
-          "description": "The launch agent is installed but not loaded: the person switched koi off in Login Items, which unloads it.",
+          "description": "The launch agent is installed but launchd lists it as disabled: the person switched koi off in Login Items.",
           "type": "string"
         },
         {
