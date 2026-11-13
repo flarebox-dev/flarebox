@@ -3104,6 +3104,97 @@ fn the_authors_edit_sent_after_another_devices_resend_revives_the_file_a_delete_
 }
 
 #[test]
+fn the_authors_lost_edit_revives_a_file_deleted_at_the_restored_version() {
+    let mut world = a_lost_edit_three_devices_held(overwrite(0));
+    let original = world
+        .space()
+        .nodes()
+        .into_iter()
+        .find(|node| node.kind == koidrive_proto::v1::NodeKind::File as i32)
+        .unwrap()
+        .node_id;
+    let mut steps = connect(&[1, 0, 2]);
+    steps.extend([(2, delete(0)), (2, SCAN), (2, COMMIT), (2, COMMIT)]);
+    steps.extend([(0, SCAN), (0, COMMIT), (0, COMMIT)]);
+    world.phase(2, &steps).unwrap();
+    for device in &world.devices {
+        let contents: Vec<_> = device
+            .disk
+            .entries()
+            .values()
+            .filter_map(|entry| entry.content.as_ref().map(|content| content.mtime_ns))
+            .collect();
+        assert_eq!(contents, [2]);
+    }
+    let live: Vec<_> = world
+        .space()
+        .nodes()
+        .into_iter()
+        .filter(|node| {
+            node.kind == koidrive_proto::v1::NodeKind::File as i32
+                && node.status == koidrive_proto::v1::NodeStatus::Live as i32
+        })
+        .collect();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].node_id, original);
+}
+
+#[test]
+fn a_delete_at_the_restored_version_stays_deleted_without_the_authors_edit() {
+    let mut world = a_lost_edit_three_devices_held(overwrite(0));
+    let mut steps = connect(&[1, 0, 2]);
+    steps.extend([(0, delete(0)), (0, SCAN)]);
+    steps.extend([(2, delete(0)), (2, SCAN), (2, COMMIT), (2, COMMIT)]);
+    world.phase(2, &steps).unwrap();
+    assert!(no_device_holds_a_file(&world));
+}
+
+#[test]
+fn an_unasked_delete_of_restored_content_is_rejected_after_an_older_overwrite() {
+    let mut world = converge(
+        3,
+        &[
+            vec![(0, file("a"))],
+            vec![(1, overwrite(0))],
+            vec![(2, overwrite(0))],
+            vec![(0, BACKUP), (0, overwrite(0))],
+        ],
+    )
+    .unwrap();
+    let mut steps = connect(&[1, 0, 2]);
+    steps.extend([(1, SCAN), (1, COMMIT)]);
+    world.run(4, &steps).unwrap();
+    let device = &mut world.devices[1];
+    let mut state = device.engine.commits.state();
+    let op = state
+        .in_flight
+        .as_mut()
+        .unwrap()
+        .commit
+        .ops
+        .iter_mut()
+        .find(|op| matches!(op.op, Some(koidrive_proto::v1::op::Op::UpdateContent(_))))
+        .unwrap();
+    let Some(koidrive_proto::v1::op::Op::UpdateContent(update)) = &op.op else {
+        unreachable!()
+    };
+    assert!(update.resend);
+    op.op = Some(koidrive_proto::v1::op::Op::Delete(
+        koidrive_proto::v1::Delete {
+            node_id: update.node_id.clone(),
+            requires: None,
+        },
+    ));
+    device.engine.commits = koidrive_engine::commit::Commits::from_state(state).unwrap();
+    device.store = device.engine.clone();
+    world.run(4, &[(1, COMMIT)]).unwrap();
+    let failure = world.phase(4, &[]).unwrap_err();
+    assert!(
+        matches!(failure, Failure::Diverged(why) if why.contains("took write 3 out of the server's tree"))
+    );
+}
+
+#[test]
 fn the_authors_resent_edit_beats_a_delete_built_before_it() {
     let mut world = a_lost_edit_three_devices_held(overwrite(0));
     let mut steps = connect(&[1, 0, 2]);
