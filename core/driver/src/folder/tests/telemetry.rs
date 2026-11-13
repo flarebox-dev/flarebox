@@ -206,6 +206,56 @@ fn telemetry_folder_retries_preserve_apply_origin_without_success_on_failure() {
 }
 
 #[test]
+fn first_sync_waits_for_a_scheduled_disk_effect_retry() {
+    let mut remote = Remote::new_at(Time::now().unix_ms - 10_000);
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(
+        &mut remote,
+        &site_a.root.join("incoming"),
+        b"remote content",
+    );
+    let mut site_b = Site::new(&remote, "b");
+    site_b.link.linked_at_ms = Time::now().unix_ms - 1000;
+    Store::open(&site_b.db)
+        .unwrap()
+        .transaction(|tx| tx.set_link(&site_b.link))
+        .unwrap();
+    Timing::initialize(&site_b.db, site_b.link.linked_at_ms);
+    let recorder = Recorder::on();
+    let mut b = site_b.start();
+    b.folder.timing.enable(recorder.clone());
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    let mut failed = false;
+    while let Some(work) = b.work.pop_front() {
+        let stage = matches!(work, Work::Stage(_));
+        if stage {
+            fs::write(site_b.root.join("incoming"), b"unobserved obstacle").unwrap();
+        }
+        b.perform(work, &mut remote).unwrap();
+        if stage {
+            failed = true;
+            break;
+        }
+    }
+    assert!(failed);
+    assert!(b.folder.retry_at.is_some());
+    assert_eq!(b.state(), FolderState::UpToDate);
+    assert!(b.folder.timing.first_pending());
+    assert!(site_b.db.with_file_name("first-sync").is_file());
+    assert!(histograms(&recorder).get("first_sync_ms").is_none());
+    fs::remove_file(site_b.root.join("incoming")).unwrap();
+    b.rest(&mut remote);
+    assert_eq!(
+        fs::read(site_b.root.join("incoming")).unwrap(),
+        b"remote content"
+    );
+    assert!(!b.folder.timing.has_first());
+    assert!(!site_b.db.with_file_name("first-sync").exists());
+    assert_eq!(histograms(&recorder)["first_sync_ms"]["1"]["count"], 1);
+}
+
+#[test]
 fn resent_commits_without_a_burst_do_not_inflate_later_uploads() {
     let mut remote = Remote::new_at(Time::now().unix_ms - 10_000);
     let (site, mut a) = linked(&mut remote, "a");

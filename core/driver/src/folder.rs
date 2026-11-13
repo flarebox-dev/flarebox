@@ -1478,10 +1478,8 @@ impl Folder {
         }
         let at = Time::now();
         self.timing.status(state, at);
-        if state == FolderState::UpToDate {
-            if self.retry_at.is_none() {
-                self.timing.drained(at);
-            }
+        if state == FolderState::UpToDate && self.retry_at.is_none() {
+            self.timing.drained(at);
             let files = if self.timing.first_pending() {
                 self.engine
                     .trees
