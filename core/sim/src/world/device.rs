@@ -125,8 +125,9 @@ impl Engine {
     /// leaves L. A parked entry keeps the position L holds for it and takes the content it has.
     pub fn scan(&mut self, disk: &Disk) {
         let root = self.trees.local().root.clone();
-        let known: BTreeMap<u128, NodeId> = (self.trees.local().iter())
-            .map(|(id, node)| (node.identity.ino, id.clone()))
+        let known: BTreeMap<u128, NodeId> = (self.trees.displaced_local().iter())
+            .map(|(id, identity)| (identity.ino, id.clone()))
+            .chain((self.trees.local().iter()).map(|(id, node)| (node.identity.ino, id.clone())))
             .collect();
         let mut nodes: BTreeMap<u128, NodeId> = BTreeMap::new();
         let mut queue: VecDeque<u128> = (disk.entries().iter())
@@ -181,6 +182,46 @@ impl Engine {
         for id in gone {
             self.trees.remove_local(&id);
         }
+        self.trees.release_halves(u64::MAX);
+    }
+
+    /// A scan of the folders entries left, before the scan of the folders they went to: a node whose entry is gone
+    /// or sits at another place leaves L with everything below it, and a file among them waits for the other half
+    /// of its move (design section 5.10). Returns how many files wait.
+    pub fn scan_left(&mut self, disk: &Disk, at_ms: u64) -> usize {
+        let local = self.trees.local();
+        let in_place = |node: &LocalNode| {
+            (disk.entries().get(&node.identity.ino)).is_some_and(|entry| {
+                entry.name == node.shape.name
+                    && match &entry.place {
+                        Place::Root => node.shape.parent == local.root,
+                        Place::In(parent) => (local.get(&node.shape.parent))
+                            .is_some_and(|parent_node| parent_node.identity.ino == *parent),
+                        Place::Parked(_) => true,
+                    }
+            })
+        };
+        let mut doomed: Vec<NodeId> = (local.iter())
+            .filter(|(_, node)| !node.parked && !in_place(node))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut next = 0;
+        while let Some(id) = doomed.get(next).cloned() {
+            doomed.extend(self.trees.local_children(&id).cloned());
+            next += 1;
+        }
+        let mut seen = BTreeSet::new();
+        let mut held = 0;
+        for id in doomed.into_iter().rev() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            match self.trees.vanish_local(&id, at_ms) {
+                true => held += 1,
+                false => self.trees.remove_local(&id),
+            }
+        }
+        held
     }
 }
 

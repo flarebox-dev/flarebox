@@ -158,6 +158,8 @@ pub enum Step {
     User(Action),
     /// A full rescan of the disk.
     Scan,
+    /// A scan of the folders entries left, which finds them gone before a later scan finds where they went.
+    ScanLeft,
     /// Plans the next effect when none is in flight, and ends the one in flight otherwise.
     Effect(Outcome),
     /// Builds the next commit when none is in flight, and sends the one in flight otherwise.
@@ -704,6 +706,7 @@ impl World {
             Step::Scan => {
                 self.scan(d)?;
             }
+            Step::ScanLeft => self.scan_left(d)?,
             Step::Effect(outcome) => {
                 if self.effect(d, *outcome)? && *outcome != Outcome::Run {
                     self.effect(d, *outcome)?;
@@ -1034,17 +1037,34 @@ impl World {
         }
     }
 
+    fn scan_left(&mut self, d: usize) -> Result<(), Failure> {
+        let device = &mut self.devices[d];
+        if device.engine.scan_left(&device.disk, NOW as u64) > 0 {
+            note(
+                &mut self.seen,
+                "a scan of part of the disk holds a file for the other half of its move",
+            );
+        }
+        device.persist()
+    }
+
     /// A full rescan. True when L changed.
     fn scan(&mut self, d: usize) -> Result<bool, Failure> {
         let device = &mut self.devices[d];
         if device.recovering.is_some() {
             return Ok(false);
         }
+        let held: Vec<NodeId> = (device.engine.trees.displaced_local().keys())
+            .cloned()
+            .collect();
         if device.rescan() > 0 {
             note(
                 &mut self.seen,
                 "rescan lets a problem node be planned again",
             );
+        }
+        if (held.iter()).any(|id| device.engine.trees.local().get(id).is_some()) {
+            note(&mut self.seen, "a full scan finds where a held file went");
         }
         self.scanned[d] = self.clock;
         let changed = device.engine != device.store;

@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use koidrive_engine::restore::RestoreIntent;
 use koidrive_engine::tree::Content;
-use koidrive_proto::v1::error;
+use koidrive_proto::v1::{NodeStatus, error};
 use koidrive_sim::world::disk::Place;
 use koidrive_sim::world::{Action, Cut, Failure, NAMES, Outcome, Reply, Step, TEXTS, World};
 use proptest::prelude::*;
@@ -67,6 +67,7 @@ fn step(losses: Losses) -> BoxedStrategy<Step> {
         8 => action().prop_map(Step::User),
         12 => any::<usize>().prop_map(Step::Work),
         2 => Just(Step::Scan),
+        1 => Just(Step::ScanLeft),
         4 => outcome.prop_map(Step::Effect),
         4 => reply.prop_map(Step::Commit),
         2 => Just(Step::Connect),
@@ -301,7 +302,7 @@ fn reaches(phases: impl Strategy<Value = Vec<Vec<(usize, Step)>>>, events: &[&st
 }
 
 /// The events of `World::seen` that the sample must reach.
-const EVENTS: [&str; 29] = [
+const EVENTS: [&str; 31] = [
     "effect failed before the disk",
     "a batch of effects ends in one transaction",
     "effect refused by the disk",
@@ -331,6 +332,8 @@ const EVENTS: [&str; 29] = [
     "commit abandoned, its bytes are gone",
     "op renamed by the server",
     "op merged a folder",
+    "a scan of part of the disk holds a file for the other half of its move",
+    "a full scan finds where a held file went",
 ];
 
 fn user(kind: u8, target: usize, parent: usize, name: &str) -> Step {
@@ -383,6 +386,46 @@ fn commit(device: usize) -> Vec<(usize, Step)> {
         (device, COMMIT),
         (device, DELIVER),
     ]
+}
+
+#[test]
+fn a_file_moved_out_of_a_folder_removed_in_an_earlier_scan_keeps_its_node() {
+    for crash in [false, true] {
+        let mut world = world(2);
+        let mut made = vec![(0, folder("b")), (0, user(1, 0, 1, "c.txt"))];
+        made.extend(commit(0));
+        world.phase(0, &made).unwrap();
+        let live_files = |world: &World| -> Vec<String> {
+            (world.space().nodes().into_iter())
+                .filter(|node| node.name == "c.txt" && node.status == NodeStatus::Live as i32)
+                .map(|node| node.node_id)
+                .collect()
+        };
+        let before = live_files(&world);
+        assert_eq!(before.len(), 1);
+
+        let mut split = vec![
+            (0, rename(1, 0, "c.txt")),
+            (0, delete(0)),
+            (0, Step::ScanLeft),
+            (0, COMMIT),
+            (0, COMMIT),
+            (0, DELIVER),
+        ];
+        if crash {
+            split.push((0, Step::Crash));
+        }
+        split.extend(commit(0));
+        world.phase(1, &split).unwrap();
+        assert_eq!(live_files(&world), before, "crash: {crash}");
+        assert!(
+            world
+                .space()
+                .nodes()
+                .iter()
+                .all(|node| node.name != "b" || node.status != NodeStatus::Live as i32)
+        );
+    }
 }
 
 #[test]
