@@ -7285,3 +7285,43 @@ fn a_resent_answer_delete_keeps_its_precondition_when_another_device_removed_the
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert_eq!(ops(&commit), [required]);
 }
+
+#[test]
+fn a_resent_answer_delete_drops_its_precondition_once_a_delete_of_this_device_trashed_the_kept_file()
+ {
+    let mut trees = trees(&[
+        synced("f", file(ROOT, "f", 1)),
+        (
+            "a",
+            None,
+            Some(file(ROOT, "a", 2)),
+            Some(remote(file(ROOT, "a", 2))),
+        ),
+    ]);
+    let mut state = trees.state();
+    state.kept_originals.insert("a".into(), "f".into());
+    trees.restore(state).unwrap();
+    trees.set_rules::<&str>(&[], None);
+    trees.rules_scanned();
+    trees.remove_local("f");
+    let state = koidrive_engine::state::CommitsState {
+        cap: Some(1),
+        ..Commits::default().state()
+    };
+    let (mut commits, mut ids) = (Commits::from_state(state).unwrap(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [delete("f")]);
+    let in_trash = RemoteNode {
+        trashed: true,
+        trash_group: "1:0".into(),
+        ..remote_at(file(ROOT, "f", 1), 1)
+    };
+    trees.set_remote("f".into(), in_trash);
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [delete("a")]);
+}

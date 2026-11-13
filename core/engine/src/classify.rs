@@ -1140,8 +1140,10 @@ impl Trees {
     }
 
     pub fn kept_original(&self, id: &str) -> Option<&NodeId> {
-        (self.kept_originals.get(id))
-            .filter(|kept| self.l.get(kept).is_some() || self.s.get(kept).is_none())
+        (self.kept_originals.get(id)).filter(|kept| {
+            self.l.get(kept).is_some()
+                || (self.s.get(kept).is_none() && !self.trashed_here.contains_key(*kept))
+        })
     }
 
     /// Records that an edit of this device, in the commit at `seq`, set the content of `id`, if R
