@@ -1475,7 +1475,11 @@ impl Commits {
             ) {
                 continue;
             }
-            let deleted = flight.deletes.get(&restore.node_id).into_iter().flatten();
+            let restored = BTreeSet::from([restore.node_id.as_str()]);
+            let deleted = (flight.deletes.values())
+                .filter(|planned| planned.contains(&restore.node_id))
+                .flatten()
+                .filter(|id| **id == restore.node_id || remote_below(trees, id, &restored));
             for id in flight
                 .restores
                 .get(&index)
