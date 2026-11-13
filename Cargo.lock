@@ -1433,6 +1433,7 @@ dependencies = [
  "koidrive-engine",
  "koidrive-fs",
  "koidrive-proto",
+ "proptest",
  "prost",
  "rusqlite",
  "serde_json",

@@ -29,6 +29,7 @@
 //! `fsync` alone may leave the data in the drive's cache. Process-kill tests
 //! cover the rollback, not power loss.
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -38,6 +39,7 @@ pub use engine::EngineState;
 use koidrive_engine::commit::Base;
 use koidrive_fs::FileId;
 use koidrive_proto::v1::{Content, NodeState, VersionInfo};
+use migrations::{LEGACY_STEPS, MIGRATIONS, NAMED};
 use prost::Message;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
@@ -45,389 +47,22 @@ mod engine;
 mod questions;
 mod restore;
 
-/// Schema migrations, applied in order. Migration `i` moves the database from
-/// `user_version = i` to `user_version = i + 1`. Never edit an entry once it
-/// has shipped; append a new one.
-const MIGRATIONS: &[&str] = &[
-    "
-    CREATE TABLE remote_cursor (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        history_id TEXT NOT NULL,
-        last_seq INTEGER NOT NULL
-    ) STRICT;
+#[doc(hidden)]
+pub mod migrations {
+    pub struct Migration {
+        pub name: &'static str,
+        pub requires: &'static [&'static str],
+        pub sql: &'static str,
+    }
 
-    CREATE TABLE remote_nodes (
-        node_id TEXT PRIMARY KEY,
-        parent_id TEXT,
-        name TEXT NOT NULL,
-        kind INTEGER NOT NULL,
-        status INTEGER NOT NULL,
-        content_rev INTEGER NOT NULL,
-        meta_rev INTEGER NOT NULL,
-        trash_group TEXT,
-        current BLOB
-    ) STRICT;
+    include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
 
-    CREATE TABLE synced_nodes (
-        node_id TEXT PRIMARY KEY,
-        parent_id TEXT,
-        name TEXT NOT NULL,
-        kind INTEGER NOT NULL,
-        content BLOB
-    ) STRICT;
+    pub const NAMED: u32 = 1000;
+}
 
-    CREATE TABLE local_nodes (
-        node_id TEXT PRIMARY KEY,
-        parent_id TEXT,
-        name TEXT NOT NULL,
-        kind INTEGER NOT NULL,
-        content BLOB,
-        dev INTEGER NOT NULL,
-        ino INTEGER NOT NULL,
-        birth_ns INTEGER,
-        parked INTEGER NOT NULL CHECK (parked IN (0, 1))
-    ) STRICT;
-
-    CREATE TABLE commit_in_flight (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        commit_message BLOB NOT NULL
-    ) STRICT;
-
-    CREATE TABLE commit_in_flight_shapes (
-        op_index INTEGER PRIMARY KEY,
-        parent_id TEXT,
-        name TEXT NOT NULL,
-        kind INTEGER NOT NULL,
-        content BLOB
-    ) STRICT;
-
-    CREATE TABLE problems (
-        node_id TEXT PRIMARY KEY,
-        reason TEXT NOT NULL
-    ) STRICT;
-
-    CREATE TABLE engine_state (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        id_generator BLOB NOT NULL
-    ) STRICT;
-
-    CREATE TABLE chunk_cache (
-        hash BLOB PRIMARY KEY CHECK (length(hash) = 32),
-        size INTEGER NOT NULL,
-        last_used_ms INTEGER NOT NULL
-    ) STRICT, WITHOUT ROWID;
-    CREATE INDEX chunk_cache_by_use ON chunk_cache (last_used_ms);
-",
-    "
-    CREATE TABLE link (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        space_id TEXT NOT NULL,
-        space_name TEXT NOT NULL,
-        root BLOB NOT NULL,
-        root_dev INTEGER NOT NULL,
-        server_url TEXT NOT NULL,
-        device_id TEXT NOT NULL,
-        linked_at_ms INTEGER NOT NULL
-    ) STRICT;
-
-    CREATE TABLE questions (
-        question_id TEXT PRIMARY KEY,
-        asked_at_ms INTEGER NOT NULL,
-        body BLOB NOT NULL,
-        answer TEXT,
-        answered_at_ms INTEGER,
-        CHECK ((answer IS NULL) = (answered_at_ms IS NULL))
-    ) STRICT;
-",
-    "
-    DROP TABLE commit_in_flight_shapes;
-    DROP TABLE problems;
-    ALTER TABLE commit_in_flight ADD COLUMN result BLOB;
-
-    CREATE TABLE commit_in_flight_deletes (
-        target TEXT PRIMARY KEY
-    ) STRICT, WITHOUT ROWID;
-
-    CREATE TABLE commit_in_flight_delete_members (
-        target TEXT NOT NULL,
-        position INTEGER NOT NULL,
-        node_id TEXT NOT NULL,
-        PRIMARY KEY (target, position)
-    ) STRICT, WITHOUT ROWID;
-
-    CREATE TABLE commit_state (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        accepted INTEGER NOT NULL,
-        halt TEXT CHECK (halt IN ('read_only', 'recovery', 'policy')),
-        policy_code INTEGER,
-        cap INTEGER CHECK (cap > 0),
-        CHECK ((halt IS 'policy') = (policy_code IS NOT NULL))
-    ) STRICT;
-
-    CREATE TABLE effect_state (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        cleared INTEGER NOT NULL,
-        in_flight BLOB
-    ) STRICT;
-
-    CREATE TABLE failed_effects (
-        node_id TEXT PRIMARY KEY,
-        effect BLOB NOT NULL
-    ) STRICT, WITHOUT ROWID;
-
-    CREATE TABLE node_sets (
-        node_set TEXT NOT NULL
-            CHECK (node_set IN ('dirty', 'unsearched', 'reverted', 'problems', 'split')),
-        node_id TEXT NOT NULL,
-        PRIMARY KEY (node_set, node_id)
-    ) STRICT, WITHOUT ROWID;
-
-    CREATE TABLE node_maps (
-        node_map TEXT NOT NULL CHECK (node_map IN ('parked_as', 'aliases')),
-        node_id TEXT NOT NULL,
-        target TEXT NOT NULL,
-        PRIMARY KEY (node_map, node_id)
-    ) STRICT, WITHOUT ROWID;
-
-    CREATE TABLE waiting_updates (
-        node_id TEXT PRIMARY KEY,
-        parent_id TEXT,
-        name TEXT,
-        kind INTEGER,
-        content BLOB,
-        CHECK ((name IS NULL) = (kind IS NULL))
-    ) STRICT, WITHOUT ROWID;
-",
-    "
-    CREATE TABLE restore_requests (
-        restore_id TEXT PRIMARY KEY,
-        node_id TEXT NOT NULL,
-        version_id TEXT,
-        target_parent_id TEXT,
-        name TEXT,
-        CHECK (version_id IS NULL OR (target_parent_id IS NULL AND name IS NULL))
-    ) STRICT, WITHOUT ROWID;
-
-    CREATE TABLE restore_intents (
-        restore_id TEXT PRIMARY KEY,
-        node_id TEXT NOT NULL,
-        version_id TEXT,
-        target_parent_id TEXT,
-        name TEXT,
-        position INTEGER UNIQUE,
-        outcome TEXT
-            CHECK (outcome IN ('restored', 'renamed', 'copied', 'rejected', 'does_not_fit')),
-        outcome_node_id TEXT,
-        outcome_name TEXT,
-        reject_reason TEXT,
-        CHECK (version_id IS NULL OR (target_parent_id IS NULL AND name IS NULL)),
-        CHECK ((outcome IS NULL) = (position IS NULL)),
-        CHECK ((outcome IS 'renamed' OR outcome IS 'copied') = (outcome_name IS NOT NULL)),
-        CHECK ((outcome IS 'copied') = (outcome_node_id IS NOT NULL)),
-        CHECK ((outcome IS 'rejected') = (reject_reason IS NOT NULL))
-    ) STRICT, WITHOUT ROWID;
-",
-    "
-    ALTER TABLE remote_cursor ADD COLUMN ahead_of_server INTEGER NOT NULL DEFAULT 0
-        CHECK (ahead_of_server IN (0, 1));
-",
-    "
-    CREATE TABLE watched_contents (
-        node_id TEXT PRIMARY KEY,
-        changed INTEGER NOT NULL CHECK (changed IN (0, 1))
-    ) STRICT, WITHOUT ROWID;
-",
-    "
-    CREATE TABLE trashed_here (
-        node_id TEXT PRIMARY KEY,
-        seq INTEGER NOT NULL
-    ) STRICT, WITHOUT ROWID;
-
-    CREATE TABLE commit_slots (
-        device_seq INTEGER PRIMARY KEY,
-        seq INTEGER NOT NULL
-    ) STRICT;
-",
-    "
-    CREATE TABLE open_questions (
-        question_id TEXT PRIMARY KEY,
-        position INTEGER NOT NULL UNIQUE,
-        asked_at_ms INTEGER NOT NULL,
-        kind TEXT NOT NULL,
-        answer TEXT
-    ) STRICT;
-
-    CREATE TABLE open_question_items (
-        question_id TEXT NOT NULL REFERENCES open_questions (question_id),
-        top_id TEXT NOT NULL,
-        files INTEGER NOT NULL,
-        PRIMARY KEY (question_id, top_id)
-    ) STRICT, WITHOUT ROWID;
-
-    CREATE TABLE open_question_members (
-        question_id TEXT NOT NULL,
-        top_id TEXT NOT NULL,
-        node_id TEXT NOT NULL,
-        content_rev INTEGER,
-        meta_rev INTEGER,
-        PRIMARY KEY (question_id, top_id, node_id),
-        FOREIGN KEY (question_id, top_id) REFERENCES open_question_items (question_id, top_id),
-        CHECK ((content_rev IS NULL) = (meta_rev IS NULL))
-    ) STRICT, WITHOUT ROWID;
-
-    CREATE TABLE guard_ledger (
-        node_id TEXT PRIMARY KEY,
-        at_ms INTEGER NOT NULL,
-        files INTEGER NOT NULL
-    ) STRICT, WITHOUT ROWID;
-
-    CREATE TABLE guard_confirmed (
-        top_id TEXT PRIMARY KEY,
-        files INTEGER NOT NULL
-    ) STRICT, WITHOUT ROWID;
-
-    CREATE TABLE guard_confirmed_members (
-        top_id TEXT NOT NULL REFERENCES guard_confirmed (top_id),
-        node_id TEXT NOT NULL,
-        content_rev INTEGER,
-        meta_rev INTEGER,
-        PRIMARY KEY (top_id, node_id),
-        CHECK ((content_rev IS NULL) = (meta_rev IS NULL))
-    ) STRICT, WITHOUT ROWID;
-",
-    "
-    CREATE TABLE open_question_shapes (
-        question_id TEXT NOT NULL REFERENCES open_questions (question_id),
-        node_id TEXT NOT NULL,
-        parent_id TEXT NOT NULL,
-        name TEXT NOT NULL,
-        kind INTEGER NOT NULL,
-        content BLOB,
-        PRIMARY KEY (question_id, node_id)
-    ) STRICT, WITHOUT ROWID;
-
-    CREATE TABLE discarded_nodes (
-        node_id TEXT PRIMARY KEY
-    ) STRICT, WITHOUT ROWID;
-",
-    "
-    CREATE TABLE recorded_nodes (
-        node_id TEXT PRIMARY KEY,
-        displaced INTEGER NOT NULL CHECK (displaced IN (0, 1)),
-        dev INTEGER,
-        ino INTEGER,
-        birth_ns INTEGER,
-        CHECK ((displaced = 1) = (dev IS NOT NULL)),
-        CHECK ((dev IS NULL) = (ino IS NULL)),
-        CHECK (dev IS NOT NULL OR birth_ns IS NULL)
-    ) STRICT, WITHOUT ROWID;
-",
-    "
-    CREATE TABLE edited_here (
-        node_id TEXT PRIMARY KEY,
-        seq INTEGER NOT NULL
-    ) STRICT, WITHOUT ROWID;
-",
-    "
-    CREATE TABLE guard_remote (
-        top_id TEXT NOT NULL,
-        known INTEGER NOT NULL CHECK (known IN (0, 1)),
-        trash_group TEXT NOT NULL,
-        trashed_seq INTEGER NOT NULL,
-        at_ms INTEGER NOT NULL,
-        files INTEGER NOT NULL,
-        PRIMARY KEY (top_id, known, trash_group, trashed_seq)
-    ) STRICT, WITHOUT ROWID;
-
-    CREATE TABLE guard_remote_dismissed (
-        top_id TEXT NOT NULL,
-        known INTEGER NOT NULL CHECK (known IN (0, 1)),
-        trash_group TEXT NOT NULL,
-        trashed_seq INTEGER NOT NULL,
-        PRIMARY KEY (top_id, known, trash_group, trashed_seq)
-    ) STRICT, WITHOUT ROWID;
-
-    CREATE TABLE guard_confirmed_limits (
-        limit_crossed TEXT PRIMARY KEY
-    ) STRICT, WITHOUT ROWID;
-",
-    "
-    CREATE TABLE watched_positions (
-        node_id TEXT PRIMARY KEY,
-        rev INTEGER
-    ) STRICT, WITHOUT ROWID;
-",
-    "
-    ALTER TABLE waiting_updates ADD COLUMN slot INTEGER CHECK (slot IS NULL OR slot > 0);
-    UPDATE waiting_updates
-       SET slot = (SELECT accepted FROM commit_state WHERE id = 1)
-     WHERE node_id NOT IN (SELECT node_id FROM discarded_nodes)
-       AND (SELECT accepted FROM commit_state WHERE id = 1) > 0;
-",
-    "
-    ALTER TABLE watched_positions ADD COLUMN parent_id TEXT;
-    ALTER TABLE watched_positions ADD COLUMN name TEXT;
-    UPDATE watched_positions
-    SET parent_id = synced_nodes.parent_id, name = synced_nodes.name
-    FROM synced_nodes
-    WHERE synced_nodes.node_id = watched_positions.node_id AND watched_positions.rev IS NOT NULL;
-    UPDATE watched_positions SET rev = NULL WHERE name IS NULL;
-",
-    "
-    ALTER TABLE remote_cursor ADD COLUMN commit_id TEXT NOT NULL DEFAULT '';
-    ALTER TABLE remote_cursor ADD COLUMN committed_at_ms INTEGER NOT NULL DEFAULT 0;
-",
-    "
-    CREATE TABLE published_nodes (
-        node_id TEXT PRIMARY KEY
-    ) STRICT, WITHOUT ROWID;
-",
-    "
-    CREATE TABLE taken_answers (
-        question_id TEXT PRIMARY KEY,
-        asked_at_ms INTEGER NOT NULL,
-        body BLOB NOT NULL,
-        answer TEXT NOT NULL,
-        answered_at_ms INTEGER NOT NULL
-    ) STRICT, WITHOUT ROWID;
-",
-    "
-    CREATE TABLE unsent_edits (
-        node_id TEXT PRIMARY KEY
-    ) STRICT, WITHOUT ROWID;
-",
-    "
-    ALTER TABLE local_nodes ADD COLUMN ino_high INTEGER NOT NULL DEFAULT 0;
-    ALTER TABLE recorded_nodes
-        ADD COLUMN ino_high INTEGER NOT NULL DEFAULT 0 CHECK (ino IS NOT NULL OR ino_high = 0);
-",
-    "
-    CREATE TABLE pending_names (
-        node_id TEXT PRIMARY KEY,
-        sent TEXT NOT NULL,
-        name TEXT NOT NULL,
-        landed INTEGER NOT NULL CHECK (landed IN (0, 1))
-    ) STRICT, WITHOUT ROWID;
-",
-    "
-    ALTER TABLE recorded_nodes ADD COLUMN lost INTEGER NOT NULL DEFAULT 0 CHECK (lost IN (0, 1));
-",
-    "
-    CREATE TABLE replaced_versions (
-        node_id TEXT NOT NULL,
-        position INTEGER NOT NULL CHECK (position >= 0),
-        version_id TEXT NOT NULL,
-        PRIMARY KEY (node_id, position)
-    ) STRICT, WITHOUT ROWID;
-
-    CREATE TABLE resends (
-        node_id TEXT PRIMARY KEY
-    ) STRICT, WITHOUT ROWID;
-",
-];
-
-/// The schema version this build writes.
-pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
+#[cfg(test)]
+#[path = "../build/plan.rs"]
+mod plan;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -435,12 +70,16 @@ pub enum Error {
     Sqlite(#[from] rusqlite::Error),
     #[error("stored protobuf does not decode: {0}")]
     Decode(#[from] prost::DecodeError),
-    #[error("database schema version {found} is newer than this build supports ({supported})")]
-    SchemaTooNew { found: u32, supported: u32 },
     #[error(
-        "database schema version {found} is older than this build's ({supported}); the daemon updates it when it starts"
+        "a newer Koidrive build updated the database with migration {0}, which this build does not know"
     )]
-    SchemaTooOld { found: u32, supported: u32 },
+    UnknownMigration(String),
+    #[error(
+        "database schema version {0} comes from a development build of an unmerged store migration; delete this store file and link the folder again with `koi folder link`"
+    )]
+    DevelopmentSchema(u32),
+    #[error("the database lacks migration {missing}; the daemon applies it when it starts")]
+    SchemaTooOld { missing: String },
     #[error(
         "{} holds changes that are not in the database file yet; the daemon applies them when it starts",
         koidrive_fs::quoted(.0)
@@ -573,7 +212,7 @@ pub struct Store {
 
 impl Store {
     /// Opens the database at `path`, creating it if needed, and applies any
-    /// migrations it lacks. Fails with [`Error::SchemaTooNew`] if a newer build
+    /// migrations it lacks. Fails with [`Error::UnknownMigration`] if a newer build
     /// already migrated it.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -593,8 +232,8 @@ impl Store {
 
     /// Opens the database at `path` to read it without writing anything: no migration, and no journal or shared-memory
     /// file. SQLite takes the file as unchanging, so the caller makes sure that no process writes it meanwhile. A
-    /// database of another schema version is refused, and so is one whose write-ahead log still holds changes, which
-    /// only a writable open applies.
+    /// database whose applied migrations differ from this build's is refused, and so is one whose write-ahead log
+    /// still holds changes, which only a writable open applies.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let mut log = path.as_os_str().to_owned();
@@ -619,13 +258,11 @@ impl Store {
                 | OpenFlags::SQLITE_OPEN_URI
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        let found: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        let supported = SCHEMA_VERSION;
-        if found > supported {
-            return Err(Error::SchemaTooNew { found, supported });
-        }
-        if found < supported {
-            return Err(Error::SchemaTooOld { found, supported });
+        let (_, applied) = applied_migrations(&conn)?;
+        if let Some(missing) = MIGRATIONS.iter().find(|m| !applied.contains(m.name)) {
+            return Err(Error::SchemaTooOld {
+                missing: missing.name.to_owned(),
+            });
         }
         Ok(Self { conn })
     }
@@ -651,12 +288,6 @@ impl Store {
         })
     }
 
-    pub fn schema_version(&self) -> Result<u32> {
-        Ok(self
-            .conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))?)
-    }
-
     /// Runs `f` in one write transaction. The transaction commits if `f`
     /// returns `Ok` and rolls back if it returns `Err` or panics.
     pub fn transaction<T, E: From<Error>>(
@@ -673,23 +304,56 @@ impl Store {
     }
 }
 
+fn applied_migrations(conn: &Connection) -> Result<(u32, BTreeSet<String>)> {
+    let version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let applied: BTreeSet<String> = match version {
+        NAMED => conn
+            .prepare("SELECT name FROM migrations")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?,
+        positional if positional as usize <= LEGACY_STEPS => MIGRATIONS[..positional as usize]
+            .iter()
+            .map(|m| m.name.to_owned())
+            .collect(),
+        other => return Err(Error::DevelopmentSchema(other)),
+    };
+    if let Some(unknown) = applied
+        .iter()
+        .find(|name| !MIGRATIONS.iter().any(|m| m.name == name.as_str()))
+    {
+        return Err(Error::UnknownMigration(unknown.clone()));
+    }
+    Ok((version, applied))
+}
+
 fn migrate(conn: &mut Connection) -> Result<()> {
-    loop {
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let found: u32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if found > SCHEMA_VERSION {
-            return Err(Error::SchemaTooNew {
-                found,
-                supported: SCHEMA_VERSION,
-            });
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (version, applied) = applied_migrations(&tx)?;
+    if version != NAMED {
+        tx.execute_batch("CREATE TABLE migrations (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;")?;
+        for name in &applied {
+            tx.execute("INSERT INTO migrations (name) VALUES (?1)", [name])?;
         }
-        let Some(sql) = MIGRATIONS.get(found as usize) else {
-            return Ok(());
-        };
-        tx.execute_batch(sql)?;
-        tx.pragma_update(None, "user_version", found + 1)?;
+        tx.pragma_update(None, "user_version", NAMED)?;
+    }
+    tx.commit()?;
+    for migration in MIGRATIONS.iter().filter(|m| !applied.contains(m.name)) {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let done: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM migrations WHERE name = ?1)",
+            [migration.name],
+            |row| row.get(0),
+        )?;
+        if !done {
+            tx.execute_batch(migration.sql)?;
+            tx.execute(
+                "INSERT INTO migrations (name) VALUES (?1)",
+                [migration.name],
+            )?;
+        }
         tx.commit()?;
     }
+    Ok(())
 }
 
 /// An open transaction. Obtain one with [`Store::transaction`].

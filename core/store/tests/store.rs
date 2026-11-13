@@ -19,10 +19,14 @@ use koidrive_proto::v1::{
     ChunkRef, Commit, CommitResult, Content, CreateFile, Delete, NodeKind, NodeState, NodeStatus,
     Op, OpResult, VersionInfo, Welcome, op, op_result,
 };
+use koidrive_store::migrations::{LEGACY_STEPS, MIGRATIONS, NAMED};
 use koidrive_store::{
-    CachedChunk, Cursor, Durability, EngineState, Error, GivenAnswer, Link, LocalNode,
-    SCHEMA_VERSION, Shape, Store, StoredQuestion, SyncedNode,
+    CachedChunk, Cursor, Durability, EngineState, Error, GivenAnswer, Link, LocalNode, Shape,
+    Store, StoredQuestion, SyncedNode,
 };
+use proptest::prelude::*;
+use proptest::strategy::ValueTree;
+use proptest::test_runner::TestRunner;
 use rusqlite::Connection;
 
 fn content(size: u64) -> Content {
@@ -64,7 +68,7 @@ fn migrations_apply_from_empty() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(applied(&path), all_migrations());
     drop(store);
 
     let conn = Connection::open(&path).unwrap();
@@ -97,6 +101,7 @@ fn migrations_apply_from_empty() {
             "guard_remote_dismissed",
             "link",
             "local_nodes",
+            "migrations",
             "node_maps",
             "node_sets",
             "open_question_items",
@@ -140,7 +145,7 @@ fn connection_uses_durable_commits() {
 }
 
 #[test]
-fn reopening_keeps_data_and_schema_version() {
+fn reopening_keeps_data_and_applied_migrations() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let cursor = Cursor {
@@ -156,26 +161,606 @@ fn reopening_keeps_data_and_schema_version() {
         .unwrap();
 
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(applied(&path), all_migrations());
     assert_eq!(store.transaction(|tx| tx.cursor()).unwrap(), Some(cursor));
 }
 
 #[test]
-fn newer_schema_is_rejected() {
+fn a_store_with_a_migration_this_build_does_not_know_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     drop(Store::open(&path).unwrap());
     Connection::open(&path)
         .unwrap()
-        .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+        .execute(
+            "INSERT INTO migrations (name) VALUES ('from_a_newer_build')",
+            [],
+        )
         .unwrap();
 
-    match Store::open(&path) {
-        Err(Error::SchemaTooNew { found, supported }) => {
-            assert_eq!((found, supported), (SCHEMA_VERSION + 1, SCHEMA_VERSION));
+    for opened in [Store::open(&path), Store::open_read_only(&path)] {
+        match opened {
+            Err(Error::UnknownMigration(name)) => assert_eq!(name, "from_a_newer_build"),
+            other => panic!("expected UnknownMigration, got {:?}", other.err()),
         }
-        other => panic!("expected SchemaTooNew, got {:?}", other.err()),
     }
+}
+
+#[test]
+fn a_store_a_migration_branch_build_wrote_is_refused_with_what_to_do() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    populate(&path);
+    for version in [LEGACY_STEPS as u32 + 1, NAMED - 1, NAMED + 1] {
+        Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", version)
+            .unwrap();
+        for opened in [Store::open(&path), Store::open_read_only(&path)] {
+            let error = opened.err().unwrap();
+            assert!(matches!(error, Error::DevelopmentSchema(found) if found == version));
+            assert!(
+                error.to_string().ends_with(
+                    "delete this store file and link the folder again with `koi folder link`"
+                ),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_upgraded_store_carries_a_version_no_positional_build_supports() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    populate(&path);
+    rewind(&path, LEGACY_STEPS - 2);
+    drop(Store::open(&path).unwrap());
+    let version: u32 = Connection::open(&path)
+        .unwrap()
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 1000);
+}
+
+#[test]
+fn a_read_only_open_refuses_a_store_that_lacks_a_migration() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    populate(&path);
+    let last = &MIGRATIONS[LEGACY_STEPS - 1];
+    store_before(&path, last.name);
+    match Store::open_read_only(&path) {
+        Err(Error::SchemaTooOld { missing }) => assert_eq!(missing, last.name),
+        other => panic!("expected SchemaTooOld, got {:?}", other.err()),
+    }
+    drop(Store::open(&path).unwrap());
+    assert!(
+        Store::open_read_only(&path)
+            .unwrap()
+            .transaction(|tx| tx.link())
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn a_store_from_any_past_version_upgrades_and_keeps_every_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let fresh = dir.path().join("fresh.db");
+    drop(Store::open(&fresh).unwrap());
+    for version in 0..=LEGACY_STEPS {
+        let path = dir.path().join(format!("{version}.db"));
+        populate(&path);
+        rewind(&path, version);
+        let kept = every_row(&path);
+        assert_eq!(kept.values().any(|(_, rows)| !rows.is_empty()), version > 0);
+
+        drop(Store::open(&path).unwrap());
+
+        assert_eq!(applied(&path), all_migrations(), "from version {version}");
+        assert_eq!(schema(&path), schema(&fresh), "from version {version}");
+        let conn = Connection::open(&path).unwrap();
+        for (table, (columns, rows)) in kept.into_iter().filter(|(_, (_, rows))| !rows.is_empty()) {
+            assert_eq!(
+                table_rows(&conn, &table, &columns),
+                rows,
+                "{table} from version {version}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_store_written_by_alpha_1_upgrades_and_keeps_every_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/alpha1.db"),
+        &path,
+    )
+    .unwrap();
+    let kept = every_row(&path);
+    let fresh = dir.path().join("fresh.db");
+    drop(Store::open(&fresh).unwrap());
+
+    let mut store = Store::open(&path).unwrap();
+    let mut expected = legacy_state();
+    expected.commits.pending.clear();
+    expected.trees.lost.clear();
+    expected.trees.outside.remove("lost");
+    expected.trees.resends.clear();
+    expected.trees.replaced_versions.clear();
+    store
+        .transaction(|tx| {
+            assert_eq!(tx.engine_state()?, expected);
+            assert_eq!(tx.link()?.unwrap().space_name, "Projects");
+            assert_eq!(tx.cursor()?.unwrap().last_seq, 30);
+            assert_eq!(tx.local_nodes()?.len(), 1);
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+    drop(store);
+
+    assert_eq!(applied(&path), all_migrations());
+    assert_eq!(schema(&path), schema(&fresh));
+    let conn = Connection::open(&path).unwrap();
+    for (table, (columns, rows)) in kept {
+        assert_eq!(table_rows(&conn, &table, &columns), rows, "{table}");
+    }
+}
+
+#[test]
+fn migrations_that_touch_different_things_commute_and_ones_that_clash_do_not() {
+    let commuting = [
+        Step {
+            name: "a_mark",
+            requires: vec![],
+            sql: "ALTER TABLE remote_nodes ADD COLUMN a_mark TEXT;",
+        },
+        Step {
+            name: "b_mark",
+            requires: vec![],
+            sql: "ALTER TABLE remote_nodes ADD COLUMN b_mark INTEGER NOT NULL DEFAULT 0;",
+        },
+        Step {
+            name: "c_ids",
+            requires: vec![],
+            sql: "CREATE TABLE c_ids (id TEXT PRIMARY KEY) STRICT;
+                  INSERT INTO c_ids SELECT lower(hex(randomblob(8))) FROM synced_nodes;",
+        },
+        Step {
+            name: "d_ids_at",
+            requires: vec!["c_ids"],
+            sql: "ALTER TABLE c_ids ADD COLUMN at_ms INTEGER;",
+        },
+    ];
+    assert_eq!(
+        differences(&commuting, &permutations(commuting.len())),
+        Vec::<String>::new()
+    );
+
+    let clashing = [
+        Step {
+            name: "x_seen",
+            requires: vec![],
+            sql: "CREATE TABLE x_seen AS SELECT node_id FROM synced_nodes;",
+        },
+        Step {
+            name: "y_forget",
+            requires: vec![],
+            sql: "DELETE FROM synced_nodes WHERE node_id = 'moved';",
+        },
+    ];
+    assert_eq!(differences(&clashing, &permutations(2)).len(), 1);
+    let ordered = [
+        Step {
+            name: "x_seen",
+            requires: vec![],
+            sql: clashing[0].sql,
+        },
+        Step {
+            name: "y_forget",
+            requires: vec!["x_seen"],
+            sql: clashing[1].sql,
+        },
+    ];
+    assert_eq!(
+        differences(&ordered, &permutations(2)),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn named_migrations_give_the_same_store_in_any_order() {
+    let named: Vec<Step> = MIGRATIONS[LEGACY_STEPS..]
+        .iter()
+        .map(|m| Step {
+            name: m.name,
+            requires: m.requires.to_vec(),
+            sql: m.sql,
+        })
+        .collect();
+    let priorities = if named.len() <= 5 {
+        permutations(named.len())
+    } else {
+        let shuffled = Just((0..named.len()).collect::<Vec<_>>()).prop_shuffle();
+        let mut runner = TestRunner::default();
+        (0..64)
+            .map(|_| shuffled.new_tree(&mut runner).unwrap().current())
+            .collect()
+    };
+    assert_eq!(differences(&named, &priorities), Vec::<String>::new());
+}
+
+struct Step {
+    name: &'static str,
+    requires: Vec<&'static str>,
+    sql: &'static str,
+}
+
+fn permutations(n: usize) -> Vec<Vec<usize>> {
+    if n == 0 {
+        return vec![vec![]];
+    }
+    permutations(n - 1)
+        .into_iter()
+        .flat_map(|shorter| {
+            (0..n).map(move |at| {
+                let mut longer = shorter.clone();
+                longer.insert(at, n - 1);
+                longer
+            })
+        })
+        .collect()
+}
+
+fn differences(steps: &[Step], priorities: &[Vec<usize>]) -> Vec<String> {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.db");
+    populate(&base);
+    rewind(&base, LEGACY_STEPS);
+    let outcome = |name: &str, priority: &[usize]| {
+        let mut order: Vec<&Step> = vec![];
+        while order.len() < steps.len() {
+            let next = priority
+                .iter()
+                .map(|&i| &steps[i])
+                .find(|step| {
+                    !order.iter().any(|placed| placed.name == step.name)
+                        && step
+                            .requires
+                            .iter()
+                            .all(|r| order.iter().any(|placed| placed.name == *r))
+                })
+                .unwrap();
+            order.push(next);
+        }
+        let path = dir.path().join(name);
+        std::fs::copy(&base, &path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "synchronous", "OFF").unwrap();
+        for step in &order {
+            conn.execute_batch(step.sql).unwrap();
+        }
+        drop(conn);
+        let names: Vec<&str> = order.iter().map(|step| step.name).collect();
+        (names, schema(&path), every_row(&path))
+    };
+    let by_name: Vec<usize> = (0..steps.len()).collect();
+    let (_, schema_by_name, rows_by_name) = outcome("by_name.db", &by_name);
+    let (_, _, rows_again) = outcome("again.db", &by_name);
+    let count = |rows: &(Vec<String>, Vec<String>)| rows.1.len();
+    let mut found = vec![];
+    for (n, priority) in priorities.iter().enumerate() {
+        let (names, schema, rows) = outcome(&format!("{n}.db"), priority);
+        let rows_differ = rows.len() != rows_by_name.len()
+            || rows
+                .iter()
+                .zip(&rows_by_name)
+                .any(|((table, rows), (other, expected))| {
+                    table != other
+                        || if rows_again[table] == rows_by_name[table] {
+                            rows != expected
+                        } else {
+                            count(rows) != count(expected)
+                        }
+                });
+        if schema != schema_by_name || rows_differ {
+            found.push(names.join(", "));
+        }
+    }
+    found
+}
+
+fn applied(path: &Path) -> BTreeSet<String> {
+    let conn = Connection::open(path).unwrap();
+    let mut stmt = conn.prepare("SELECT name FROM migrations").unwrap();
+    stmt.query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+fn all_migrations() -> BTreeSet<String> {
+    MIGRATIONS.iter().map(|m| m.name.to_owned()).collect()
+}
+
+fn legacy_state() -> EngineState {
+    let full = engine_state();
+    let mut state = EngineState::default();
+    state.trees.dirty = full.trees.dirty;
+    state.trees.unsearched = full.trees.unsearched;
+    state.trees.reverted = full.trees.reverted;
+    state.trees.parked_as = full.trees.parked_as;
+    state.trees.waiting = full.trees.waiting;
+    state.trees.watched = full.trees.watched;
+    state.trees.watched_positions = full.trees.watched_positions;
+    state.trees.trashed_here = full.trees.trashed_here;
+    state.trees.discarded = full.trees.discarded;
+    state.trees.outside = full.trees.outside;
+    state.trees.lost = full.trees.lost;
+    state.trees.displaced = full.trees.displaced;
+    state.trees.edited_here = full.trees.edited_here;
+    state.trees.unsent_edits = full.trees.unsent_edits;
+    state.trees.resends = full.trees.resends;
+    state.trees.replaced_versions = full.trees.replaced_versions;
+    state.commits.accepted = full.commits.accepted;
+    state.commits.in_flight = full.commits.in_flight;
+    state.commits.problems = full.commits.problems;
+    state.commits.halted = full.commits.halted;
+    state.commits.cap = full.commits.cap;
+    state.commits.split = full.commits.split;
+    state.commits.aliases = full.commits.aliases;
+    state.commits.restores = full.commits.restores;
+    state.commits.resolved = full.commits.resolved;
+    state.commits.slots = full.commits.slots;
+    state.commits.questions = full.commits.questions;
+    state.commits.published = full.commits.published;
+    state.commits.pending = full.commits.pending;
+    state.commits.guard = full.commits.guard;
+    state.effects.in_flight = full.effects.in_flight;
+    state.effects.cleared = full.effects.cleared;
+    state.effects.failed = full.effects.failed;
+    state
+}
+
+fn populate(path: &Path) {
+    let link = Link {
+        space_id: "0190f0a0-0000-7000-8000-000000000001".into(),
+        space_name: "Projects".into(),
+        root: std::path::PathBuf::from("/home/ada/Koidrive"),
+        root_dev: 66306,
+        server_url: "https://files.example.com/".into(),
+        device_id: "d1".into(),
+        linked_at_ms: 1_700_000_000_000,
+    };
+    let moved = file_shape("root", "moved.txt");
+    Store::open(path)
+        .unwrap()
+        .transaction(|tx| {
+            tx.set_engine_state(&engine_state())?;
+            tx.put_synced_node(&SyncedNode {
+                node_id: "moved".into(),
+                shape: moved.clone(),
+            })?;
+            tx.put_local_node(&LocalNode {
+                node_id: "moved".into(),
+                shape: moved.clone(),
+                identity: FileId {
+                    dev: 1,
+                    ino: 7,
+                    birth_ns: Some(-1),
+                },
+                parked: false,
+            })?;
+            tx.put_remote_node(&NodeState {
+                node_id: "moved".into(),
+                parent_id: "root".into(),
+                name: "moved.txt".into(),
+                kind: NodeKind::File as i32,
+                status: NodeStatus::Live as i32,
+                content_rev: 2,
+                meta_rev: 9,
+                ..Default::default()
+            })?;
+            tx.set_cursor(&Cursor {
+                history_id: "h1".into(),
+                last_seq: 30,
+                ahead_of_server: false,
+                commit_id: "c30".into(),
+                committed_at_ms: 300,
+            })?;
+            tx.set_link(&link)?;
+            tx.put_question(&StoredQuestion {
+                question_id: "q1".into(),
+                asked_at_ms: 10,
+                body: b"{}".to_vec(),
+                answer: None,
+            })?;
+            tx.put_chunk(&[1; 32], 100, 10)?;
+            tx.set_id_generator(&[1, 2, 3])?;
+            tx.request_restore(&id(103), &from_trash(1))?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+}
+
+fn store_before(path: &Path, migration: &str) {
+    let position = MIGRATIONS.iter().position(|m| m.name == migration).unwrap();
+    if position < LEGACY_STEPS {
+        rewind(path, position);
+        return;
+    }
+    let mut skipped = BTreeSet::from([migration]);
+    for m in MIGRATIONS {
+        if m.requires.iter().any(|r| skipped.contains(r)) {
+            skipped.insert(m.name);
+        }
+    }
+    let kept: Vec<_> = MIGRATIONS
+        .iter()
+        .filter(|m| !skipped.contains(m.name))
+        .collect();
+    rebuild(path, |conn| {
+        for m in &kept {
+            conn.execute_batch(m.sql).unwrap();
+        }
+        conn.execute_batch(
+            "CREATE TABLE migrations (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;",
+        )
+        .unwrap();
+        for m in &kept {
+            conn.execute("INSERT INTO migrations (name) VALUES (?1)", [m.name])
+                .unwrap();
+        }
+        conn.pragma_update(None, "user_version", NAMED).unwrap();
+    });
+}
+
+fn rewind(path: &Path, version: usize) {
+    rebuild(path, |conn| {
+        for m in &MIGRATIONS[..version] {
+            conn.execute_batch(m.sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", version as u32)
+            .unwrap();
+    });
+}
+
+fn rebuild(path: &Path, migrate: impl FnOnce(&Connection)) {
+    let rebuilt = path.with_extension("rebuilt");
+    let conn = Connection::open(&rebuilt).unwrap();
+    conn.pragma_update(None, "foreign_keys", false).unwrap();
+    conn.pragma_update(None, "synchronous", "OFF").unwrap();
+    migrate(&conn);
+    conn.execute("ATTACH ?1 AS original", [path.to_str().unwrap()])
+        .unwrap();
+    for table in tables(&conn) {
+        let original = columns(&conn, "original", &table);
+        let shared: Vec<String> = columns(&conn, "main", &table)
+            .into_iter()
+            .filter(|column| original.contains(column))
+            .map(|column| format!("\"{column}\""))
+            .collect();
+        if shared.is_empty() {
+            continue;
+        }
+        let shared = shared.join(", ");
+        conn.execute_batch(&format!(
+            "INSERT INTO main.\"{table}\" ({shared}) SELECT {shared} FROM original.\"{table}\""
+        ))
+        .unwrap();
+    }
+    conn.execute_batch("DETACH original").unwrap();
+    drop(conn);
+    for suffix in ["", "-wal", "-shm"] {
+        let mut file = path.as_os_str().to_owned();
+        file.push(suffix);
+        let _ = std::fs::remove_file(file);
+    }
+    std::fs::rename(rebuilt, path).unwrap();
+}
+
+fn tables(conn: &Connection) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT name FROM main.sqlite_schema
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'migrations' ORDER BY name",
+        )
+        .unwrap();
+    stmt.query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+fn columns(conn: &Connection, schema: &str, table: &str) -> Vec<String> {
+    let mut stmt = conn
+        .prepare("SELECT name FROM pragma_table_info(?1, ?2) ORDER BY name")
+        .unwrap();
+    stmt.query_map([table, schema], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+fn table_rows(conn: &Connection, table: &str, columns: &[String]) -> Vec<String> {
+    let list: Vec<String> = columns.iter().map(|c| format!("\"{c}\"")).collect();
+    let mut stmt = conn
+        .prepare(&format!("SELECT {} FROM \"{table}\"", list.join(", ")))
+        .unwrap();
+    let mut rows: Vec<String> = stmt
+        .query_map([], |row| {
+            (0..columns.len())
+                .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|values| format!("{values:?}"))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    rows.sort();
+    rows
+}
+
+fn every_row(path: &Path) -> BTreeMap<String, (Vec<String>, Vec<String>)> {
+    let conn = Connection::open(path).unwrap();
+    tables(&conn)
+        .into_iter()
+        .map(|table| {
+            let columns = columns(&conn, "main", &table);
+            let rows = table_rows(&conn, &table, &columns);
+            (table, (columns, rows))
+        })
+        .collect()
+}
+
+fn schema(path: &Path) -> BTreeMap<String, Vec<String>> {
+    let conn = Connection::open(path).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT type || ' ' || name, sql FROM sqlite_schema
+             WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'",
+        )
+        .unwrap();
+    stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })
+    .unwrap()
+    .map(|row| {
+        let (object, sql) = row.unwrap();
+        (object, definitions(&sql))
+    })
+    .collect()
+}
+
+fn definitions(sql: &str) -> Vec<String> {
+    let collapse = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let (Some(open), Some(close)) = (sql.find('('), sql.rfind(')')) else {
+        return vec![collapse(sql)];
+    };
+    let mut parts = vec![];
+    let (mut depth, mut start) = (0, open + 1);
+    for (at, c) in sql
+        .char_indices()
+        .filter(|(at, _)| *at > open && *at < close)
+    {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(collapse(&sql[start..at]));
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(collapse(&sql[start..close]));
+    parts.sort();
+    parts.insert(0, collapse(&sql[..open]));
+    parts.push(collapse(&sql[close + 1..]));
+    parts
 }
 
 #[test]
@@ -1038,33 +1623,10 @@ fn a_cursor_stored_before_it_could_record_a_server_behind_it_records_none() {
         .unwrap()
         .transaction(|tx| tx.set_cursor(&cursor))
         .unwrap();
-    let conn = Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "DROP TABLE recorded_nodes; DROP TABLE open_question_shapes;
-         DROP TABLE discarded_nodes; DROP TABLE open_question_members;
-         DROP TABLE open_question_items;
-         DROP TABLE open_questions; DROP TABLE guard_ledger;
-         DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
-         DROP TABLE edited_here; DROP TABLE trashed_here; DROP TABLE commit_slots;
-         DROP TABLE watched_contents;
-         DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
-         DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions; DROP TABLE published_nodes; DROP TABLE unsent_edits;
-         ALTER TABLE remote_cursor DROP COLUMN ahead_of_server;",
-    )
-    .unwrap();
-    conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
-        .unwrap();
-    drop_cursor_tokens(&conn);
-    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
-    conn.execute_batch("DROP TABLE pending_names;").unwrap();
-    drop_ino_high(&conn);
-    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
-        .unwrap();
-    conn.pragma_update(None, "user_version", 4).unwrap();
-    drop(conn);
+    store_before(&path, "05_ahead_of_server");
 
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(applied(&path), all_migrations());
     let stored = store.transaction(|tx| tx.cursor()).unwrap();
     assert_eq!(
         stored,
@@ -1083,7 +1645,7 @@ fn a_cursor_stored_before_it_could_record_a_server_behind_it_records_none() {
 fn a_store_from_before_contents_were_watched_opens_with_nothing_watched() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
-    let mut before = engine_state();
+    let mut before = legacy_state();
     before.commits.published.clear();
     before.trees.unsent_edits.clear();
     before.commits.pending.clear();
@@ -1091,32 +1653,10 @@ fn a_store_from_before_contents_were_watched_opens_with_nothing_watched() {
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
-    let conn = Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "DROP TABLE recorded_nodes; DROP TABLE open_question_shapes;
-         DROP TABLE discarded_nodes; DROP TABLE open_question_members;
-         DROP TABLE open_question_items;
-         DROP TABLE open_questions; DROP TABLE guard_ledger;
-         DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
-         DROP TABLE edited_here; DROP TABLE trashed_here; DROP TABLE commit_slots;
-         DROP TABLE watched_contents;
-         DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
-         DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions; DROP TABLE published_nodes; DROP TABLE unsent_edits;",
-    )
-    .unwrap();
-    conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
-        .unwrap();
-    drop_cursor_tokens(&conn);
-    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
-    conn.execute_batch("DROP TABLE pending_names;").unwrap();
-    drop_ino_high(&conn);
-    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
-        .unwrap();
-    conn.pragma_update(None, "user_version", 5).unwrap();
-    drop(conn);
+    store_before(&path, "06_watched_contents");
 
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(applied(&path), all_migrations());
     before.trees.watched.clear();
     before.trees.trashed_here.clear();
     before.trees.discarded.clear();
@@ -1139,7 +1679,7 @@ fn a_store_from_before_contents_were_watched_opens_with_nothing_watched() {
 fn a_store_from_before_edits_were_recorded_opens_with_none_recorded() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
-    let mut before = engine_state();
+    let mut before = legacy_state();
     before.commits.published.clear();
     before.trees.unsent_edits.clear();
     before.commits.pending.clear();
@@ -1151,27 +1691,10 @@ fn a_store_from_before_edits_were_recorded_opens_with_none_recorded() {
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
-    let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
-        .unwrap();
-    conn.execute_batch(
-        "DROP TABLE edited_here; DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
-         DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions; DROP TABLE published_nodes; DROP TABLE unsent_edits;",
-    )
-    .unwrap();
-    conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
-        .unwrap();
-    drop_cursor_tokens(&conn);
-    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
-    conn.execute_batch("DROP TABLE pending_names;").unwrap();
-    drop_ino_high(&conn);
-    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
-        .unwrap();
-    conn.pragma_update(None, "user_version", 10).unwrap();
-    drop(conn);
+    store_before(&path, "11_edited_here");
 
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(applied(&path), all_migrations());
     before.trees.edited_here.clear();
     before.trees.replaced_versions.clear();
     before.trees.resends.clear();
@@ -1186,7 +1709,7 @@ fn a_store_from_before_edits_were_recorded_opens_with_none_recorded() {
 fn a_store_from_before_deletes_were_recorded_opens_with_none_recorded() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
-    let mut before = engine_state();
+    let mut before = legacy_state();
     before.commits.published.clear();
     before.trees.unsent_edits.clear();
     before.commits.pending.clear();
@@ -1194,31 +1717,10 @@ fn a_store_from_before_deletes_were_recorded_opens_with_none_recorded() {
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
-    let conn = Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "DROP TABLE recorded_nodes; DROP TABLE open_question_shapes;
-         DROP TABLE discarded_nodes; DROP TABLE open_question_members;
-         DROP TABLE open_question_items;
-         DROP TABLE open_questions; DROP TABLE guard_ledger;
-         DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
-         DROP TABLE edited_here; DROP TABLE trashed_here; DROP TABLE commit_slots;
-         DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
-         DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions; DROP TABLE published_nodes; DROP TABLE unsent_edits;",
-    )
-    .unwrap();
-    conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
-        .unwrap();
-    drop_cursor_tokens(&conn);
-    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
-    conn.execute_batch("DROP TABLE pending_names;").unwrap();
-    drop_ino_high(&conn);
-    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
-        .unwrap();
-    conn.pragma_update(None, "user_version", 6).unwrap();
-    drop(conn);
+    store_before(&path, "07_trashed_here_and_commit_slots");
 
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(applied(&path), all_migrations());
     before.trees.trashed_here.clear();
     before.trees.discarded.clear();
     before.trees.edited_here.clear();
@@ -1240,7 +1742,7 @@ fn a_store_from_before_deletes_were_recorded_opens_with_none_recorded() {
 fn a_store_from_before_the_guard_opens_with_an_empty_guard() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
-    let mut before = engine_state();
+    let mut before = legacy_state();
     before.commits.published.clear();
     before.trees.unsent_edits.clear();
     before.commits.pending.clear();
@@ -1248,31 +1750,10 @@ fn a_store_from_before_the_guard_opens_with_an_empty_guard() {
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
-    let conn = Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "DROP TABLE recorded_nodes; DROP TABLE open_question_shapes;
-         DROP TABLE discarded_nodes; DROP TABLE open_question_members;
-         DROP TABLE open_question_items;
-         DROP TABLE open_questions; DROP TABLE guard_ledger;
-         DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
-         DROP TABLE edited_here;
-         DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
-         DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions; DROP TABLE published_nodes; DROP TABLE unsent_edits;",
-    )
-    .unwrap();
-    conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
-        .unwrap();
-    drop_cursor_tokens(&conn);
-    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
-    conn.execute_batch("DROP TABLE pending_names;").unwrap();
-    drop_ino_high(&conn);
-    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
-        .unwrap();
-    conn.pragma_update(None, "user_version", 7).unwrap();
-    drop(conn);
+    store_before(&path, "08_open_questions_and_guard");
 
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(applied(&path), all_migrations());
     before.trees.discarded.clear();
     before.trees.outside.clear();
     before.trees.lost.clear();
@@ -1292,7 +1773,7 @@ fn a_store_from_before_the_guard_opens_with_an_empty_guard() {
 fn a_store_from_before_questions_showed_local_shapes_keeps_its_questions() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
-    let mut before = engine_state();
+    let mut before = legacy_state();
     before.commits.published.clear();
     before.trees.unsent_edits.clear();
     before.commits.pending.clear();
@@ -1315,27 +1796,10 @@ fn a_store_from_before_questions_showed_local_shapes_keeps_its_questions() {
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
-    let conn = Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "DROP TABLE recorded_nodes; DROP TABLE open_question_shapes;
-         DROP TABLE discarded_nodes; DROP TABLE edited_here;
-         DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
-         DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions; DROP TABLE published_nodes; DROP TABLE unsent_edits;",
-    )
-    .unwrap();
-    conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
-        .unwrap();
-    drop_cursor_tokens(&conn);
-    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
-    conn.execute_batch("DROP TABLE pending_names;").unwrap();
-    drop_ino_high(&conn);
-    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
-        .unwrap();
-    conn.pragma_update(None, "user_version", 8).unwrap();
-    drop(conn);
+    store_before(&path, "09_open_question_shapes_and_discarded_nodes");
 
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(applied(&path), all_migrations());
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
 }
 
@@ -1345,7 +1809,7 @@ fn a_store_from_before_questions_showed_local_shapes_keeps_its_questions() {
 fn a_store_from_before_nodes_in_ignored_folders_were_stored_opens_with_none_recorded() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
-    let mut before = engine_state();
+    let mut before = legacy_state();
     before.commits.published.clear();
     before.trees.unsent_edits.clear();
     before.commits.pending.clear();
@@ -1357,26 +1821,10 @@ fn a_store_from_before_nodes_in_ignored_folders_were_stored_opens_with_none_reco
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
-    let conn = Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "DROP TABLE recorded_nodes; DROP TABLE edited_here;
-         DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
-         DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions; DROP TABLE published_nodes; DROP TABLE unsent_edits;",
-    )
-    .unwrap();
-    conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
-        .unwrap();
-    drop_cursor_tokens(&conn);
-    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
-    conn.execute_batch("DROP TABLE pending_names;").unwrap();
-    drop_ino_high(&conn);
-    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
-        .unwrap();
-    conn.pragma_update(None, "user_version", 9).unwrap();
-    drop(conn);
+    store_before(&path, "10_recorded_nodes");
 
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(applied(&path), all_migrations());
     let after = before.clone();
     before.trees.outside.clear();
     before.trees.lost.clear();
@@ -1401,7 +1849,7 @@ fn a_store_from_before_nodes_in_ignored_folders_were_stored_opens_with_none_reco
 fn a_store_from_before_remote_removals_were_counted_opens_with_none_counted() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
-    let mut before = engine_state();
+    let mut before = legacy_state();
     before.trees.replaced_versions.clear();
     before.trees.resends.clear();
     before.commits.published.clear();
@@ -1412,24 +1860,10 @@ fn a_store_from_before_remote_removals_were_counted_opens_with_none_counted() {
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
-    let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
-        .unwrap();
-    conn.execute_batch("DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed; DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions; DROP TABLE published_nodes; DROP TABLE unsent_edits;")
-        .unwrap();
-    conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
-        .unwrap();
-    drop_cursor_tokens(&conn);
-    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
-    conn.execute_batch("DROP TABLE pending_names;").unwrap();
-    drop_ino_high(&conn);
-    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
-        .unwrap();
-    conn.pragma_update(None, "user_version", 11).unwrap();
-    drop(conn);
+    store_before(&path, "12_guard_remote");
 
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(applied(&path), all_migrations());
     before.trees.watched_positions.clear();
     before.commits.guard.remote.clear();
     before.commits.guard.dismissed.clear();
@@ -1444,33 +1878,17 @@ fn a_store_from_before_remote_removals_were_counted_opens_with_none_counted() {
 fn a_store_from_before_positions_were_watched_opens_with_none_watched() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
-    let mut before = engine_state();
+    let mut before = legacy_state();
     before.trees.replaced_versions.clear();
     before.trees.resends.clear();
     Store::open(&path)
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
-    let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
-        .unwrap();
-    conn.execute_batch(
-        "DROP TABLE watched_positions; DROP TABLE published_nodes; DROP TABLE unsent_edits;",
-    )
-    .unwrap();
-    conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
-        .unwrap();
-    drop_cursor_tokens(&conn);
-    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
-    conn.execute_batch("DROP TABLE pending_names;").unwrap();
-    drop_ino_high(&conn);
-    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
-        .unwrap();
-    conn.pragma_update(None, "user_version", 12).unwrap();
-    drop(conn);
+    store_before(&path, "13_watched_positions");
 
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(applied(&path), all_migrations());
     before.trees.watched_positions.clear();
     before.commits.published.clear();
     before.trees.unsent_edits.clear();
@@ -1510,7 +1928,7 @@ fn waiting_updates_keep_their_origin() {
 fn a_store_from_before_waiting_updates_kept_their_origin_takes_the_accepted_slot() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
-    let mut before = engine_state();
+    let mut before = legacy_state();
     before.trees.replaced_versions.clear();
     before.trees.resends.clear();
     before.trees.waiting = BTreeMap::from([
@@ -1538,57 +1956,15 @@ fn a_store_from_before_waiting_updates_kept_their_origin_takes_the_accepted_slot
             tx.set_engine_state(&before)
         })
         .unwrap();
-    let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
-        .unwrap();
-    conn.execute_batch(
-        "ALTER TABLE waiting_updates DROP COLUMN slot;
-         ALTER TABLE watched_positions DROP COLUMN parent_id;
-         ALTER TABLE watched_positions DROP COLUMN name;
-         DROP TABLE published_nodes; DROP TABLE unsent_edits;",
-    )
-    .unwrap();
-    drop_cursor_tokens(&conn);
-    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
-    conn.execute_batch("DROP TABLE pending_names;").unwrap();
-    drop_ino_high(&conn);
-    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
-        .unwrap();
-    conn.pragma_update(None, "user_version", 13).unwrap();
-    drop(conn);
+    store_before(&path, "14_waiting_update_slots");
 
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(applied(&path), all_migrations());
     before.commits.published.clear();
     before.trees.unsent_edits.clear();
     before.commits.pending.clear();
     before.trees.lost.clear();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
-}
-
-fn drop_ino_high(conn: &Connection) {
-    conn.execute_batch("ALTER TABLE local_nodes DROP COLUMN ino_high;")
-        .unwrap();
-    let recorded: bool = conn
-        .query_row(
-            "SELECT count(*) FROM sqlite_schema WHERE name = 'recorded_nodes'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    if recorded {
-        conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN ino_high;")
-            .unwrap();
-    }
-}
-
-/// Takes the cursor back to the schema before commit tokens (RFC 0013).
-fn drop_cursor_tokens(conn: &Connection) {
-    conn.execute_batch(
-        "ALTER TABLE remote_cursor DROP COLUMN commit_id;
-         ALTER TABLE remote_cursor DROP COLUMN committed_at_ms;",
-    )
-    .unwrap();
 }
 
 /// A database of the schema before commit tokens keeps its cursor, with no token at its seq, so its next Resume
@@ -1608,21 +1984,10 @@ fn a_cursor_stored_before_commit_tokens_opens_with_none() {
         .unwrap()
         .transaction(|tx| tx.set_cursor(&cursor))
         .unwrap();
-    let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
-        .unwrap();
-    drop_cursor_tokens(&conn);
-    conn.execute_batch(
-        "DROP TABLE published_nodes; DROP TABLE taken_answers; DROP TABLE unsent_edits; DROP TABLE replaced_versions; DROP TABLE resends;",
-    )
-    .unwrap();
-    conn.execute_batch("DROP TABLE pending_names;").unwrap();
-    drop_ino_high(&conn);
-    conn.pragma_update(None, "user_version", 15).unwrap();
-    drop(conn);
+    store_before(&path, "16_commit_tokens");
 
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(applied(&path), all_migrations());
     assert_eq!(
         store.transaction(|tx| tx.cursor()).unwrap(),
         Some(Cursor {
@@ -1640,7 +2005,7 @@ fn a_cursor_stored_before_commit_tokens_opens_with_none() {
 fn a_store_from_before_watched_positions_were_kept_takes_them_from_s() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
-    let mut before = engine_state();
+    let mut before = legacy_state();
     before.trees.replaced_versions.clear();
     before.trees.resends.clear();
     before.trees.watched_positions.insert(
@@ -1662,26 +2027,10 @@ fn a_store_from_before_watched_positions_were_kept_takes_them_from_s() {
         })
         .unwrap();
     drop(store);
-    let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
-        .unwrap();
-    conn.execute_batch(
-        "ALTER TABLE watched_positions DROP COLUMN parent_id;
-         ALTER TABLE watched_positions DROP COLUMN name;
-         DROP TABLE published_nodes; DROP TABLE unsent_edits;",
-    )
-    .unwrap();
-    drop_cursor_tokens(&conn);
-    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
-    conn.execute_batch("DROP TABLE pending_names;").unwrap();
-    drop_ino_high(&conn);
-    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
-        .unwrap();
-    conn.pragma_update(None, "user_version", 14).unwrap();
-    drop(conn);
+    store_before(&path, "15_watched_position_shapes");
 
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(applied(&path), all_migrations());
     before.trees.watched_positions.insert("lost".into(), None);
     before.commits.published.clear();
     before.trees.unsent_edits.clear();
@@ -1694,21 +2043,15 @@ fn a_store_from_before_watched_positions_were_kept_takes_them_from_s() {
 fn a_store_from_before_lost_folders_were_marked_opens_with_none_marked() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
-    let mut before = engine_state();
+    let mut before = legacy_state();
     Store::open(&path)
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
-    let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
-        .unwrap();
-    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
-        .unwrap();
-    conn.pragma_update(None, "user_version", 21).unwrap();
-    drop(conn);
+    store_before(&path, "22_recorded_nodes_lost");
 
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(applied(&path), all_migrations());
     let after = before.clone();
     before.trees.lost.clear();
     before.trees.replaced_versions.clear();
@@ -1729,27 +2072,17 @@ fn a_store_from_before_lost_folders_were_marked_opens_with_none_marked() {
 fn a_store_from_before_published_entries_were_recorded_opens_with_none_recorded() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
-    let mut before = engine_state();
+    let mut before = legacy_state();
     before.trees.replaced_versions.clear();
     before.trees.resends.clear();
     Store::open(&path)
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
-    let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
-        .unwrap();
-    conn.execute_batch(
-        "DROP TABLE published_nodes; DROP TABLE taken_answers; DROP TABLE unsent_edits; DROP TABLE replaced_versions; DROP TABLE resends;",
-    )
-    .unwrap();
-    conn.execute_batch("DROP TABLE pending_names;").unwrap();
-    drop_ino_high(&conn);
-    conn.pragma_update(None, "user_version", 16).unwrap();
-    drop(conn);
+    store_before(&path, "17_published_nodes");
 
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(applied(&path), all_migrations());
     let after = before.clone();
     before.commits.published.clear();
     before.trees.unsent_edits.clear();
@@ -1769,24 +2102,15 @@ fn a_store_from_before_published_entries_were_recorded_opens_with_none_recorded(
 fn a_store_from_before_unsent_edits_were_recorded_opens_with_none_recorded() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
-    let mut before = engine_state();
+    let mut before = legacy_state();
     Store::open(&path)
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
-    let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
-        .unwrap();
-    conn.execute_batch("DROP TABLE unsent_edits;").unwrap();
-    conn.execute_batch("DROP TABLE pending_names;").unwrap();
-    drop_ino_high(&conn);
-    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
-        .unwrap();
-    conn.pragma_update(None, "user_version", 18).unwrap();
-    drop(conn);
+    store_before(&path, "19_unsent_edits");
 
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(applied(&path), all_migrations());
     let after = before.clone();
     before.trees.unsent_edits.clear();
     before.commits.pending.clear();
@@ -1807,7 +2131,7 @@ fn a_store_from_before_unsent_edits_were_recorded_opens_with_none_recorded() {
 fn a_store_from_before_inodes_took_128_bits_keeps_every_identity() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
-    let mut state = engine_state();
+    let mut state = legacy_state();
     state.commits.pending.clear();
     state.trees.replaced_versions.clear();
     state.trees.resends.clear();
@@ -1832,14 +2156,8 @@ fn a_store_from_before_inodes_took_128_bits_keeps_every_identity() {
             Ok::<_, Error>(())
         })
         .unwrap();
+    store_before(&path, "20_ino_high");
     let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("DROP TABLE pending_names;").unwrap();
-    conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
-        .unwrap();
-    drop_ino_high(&conn);
-    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
-        .unwrap();
-    conn.pragma_update(None, "user_version", 19).unwrap();
     let stored: i64 = conn
         .query_row(
             "SELECT ino FROM local_nodes WHERE node_id = 'a'",
@@ -1851,7 +2169,7 @@ fn a_store_from_before_inodes_took_128_bits_keeps_every_identity() {
     drop(conn);
 
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(applied(&path), all_migrations());
     store
         .transaction(|tx| {
             assert_eq!(tx.local_nodes()?, local);
@@ -1927,22 +2245,15 @@ fn an_inode_wider_than_64_bits_survives_a_reopen() {
 fn a_store_from_before_pending_names_were_recorded_opens_with_none_recorded() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
-    let mut before = engine_state();
+    let mut before = legacy_state();
     Store::open(&path)
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
-    let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
-        .unwrap();
-    conn.execute_batch("DROP TABLE pending_names;").unwrap();
-    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
-        .unwrap();
-    conn.pragma_update(None, "user_version", 20).unwrap();
-    drop(conn);
+    store_before(&path, "21_pending_names");
 
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(applied(&path), all_migrations());
     let after = before.clone();
     before.commits.pending.clear();
     before.trees.lost.clear();
@@ -1962,19 +2273,15 @@ fn a_store_from_before_pending_names_were_recorded_opens_with_none_recorded() {
 fn a_store_from_before_replaced_versions_were_recorded_opens_with_none_recorded() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
-    let mut before = engine_state();
+    let mut before = legacy_state();
     Store::open(&path)
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
-    let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
-        .unwrap();
-    conn.pragma_update(None, "user_version", 22).unwrap();
-    drop(conn);
+    store_before(&path, "23_replaced_versions");
 
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(applied(&path), all_migrations());
     let after = before.clone();
     before.trees.replaced_versions.clear();
     before.trees.resends.clear();
@@ -1995,7 +2302,7 @@ fn a_store_from_before_replaced_versions_were_recorded_opens_with_none_recorded(
 fn a_version_3_store_opens_with_empty_restore_tables() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
-    let mut before = engine_state();
+    let mut before = legacy_state();
     before.commits.published.clear();
     before.trees.unsent_edits.clear();
     before.commits.pending.clear();
@@ -2019,41 +2326,17 @@ fn a_version_3_store_opens_with_empty_restore_tables() {
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
-    let conn = Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "DROP TABLE restore_requests; DROP TABLE restore_intents;
-         DROP TABLE recorded_nodes; DROP TABLE open_question_shapes;
-         DROP TABLE discarded_nodes; DROP TABLE open_question_members;
-         DROP TABLE open_question_items;
-         DROP TABLE open_questions; DROP TABLE guard_ledger;
-         DROP TABLE guard_confirmed_members; DROP TABLE guard_confirmed;
-         DROP TABLE watched_contents; DROP TABLE edited_here; DROP TABLE trashed_here;
-         DROP TABLE commit_slots;
-         DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
-         DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions; DROP TABLE published_nodes; DROP TABLE unsent_edits;
-         ALTER TABLE remote_cursor DROP COLUMN ahead_of_server;",
-    )
-    .unwrap();
-    conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
-        .unwrap();
-    drop_cursor_tokens(&conn);
-    conn.execute_batch("DROP TABLE taken_answers;").unwrap();
-    conn.execute_batch("DROP TABLE pending_names;").unwrap();
-    drop_ino_high(&conn);
-    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
-        .unwrap();
-    conn.pragma_update(None, "user_version", 3).unwrap();
-    drop(conn);
+    store_before(&path, "04_restores");
 
     let mut store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(applied(&path), all_migrations());
     store
         .transaction(|tx| {
             assert_eq!(tx.engine_state()?, before);
             assert_eq!(tx.restore_requests()?, vec![]);
             tx.request_restore(&id(100), &from_trash(1))?;
-            tx.set_engine_state(&engine_state())?;
-            assert_eq!(tx.engine_state()?, engine_state());
+            tx.set_engine_state(&legacy_state())?;
+            assert_eq!(tx.engine_state()?, legacy_state());
             Ok::<_, Error>(())
         })
         .unwrap();
@@ -2127,10 +2410,7 @@ fn failed_transaction_rolls_back() {
             ahead_of_server: false,
             ..Default::default()
         })?;
-        Err(Error::SchemaTooNew {
-            found: 0,
-            supported: 0,
-        })
+        Err(Error::InvalidEngineState("rolled back".into()))
     });
     assert!(result.is_err());
 

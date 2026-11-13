@@ -1,0 +1,2 @@
+
+    ALTER TABLE recorded_nodes ADD COLUMN lost INTEGER NOT NULL DEFAULT 0 CHECK (lost IN (0, 1));

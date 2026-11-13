@@ -35,6 +35,28 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 2
+      - name: Keep merged store migrations unchanged
+        if: github.event_name != 'push'
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.merge_group.base_sha }}
+        run: |
+          if [ "$EVENT" = merge_group ]; then
+            git fetch --no-tags --depth=1 origin "$BASE"
+          else
+            BASE=$(git rev-parse HEAD^1)
+          fi
+          if ! changed="$(git diff --name-only --no-renames --diff-filter=DMT "$BASE" HEAD -- core/store/migrations)"; then
+            echo "::error::git diff between $BASE and HEAD failed, so changes to merged store migrations are unknown."
+            exit 1
+          fi
+          if [ -n "$changed" ]; then
+            while read -r file; do
+              echo "::error file=$file::$file is a merged store migration. Stores may have applied it already, so add a new migration instead of changing or removing this one."
+            done <<<"$changed"
+            exit 1
+          fi
+          echo "No merged store migration changed."
       - name: Decide which jobs the change needs
         id: paths
         env:
