@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use koidrive_engine::classify::HALF_WAIT_MS;
 use koidrive_engine::commit::{Base, Failure, Halt as CommitHalt, Reconnect};
 use koidrive_engine::effects::{self, Stuck};
 use koidrive_engine::ignore::LocalRules;
@@ -43,7 +44,7 @@ use tokio::sync::{Notify, mpsc, watch};
 
 use crate::claim::{self, Flock, Identity, Owner};
 use crate::credential::SET_UP_AGAIN;
-use crate::disk::{Batch, Disk, Pending, Sections, Settled, Staged, Stall, Stop, Upload};
+use crate::disk::{Batch, Disk, Pending, Requests, Sections, Settled, Staged, Stall, Stop, Upload};
 use crate::driver::check_placement;
 use crate::engine::{Applied, Engine, Staging};
 use crate::failures::{self, Halted};
@@ -131,6 +132,7 @@ pub(crate) struct Folder {
     /// When the [`Work::RetryAfter`] that is out ends.
     retry_at: Option<Instant>,
     halves_at: Option<u64>,
+    halves_asked: Option<(Requests, u64)>,
     /// Tests stop the task after this many more store transactions, as a crash right after one would.
     #[cfg(test)]
     crash_after: Option<usize>,
@@ -326,6 +328,7 @@ impl Folder {
             asked,
             retry_at: None,
             halves_at: None,
+            halves_asked: None,
             #[cfg(test)]
             crash_after: None,
         })
@@ -475,18 +478,15 @@ impl Folder {
     /// One observation batch, with the number of entries the folder holds after it.
     pub fn observed(&mut self, batch: Batch, entries: u64) -> Result<Vec<Work>, Stop> {
         self.local_entries = Some(entries);
+        let answered = batch.answered;
         self.disk
             .observed(batch, &mut self.engine, &mut self.store)?;
-        let mut work = Vec::new();
-        self.wait_for_halves(&mut work);
-        self.drive(&mut work)?;
-        Ok(work)
-    }
-
-    pub fn halves_ended(&mut self) -> Result<Vec<Work>, Stop> {
-        if let Some(due) = self.halves_at.take() {
+        if let Some((asked, at_ms)) = self.halves_asked
+            && answered >= Some(asked)
+        {
+            self.halves_asked = None;
             self.step(|engine, _| {
-                engine.trees.release_halves(due);
+                engine.trees.release_halves(at_ms);
                 Ok(())
             })?;
         }
@@ -496,9 +496,18 @@ impl Folder {
         Ok(work)
     }
 
+    pub fn halves_ended(&mut self) -> Result<Vec<Work>, Stop> {
+        let Some(due) = self.halves_at.take() else {
+            return Ok(Vec::new());
+        };
+        let asked = self.disk.rescan(&self.engine, self.engine.held_scopes());
+        self.halves_asked = Some((asked, due));
+        Ok(Vec::new())
+    }
+
     fn wait_for_halves(&mut self, work: &mut Vec<Work>) {
         let due = self.engine.trees.halves_due();
-        if due == self.halves_at {
+        if self.halves_asked.is_some() || due == self.halves_at {
             return;
         }
         self.halves_at = due;
@@ -506,7 +515,7 @@ impl Folder {
             let now_ms = (SystemTime::now().duration_since(UNIX_EPOCH))
                 .map_or(0, |since| since.as_millis() as u64);
             work.push(Work::HalvesAfter(Duration::from_millis(
-                due.saturating_sub(now_ms),
+                due.saturating_sub(now_ms).min(HALF_WAIT_MS),
             )));
         }
     }

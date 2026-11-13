@@ -8,7 +8,7 @@
 //! tree. [`Engine::observe`] puts an observation batch into L: each change goes to the node with the entry's
 //! identity, or to the node at the change's path, and a change that leaves a node as L has it changes nothing.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::BuildHasher;
 use std::path::{Component, Path, PathBuf};
 
@@ -615,6 +615,31 @@ impl Engine {
         Some(names.into_iter().rev().collect())
     }
 
+    pub fn held_scopes(&self) -> Vec<PathBuf> {
+        let mut scopes = BTreeSet::new();
+        for id in self.trees.halves().keys() {
+            let mut current = id.clone();
+            let mut scope = PathBuf::new();
+            for _ in 0..=self.trees.remote().len() + self.trees.synced().len() {
+                if let Some(path) = self.path_of(&current) {
+                    scope = path;
+                    break;
+                }
+                let parent = (self.trees.synced().get(&current))
+                    .map(|shape| shape.parent.clone())
+                    .or_else(|| {
+                        (self.trees.remote().get(&current)).map(|node| node.shape.parent.clone())
+                    });
+                match parent {
+                    Some(parent) => current = parent,
+                    None => break,
+                }
+            }
+            scopes.insert(scope);
+        }
+        scopes.into_iter().collect()
+    }
+
     /// Gives the trees the rules files a batch lists, before the changes of that batch. An observer's first batch
     /// follows its scan of the whole tree and lists every rules file, so from the first call on the trees know the
     /// rules, and the engine plans again (design §5.10), except below a folder that could not be read
@@ -715,7 +740,7 @@ impl Engine {
         whole: bool,
     ) -> BTreeSet<NodeId> {
         let mut touched = BTreeSet::new();
-        let mut gone = Gone::new();
+        let mut gone = Gone::default();
         self.take_links(changes, now_ms, &mut touched, &mut gone);
         self.vanishing = (!whole).then_some(now_ms);
         let unscanned = self.unscanned.take();
@@ -921,19 +946,17 @@ impl Engine {
                         .or_else(|| self.trees.displaced_with_identity(&identity).filter(takes))
                         .cloned()
                         .or_else(|| {
-                            (gone.get(path))
+                            (gone.at.get(path))
                                 .filter(|(node, held)| {
                                     *held == identity && self.trees.local().get(node).is_none()
                                 })
                                 .map(|(node, _)| node.clone())
                         })
                         .or_else(|| {
-                            (gone.values())
+                            (gone.by_identity.get(&identity).into_iter().flatten())
                                 .filter(|_| !linked)
-                                .find(|(node, held)| {
-                                    *held == identity && self.trees.local().get(node).is_none()
-                                })
-                                .map(|(node, _)| node.clone())
+                                .find(|node| self.trees.local().get(node).is_none())
+                                .cloned()
                         });
                     let link = node.is_none()
                         && *linked
@@ -995,8 +1018,9 @@ impl Engine {
             }
         }
         self.vanishing = None;
-        self.trees
-            .release_halves(if whole { u64::MAX } else { now_ms });
+        if whole {
+            self.trees.release_halves(u64::MAX);
+        }
         touched
     }
 
@@ -1280,7 +1304,7 @@ impl Engine {
         }
         for id in &doomed {
             if let (Some(path), Some(node)) = (self.path_of(id), self.trees.local().get(id)) {
-                gone.insert(path, (id.clone(), node.identity));
+                gone.insert(path, id.clone(), node.identity);
             }
         }
         for id in doomed {
@@ -1299,7 +1323,18 @@ impl Engine {
 }
 
 /// The nodes a batch took out of L, by the path each had, with the identity it had.
-type Gone = BTreeMap<PathBuf, (NodeId, FileIdentity)>;
+#[derive(Default)]
+struct Gone {
+    at: BTreeMap<PathBuf, (NodeId, FileIdentity)>,
+    by_identity: HashMap<FileIdentity, Vec<NodeId>>,
+}
+
+impl Gone {
+    fn insert(&mut self, path: PathBuf, id: NodeId, identity: FileIdentity) {
+        (self.by_identity.entry(identity).or_default()).push(id.clone());
+        self.at.insert(path, (id, identity));
+    }
+}
 
 /// The path of a node `tree` holds live, relative to the linked folder.
 fn path<N: Node>(tree: &Tree<N>, id: &str) -> String {

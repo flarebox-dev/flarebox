@@ -350,6 +350,14 @@ impl Device {
         self.work.remove(at);
         let step = self.folder.halves_ended();
         self.take(step).unwrap();
+        self.answer_halves();
+    }
+
+    fn answer_halves(&mut self) {
+        eventually("the observer answers the end of a wait for halves", || {
+            self.scan(Duration::from_millis(100));
+            self.folder.halves_asked.is_none()
+        });
     }
 
     /// Observes until `done`.
@@ -470,7 +478,12 @@ impl Device {
             }
             Work::ResendAfter(_) => self.folder.resend(),
             Work::RetryAfter(_) => self.folder.retry(),
-            Work::HalvesAfter(_) => self.folder.halves_ended(),
+            Work::HalvesAfter(_) => {
+                let step = self.folder.halves_ended();
+                self.take(step)?;
+                self.answer_halves();
+                Ok(Vec::new())
+            }
         };
         self.take(step)
     }

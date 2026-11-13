@@ -715,11 +715,49 @@ fn a_file_deleted_in_a_scan_of_part_of_the_tree_leaves_the_server_once_the_wait_
             a.scan_until(|a| a.folder.scanned);
             assert_eq!(a.run(&mut remote), ["subscribe", "send"]);
         } else {
-            assert_eq!(a.run(&mut remote), ["wait for halves", "send"]);
+            a.work.clear();
+            let step = a.folder.halves_ended();
+            a.take(step).unwrap();
+            assert!(a.folder.engine.trees.halves_due().is_some());
+            assert_eq!(remote.names(), ["notes.txt"]);
+            a.answer_halves();
+            assert_eq!(a.run(&mut remote), ["send"]);
         }
         assert!(remote.names().is_empty(), "restart: {restart}");
         a.settle();
         assert!(a.run(&mut remote).is_empty());
         assert_eq!(a.state(), FolderState::UpToDate);
     }
+}
+
+#[test]
+fn a_file_moved_out_and_back_in_after_the_wait_for_its_move_ended_keeps_its_node() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("notes.txt"), b"written on a");
+    fs::create_dir(site.root.join("e")).unwrap();
+    a.settle();
+    a.run(&mut remote);
+    let node = node_named(&a, "notes.txt");
+    let outside = site.root.with_extension("outside");
+    fs::rename(site.root.join("notes.txt"), &outside).unwrap();
+    eventually("the scan finds the file gone", || {
+        a.scan(Duration::from_millis(100));
+        a.folder.engine.trees.halves_due().is_some()
+    });
+    a.work.clear();
+    let step = a.folder.halves_ended();
+    a.take(step).unwrap();
+
+    fs::rename(&outside, site.root.join("e/notes.txt")).unwrap();
+    a.answer_halves();
+    a.settle();
+    a.run(&mut remote);
+    assert!(a.folder.engine.trees.halves_due().is_none());
+    assert_eq!(node_named(&a, "notes.txt"), node);
+    assert_eq!(remote.names(), ["e", "notes.txt"]);
+    assert_eq!(
+        remote.space.node(&node).map(|state| state.parent_id),
+        Some(node_named(&a, "e"))
+    );
 }

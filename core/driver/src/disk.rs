@@ -644,7 +644,7 @@ impl Disk {
                 }
             }
         }
-        let whole = observation.whole;
+        let whole = observation.whole && !stale.contains(&true);
         let dropped: BTreeSet<PathBuf> = (observation.changes.iter().zip(&stale))
             .filter(|(_, stale)| **stale)
             .flat_map(|(change, _)| paths(change).map(Path::to_path_buf))
@@ -695,8 +695,8 @@ impl Disk {
     }
 
     /// Asks the observer to reset `paths` to L and scan them again.
-    pub fn rescan(&self, engine: &Engine, paths: Vec<PathBuf>) {
-        self.sections.request(engine.resets(paths));
+    pub fn rescan(&self, engine: &Engine, paths: Vec<PathBuf>) -> Requests {
+        self.sections.request(engine.resets(paths))
     }
 
     /// The chunks `commit` adds, with where the bytes of each are: for every content the commit creates or
