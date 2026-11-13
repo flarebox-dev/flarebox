@@ -216,7 +216,7 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "after a server loss, the author of an owed rename sends it again without from and brings back what another device deleted (GUN-615)"]
+    #[ignore = "after a server restore, a device sends its lost creates again under a folder another device deleted (GUN-700)"]
     fn devices_lose_no_write_around_an_owed_rename_across_server_restores(devices in 2..=3usize, phases in owing_a_rename(Losses::Restores)) {
         keep(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
@@ -4968,7 +4968,6 @@ fn a_folder_deleted_after_a_restore_stays_deleted_on_a_device_that_heard_its_owe
 }
 
 #[test]
-#[ignore = "after a server loss, the author of an owed rename sends it again without from and brings back what another device deleted (GUN-615)"]
 fn a_folder_deleted_before_a_restore_stays_deleted_when_its_owed_rename_is_sent_again() {
     let create = |parent| {
         Step::User(Action {
