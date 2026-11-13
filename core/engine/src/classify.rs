@@ -1407,10 +1407,10 @@ impl Trees {
             .collect()
     }
 
-    /// The nodes whose content L and S hold as R holds it live, a folder's as any folder's, where no
-    /// commit of this device that the server lost set R's content and L holds no unsent edit
-    /// ([`Trees::unsent_edits`]): `lost_here` tells whether a seq is one of those commits. For
-    /// [`Trees::forget_lost`] once a bootstrap has replaced R.
+    /// The nodes whose content L and S hold as R holds it, live or in the trash, a folder's as any
+    /// folder's, where no commit of this device that the server lost set R's content and L holds no
+    /// unsent edit ([`Trees::unsent_edits`]): `lost_here` tells whether a seq is one of those
+    /// commits. For [`Trees::forget_lost`] once a bootstrap has replaced R.
     pub fn taken_from_others(&self, lost_here: impl Fn(u64) -> bool) -> Vec<NodeId> {
         (self.s.iter())
             .filter(|(id, _)| !self.unsent_edits.contains(*id))
@@ -1422,7 +1422,6 @@ impl Trees {
                     })
                 };
                 let remote = (self.r.get(id))
-                    .filter(|remote| !remote.trashed)
                     .filter(|remote| !lost_here(remote.content_rev.max(remote.edit_rev)));
                 holds(remote.map(|remote| &remote.shape)) && holds(self.l.live(id))
             })
