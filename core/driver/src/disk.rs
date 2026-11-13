@@ -55,6 +55,7 @@ use koidrive_fs::{
     Outcome, Reason, Reclaimed, RootProblem, Space, Step,
 };
 use koidrive_net::{CallError, ChunkError, Session, StopReason, Transfer};
+use koidrive_proto::v1::error::Code;
 use koidrive_proto::v1::{ChunkRef, Commit, VersionInfo, op};
 use koidrive_store::{Link, Store, Tx};
 use prost::Message;
@@ -923,12 +924,14 @@ impl Pending {
             if let Some(error) = local {
                 return Err(halt(error));
             }
-            let hash = corrupt
-                .clone()
-                .or_else(|| chunk_hash(&error).map(<[u8]>::to_vec));
+            let named = match &corrupt {
+                Some(hash) => Some(vec![hash.clone()]),
+                None => chunk_hashes(&error),
+            };
             let holds = |write: usize| {
-                hash.as_ref()
-                    .is_none_or(|hash| writes[write].2.offsets.contains_key(hash))
+                named.as_ref().is_none_or(|hashes| {
+                    (hashes.iter()).any(|hash| writes[write].2.offsets.contains_key(hash))
+                })
             };
             let failing: Vec<usize> = (0..writes.len())
                 .filter(|write| open(&unfetchable, &missing, *write) && holds(*write))
@@ -976,15 +979,20 @@ fn key(chunk: &ChunkRef) -> ChunkKey {
     (chunk.hash.clone(), chunk.size)
 }
 
-fn chunk_hash(error: &ChunkError) -> Option<&[u8]> {
+fn chunk_hashes(error: &ChunkError) -> Option<Vec<Vec<u8>>> {
     match error {
+        ChunkError::Call(CallError::Server(refusal))
+            if refusal.code() == Code::MissingChunks && !refusal.0.missing_chunks.is_empty() =>
+        {
+            Some(refusal.0.missing_chunks.clone())
+        }
         ChunkError::Call(_) => None,
         ChunkError::SourceChanged { hash }
         | ChunkError::Corrupt { hash }
         | ChunkError::Refused { hash, .. }
         | ChunkError::Unavailable { hash, .. }
         | ChunkError::NoTarget { hash }
-        | ChunkError::Io { hash, .. } => Some(hash),
+        | ChunkError::Io { hash, .. } => Some(vec![hash.clone()]),
     }
 }
 
@@ -1031,7 +1039,7 @@ fn failed_transfer(effect_id: &str, error: ChunkError, corrupt: bool) -> Result<
             ..
         } => Some(policy::after_refusal(refusal)),
         ChunkError::Call(call)
-            if call.code() == Some(koidrive_proto::v1::error::Code::NotFound) =>
+            if matches!(call.code(), Some(Code::NotFound | Code::MissingChunks)) =>
         {
             None
         }

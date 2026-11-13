@@ -381,6 +381,7 @@ pub(crate) struct Server {
     /// While set, every download is refused with this error.
     pub refusal: Mutex<Option<ServerError>>,
     pub call_error: Mutex<Option<CallError>>,
+    pub missing: BTreeSet<Vec<u8>>,
     /// Runs once, before the first chunk is handed over.
     during: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     calls: Mutex<u32>,
@@ -415,6 +416,20 @@ impl Fetch for Server {
         *self.calls.lock().unwrap() += 1;
         if let Some(error) = self.call_error.lock().unwrap().clone() {
             return Err(ChunkError::Call(error));
+        }
+        let missing: Vec<Vec<u8>> = (chunks.iter())
+            .filter(|chunk| self.missing.contains(&chunk.hash))
+            .map(|chunk| chunk.hash.clone())
+            .collect();
+        if !missing.is_empty() {
+            return Err(ChunkError::Call(CallError::Server(ServerError(
+                koidrive_proto::v1::Error {
+                    code: koidrive_proto::v1::error::Code::MissingChunks as i32,
+                    message: "some chunks are not stored".into(),
+                    missing_chunks: missing,
+                    retry_after_ms: 0,
+                },
+            ))));
         }
         if let Some(error) = self.refusal.lock().unwrap().clone() {
             return Err(ChunkError::Refused {
@@ -2944,4 +2959,47 @@ fn files_that_share_a_chunk_are_staged_within_a_small_descriptor_limit() {
             *bytes
         );
     }
+}
+
+#[test]
+fn a_chunk_the_server_reports_missing_fails_only_the_writes_of_the_batch_that_list_it() {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    let kept = server.hold(REMOTE, ChunkerConfig::V0);
+    let missing = server.hold(NEWER_NOTES, ChunkerConfig::V0);
+    let other = server.hold(MOVED, ChunkerConfig::V0);
+    server.missing = missing
+        .chunks
+        .iter()
+        .map(|chunk| chunk.hash.clone())
+        .collect();
+    let missing_node = "0190f0a0-0000-7000-8000-0000000000f1";
+    folder.seed(
+        &[
+            remote("0190f0a0-0000-7000-8000-0000000000f0", "a.txt", Some(kept)),
+            remote(missing_node, "b.txt", Some(missing)),
+            remote("0190f0a0-0000-7000-8000-0000000000f2", "c.txt", Some(other)),
+        ],
+        &[],
+        0,
+    );
+    let mut running = folder.start(no_hook()).unwrap();
+
+    let settled = running.step_batch(&server).expect("a batch");
+
+    assert_eq!(settled.len(), 3);
+    for (node, settled) in &settled {
+        match node == missing_node {
+            true => assert!(
+                matches!(settled, Settled::Failed(why) if why.starts_with("its content cannot be downloaded")),
+                "{settled:?}"
+            ),
+            false => assert_eq!(*settled, Settled::Done, "{node}"),
+        }
+    }
+    assert_eq!(fs::read(folder.root.join("a.txt")).unwrap(), REMOTE);
+    assert_eq!(fs::read(folder.root.join("c.txt")).unwrap(), MOVED);
+    assert!(!folder.root.join("b.txt").exists());
+    assert_eq!(names(&folder, STAGING_DIR), Vec::<String>::new());
+    assert!(running.engine.effects.blocked().contains_key(missing_node));
 }
