@@ -55,7 +55,7 @@ brew update && brew upgrade --formula koidrive/tap/koidrive
 koi update
 ```
 
-`koi update` asks GitHub for the newest release and upgrades the `koi` on this computer. For a `koi` from the installer, it runs the installer again for the folder that holds `koi`. The new `koi` then takes over the [background service](#background-sync). When this computer already runs the newest release, it prints `Koidrive 0.1.0-alpha.1 is the newest release.` and changes nothing. Running the install command again also upgrades `koi`, and restarts the background service of every profile that runs one.
+`koi update` follows links to identify the running installation. For Homebrew, it prints `brew upgrade --cask koidrive` for the cask or `brew upgrade koidrive` for the formula, without changing files. For an installer copy, it asks GitHub for the newest release and runs the installer again in the executable's real folder. The new `koi` then takes over the [background service](#background-sync). When the installer copy already runs the newest release, it reports that version and changes nothing. Running the install command again also upgrades `koi`, and restarts the background service of every profile that runs one.
 
 `koi status` shows an `Update:` line when a newer release is out. [Updates](service.md#updates) covers which install `koi update` upgrades, the daily update check and how to turn it off.
 

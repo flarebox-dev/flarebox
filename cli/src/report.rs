@@ -582,10 +582,8 @@ pub enum UpdateState {
     Off,
 }
 
-pub const UPDATE_COMMAND: &str = "koi update";
-
 impl UpdateNoticeData {
-    pub fn of(update: &Update, version: &str) -> Self {
+    pub fn of(update: &Update, version: &str, command: Option<&str>) -> Self {
         let notice = |state| UpdateNoticeData {
             state,
             version: version.to_owned(),
@@ -602,7 +600,7 @@ impl UpdateNoticeData {
             } => UpdateNoticeData {
                 latest: Some(latest.clone()),
                 url: Some(url.clone()),
-                command: Some(UPDATE_COMMAND.to_owned()),
+                command: command.map(str::to_owned),
                 checked_at: Some(utc(*checked_at_ms)),
                 ..notice(UpdateState::Available)
             },
@@ -1285,8 +1283,9 @@ mod tests {
 
     #[test]
     fn the_update_notice_carries_latest_url_and_command_only_while_a_release_is_out() {
-        let json =
-            |update: &Update| serde_json::to_value(UpdateNoticeData::of(update, "0.1.0")).unwrap();
+        let json = |update: &Update| {
+            serde_json::to_value(UpdateNoticeData::of(update, "0.1.0", Some("koi update"))).unwrap()
+        };
         let checked_at_ms = 1_763_006_400_000;
         assert_eq!(
             json(&Update::Available {
