@@ -653,6 +653,8 @@ jobs:
             BASE=$(git rev-parse HEAD^1)
           fi
           python3 scripts/check-new-comments.py "$BASE" HEAD
+      - name: Test the design-document splitter
+        run: python3 scripts/test-split-sync-design.py -v
 
   ci-report:
     name: ci-report

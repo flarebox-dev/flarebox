@@ -41,7 +41,11 @@ def headings(source):
         if marker:
             if fence is None:
                 fence = marker[1]
-            elif marker[1][0] == fence[0] and len(marker[1]) >= len(fence):
+            elif (
+                marker[1][0] == fence[0]
+                and len(marker[1]) >= len(fence)
+                and re.fullmatch(r"[ \t]*(?:\r?\n)?", line[marker.end():])
+            ):
                 fence = None
         elif fence is None and (match := re.match(r"^(#{1,6}) (.+?)\s*$", line)):
             found.append((offset, len(match[1]), match[2]))
