@@ -221,7 +221,7 @@ impl Device {
     pub fn persist(&mut self) -> Result<(), Failure> {
         self.engine.trees.settle();
         let (engine, store) = (&mut self.engine, &self.store);
-        let differences = [
+        let differences: Vec<String> = [
             differences(
                 "trees",
                 &engine.trees.take_changes(),
@@ -238,7 +238,9 @@ impl Device {
                 &EffectsChanges::between(&store.effects.state(), &engine.effects.state()),
             ),
         ]
-        .concat();
+        .into_iter()
+        .flatten()
+        .collect();
         if !differences.is_empty() {
             return Err(Failure::Broken(format!(
                 "the tracked changes differ from the state diff: {}",
@@ -261,9 +263,9 @@ impl Device {
     }
 }
 
-fn differences<T: PartialEq + Debug>(part: &str, tracked: &T, diff: &T) -> Vec<String> {
+fn differences<T: PartialEq + Debug>(part: &str, tracked: &T, diff: &T) -> Option<String> {
     if tracked == diff {
-        return Vec::new();
+        return None;
     }
     let fields = |changes: &T| {
         let mut fields: Vec<(String, String)> = Vec::new();
@@ -275,21 +277,48 @@ fn differences<T: PartialEq + Debug>(part: &str, tracked: &T, diff: &T) -> Vec<S
                 Some((name, value)) => fields.push((name.to_owned(), value.to_owned())),
                 None => {
                     if let Some((_, value)) = fields.last_mut() {
-                        value.push_str(line.trim());
+                        value.push_str(line.trim_start());
                     }
                 }
             }
         }
-        (fields.into_iter())
-            .map(|(name, value)| {
-                let value = (value.replace(",)", ")").replace(",]", "]")).replace(",}", "}");
-                (name, value.trim_end_matches(',').to_owned())
-            })
-            .collect::<Vec<_>>()
+        fields
     };
-    (fields(tracked).into_iter())
+    let fields: Vec<String> = (fields(tracked).into_iter())
         .zip(fields(diff))
         .filter(|(tracked, diff)| tracked != diff)
         .map(|((name, tracked), (_, diff))| format!("{part}.{name}: tracked {tracked} diff {diff}"))
-        .collect()
+        .collect();
+    Some(match fields.is_empty() {
+        true => format!("{part}: tracked {tracked:?} diff {diff:?}"),
+        false => fields.join("; "),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unequal_changes_differ_whatever_their_debug_text() {
+        let shape = |name: &str| Shape {
+            parent: "root".into(),
+            name: name.into(),
+            kind: Kind::Dir,
+            content: None,
+        };
+        let tracked = TreesChanges {
+            discarded: vec![("node".into(), Some(shape("a,)")))],
+            ..TreesChanges::default()
+        };
+        let diff = TreesChanges {
+            discarded: vec![("node".into(), Some(shape("a)")))],
+            ..TreesChanges::default()
+        };
+        let message = differences("trees", &tracked, &diff).expect("unequal changes differ");
+        assert!(message.starts_with("trees.discarded: "), "{message}");
+        assert!(message.contains(r#"name: "a,)""#), "{message}");
+        assert!(message.contains(r#"name: "a)""#), "{message}");
+        assert_eq!(differences("trees", &tracked, &tracked), None);
+    }
 }
