@@ -14,6 +14,7 @@ include!("commit/late_position_acknowledgements.rs");
 include!("commit/lost_changes_and_reverted_nodes.rs");
 include!("commit/lost_download_versions.rs");
 include!("commit/lost_waiting_changes.rs");
+include!("commit/own_records_after_loss.rs");
 include!("commit/parked_edits_and_pending_names.rs");
 include!("commit/refusal_and_reconnect.rs");
 include!("commit/refused_creates.rs");

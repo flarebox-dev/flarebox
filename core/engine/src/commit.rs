@@ -172,7 +172,8 @@ pub struct Commits {
     restores: Marked<BTreeMap<RestoreId, RestoreIntent>>,
     /// The last [`RESOLVED_KEPT`] restores that ended, oldest first.
     resolved: Marked<Vec<Resolved>>,
-    /// The seq of each of this device's last [`SLOTS_KEPT`] acknowledged commits, by slot.
+    /// The seq of each of this device's last [`SLOTS_KEPT`] acknowledged commits, and of the commit
+    /// in flight once R holds its record, by slot.
     slots: TrackedMap<u64, u64>,
     /// The open questions, in the order they were asked.
     questions: Marked<Vec<Question>>,
@@ -331,17 +332,26 @@ impl Commits {
         (self.slots.range(..=*self.accepted).next_back()).map_or(0, |(_, &seq)| seq)
     }
 
-    /// Whether one of this device's last [`SLOTS_KEPT`] acknowledged commits has seq `seq`, a
-    /// commit the server lost included until R is listed again ([`Commits::forget_lost_slots`]).
+    /// Whether one of this device's commits has seq `seq`: one of the last [`SLOTS_KEPT`]
+    /// acknowledged, or one whose record R held while it was in flight ([`Commits::own_record`]). A
+    /// commit the server lost is included until R is listed again ([`Commits::forget_lost_slots`]).
     pub fn made_here(&self, seq: u64) -> bool {
         self.slots.values().any(|&made| made == seq)
     }
 
-    /// Whether the commit of `seq` and `commit_id` is this device's: an acknowledged one, or the
-    /// commit in flight, whose record can arrive before its result.
-    pub fn made_record(&self, seq: u64, commit_id: &str) -> bool {
-        self.made_here(seq)
-            || (self.in_flight.as_ref()).is_some_and(|flight| flight.commit.commit_id == commit_id)
+    /// Whether the record of the commit of `seq` and `commit_id` is this device's: one of an
+    /// acknowledged commit, or one of the commit in flight, which can arrive before its result. The
+    /// record of the commit in flight gives it slot `seq`, so a loss that drops the commit before its
+    /// result still finds the commit made here.
+    pub fn own_record(&mut self, seq: u64, commit_id: &str) -> bool {
+        let Some(slot) = (self.in_flight.as_ref())
+            .filter(|flight| flight.commit.commit_id == commit_id)
+            .map(|flight| flight.commit.device_seq)
+        else {
+            return self.made_here(seq);
+        };
+        self.slots.insert(slot, seq);
+        true
     }
 
     /// Whether the commit in flight is `commit_id` and its last op that sets the content of `id` is
@@ -1080,10 +1090,47 @@ impl Commits {
     ///
     /// S stays a valid tree. When the updates together would break it, because S still lags R
     /// elsewhere, each is made as soon as it fits and the rest wait (see [`Trees::waiting`]).
+    ///
+    /// Once R holds the record of the commit in flight and its result has not arrived
+    /// ([`Commits::own_record`]), what the record shows of the commit is recorded as the result
+    /// would record it: the nodes its deletes trashed and the positions its creates and moves set,
+    /// as its edits are recorded when the record arrives ([`Commits::edits_in_flight`]). A loss
+    /// that drops the commit before its result then sends those changes again as this device's own
+    /// ([`Trees::forget_lost`]).
     pub fn acknowledge(&mut self, trees: &mut Trees, last_seq: u64) -> bool {
+        self.record_served(trees, last_seq);
         let acknowledged = self.acknowledge_flight(trees, last_seq);
         self.retire_pending(trees);
         acknowledged
+    }
+
+    fn record_served(&self, trees: &mut Trees, last_seq: u64) {
+        let Some(flight) = (self.in_flight.as_ref()).filter(|flight| flight.result.is_none())
+        else {
+            return;
+        };
+        let Some(&seq) =
+            (self.slots.get(&flight.commit.device_seq)).filter(|&&seq| seq <= last_seq)
+        else {
+            return;
+        };
+        for op in flight.commit.ops.iter().filter_map(|op| op.op.as_ref()) {
+            match op {
+                op::Op::Delete(delete) => {
+                    let kept = delete.requires.as_ref().map(|kept| kept.node_id.as_str());
+                    trees.record_trashed(&delete.node_id, seq, kept);
+                    for id in (flight.deletes.get(&delete.node_id).into_iter().flatten())
+                        .filter(|id| **id != delete.node_id)
+                    {
+                        trees.record_trashed(id, seq, None);
+                    }
+                }
+                op::Op::CreateDir(_) | op::Op::CreateFile(_) | op::Op::Move(_) => {
+                    trees.record_moved(op_node(op), seq);
+                }
+                op::Op::UpdateContent(_) | op::Op::Restore(_) => {}
+            }
+        }
     }
 
     fn retire_pending(&mut self, trees: &mut Trees) {
@@ -1565,8 +1612,8 @@ impl Commits {
     /// 2.8). With *w* the server's counter, *w* = *a* means the commit in flight was not accepted
     /// and *w* = *a* + 1 that it was and its response was lost; both resend it unchanged, and
     /// the server answers an accepted one with its stored result. *w* < *a* means the server lost
-    /// commits it had accepted, since its counter only grows and the store learns a slot only from
-    /// its result. So does *w* = *a* while the result of the commit in flight is held, since the
+    /// commits it had accepted, since its counter only grows and *a* takes a slot only from a
+    /// result. So does *w* = *a* while the result of the commit in flight is held, since the
     /// server sent that result. Either way *a* takes *w*, and the commit in flight is dropped, its
     /// restores staying queued, so that its changes are planned again once R is listed again. Any other *w*, or a commit
     /// built in another history, starts recovery. A read-only device resends nothing. A device
