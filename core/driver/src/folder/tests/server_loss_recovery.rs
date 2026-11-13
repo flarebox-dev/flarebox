@@ -327,7 +327,14 @@ fn a_server_that_lost_a_commit_of_this_device_gets_it_back_after_others_committe
     assert_eq!(a.state(), FolderState::UpToDate);
 }
 
-fn created_in_a_folder_then_listed_and_lost(result_arrives: bool) -> (Vec<(String, String)>, Vec<String>) {
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Answered {
+    Received,
+    Dropped,
+    ResendRefused(Code),
+}
+
+fn created_in_a_folder_then_listed_and_lost(answered: Answered) -> (Vec<(String, String)>, Vec<String>) {
     let mut remote = Remote::new();
     let (site, mut a) = linked(&mut remote, "a");
     fs::create_dir(site.root.join("docs")).unwrap();
@@ -343,7 +350,7 @@ fn created_in_a_folder_then_listed_and_lost(result_arrives: bool) -> (Vec<(Strin
         panic!("the commit is sent after its upload");
     };
     let result = remote.commit(&a.caller, &commit);
-    if result_arrives {
+    if answered == Answered::Received {
         let step = a.folder.sent(result);
         a.take(step).unwrap();
     }
@@ -353,6 +360,20 @@ fn created_in_a_folder_then_listed_and_lost(result_arrives: bool) -> (Vec<(Strin
     }))
     .unwrap();
     a.run(&mut remote);
+    if let Answered::ResendRefused(code) = answered {
+        let welcome = remote.space.welcome(&a.caller);
+        assert_eq!(welcome.device_seq, a.folder.engine.commits.accepted() + 1);
+        a.event(Event::Connected(welcome)).unwrap();
+        a.run(&mut remote);
+        let refusal = ProtoError {
+            code: code as i32,
+            ..Default::default()
+        };
+        let step = a.folder.sent(Err(CallError::Server(ServerError(refusal))));
+        a.take(step).unwrap();
+        a.work.retain(|work| !matches!(work, Work::ResendAfter(_)));
+        a.run(&mut remote);
+    }
     let (other, mut b) = linked(&mut restored, "b");
     b.settle();
     fs::remove_dir(other.root.join("docs")).unwrap();
@@ -369,9 +390,16 @@ fn created_in_a_folder_then_listed_and_lost(result_arrives: bool) -> (Vec<(Strin
 
 #[test]
 fn a_create_whose_result_never_came_is_sent_again_after_a_listing_whose_pages_held_it() {
-    let received = created_in_a_folder_then_listed_and_lost(true);
+    let received = created_in_a_folder_then_listed_and_lost(Answered::Received);
     assert!(received.0.contains(&("docs/n.txt".into(), "only on a".into())), "{received:?}");
-    assert_eq!(created_in_a_folder_then_listed_and_lost(false), received);
+    for answered in [
+        Answered::Dropped,
+        Answered::ResendRefused(Code::RetryLater),
+        Answered::ResendRefused(Code::Unauthenticated),
+    ] {
+        let lost = created_in_a_folder_then_listed_and_lost(answered);
+        assert_eq!(lost, received, "{answered:?} changed the outcome");
+    }
 }
 
 /// The server's storage is restored from a backup taken before `a` deleted `one.txt` (GUN-359). `a` lists the tree

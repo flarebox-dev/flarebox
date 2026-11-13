@@ -61,7 +61,7 @@ After `LOG_TRUNCATED` or `AHEAD_OF_SERVER`, the engine lists the tree (spec §7.
 
 - The listing is collected into a staging tree while the old R stays in use. It reads every `ListTrash` page after every `ListTree` page, merged by rev like the replay, and ends only at the `CaughtUp` sent after both (RFC 0002 §6). So a node another device trashed counts as trashed, and is never created again under an ID the server holds in its trash.
 - The staging tree replaces R only after the log has been replayed up to the highest `head_seq` of any page and the result is a valid tree. Until then the planner does not run.
-- While the server may hold the commit in flight, because it was sent and no refusal came back, the staging tree also waits for that commit's result. A page can hold the commit's changes without naming the commit, so only the result gives the commit's seq, which the loss rules below need. A device under a halt resends nothing, so its staging tree does not wait.
+- Once the commit in flight was sent, the staging tree also waits for that commit's result, since the server may hold the commit. A refused resend does not end the wait, because an earlier send may have been applied. A page can hold the commit's changes without naming the commit, so only the result gives the commit's seq, which the loss rules below need. A device under a halt resends nothing, so its staging tree does not wait.
 - S and L are kept, and the normal classification decides what moves in which direction, with the loss rules below.
 
 ### Commits the server lost

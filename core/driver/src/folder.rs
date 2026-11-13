@@ -100,6 +100,7 @@ pub(crate) struct Folder {
     disk: Disk,
     stream: Stream,
     flight: Flight,
+    sent_commit: Option<String>,
     /// The observer has scanned the folder once. Nothing is planned before, because L does not describe the disk
     /// until then.
     scanned: bool,
@@ -290,6 +291,8 @@ impl Folder {
             Some(flight) if flight.result.is_none() => Flight::Unknown,
             _ => Flight::Idle,
         };
+        let sent_commit =
+            (engine.commits.in_flight()).map(|flight| flight.commit.commit_id.clone());
         let asked = (engine.commits.questions().iter())
             .map(|question| question.id.clone())
             .collect();
@@ -301,6 +304,7 @@ impl Folder {
             disk,
             stream: Stream::Connecting,
             flight,
+            sent_commit,
             scanned: false,
             offline: false,
             history_id: String::new(),
@@ -640,6 +644,7 @@ impl Folder {
                         receipts,
                         ..flight.commit.clone()
                     };
+                    self.sent_commit = Some(commit.commit_id.clone());
                     self.flight = Flight::Sending(commit.clone());
                     work.push(Work::Send(commit));
                 }
@@ -1263,10 +1268,10 @@ impl Folder {
             return Ok(());
         };
         let commits = &self.engine.commits;
-        let unanswered = (commits.in_flight()).is_some_and(|flight| flight.result.is_none());
-        let server_may_hold_it = matches!(self.flight, Flight::Sending(_) | Flight::Unknown)
-            && commits.halted().is_none();
-        if !staging.ready() || (unanswered && server_may_hold_it) {
+        let sent_unanswered = (commits.in_flight()).is_some_and(|flight| {
+            flight.result.is_none() && self.sent_commit.as_ref() == Some(&flight.commit.commit_id)
+        });
+        if !staging.ready() || (sent_unanswered && commits.halted().is_none()) {
             return Ok(());
         }
         let first_link = self.engine.cursor.is_none();
@@ -1411,6 +1416,7 @@ impl Folder {
             upload.timing_bytes = self.timing.uploading(&commit, Time::now());
         }
         if upload.chunks.is_empty() {
+            self.sent_commit = Some(commit.commit_id.clone());
             self.flight = Flight::Sending(commit.clone());
             work.push(Work::Send(commit));
         } else {
