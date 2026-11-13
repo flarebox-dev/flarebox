@@ -53,6 +53,7 @@ enum Prompt {
     Input {
         question: String,
         secret: bool,
+        default: Option<String>,
     },
     Select {
         question: String,
@@ -387,13 +388,25 @@ impl Terminal {
     }
 
     pub async fn input(&self, question: &str, secret: bool) -> Result<String, PromptFailure> {
-        match self
-            .prompt(Prompt::Input {
-                question: question.into(),
-                secret,
-            })
-            .await?
-        {
+        self.text(Prompt::Input {
+            question: question.into(),
+            secret,
+            default: None,
+        })
+        .await
+    }
+
+    pub async fn input_or(&self, question: &str, default: &str) -> Result<String, PromptFailure> {
+        self.text(Prompt::Input {
+            question: question.into(),
+            secret: false,
+            default: Some(default.into()),
+        })
+        .await
+    }
+
+    async fn text(&self, request: Prompt) -> Result<String, PromptFailure> {
+        match self.prompt(request).await? {
             Answer::Text(text) => Ok(text),
             _ => Err(PromptFailure::Io(
                 "the terminal returned the wrong answer type".into(),
@@ -607,16 +620,27 @@ fn line(question: &str, secret: bool) -> Result<String, PromptFailure> {
 
 fn interact(request: Prompt, rich: bool) -> Result<Answer, PromptFailure> {
     match request {
-        Prompt::Input { question, secret } => {
+        Prompt::Input {
+            question,
+            secret,
+            default,
+        } => {
             let question = crate::printable(&question);
             let text = if rich && secret {
                 cliclack::password(question).interact()?
             } else if rich {
-                cliclack::input(question).interact::<String>()?
+                let mut input = cliclack::input(question);
+                if let Some(default) = &default {
+                    input = input.default_input(default);
+                }
+                input.interact::<String>()?
             } else {
                 line(&format!("{question}: "), secret)?
             };
-            Ok(Answer::Text(text))
+            Ok(Answer::Text(match default {
+                Some(default) if text.trim().is_empty() => default,
+                _ => text,
+            }))
         }
         Prompt::Select { question, items } => {
             if items.is_empty() {

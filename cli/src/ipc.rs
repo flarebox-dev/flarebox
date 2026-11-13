@@ -100,6 +100,17 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
                     Linked::Already(folder) => Response::AlreadyLinked { folder },
                 })
         }
+        Request::LinkApproved {
+            folder,
+            space,
+            approval,
+        } => driver
+            .link_approved(&folder, &space, Some(approval))
+            .await
+            .map(|linked| match linked {
+                Linked::New(folder) => Response::Linked { folder },
+                Linked::Already(folder) => Response::AlreadyLinked { folder },
+            }),
         Request::Unlink { folder } => match driver.unlink(&folder).await {
             Ok(link) => Ok(Response::Unlinked {
                 space_id: link.space_id,

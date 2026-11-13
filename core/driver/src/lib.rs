@@ -36,10 +36,10 @@ mod scripted;
 mod status;
 mod volume;
 
-pub use claim::Flock;
+pub use claim::{Flock, Identity as DirectoryIdentity};
 pub use config::{BackgroundService, Config, ConfigError, LocalTrash, SyncRules};
 pub use credential::{Credential, CredentialError, SET_UP_AGAIN, api_for};
-pub use driver::{Answered, Driver, DriverError, Linked};
+pub use driver::{Answered, Driver, DriverError, LinkApproval, Linked};
 pub use failures::{Failure, failures};
 pub use folder::MAX_FORMAT;
 pub use koidrive_engine::guard::MAX_DELETIONS;

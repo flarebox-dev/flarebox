@@ -11,8 +11,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use koidrive_driver::{
-    Account, Answer, Credential, FolderStatus, Paths, Question, RestoreRequest, RestoreStatus,
-    Status,
+    Account, Answer, Credential, FolderStatus, LinkApproval, Paths, Question, RestoreRequest,
+    RestoreStatus, Status,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -58,6 +58,11 @@ pub enum Request {
     Link {
         folder: PathBuf,
         space: String,
+    },
+    LinkApproved {
+        folder: PathBuf,
+        space: String,
+        approval: LinkApproval,
     },
     Unlink {
         folder: PathBuf,
@@ -464,6 +469,40 @@ mod tests {
     use tokio::net::UnixListener;
 
     use super::*;
+
+    #[test]
+    fn an_approved_link_is_not_a_plain_link_to_an_older_daemon() {
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "request", rename_all = "snake_case")]
+        enum OlderRequest {
+            Link { folder: PathBuf, space: String },
+        }
+        let folder = tempfile::tempdir().unwrap();
+        let plain = Request::Link {
+            folder: folder.path().into(),
+            space: "s1".into(),
+        };
+        let json = serde_json::to_string(&plain).unwrap();
+        let OlderRequest::Link {
+            folder: path,
+            space,
+        } = serde_json::from_str(&json).unwrap();
+        assert_eq!(path, folder.path());
+        assert_eq!(space, "s1");
+        let approved = Request::LinkApproved {
+            folder: folder.path().into(),
+            space,
+            approval: LinkApproval {
+                directory: koidrive_driver::DirectoryIdentity::of(
+                    &folder.path().metadata().unwrap(),
+                ),
+                accept_existing_files: false,
+            },
+        };
+        let json = serde_json::to_string(&approved).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), approved);
+        assert!(serde_json::from_str::<OlderRequest>(&json).is_err());
+    }
 
     #[test]
     fn an_error_from_an_older_daemon_reads_as_unclassified() {

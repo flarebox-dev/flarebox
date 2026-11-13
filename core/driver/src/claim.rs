@@ -99,15 +99,15 @@ pub(crate) fn lock(root: &Path) -> io::Result<Option<Flock>> {
 
 /// What tells one folder from another whatever path reaches it: its device, its inode and, where the file system
 /// reports it, its birth time, which tells a reused inode number apart.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Identity {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Identity {
     dev: u64,
     ino: u64,
     born: Option<SystemTime>,
 }
 
 impl Identity {
-    pub(crate) fn of(meta: &fs::Metadata) -> Self {
+    pub fn of(meta: &fs::Metadata) -> Self {
         Identity {
             dev: meta.dev(),
             ino: meta.ino(),

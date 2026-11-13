@@ -108,6 +108,8 @@ enum Command {
         device: DeviceArgs,
         #[command(flatten)]
         login: setup::LoginArgs,
+        #[command(flatten)]
+        script: setup::ScriptArgs,
     },
     /// Add this device with a pairing code from a device that is already paired.
     Join {
@@ -354,14 +356,16 @@ fn main() -> ExitCode {
         Command::Server { action } => action.login().is_some_and(|login| login.interactive),
         _ => false,
     };
-    let guided = setup::mode(
-        io::stdin().is_terminal(),
-        io::stderr().is_terminal(),
-        json,
-        std::env::var_os("CI").is_some(),
-        interactive,
-    )
-    .is_ok_and(|mode| mode == setup::Mode::Guided);
+    let scripted = matches!(&command_args, Command::Setup { script, .. } if script.given());
+    let guided = !scripted
+        && setup::mode(
+            io::stdin().is_terminal(),
+            io::stderr().is_terminal(),
+            json,
+            std::env::var_os("CI").is_some(),
+            interactive,
+        )
+        .is_ok_and(|mode| mode == setup::Mode::Guided);
     let terminal = Arc::new(terminal::Terminal::new(cli.plain, guided));
     let log_format = match &command_args {
         Command::Daemon { .. } if json => Some(LogFormat::Json),
@@ -563,9 +567,11 @@ async fn execute(
         Command::Status { check } => status(&paths, check).await,
         Command::Diagnose => diagnose::run(&paths).await,
         Command::Resolve { id, answer } => resolve(&paths, id, answer).await,
-        Command::Setup { device, login } => {
-            setup::setup(&paths, &device.name(), &login, json, terminal).await
-        }
+        Command::Setup {
+            device,
+            login,
+            script,
+        } => setup::setup(&paths, &device.name(), &login, &script, json, terminal).await,
         Command::Join {
             code,
             server,
@@ -1105,10 +1111,14 @@ async fn resolve(
 /// Runs a folder command in the daemon, or on its own when no daemon runs.
 async fn folder(paths: &Paths, action: FolderAction) -> Result<Done, CliError> {
     let request = match action {
-        FolderAction::Link { folder, space } => Request::Link {
-            folder: absolute(&folder)?,
-            space,
-        },
+        FolderAction::Link { folder, space } => {
+            let (folder, outcome) = link(paths, absolute(&folder)?, space, None).await?;
+            let text = linked(&folder, outcome);
+            return Ok(Done {
+                outcome,
+                ..Done::ok(FolderData::of(&folder), text)
+            });
+        }
         FolderAction::Unlink { folder } => Request::Unlink {
             folder: absolute(&folder)?,
         },
@@ -1129,24 +1139,6 @@ async fn folder(paths: &Paths, action: FolderAction) -> Result<Done, CliError> {
         }
     };
     match ipc::run(paths, request).await? {
-        Response::Linked { folder } => {
-            let text = format!(
-                "Linked {} to space {} ({}).\n",
-                printable(&folder.path),
-                printable(&folder.space_name),
-                printable(&folder.space_id)
-            );
-            Ok(Done::ok(FolderData::of(&folder), text))
-        }
-        Response::AlreadyLinked { folder } => {
-            let text = format!(
-                "{} is already linked to space {} ({}).\n",
-                printable(&folder.path),
-                printable(&folder.space_name),
-                printable(&folder.space_id)
-            );
-            Ok(Done::ok(FolderData::of(&folder), text).unchanged())
-        }
         Response::Unlinked { space_id, path } => {
             let text = format!(
                 "Unlinked {} from space {}. Its files and its .koidrive folder stay.\n",
@@ -1173,6 +1165,43 @@ async fn folder(paths: &Paths, action: FolderAction) -> Result<Done, CliError> {
         }
         Response::Restarted { folder } => restarted(folder),
         other => Err(unexpected(other)),
+    }
+}
+
+async fn link(
+    paths: &Paths,
+    folder: PathBuf,
+    space: String,
+    approval: Option<koidrive_driver::LinkApproval>,
+) -> Result<(FolderStatus, report::Outcome), CliError> {
+    let request = match approval {
+        Some(approval) => {
+            service::reconcile(paths, false).await;
+            Request::LinkApproved {
+                folder,
+                space,
+                approval,
+            }
+        }
+        None => Request::Link { folder, space },
+    };
+    match ipc::run(paths, request).await? {
+        Response::Linked { folder } => Ok((folder, report::Outcome::Ok)),
+        Response::AlreadyLinked { folder } => Ok((folder, report::Outcome::Unchanged)),
+        other => Err(unexpected(other)),
+    }
+}
+
+fn linked(folder: &FolderStatus, outcome: report::Outcome) -> String {
+    let path = printable(&folder.path);
+    let space = format!(
+        "space {} ({})",
+        printable(&folder.space_name),
+        printable(&folder.space_id)
+    );
+    match outcome {
+        report::Outcome::Unchanged => format!("{path} is already linked to {space}.\n"),
+        _ => format!("Linked {path} to {space}.\n"),
     }
 }
 
@@ -1390,38 +1419,75 @@ async fn space(paths: Paths, action: SpaceAction) -> Result<Done, CliError> {
             if name.is_empty() {
                 return Err(CliError::usage("a space needs a name"));
             }
-            let existing = |spaces: &[SpaceInfo]| {
-                let existing = spaces.iter().find(|space| space.name == name)?;
-                let id = printable(&existing.space_id);
-                let note = format!(
-                    "The space {} ({id}) already exists.\nLink a folder to it with koi folder link <folder> --space {id}.\n",
-                    printable(&existing.name),
-                );
-                Some(Done::value(SpaceData::of(existing), &id, note).unchanged())
+            let named = named_space(&auth, &spaces, name).await?;
+            let space = named.space();
+            let id = printable(&space.space_id);
+            let shown = format!("{} ({id})", printable(&space.name));
+            let said = match &named {
+                Named::Existing(_) => format!("The space {shown} already exists."),
+                Named::Created(_) => format!("Created the space {shown}."),
             };
-            if let Some(done) = existing(&spaces) {
-                return Ok(done);
-            }
-            let request = CreateSpaceRequest {
-                name: name.to_owned(),
-            };
-            let created = match auth.api().create_space(&auth, &request).await {
-                Ok(created) => created,
-                Err(error) => {
-                    let now = auth.api().list_spaces(&auth).await.map(|list| list.spaces);
-                    return match now.ok().as_deref().and_then(existing) {
-                        Some(done) => Ok(done),
-                        None => Err(error.into()),
-                    };
-                }
-            };
-            let id = printable(&created.space_id);
             let note = format!(
-                "Created the space {} ({id}).\nLink a folder to it with koi folder link <folder> --space {id}.\n",
-                printable(&created.name),
+                "{said}\nLink a folder to it with koi folder link <folder> --space {id}.\n"
             );
-            Ok(Done::value(SpaceData::of(&created), &id, note))
+            let done = Done::value(SpaceData::of(space), &id, note);
+            Ok(match named {
+                Named::Existing(_) => done.unchanged(),
+                Named::Created(_) => done,
+            })
         }
+    }
+}
+
+enum Named {
+    Existing(SpaceInfo),
+    Created(SpaceInfo),
+}
+
+impl Named {
+    fn space(&self) -> &SpaceInfo {
+        match self {
+            Named::Existing(space) | Named::Created(space) => space,
+        }
+    }
+}
+
+async fn named_space(auth: &Auth, spaces: &[SpaceInfo], name: &str) -> Result<Named, CliError> {
+    if let Some(space) = existing_space(spaces, name)? {
+        return Ok(Named::Existing(space));
+    }
+    let request = CreateSpaceRequest {
+        name: name.to_owned(),
+    };
+    match auth.api().create_space(auth, &request).await {
+        Ok(created) => Ok(Named::Created(created)),
+        Err(error) => {
+            let now = auth.api().list_spaces(auth).await.ok();
+            let existing = match now {
+                Some(list) => existing_space(&list.spaces, name)?,
+                None => None,
+            };
+            match existing {
+                Some(space) => Ok(Named::Existing(space)),
+                None => Err(error.into()),
+            }
+        }
+    }
+}
+
+fn existing_space(spaces: &[SpaceInfo], name: &str) -> Result<Option<SpaceInfo>, CliError> {
+    let matches: Vec<_> = spaces.iter().filter(|space| space.name == name).collect();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [space] => Ok(Some((*space).clone())),
+        _ => Err(koidrive_driver::DriverError::SpaceAmbiguous {
+            name: name.to_owned(),
+            ids: matches
+                .into_iter()
+                .map(|space| space.space_id.clone())
+                .collect(),
+        }
+        .into()),
     }
 }
 

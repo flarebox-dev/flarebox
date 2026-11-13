@@ -6,7 +6,7 @@ Every `koi` command can run without a person at the terminal. Add `--json` and r
 
 `--json` works on every command and in any position, as in `koidrive --json status` or `koi folder link ~/Work --space Work --json`. It selects schema 1, the only schema so far. `--json=1` names it explicitly, and any other version is a usage error. A later schema will need its number; plain `--json` keeps meaning schema 1.
 
-With `--json`, every command except `koi _daemon` prints exactly one JSON object on stdout, also when it fails, when it shows help and when it shows the version. The daemon prints one object per line, as [Watch the daemon](#watch-the-daemon) describes. Logs and progress go to stderr. A command with `--json` never asks a question, never reads stdin, never opens a browser and prints no pending-decision line.
+With `--json`, every command except `koi _daemon` prints exactly one JSON object on stdout, also when it fails, when it shows help and when it shows the version. The daemon prints one object per line, as [Watch the daemon](#watch-the-daemon) describes. Logs and progress go to stderr. A command with `--json` never asks a question, never opens a browser and prints no pending-decision line. It reads stdin only when an explicit input flag, such as `koi setup --pairing-code-stdin`, requests it.
 
 Without `--json`, a command whose result is one value prints only that value on stdout, and what it means on stderr, so that shell capture works: `koi space create` prints the new space's ID, `koi history restore` the restore's ID, and `koi device invite` the pairing code, as in `id=$(koi space create Notes)`.
 
@@ -122,7 +122,7 @@ Connecting and catching up aren't failures, so they exit 0. Neither is a pause: 
 
 No command asks a question unless both stdin and stderr are terminals. Without them, commands that would ask stop instead and say which flag answers the question.
 
-- `koi setup` runs the guided setup only on a terminal, without `--json` and without the `CI` environment variable. Otherwise it lists the setup commands and exits 0. With `--json` they are in `data.choices` and `next_commands`.
+- `koi setup` runs the guided setup only on a terminal, without `--json` and without the `CI` environment variable. Otherwise it lists the setup commands and exits 0. With `--json` they are in `data.choices` and `next_commands`. `--folder` and `--space`, with `--pairing-code-stdin` on a new device, run a [scripted setup](setup.md#scripted-setup) that asks nothing.
 - `--interactive` asks for the guided setup explicitly. It fails with exit status 2 when no terminal is attached, and can't be used with `--json`.
 - `koi server deploy`, `add-device`, `upgrade` and `delete` log in with Cloudflare in a browser, so they run only with `--interactive` and a terminal on stdin and stderr. Otherwise, with or without `--json`, they stop with `auth_required` (exit 4) and name the same command with `--interactive` for a person to run.
 - `--no-browser` reads the login address from the terminal, so it needs `--interactive` too.

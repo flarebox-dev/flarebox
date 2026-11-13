@@ -190,6 +190,7 @@ impl From<DriverError> for CliError {
             | DriverError::SpaceAmbiguous { .. }
             | DriverError::FolderNotFound(_)
             | DriverError::NotAFolder(_)
+            | DriverError::FolderApprovalChanged(_)
             | DriverError::NotLinked(_)
             | DriverError::SpaceNotLinked(_)
             | DriverError::InvalidRestore(_)
