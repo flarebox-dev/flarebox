@@ -42,7 +42,11 @@ struct QuestionsView: View {
                         .id(question.id)
                         .frame(minWidth: 480, minHeight: 360)
                 } else {
-                    NothingNeedsYou()
+                    EmptyState(
+                        systemImage: "checkmark.circle",
+                        title: "Nothing needs you",
+                        message: Text("Decisions Koidrive needs from you appear here.")
+                    )
                 }
             }
             .background(Color.panel)
@@ -345,25 +349,6 @@ struct QuestionDetail: View {
 
 extension Answer: @retroactive Identifiable {
     public var id: Self { self }
-}
-
-private struct NothingNeedsYou: View {
-    var body: some View {
-        VStack(spacing: 6) {
-            Image(systemName: "checkmark.circle")
-                .font(.system(size: 28))
-                .foregroundStyle(Color.text3)
-                .padding(.bottom, 12)
-            Text("Nothing needs you")
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(Color.text)
-            Text("Decisions Koidrive needs from you appear here.")
-                .foregroundStyle(Color.text2)
-        }
-        .multilineTextAlignment(.center)
-        .padding(20)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
 }
 
 struct ConfirmSheet: View {

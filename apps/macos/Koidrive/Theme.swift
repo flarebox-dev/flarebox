@@ -8,14 +8,14 @@ extension Color {
     static let koi = Color(red: 1, green: 0x6A / 255, blue: 0x13 / 255)
     static let onKoi = Color(red: 0x1A / 255, green: 0x0A / 255, blue: 0)
     static let koiText = Color(light: 0xC2480A, dark: 0xFF8F4D)
-    static let koiTint = Color(light: NSColor(red: 1, green: 106 / 255, blue: 19 / 255, alpha: 0.12),
-                               dark: NSColor(red: 1, green: 106 / 255, blue: 19 / 255, alpha: 0.18))
     static let statusGreen = Color(light: 0x1FA83A, dark: 0x32D74B)
     static let statusRed = Color(light: 0xE0352B, dark: 0xFF453A)
     static let redLabel = Color(light: NSColor(hex: 0xD70015), dark: NSColor(hex: 0xFF6961),
                                 increasedContrast: (NSColor(hex: 0xB0000F), NSColor(hex: 0xFF8A82)))
     static let statusYellow = Color(light: 0xB07A00, dark: 0xFFD60A)
     static let needsYou = statusYellow
+    static let needsYouTint = Color(light: NSColor(red: 176 / 255, green: 122 / 255, blue: 0, alpha: 0.12),
+                                    dark: NSColor(red: 1, green: 214 / 255, blue: 10 / 255, alpha: 0.14))
     static let redTint = Color(light: NSColor(red: 224 / 255, green: 53 / 255, blue: 43 / 255, alpha: 0.1),
                                dark: NSColor(red: 1, green: 69 / 255, blue: 58 / 255, alpha: 0.16))
     static let redFill = Color(red: 0xD7 / 255, green: 0, blue: 0x15 / 255)
@@ -242,13 +242,16 @@ struct PathText: View {
 
     var body: some View {
         let slash = path.lastIndex(of: "/").map { path.index(after: $0) } ?? path.startIndex
-        var folder = AttributedString(path[..<slash])
-        folder.foregroundColor = Color.text2
-        var name = AttributedString(path[slash...])
-        name.foregroundColor = Color.text
-        return Text(folder + name)
-            .lineLimit(1)
-            .truncationMode(.head)
+        return HStack(alignment: .firstTextBaseline, spacing: 0) {
+            Text(verbatim: String(path[..<slash]))
+                .foregroundStyle(Color.text2)
+                .truncationMode(.tail)
+            Text(verbatim: String(path[slash...]))
+                .foregroundStyle(Color.text)
+                .truncationMode(.middle)
+                .layoutPriority(1)
+        }
+        .lineLimit(1)
     }
 }
 

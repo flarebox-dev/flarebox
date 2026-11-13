@@ -93,8 +93,8 @@ extension Question {
 
     func confirmationMessage(for answer: Answer) -> String {
         switch (answer, kind) {
-        case (.delete, .recovery): String(localized: "This deletes \(fileCount(affectedFiles)) on the server and every device. The server keeps them in its trash.")
-        case (.delete, _): String(localized: "This deletes \(fileCount(affectedFiles)) on every device. The server keeps them in its trash.")
+        case (.delete, .recovery): String(localized: "This deletes \(fileCount(affectedFiles)) on the server and every device. The server keeps them in Deleted Files.")
+        case (.delete, _): String(localized: "This deletes \(fileCount(affectedFiles)) on every device. The server keeps them in Deleted Files.")
         default: String(localized: "This applies to \(itemCount(items.count)), \(fileCount(affectedFiles)).")
         }
     }
@@ -206,7 +206,7 @@ extension ItemDetail {
         case .edited: String(localized: "Edited")
         case .moved(let from): String(localized: "Moved from \(from)")
         case .editedAndMoved(let from): String(localized: "Edited and moved from \(from)")
-        case .restoreFromTrash: String(localized: "Restore from trash")
+        case .restoreFromTrash: String(localized: "Restore from Deleted Files")
         case .restoreVersion(let ms):
             String(localized: "Restore version from \(Date(milliseconds: ms).formatted(date: .abbreviated, time: .shortened))")
         }

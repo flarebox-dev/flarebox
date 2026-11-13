@@ -476,7 +476,7 @@ struct StorageSettings: View {
         switch entry.usage {
         case .success(let usage):
             StorageRow(title: "Live files", count: "^[\(usage.liveFiles) file](inflect: true)", bytes: usage.liveBytes)
-            StorageRow(title: "Trash", count: "^[\(usage.trashedFiles) file](inflect: true)", bytes: usage.trashBytes)
+            StorageRow(title: "Deleted Files", count: "^[\(usage.trashedFiles) file](inflect: true)", bytes: usage.trashBytes)
             StorageRow(title: "Old versions", count: "^[\(usage.oldVersions) version](inflect: true)", bytes: usage.oldVersionBytes)
             StorageRow(title: "Unreferenced", count: nil, bytes: usage.unreferencedBytes)
             StorageRow(title: "Total", count: nil, bytes: usage.totalBytes, isTotal: true)

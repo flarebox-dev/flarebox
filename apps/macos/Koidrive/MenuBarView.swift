@@ -284,11 +284,6 @@ extension AppModel {
     }
 }
 
-private extension Color {
-    static let needsYouTint = Color(light: NSColor(red: 176 / 255, green: 122 / 255, blue: 0, alpha: 0.12),
-                                    dark: NSColor(red: 1, green: 214 / 255, blue: 10 / 255, alpha: 0.14))
-}
-
 /// The system's linear progress view takes the system accent colour on macOS,
 /// not the tint.
 private struct ProgressBar: View {
