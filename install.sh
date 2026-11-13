@@ -9,7 +9,28 @@ main() {
         exit 1
     }
 
-    [ "$#" -eq 0 ] || fail 'Usage: sh install.sh'
+    no_setup=${KOIDRIVE_NO_SETUP:-0}
+    no_modify_path=${KOIDRIVE_NO_MODIFY_PATH:-0}
+    no_app=0
+    for option do
+        case "$option" in
+            --no-setup) no_setup=1 ;;
+            --no-modify-path) no_modify_path=1 ;;
+            --no-app) no_app=1 ;;
+            -h|--help)
+                printf '%s\n' 'Usage: sh install.sh [--no-setup] [--no-modify-path] [--no-app]' \
+                    '  --no-setup          Install without guided setup (KOIDRIVE_NO_SETUP=1)' \
+                    '  --no-modify-path    Leave shell profiles unchanged (KOIDRIVE_NO_MODIFY_PATH=1)' \
+                    '  --no-app            Pass --no-app to guided setup on macOS'
+                return
+                ;;
+            *) fail "Unknown option: $option. Run with --help for usage" ;;
+        esac
+    done
+    attended=0
+    if [ "${CI+x}" != x ] && [ -t 1 ] && [ -t 2 ] && ( : < /dev/tty ) 2>/dev/null; then
+        attended=1
+    fi
 
     case "$(uname -s)" in
         Linux) os=unknown-linux-musl ;;
@@ -84,11 +105,100 @@ main() {
     mv -f "$staged" "$install_dir/koi"
     staged=
     printf 'Installed koi to %s/koi\n' "$install_dir"
+
+    shell_quote() {
+        printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+    }
+
+    configure_path() {
+        quoted_dir=$(shell_quote "$install_dir")
+        login_shell=${SHELL:-}
+        path_prelude=
+        case "${login_shell##*/}" in
+            zsh|bash)
+                case "${login_shell##*/}" in
+                    zsh) path_file=${ZDOTDIR:-$HOME}/.zprofile ;;
+                    bash)
+                        path_file=$HOME/.bash_profile
+                        if [ ! -e "$path_file" ] && { [ -r "$HOME/.bash_login" ] || [ -r "$HOME/.profile" ]; }; then
+                            path_prelude="if [ -r \"\$HOME/.bash_login\" ]; then . \"\$HOME/.bash_login\"; elif [ -r \"\$HOME/.profile\" ]; then . \"\$HOME/.profile\"; fi"
+                        fi
+                        ;;
+                esac
+                path_marker="; : 'koidrive PATH'"
+                path_line="case \":\$PATH:\" in *:${quoted_dir}:*) ;; *) export PATH=${quoted_dir}:\"\$PATH\" ;; esac$path_marker"
+                ;;
+            fish)
+                path_file=${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/koidrive.fish
+                path_marker="; true 'koidrive PATH'"
+                fish_dir=$(printf '%s' "$install_dir" | sed "s/\\\\/\\\\\\\\/g; s/'/\\\\'/g")
+                path_line="contains -- '$fish_dir' \$PATH; or set -gx PATH '$fish_dir' \$PATH$path_marker"
+                ;;
+            *)
+                printf 'Warning: %s is not on PATH. Add it to your shell profile.\n' "$install_dir" >&2
+                return
+                ;;
+        esac
+        path_target=$path_file
+        path_links=0
+        while [ -L "$path_target" ]; do
+            path_links=$((path_links + 1))
+            [ "$path_links" -le 40 ] || return 1
+            path_link=$(readlink "$path_target") || return
+            case "$path_link" in
+                /*) path_target=$path_link ;;
+                *) path_target=$(dirname "$path_target")/$path_link ;;
+            esac
+        done
+        [ ! -e "$path_target" ] || [ -f "$path_target" ] || return 1
+        if [ -f "$path_file" ] && grep -Fqx -- "$path_line" "$path_file"; then
+            return
+        fi
+        mkdir -p "$(dirname "$path_target")" || return
+        : > "$tmp/removed-lines" || return
+        if [ -e "$path_file" ]; then
+            KOIDRIVE_PATH_MARKER=$path_marker KOIDRIVE_PATH_REMOVED=$tmp/removed-lines awk '
+                BEGIN { marker = ENVIRON["KOIDRIVE_PATH_MARKER"] }
+                substr($0, length($0) - length(marker) + 1) == marker {
+                    print "- " $0 > ENVIRON["KOIDRIVE_PATH_REMOVED"]
+                    next
+                }
+                { print }
+            ' "$path_file" > "$tmp/profile" || return
+        else
+            : > "$tmp/profile" || return
+        fi
+        if [ -n "$path_prelude" ]; then
+            printf '%s\n' "$path_prelude" >> "$tmp/profile" || return
+        fi
+        printf '%s\n' "$path_line" >> "$tmp/profile" || return
+        staged=$(mktemp "$(dirname "$path_target")/.koidrive-profile.XXXXXXXX") || return
+        if [ -e "$path_target" ]; then
+            cp -p "$path_target" "$staged" || return
+        fi
+        cat "$tmp/profile" > "$staged" || return
+        mv -f "$staged" "$path_target" || return
+        staged=
+        printf 'Updated %s:\n' "$path_target"
+        cat "$tmp/removed-lines"
+        if [ -n "$path_prelude" ]; then
+            printf '+ %s\n' "$path_prelude"
+        fi
+        printf '+ %s\n' "$path_line"
+        printf 'Open a new terminal to use koi by name.\n'
+    }
+
     other=$(command -v koi 2>/dev/null || true)
     if [ -z "$other" ] || ! [ "$other" -ef "$install_dir/koi" ]; then
         case ":${PATH:-}:" in
             *":$install_dir:"*) ;;
-            *) printf 'Warning: %s is not on PATH. Add it to your shell profile.\n' "$install_dir" >&2 ;;
+            *)
+                if [ "$attended" = 1 ] && [ "$no_modify_path" != 1 ]; then
+                    configure_path || printf 'Warning: could not update PATH. Add %s to your shell profile.\n' "$install_dir" >&2
+                else
+                    printf 'Warning: %s is not on PATH. Add it to your shell profile.\n' "$install_dir" >&2
+                fi
+                ;;
         esac
         if [ -z "$other" ]; then
             :
@@ -125,6 +235,15 @@ main() {
                 printf 'Warning: koi is installed, but the koi daemon with process ID %s still runs the old koi. Restart it with the service manager that started it.\n' "$pid" >&2
             fi
         done
+    fi
+
+    set -- setup
+    if [ "$no_app" = 1 ]; then set -- "$@" --no-app; fi
+    if [ "$os" = apple-darwin ] && [ "$attended" = 1 ] && [ "$no_setup" != 1 ]; then
+        printf 'Starting guided setup with %s/koi\n' "$install_dir"
+        "$install_dir/koi" "$@" < /dev/tty
+    else
+        printf 'To set up Koidrive, run: %s/koi %s\n' "$(shell_quote "$install_dir")" "$*"
     fi
 }
 

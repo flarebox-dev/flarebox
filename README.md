@@ -92,9 +92,11 @@ You need a Cloudflare account with R2 turned on, and a Mac with Apple silicon or
    curl -fsSL https://koidrive.com/install.sh | sh
    ```
 
-   Then `koi --version` prints the version. [Install](docs/guide/install.md) covers `PATH` warnings and building from source.
+   On macOS, the installer continues into guided setup, which installs and verifies the app and connects this machine. It configures `PATH` for zsh, bash, or fish in an attended terminal. Open a new terminal to run `koi` by name. [Install](docs/guide/install.md) covers opting out and building from source.
 
-2. **Deploy your server and sign in this machine.** Deploy the server with the deploy button, open `<your server>/setup` to get a claim code, and claim the server:
+   Skip steps 2 and 3 if guided setup has connected this machine and linked a folder. Otherwise, complete the steps that remain.
+
+2. **Deploy your server and sign in this machine if you skipped guided setup.** Deploy the server with the deploy button, open `<your server>/setup` to get a claim code, and claim the server:
 
    ```sh
    koi server claim koidrive.alice.workers.dev ABCD-EFGH-JKLM --user "Alice Park"
@@ -102,7 +104,7 @@ You need a Cloudflare account with R2 turned on, and a Mac with Apple silicon or
 
    [Set up](docs/guide/setup.md#deploy-a-server-and-claim-it) walks through each step.
 
-3. **Link a folder.**
+3. **Link a folder if setup has not linked one.**
 
    ```sh
    mkdir -p ~/Koidrive
