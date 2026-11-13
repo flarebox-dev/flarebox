@@ -699,11 +699,11 @@ impl Tx<'_> {
                     }
                 }
                 let mut restored = self.0.prepare_cached(
-                    "INSERT INTO commit_in_flight_restore_members (target, position, node_id) VALUES (?1, ?2, ?3)",
+                    "INSERT INTO commit_in_flight_restore_members (op, position, node_id) VALUES (?1, ?2, ?3)",
                 )?;
-                for (target, nodes) in &flight.restores {
+                for (index, nodes) in &flight.restores {
                     for (position, node) in nodes.iter().enumerate() {
-                        restored.execute(params![target, position, node])?;
+                        restored.execute(params![index, position, node])?;
                     }
                 }
             }
@@ -883,9 +883,9 @@ impl Tx<'_> {
             };
             nodes.push(row.get(1)?);
         }
-        let mut restores: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
+        let mut restores: BTreeMap<usize, Vec<NodeId>> = BTreeMap::new();
         let mut stmt = self.0.prepare_cached(
-            "SELECT target, node_id FROM commit_in_flight_restore_members ORDER BY target, position",
+            "SELECT op, node_id FROM commit_in_flight_restore_members ORDER BY op, position",
         )?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {

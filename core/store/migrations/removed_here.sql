@@ -4,8 +4,8 @@ CREATE TABLE removed_here (
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE commit_in_flight_restore_members (
-    target TEXT NOT NULL,
+    op INTEGER NOT NULL,
     position INTEGER NOT NULL,
     node_id TEXT NOT NULL,
-    PRIMARY KEY (target, position)
+    PRIMARY KEY (op, position)
 ) STRICT, WITHOUT ROWID;

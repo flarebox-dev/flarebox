@@ -61,9 +61,9 @@ pub struct InFlight {
     pub commit: proto::Commit,
     /// For each `Delete` op, by its target, every node the client planned to delete with it.
     pub deletes: BTreeMap<NodeId, Vec<NodeId>>,
-    /// For each `Restore` op, by its target, the nodes this device's user removed that it brings
-    /// back. When the restore is applied, they are downloaded instead of deleted again.
-    pub restores: BTreeMap<NodeId, Vec<NodeId>>,
+    /// For each `Restore` op, by its index in the commit, the nodes this device's user removed that
+    /// it brings back. When the restore is applied, they are downloaded instead of deleted again.
+    pub restores: BTreeMap<usize, Vec<NodeId>>,
     /// The result once it has arrived, kept until R holds its records.
     pub result: Option<proto::CommitResult>,
 }
@@ -844,14 +844,14 @@ impl Commits {
 
         let require_head = (ops.iter().filter_map(|op| op.op.as_ref()))
             .any(|op| trees.resends().contains(op_node(op)));
-        let restores = (ops.iter())
-            .filter_map(|op| match &op.op {
-                Some(op::Op::Restore(restore)) => Some(restore),
+        let restores = (ops.iter().enumerate())
+            .filter_map(|(index, op)| match &op.op {
+                Some(op::Op::Restore(restore)) => Some((index, restore)),
                 _ => None,
             })
-            .map(|restore| {
+            .map(|(index, restore)| {
                 let removed = trees.removed_restored(&restore.node_id, &restore.target_parent_id);
-                (restore.node_id.clone(), removed)
+                (index, removed)
             })
             .filter(|(_, removed)| !removed.is_empty())
             .collect();
@@ -1464,7 +1464,7 @@ impl Commits {
                 self.problems.insert(node.clone());
             }
         }
-        for (op, outcome) in flight.commit.ops.iter().zip(&result.results) {
+        for (index, (op, outcome)) in flight.commit.ops.iter().zip(&result.results).enumerate() {
             let Some(op::Op::Restore(restore)) = &op.op else {
                 continue;
             };
@@ -1475,7 +1475,16 @@ impl Commits {
             ) {
                 continue;
             }
-            for id in flight.restores.get(&restore.node_id).into_iter().flatten() {
+            let restored = BTreeSet::from([restore.node_id.as_str()]);
+            let deleted = (flight.deletes.values().flatten())
+                .filter(|id| **id == restore.node_id || remote_below(trees, id, &restored));
+            for id in flight
+                .restores
+                .get(&index)
+                .into_iter()
+                .flatten()
+                .chain(deleted)
+            {
                 if trees.local().get(id).is_none() && trees.remote().live(id).is_some() {
                     synced.set(id, None);
                 }

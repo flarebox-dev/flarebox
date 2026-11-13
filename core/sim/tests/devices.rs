@@ -4412,6 +4412,43 @@ fn a_version_restore_the_server_rejects_leaves_a_file_its_user_removed_deleted()
 }
 
 #[test]
+fn a_file_restored_while_another_device_deletes_its_folder_stays_restored() {
+    let mut world = world(2);
+    world
+        .phase(0, &[(0, folder("a")), (0, user(1, 0, 1, "b"))])
+        .unwrap();
+    world
+        .run(1, &[(1, delete(1)), (1, rename(0, 0, "A"))])
+        .unwrap();
+    let engine = &mut world.devices[1].engine;
+    let b = (engine.trees.remote().iter())
+        .find(|(_, node)| node.shape.name == "b")
+        .map(|(id, _)| id.clone())
+        .unwrap();
+    let request = engine.ids.uuid_v7(1_700_000_000_000);
+    let intent = RestoreIntent::from_trash(b, None, None).unwrap();
+    assert!(engine.commits.restore(request.clone(), intent));
+    world.run(2, &[(1, SCAN), (1, COMMIT)]).unwrap();
+    let mut remote = vec![(0, delete(0))];
+    remote.extend(commit(0));
+    world.run(3, &remote).unwrap();
+    world.run(4, &[(1, COMMIT)]).unwrap();
+    world.phase(5, &[]).unwrap();
+    let resolved = world.devices[1].engine.commits.resolved();
+    let restored = resolved.iter().find(|ended| ended.id == request).unwrap();
+    assert_eq!(
+        restored.outcome,
+        koidrive_engine::restore::Outcome::Restored
+    );
+    for device in 0..2 {
+        let names: Vec<String> = (files_on(&world, device).into_iter())
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["A", "b"], "device {device}");
+    }
+}
+
+#[test]
 fn a_folder_delete_superseded_behind_a_name_that_differs_only_in_case_brings_the_folder_back() {
     let made = vec![(0, folder("a")), (2, file("C.TXT"))];
     let filled = vec![(0, user(1, 0, 1, "ß"))];

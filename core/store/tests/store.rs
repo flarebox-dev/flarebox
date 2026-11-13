@@ -3623,7 +3623,7 @@ fn a_store_from_before_removals_here_were_recorded_opens_with_none_recorded() {
     assert_eq!(applied(&path), all_migrations());
     let mut after = before.clone();
     let flight = after.commits.in_flight.as_mut().unwrap();
-    flight.restores = BTreeMap::from([("r".into(), vec!["r".into(), "r-child".into()])]);
+    flight.restores = BTreeMap::from([(2, vec!["r".into(), "r-child".into()])]);
     before.trees.removed_here.clear();
     assert!(!after.trees.removed_here.is_empty());
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
