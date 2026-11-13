@@ -26,7 +26,7 @@ use crate::credential::{
     Credential, CredentialError, CredentialFiles, NewCredentialFile, StoredCredential, api_for,
     next_path,
 };
-use crate::failures::{self, Failure, Halted};
+use crate::failures::Halted;
 use crate::folder::FolderTask;
 use crate::ignore::{Matcher, local_rules, matcher};
 use crate::leave::{Leaving, Phase};
@@ -318,7 +318,7 @@ impl Drop for Inner {
 /// that starts later still finds its task and its cleanup, also after an earlier caller gave up waiting.
 struct Folder {
     link: Link,
-    status: Arc<Mutex<FolderStatus>>,
+    status: Arc<crate::lifecycle::Lifecycle>,
     /// The folder's task, from its start until a stop has seen it end.
     run: Option<Running>,
     /// Set from the moment an unlink begins until it has removed the folder or failed. No task starts for the folder
@@ -348,6 +348,11 @@ impl Drop for Unlinking<'_> {
         };
         if folder.unlink == Some(Unlink::Running) {
             folder.unlink = Some(Unlink::Abandoned);
+            folder.status.halt(
+                Halted::Unlink,
+                "unlinking the folder did not finish; unlink it again to finish".into(),
+                crate::lifecycle::Recovery::Unlink,
+            );
             drop(folders);
             self.driver.changed();
         }
@@ -412,7 +417,7 @@ impl Driver {
         };
         Ok(read_folders(paths, |path| Store::open_read_only(path))?
             .into_iter()
-            .map(|(_, status)| status)
+            .map(|(_, status)| status.lock().unwrap().clone())
             .collect())
     }
 
@@ -1184,7 +1189,10 @@ impl Driver {
             .and_then(|mut store| store.transaction(|tx| tx.set_link(&link)))
             .map_err(store_error(&store_path))?;
         tracing::info!(space_id = link.space_id, path = %koidrive_fs::quoted(&link.root), "linked a folder");
-        let status = Arc::new(Mutex::new(folder_status(&link, None, 0, 0)));
+        let status = Arc::new(
+            crate::lifecycle::Lifecycle::open(&store_path, folder_status(&link, None, 0, 0))
+                .map_err(io_error(&store_path))?,
+        );
         let linked = roots(&folders);
         let mut folder = Folder {
             link,
@@ -1216,6 +1224,19 @@ impl Driver {
         let (link, done, store) = {
             let mut folders = self.inner.folders.lock().unwrap();
             let found = find(&mut folders, folder)?;
+            if let Err(error) = found.status.begin_unlink() {
+                let error = io_error(found.status.path())(error);
+                if found.run.as_ref().is_none_or(Running::ended) {
+                    halt(
+                        found,
+                        Halted::Io,
+                        format!("the folder could not be unlinked: {error}"),
+                    );
+                }
+                drop(folders);
+                self.changed();
+                return Err(error);
+            }
             found.unlink = Some(Unlink::Running);
             let done = found.run.as_ref().map(Running::stop);
             (found.link.clone(), done, found.store.clone())
@@ -1443,11 +1464,17 @@ impl Driver {
             let _pausing = pausing;
             let path = driver.inner.paths.paused();
             fs::write(&path, b"paused\n").map_err(io_error(&path))?;
-            if driver.inner.paused.swap(true, Ordering::SeqCst) {
-                return Ok(false);
+            let changed = !driver.inner.paused.swap(true, Ordering::SeqCst);
+            if changed {
+                driver.stop_folders().await;
             }
-            driver.stop_folders().await;
-            Ok(true)
+            for folder in driver.inner.folders.lock().unwrap().values() {
+                folder
+                    .status
+                    .persist()
+                    .map_err(io_error(folder.status.path()))?;
+            }
+            Ok(changed)
         });
         paused
             .await
@@ -1545,6 +1572,22 @@ impl Driver {
                 .and_then(|path| lift_halt(&path, lift)),
             None => Ok(()),
         };
+        let reset = {
+            let mut folders = self.inner.folders.lock().unwrap();
+            let folder = folders
+                .get_mut(&space_id)
+                .expect("only an unlink removes a folder, and it holds the lifecycle lock");
+            if folder.run.as_ref().is_none_or(Running::ended) {
+                folder.run = None;
+                folder
+                    .status
+                    .restart()
+                    .map_err(io_error(folder.status.path()))
+            } else {
+                Ok(())
+            }
+        };
+        reset?;
         drop(startup);
         let credential = self.inner.credential.lock().unwrap().clone();
         let mut folders = self.inner.folders.lock().unwrap();
@@ -1552,10 +1595,6 @@ impl Driver {
         let folder = folders
             .get_mut(&space_id)
             .expect("only an unlink removes a folder, and it holds the lifecycle lock");
-        if folder.run.as_ref().is_none_or(Running::ended) {
-            folder.run = None;
-            folder.status.lock().unwrap().state = FolderState::Stopped;
-        }
         if self.syncs() {
             self.start_folder(folder, credential.as_ref(), &all);
         }
@@ -1568,7 +1607,10 @@ impl Driver {
     /// Starts the task of `folder` unless it is being unlinked or its task still runs. `all` are the roots of every
     /// linked folder.
     fn start_folder(&self, folder: &mut Folder, credential: Option<&Credential>, all: &[PathBuf]) {
-        if folder.unlink.is_some() || folder.run.as_ref().is_some_and(|run| !run.ended()) {
+        if folder.unlink.is_some()
+            || folder.run.as_ref().is_some_and(|run| !run.ended())
+            || folder.status.needs_restart()
+        {
             return;
         }
         let linked = all
@@ -1618,7 +1660,9 @@ impl Driver {
             if folder.run.as_ref().is_none_or(Running::ended) {
                 folder.run = None;
                 let mut status = folder.status.lock().unwrap();
-                status.state = FolderState::Stopped;
+                if status.state != FolderState::Halted {
+                    status.state = FolderState::Stopped;
+                }
                 status.wait = None;
             }
         }
@@ -1833,12 +1877,11 @@ fn halt(folder: &mut Folder, why: Halted, problem: String) {
         problem,
         "a folder cannot sync"
     );
-    let mut status = folder.status.lock().unwrap();
-    if status.state != FolderState::Halted {
-        failures::failed(Failure::Halted(why));
-    }
-    status.state = FolderState::Halted;
-    status.problem = Some(problem);
+    let recovery = match why {
+        Halted::Unlink => crate::lifecycle::Recovery::Unlink,
+        _ => crate::lifecycle::Recovery::Restart,
+    };
+    folder.status.halt(why, problem, recovery);
 }
 
 fn folder_status(
@@ -1871,7 +1914,7 @@ fn load_folders(paths: &Paths) -> Result<BTreeMap<String, Folder>, DriverError> 
             (
                 link.space_id.clone(),
                 Folder {
-                    status: Arc::new(Mutex::new(status)),
+                    status,
                     link,
                     run: None,
                     unlink: None,
@@ -1887,7 +1930,7 @@ fn load_folders(paths: &Paths) -> Result<BTreeMap<String, Folder>, DriverError> 
 fn read_folders(
     paths: &Paths,
     open: impl Fn(&Path) -> Result<Store, koidrive_store::Error>,
-) -> Result<Vec<(Link, FolderStatus)>, DriverError> {
+) -> Result<Vec<(Link, Arc<crate::lifecycle::Lifecycle>)>, DriverError> {
     let spaces = paths.spaces();
     let entries = match fs::read_dir(&spaces) {
         Ok(entries) => entries,
@@ -1923,7 +1966,13 @@ fn read_folders(
             tracing::warn!(path = %koidrive_fs::quoted(&path), "a store records no linked folder; ignoring it");
             continue;
         };
-        let status = folder_status(&link, cursor, nodes, questions as u64);
+        let status = Arc::new(
+            crate::lifecycle::Lifecycle::open(
+                &path,
+                folder_status(&link, cursor, nodes, questions as u64),
+            )
+            .map_err(io_error(&path))?,
+        );
         folders.push((link, status));
     }
     Ok(folders)
@@ -2087,6 +2136,7 @@ async fn revoke(
 
 #[cfg(test)]
 mod tests {
+    use crate::failures::{self, Failure};
     use std::sync::atomic::AtomicUsize;
     use std::time::{Duration, Instant};
 
@@ -2425,7 +2475,327 @@ mod tests {
             "{folder:?}"
         );
         driver.stop().await;
-        assert_eq!(driver.status().folders[0].state, FolderState::Stopped);
+        assert_eq!(driver.status().folders[0].state, FolderState::Halted);
+    }
+
+    #[tokio::test]
+    async fn pausing_a_halted_folder_keeps_its_problem_and_resuming_rechecks_it() {
+        let (_dir, paths, _root) = profile(&[]);
+        credential("d2").save_new(&paths.credential()).unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+        driver.start();
+        let halted = driver.status().folders[0].clone();
+        assert_eq!(halted.state, FolderState::Halted);
+        assert!(halted.problem.as_ref().unwrap().contains("device d1"));
+        driver.pause().await.unwrap();
+        let paused = driver.status();
+        assert!(paused.paused);
+        assert_eq!(paused.folders[0].state, FolderState::Halted);
+        assert_eq!(paused.folders[0].problem, halted.problem);
+        driver.resume().await.unwrap();
+        assert_eq!(driver.status().folders[0].state, FolderState::Halted);
+        assert_eq!(driver.status().folders[0].problem, halted.problem);
+        driver.pause().await.unwrap();
+        drop(driver);
+
+        let driver = Driver::open(paths).unwrap();
+        driver.start();
+        assert!(driver.status().paused);
+        assert_eq!(driver.status().folders[0].state, FolderState::Halted);
+        assert_eq!(driver.status().folders[0].problem, halted.problem);
+        driver.resume().await.unwrap();
+        assert_eq!(driver.status().folders[0].state, FolderState::Halted);
+        assert_eq!(driver.status().folders[0].problem, halted.problem);
+        driver.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_resume_and_a_reopen_keep_a_replacement_folder_waiting_for_explicit_restart() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let dir = tempfile::tempdir().unwrap();
+            let base = fs::canonicalize(dir.path()).unwrap();
+            let root = base.join("Koidrive");
+            let paths = Paths::under(&base.join("profile"));
+            linked(&paths, &root, "d1");
+            let driver = Driver::open(paths.clone()).unwrap();
+            driver.start();
+            eventually("the original folder is claimed", || {
+                claim::owner(&root).unwrap().is_some()
+            })
+            .await;
+            fs::rename(&root, base.join("Moved")).unwrap();
+            fs::create_dir(&root).unwrap();
+            write_marker(
+                &root,
+                &Marker {
+                    space_id: SPACE.into(),
+                    effects: 0,
+                },
+            )
+            .unwrap();
+            eventually("the replacement requires a restart", || {
+                driver.status().folders[0]
+                    .problem
+                    .as_ref()
+                    .is_some_and(|problem| problem.contains("koi folder restart"))
+            })
+            .await;
+            let problem = driver.status().folders[0].problem.clone();
+            driver.pause().await.unwrap();
+            driver.resume().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(claim::owner(&root).unwrap(), None);
+            assert_eq!(driver.status().folders[0].state, FolderState::Halted);
+            assert_eq!(driver.status().folders[0].problem, problem);
+            driver.pause().await.unwrap();
+            drop(driver);
+
+            let driver = Driver::open(paths).unwrap();
+            driver.start();
+            assert!(driver.status().paused);
+            assert_eq!(driver.status().folders[0].state, FolderState::Halted);
+            assert_eq!(driver.status().folders[0].problem, problem);
+            driver.resume().await.unwrap();
+            assert_eq!(claim::owner(&root).unwrap(), None);
+            assert_eq!(driver.status().folders[0].state, FolderState::Halted);
+            driver.restart(&root).await.unwrap();
+            eventually("the explicit restart claims the replacement", || {
+                claim::owner(&root).unwrap().is_some()
+            })
+            .await;
+            driver.stop().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_paused_root_wait_reopens_and_recovers_only_the_original_folder() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let dir = tempfile::tempdir().unwrap();
+            let base = fs::canonicalize(dir.path()).unwrap();
+            let root = base.join("Koidrive");
+            let moved = base.join("Moved");
+            let paths = Paths::under(&base.join("profile"));
+            linked(&paths, &root, "d1");
+            let driver = Driver::open(paths.clone()).unwrap();
+            driver.start();
+            eventually("the folder is claimed", || {
+                claim::owner(&root).unwrap().is_some()
+            })
+            .await;
+            fs::rename(&root, &moved).unwrap();
+            halted(&driver).await;
+            driver.pause().await.unwrap();
+            let problem = driver.status().folders[0].problem.clone();
+            drop(driver);
+
+            let driver = Driver::open(paths).unwrap();
+            driver.start();
+            assert_eq!(driver.status().folders[0].state, FolderState::Halted);
+            assert_eq!(driver.status().folders[0].problem, problem);
+            fs::rename(&moved, &root).unwrap();
+            driver.resume().await.unwrap();
+            eventually("the original folder syncs again", || {
+                driver.status().folders[0].state != FolderState::Halted
+                    && claim::lock(&root).unwrap().is_none()
+            })
+            .await;
+            driver.stop().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_open_preserves_the_claimed_root_after_reopen() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let dir = tempfile::tempdir().unwrap();
+            let base = fs::canonicalize(dir.path()).unwrap();
+            let root = base.join("Koidrive");
+            let paths = Paths::under(&base.join("profile"));
+            linked(&paths, &root, "d1");
+            let original = claim::Identity::of(&fs::metadata(&root).unwrap());
+            crate::folder::BEFORE_OPEN.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new({
+                    let root = root.clone();
+                    move || {
+                        write_marker(
+                            &root,
+                            &Marker {
+                                space_id: "another-space".into(),
+                                effects: 0,
+                            },
+                        )
+                        .unwrap();
+                    }
+                }));
+            });
+            let driver = Driver::open(paths.clone()).unwrap();
+            driver.start();
+            halted(&driver).await;
+            assert!(claim::owner(&root).unwrap().is_some());
+            assert_eq!(
+                read_marker(&root).unwrap().unwrap().space_id,
+                "another-space"
+            );
+            assert!(
+                !driver
+                    .inner
+                    .folders
+                    .lock()
+                    .unwrap()
+                    .get(SPACE)
+                    .unwrap()
+                    .status
+                    .needs_restart()
+            );
+            driver.stop().await;
+            drop(driver);
+            fs::rename(&root, base.join("Moved")).unwrap();
+            fs::create_dir(&root).unwrap();
+            write_marker(
+                &root,
+                &Marker {
+                    space_id: SPACE.into(),
+                    effects: 0,
+                },
+            )
+            .unwrap();
+            let driver = Driver::open(paths).unwrap();
+            let lifecycle = driver
+                .inner
+                .folders
+                .lock()
+                .unwrap()
+                .get(SPACE)
+                .unwrap()
+                .status
+                .clone();
+            let saved = lifecycle.root();
+            driver.start();
+            eventually(
+                "the reopened folder either rejects or observes the replacement",
+                || lifecycle.needs_restart() || driver.status().folders[0].local_entries.is_some(),
+            )
+            .await;
+            let owner = claim::owner(&root).unwrap();
+            let status = driver.status().folders[0].clone();
+            driver.stop().await;
+            assert_eq!(
+                owner, None,
+                "reopen claimed a replacement after Folder::open failed"
+            );
+            assert_eq!(saved, Some(original));
+            assert_eq!(status.state, FolderState::Halted);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_pending_start_cannot_skip_a_restarts_root_reset() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let dir = tempfile::tempdir().unwrap();
+            let base = fs::canonicalize(dir.path()).unwrap();
+            let root = base.join("Koidrive");
+            let paths = Paths::under(&base.join("profile"));
+            linked(&paths, &root, "d1");
+            let driver = Driver::open(paths.clone()).unwrap();
+            driver.start();
+            eventually("the original folder is claimed", || {
+                claim::owner(&root).unwrap().is_some()
+            })
+            .await;
+            fs::rename(&root, base.join("Moved")).unwrap();
+            halted(&driver).await;
+            driver.stop().await;
+            let lifecycle = driver
+                .inner
+                .folders
+                .lock()
+                .unwrap()
+                .get(SPACE)
+                .unwrap()
+                .status
+                .clone();
+            assert!(!lifecycle.needs_restart());
+            fs::create_dir(&root).unwrap();
+            write_marker(
+                &root,
+                &Marker {
+                    space_id: SPACE.into(),
+                    effects: 0,
+                },
+            )
+            .unwrap();
+            let replacement = claim::Identity::of(&fs::metadata(&root).unwrap());
+            assert_ne!(lifecycle.root(), Some(replacement));
+            let (reached, stopped) = tokio::sync::oneshot::channel();
+            let (proceed, released) = tokio::sync::oneshot::channel();
+            *driver.inner.restart_stopped.lock().unwrap() = Some(RestartStopped {
+                reached,
+                proceed: released,
+            });
+            let restarting = tokio::spawn({
+                let driver = driver.clone();
+                let root = root.clone();
+                async move { driver.restart(&root).await }
+            });
+            stopped.await.unwrap();
+            driver.start();
+            assert!(driver.inner.startup_pending.load(Ordering::SeqCst));
+            proceed.send(()).unwrap();
+            restarting.await.unwrap().unwrap();
+            eventually(
+                "the restart either claims or rejects the replacement",
+                || lifecycle.needs_restart() || claim::owner(&root).unwrap().is_some(),
+            )
+            .await;
+            let owner = claim::owner(&root).unwrap();
+            driver.stop().await;
+            assert!(
+                owner.is_some(),
+                "a pending start prevented the explicit root reset"
+            );
+            assert_eq!(lifecycle.root(), Some(replacement));
+            let blocked = paths
+                .store(SPACE)
+                .unwrap()
+                .with_file_name("lifecycle.json.tmp");
+            fs::create_dir(&blocked).unwrap();
+            assert!(matches!(
+                driver.restart(&root).await,
+                Err(DriverError::Io { .. })
+            ));
+            assert!(!driver.inner.startup_blocked.load(Ordering::SeqCst));
+            assert_eq!(lifecycle.root(), Some(replacement));
+            fs::remove_dir(blocked).unwrap();
+            driver.restart(&root).await.unwrap();
+            assert_eq!(lifecycle.root(), None);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_lifecycle_record_cannot_reopen_as_a_healthy_folder() {
+        let (_dir, paths, _root) = profile(&[]);
+        credential("d2").save_new(&paths.credential()).unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+        driver.start();
+        driver.pause().await.unwrap();
+        drop(driver);
+        let record = paths.store(SPACE).unwrap().with_file_name("lifecycle.json");
+        fs::write(record, b"not json").unwrap();
+        assert!(matches!(
+            Driver::open(paths.clone()),
+            Err(DriverError::Io { .. })
+        ));
+        assert!(matches!(
+            Driver::linked_folders(&paths),
+            Err(DriverError::Io { .. })
+        ));
     }
 
     #[tokio::test]
@@ -2675,6 +3045,8 @@ mod tests {
         first.stop().await;
 
         second.start();
+        assert!(halted(&second).await.contains("another Koidrive process"));
+        second.restart(&root).await.unwrap();
         let problem = halted(&second).await;
         assert!(problem.contains("linked by device d1"), "{problem}");
         second.stop().await;
@@ -3880,6 +4252,7 @@ mod tests {
                 if checking {
                     driver.check_for_updates();
                 }
+                let before = driver.status().folders;
                 {
                     let leave = driver.sign_out(false);
                     tokio::pin!(leave);
@@ -3931,12 +4304,16 @@ mod tests {
                 assert_eq!(status.paused, paused);
                 if paused {
                     assert_eq!(fs::read(paths.paused()).unwrap(), b"pause stays\n");
-                    assert!(
-                        status
-                            .folders
-                            .iter()
-                            .all(|folder| folder.state == FolderState::Stopped)
-                    );
+                    assert_eq!(status.folders.len(), before.len());
+                    for (folder, before) in status.folders.iter().zip(&before) {
+                        assert_eq!(folder.space_id, before.space_id);
+                        if before.state == FolderState::Halted {
+                            assert_eq!(folder.state, FolderState::Halted);
+                            assert_eq!(folder.problem, before.problem);
+                        } else {
+                            assert_eq!(folder.state, FolderState::Stopped);
+                        }
+                    }
                 } else {
                     assert!(!paths.paused().exists());
                 }
@@ -5388,6 +5765,173 @@ mod tests {
         assert!(folder.problem.as_ref().unwrap().contains("unlink it again"));
         driver.sign_out(true).await.unwrap();
         signed_out(&driver, &paths, &root);
+    }
+
+    #[tokio::test]
+    async fn an_unlink_preparation_failure_leaves_the_task_running() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let dir = tempfile::tempdir().unwrap();
+            let base = fs::canonicalize(dir.path()).unwrap();
+            let root = base.join("Koidrive");
+            let paths = Paths::under(&base.join("profile"));
+            let (driver, gate) = paused_driver(&paths, &root).await;
+            let blocked = paths
+                .store(SPACE)
+                .unwrap()
+                .with_file_name("lifecycle.json.tmp");
+            fs::create_dir(&blocked).unwrap();
+            let watch = driver.watch();
+            assert!(matches!(
+                driver.unlink(&root).await,
+                Err(DriverError::Io { .. })
+            ));
+            assert!(watch.has_changed().unwrap());
+            {
+                let folders = driver.inner.folders.lock().unwrap();
+                let folder = folders.get(SPACE).unwrap();
+                assert!(folder.unlink.is_none());
+                assert!(!*folder.run.as_ref().unwrap().stop.borrow());
+                assert!(!folder.status.needs_restart());
+            }
+            assert!(!lockable(&root));
+            fs::remove_dir(blocked).unwrap();
+            gate.open();
+            driver.unlink(&root).await.unwrap();
+            assert!(driver.status().folders.is_empty());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_process_exit_during_unlink_keeps_its_recovery_authority() {
+        const CHILD: &str = "KOI_UNLINK_EXIT_CHILD";
+        if let Some(base) = std::env::var_os(CHILD) {
+            let base = PathBuf::from(base);
+            let paths = Paths::under(&base.join("profile"));
+            let root = base.join("Koidrive");
+            let (driver, _gate) = paused_driver(&paths, &root).await;
+            let unlink = tokio::spawn({
+                let driver = driver.clone();
+                async move { driver.unlink(&root).await }
+            });
+            assert!(still_waiting(&unlink).await);
+            std::process::exit(0);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "driver::tests::a_process_exit_during_unlink_keeps_its_recovery_authority",
+                "--nocapture",
+            ])
+            .env(CHILD, &base)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(15), child.wait()).await;
+        let Ok(result) = result else {
+            let _ = child.kill().await;
+            panic!("the unlink child did not exit within 15 seconds");
+        };
+        assert!(result.unwrap().success());
+        let paths = Paths::under(&base.join("profile"));
+        let root = base.join("Koidrive");
+        let driver = Driver::open(paths.clone()).unwrap();
+        driver.start();
+        assert_eq!(driver.status().folders[0].state, FolderState::Halted);
+        driver.restart(&root).await.unwrap();
+        assert_eq!(driver.status().folders[0].state, FolderState::Halted);
+        assert!(lockable(&root));
+        driver.unlink(&root).await.unwrap();
+        assert!(driver.status().folders.is_empty());
+        assert!(!paths.store(SPACE).unwrap().parent().unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_unlink_stays_halted_after_reopen_resume_and_restart() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let dir = tempfile::tempdir().unwrap();
+            let base = fs::canonicalize(dir.path()).unwrap();
+            let root = base.join("Koidrive");
+            let paths = Paths::under(&base.join("profile"));
+            let (driver, gate) = paused_driver(&paths, &root).await;
+            let unlink = tokio::spawn({
+                let driver = driver.clone();
+                let root = root.clone();
+                async move { driver.unlink(&root).await }
+            });
+            assert!(still_waiting(&unlink).await);
+            unlink.abort();
+            assert!(unlink.await.unwrap_err().is_cancelled());
+            let lifecycle = driver
+                .inner
+                .folders
+                .lock()
+                .unwrap()
+                .get(SPACE)
+                .unwrap()
+                .status
+                .clone();
+            lifecycle.halt(
+                Halted::Io,
+                "a task stopped after unlink was cancelled".into(),
+                crate::lifecycle::Recovery::Restart,
+            );
+            assert!(
+                lifecycle
+                    .claimed(claim::Identity::of(&fs::metadata(&root).unwrap()))
+                    .is_err()
+            );
+            gate.open();
+            driver.pause().await.unwrap();
+            drop(driver);
+
+            let driver = Driver::open(paths.clone()).unwrap();
+            driver.start();
+            assert!(driver.status().paused);
+            assert_eq!(driver.status().folders[0].state, FolderState::Halted);
+            driver.resume().await.unwrap();
+            driver.restart(&root).await.unwrap();
+            assert!(lockable(&root));
+            let status = driver.status();
+            assert_eq!(status.folders[0].state, FolderState::Halted);
+            assert!(
+                status.folders[0]
+                    .problem
+                    .as_ref()
+                    .unwrap()
+                    .contains("unlink it again")
+            );
+            driver.unlink(&root).await.unwrap();
+            assert!(driver.status().folders.is_empty());
+            assert!(!paths.store(SPACE).unwrap().parent().unwrap().exists());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_pause_cannot_report_success_until_its_halt_is_saved() {
+        let (_dir, paths, _root) = profile(&[]);
+        let temporary = paths
+            .store(SPACE)
+            .unwrap()
+            .with_file_name("lifecycle.json.tmp");
+        fs::create_dir(&temporary).unwrap();
+        credential("d2").save_new(&paths.credential()).unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+        driver.start();
+        assert!(matches!(driver.pause().await, Err(DriverError::Io { .. })));
+        fs::remove_dir(&temporary).unwrap();
+        assert!(!driver.pause().await.unwrap());
+        let problem = driver.status().folders[0].problem.clone();
+        drop(driver);
+        let reopened = Driver::open(paths).unwrap();
+        assert!(reopened.status().paused);
+        assert_eq!(reopened.status().folders[0].state, FolderState::Halted);
+        assert_eq!(reopened.status().folders[0].problem, problem);
     }
 
     #[tokio::test]

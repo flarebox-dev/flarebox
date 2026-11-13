@@ -50,7 +50,7 @@ use crate::failures::{self, Halted};
 use crate::ignore::Matcher;
 use crate::observe::{FsObserver, Observer};
 use crate::policy::{self, Disposition};
-use crate::status::{FolderState, FolderStatus, Wait, WaitKind};
+use crate::status::{FolderState, Wait, WaitKind};
 
 /// The highest space format this build reads (spec v0 section 9.2).
 pub const MAX_FORMAT: u32 = 1;
@@ -1428,7 +1428,7 @@ pub(crate) struct FolderTask {
     pub link: Link,
     pub store: PathBuf,
     pub auth: Arc<Auth>,
-    pub status: Arc<Mutex<FolderStatus>>,
+    pub status: Arc<crate::lifecycle::Lifecycle>,
     pub matcher: Arc<dyn Matcher>,
     /// This device's `[sync]` list as the engine's trees take it, the same list `matcher` applies to the scans.
     pub local: LocalRules,
@@ -1457,6 +1457,11 @@ pub(crate) struct FolderTask {
 #[cfg(test)]
 pub(crate) struct ObserveFault {
     pub paused: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static BEFORE_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Why the task stopped syncing before it was asked to.
@@ -1599,7 +1604,7 @@ impl FolderTask {
     pub async fn run(self, mut stop: watch::Receiver<bool>) {
         let space_id = self.link.space_id.clone();
         let mut again = ROOT_AGAIN;
-        let mut locked = None;
+        let mut locked = self.status.root();
         loop {
             let halted = tokio::select! {
                 halted = self.sync(&mut locked) => Some(halted),
@@ -1610,11 +1615,18 @@ impl FolderTask {
                 return;
             };
             tracing::warn!(space_id, reason = %halted, "sync of a folder halted");
-            let (why, problem) = match &halted {
-                Halt::Root(why, problem) => (*why, format!("{problem}; checking the folder again")),
-                Halt::Person(why, problem) => (*why, problem.clone()),
+            let (why, problem, recovery) = match &halted {
+                Halt::Root(why, problem) => (
+                    *why,
+                    format!("{problem}; checking the folder again"),
+                    crate::lifecycle::Recovery::Root,
+                ),
+                Halt::Person(why, problem) => {
+                    (*why, problem.clone(), crate::lifecycle::Recovery::Restart)
+                }
             };
-            self.halt(why, problem);
+            self.status.halt(why, problem, recovery);
+            self.changed.send_replace(());
             self.join_observer().await;
             if let Halt::Person(..) = halted {
                 let _ = stop.wait_for(|stop| *stop).await;
@@ -1650,6 +1662,19 @@ impl FolderTask {
             Ok(lock) => Arc::new(lock),
             Err(problem) => return Halt::Person(Halted::Claim, problem),
         };
+        if let Err(error) = self
+            .status
+            .claimed(locked.expect("a claimed folder has an identity"))
+        {
+            return Halt::Person(
+                Halted::Io,
+                format!("the folder's lifecycle cannot be saved: {error}"),
+            );
+        }
+        #[cfg(test)]
+        if let Some(before_open) = BEFORE_OPEN.with(|hook| hook.borrow_mut().take()) {
+            before_open();
+        }
         let local = self.local.clone();
         let mut folder = match Folder::open(self.link.clone(), &lock, &self.store, local) {
             Ok(folder) => folder,
@@ -1787,15 +1812,16 @@ impl FolderTask {
         loop {
             match check_root(&self.link.root, &self.link.space_id, self.link.root_dev) {
                 Ok(_) => {
-                    self.update(|status| status.problem = None);
                     return;
                 }
                 Err(problem) => {
                     tracing::warn!(space_id = self.link.space_id, %problem, "the folder fails its root check");
-                    self.halt(
+                    self.status.halt(
                         Halted::Root,
                         format!("{problem}; checking again in 30 seconds"),
+                        crate::lifecycle::Recovery::Root,
                     );
+                    self.changed.send_replace(());
                     tokio::time::sleep(ROOT_RECHECK).await;
                 }
             }
@@ -1949,21 +1975,6 @@ impl FolderTask {
         status.wait = view.wait;
         status.questions = view.questions;
         drop(status);
-        self.changed.send_replace(());
-    }
-
-    fn halt(&self, why: Halted, problem: String) {
-        self.update(|status| {
-            if status.state != FolderState::Halted {
-                failures::failed(failures::Failure::Halted(why));
-            }
-            status.state = FolderState::Halted;
-            status.problem = Some(problem);
-        });
-    }
-
-    fn update(&self, change: impl FnOnce(&mut FolderStatus)) {
-        change(&mut self.status.lock().unwrap());
         self.changed.send_replace(());
     }
 }

@@ -661,9 +661,6 @@ pub enum UpdateResult {
 #[serde(tag = "condition", rename_all = "snake_case")]
 pub enum Condition {
     NotSetUp,
-    /// Sync is paused until `koi resume`. `status --check` exits 0 for it, and the folders the pause stops add no
-    /// `stopped` condition.
-    Paused,
     Halted {
         folder: String,
         problem: Option<String>,
@@ -690,7 +687,6 @@ impl Condition {
     /// The exit status of `status --check` for this condition alone.
     pub fn exit(&self) -> u8 {
         match self {
-            Condition::Paused => 0,
             Condition::NotSetUp => Code::AuthRequired.exit(),
             Condition::Halted { .. } | Condition::Stopped { .. } => Code::Halted.exit(),
             Condition::DecisionRequired { .. } => Code::DecisionRequired.exit(),
@@ -704,9 +700,6 @@ pub fn conditions(status: &Status, questions: &[Question]) -> Vec<Condition> {
     let mut found = Vec::new();
     if status.account.is_none() {
         found.push(Condition::NotSetUp);
-    }
-    if status.paused {
-        found.push(Condition::Paused);
     }
     for folder in &status.folders {
         let path = folder.path.clone();
@@ -1679,13 +1672,13 @@ mod tests {
     }
 
     #[test]
-    fn a_pause_is_a_condition_that_exits_0_and_the_folders_it_stopped_are_none() {
+    fn a_pause_adds_no_condition_and_the_folders_it_stopped_are_none() {
         let paused = |folders| Status {
             paused: true,
             ..status(true, folders)
         };
         let stopped = paused(vec![folder("Work", FolderState::Stopped)]);
-        assert_eq!(conditions(&stopped, &[]), [Condition::Paused]);
+        assert!(conditions(&stopped, &[]).is_empty());
         assert_eq!(exit(&stopped, &[]), 0);
         let choice = question("q1", held());
         assert_eq!(exit(&stopped, std::slice::from_ref(&choice)), 3);
