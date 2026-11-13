@@ -628,7 +628,9 @@
     "fn:a_superseded_owed_rename_ends_the_debt_and_leaves_the_change_it_met_to_reach_the_disk": "parked_edits_and_pending_names",
     "fn:a_superseded_owed_rename_of_a_node_another_device_deleted_keeps_the_debt": "parked_edits_and_pending_names",
     "fn:another_devices_resend_of_a_place_and_its_content_sends_nothing_back": "commit_moves_and_conflicts",
-    "use:koidrive_engine :: question :: { Answer , RecoveryCause , RecoveryTrigger }": "common"
+    "use:koidrive_engine :: question :: { Answer , RecoveryCause , RecoveryTrigger }": "common",
+    "fn:a_file_the_user_deletes_before_the_server_renames_its_create_is_deleted": "refusal_and_reconnect",
+    "fn:a_folder_the_user_empties_and_deletes_before_the_server_renames_its_create_is_deleted": "refusal_and_reconnect"
   },
   "core/sim/tests/engine_sync.rs": {
     "use:std :: collections :: { BTreeMap , BTreeSet }": "common",

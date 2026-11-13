@@ -390,3 +390,58 @@ fn reconnecting_compares_the_device_counter_and_the_history() {
     assert_eq!(commits.connected(&welcome(1)), Reconnect::Resend);
     assert_eq!(commits.halted(), None);
 }
+
+#[test]
+fn a_file_the_user_deletes_before_the_server_renames_its_create_is_deleted() {
+    let mut trees = trees(&[("a", Some(file(ROOT, "x", 1)), None, None)]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    trees.remove_local("a");
+    trees.settle();
+    trees.set_remote("a".into(), remote(file(ROOT, "x (conflict)", 1)));
+    let renamed = OpResult {
+        name: "x (conflict)".into(),
+        ..outcome(op_result::Code::AppliedRenamed)
+    };
+    acknowledge(&mut commits, &mut trees, vec![renamed]);
+    trees.settle();
+    let mut effects = Effects::default();
+    assert!(
+        (effects.plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)).is_empty()
+    );
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [delete("a")]);
+}
+
+#[test]
+fn a_folder_the_user_empties_and_deletes_before_the_server_renames_its_create_is_deleted() {
+    let mut trees = trees(&[
+        ("n", Some(dir(ROOT, "x")), None, None),
+        ("c", Some(dir("n", "y")), None, None),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    trees.set_local("c".into(), local(dir(ROOT, "y"), 2));
+    trees.remove_local("n");
+    trees.settle();
+    trees.set_remote("n".into(), remote(dir(ROOT, "x (conflict)")));
+    trees.set_remote("c".into(), remote(dir("n", "y")));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![
+            OpResult {
+                name: "x (conflict)".into(),
+                ..outcome(op_result::Code::AppliedRenamed)
+            },
+            outcome(op_result::Code::Applied),
+        ],
+    );
+    trees.settle();
+    let mut effects = Effects::default();
+    assert!(
+        (effects.plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)).is_empty()
+    );
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("c", ROOT, "y"), delete("n")]);
+}

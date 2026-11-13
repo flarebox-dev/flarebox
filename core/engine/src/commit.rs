@@ -1762,7 +1762,7 @@ impl Commits {
                 aliases.contains_key(held) || merged.contains_key(held)
             });
             let left = sent.is_some_and(|(sent_parent, name)| {
-                (trees.local().get(node)).is_some_and(|local| {
+                (trees.local().get(node)).is_none_or(|local| {
                     local.shape.parent != *merged.get(sent_parent).unwrap_or(sent_parent)
                         || nfc(&local.shape.name) != nfc(name)
                 })
