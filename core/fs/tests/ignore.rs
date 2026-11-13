@@ -3269,3 +3269,73 @@ fn a_rescan_of_a_sibling_reports_an_entry_a_rule_left_out_as_removed_once_it_is_
     );
     assert!(snapshot.left_out.is_empty());
 }
+
+#[test]
+fn an_entry_a_rule_left_out_moved_to_another_excluded_name_is_removed_once_it_is_gone() {
+    let (dir, mut snapshot, mut rules) = tree_without_rules();
+    let root = dir.path();
+    write(root, RULES_FILE, "cache/\nother/\n");
+    snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    fs::rename(root.join("sub/cache"), root.join("sub/other")).unwrap();
+    snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    fs::remove_dir_all(root.join("sub/other")).unwrap();
+
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(rescan.changes, [removed("sub/other", Dir)]);
+    assert!(snapshot.left_out.is_empty());
+}
+
+#[test]
+fn an_entry_a_rule_left_out_in_a_renamed_folder_is_removed_once_it_is_gone() {
+    let (dir, mut snapshot, mut rules) = tree_without_rules();
+    let root = dir.path();
+    write(root, RULES_FILE, "cache/\n");
+    snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    fs::rename(root.join("sub"), root.join("moved")).unwrap();
+    snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    fs::remove_dir_all(root.join("moved/cache")).unwrap();
+
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(rescan.changes, [removed("moved/cache", Dir)]);
+    assert!(snapshot.left_out.is_empty());
+}
+
+#[test]
+fn an_entry_renamed_to_a_name_the_rules_exclude_is_removed_once_it_is_gone() {
+    let (dir, mut snapshot, mut rules) = tree_without_rules();
+    let root = dir.path();
+    write(root, RULES_FILE, "cache/\n*.log\n");
+    snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    fs::rename(root.join("sub/b.txt"), root.join("sub/b.log")).unwrap();
+    let moved = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert!(
+        matches!(&moved.changes[..], [Change::Ignored { from, to, .. }] if from == Path::new("sub/b.txt") && to == Path::new("sub/b.log")),
+        "{moved:?}"
+    );
+    fs::remove_file(root.join("sub/b.log")).unwrap();
+
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(rescan.changes, [removed("sub/b.log", File)]);
+    assert_eq!(
+        snapshot.left_out.keys().collect::<Vec<_>>(),
+        [Path::new("sub/cache")]
+    );
+}

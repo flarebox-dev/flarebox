@@ -8067,3 +8067,54 @@ fn an_excluded_folder_removed_while_the_device_is_stopped_frees_its_name_for_the
     assert!(b.sent.iter().all(|commit| commit.ops.is_empty()));
     assert_eq!(remote.names(), ["a", "ß"]);
 }
+
+#[test]
+fn an_excluded_folder_moved_to_another_excluded_name_leaves_l_once_deleted() {
+    an_excluded_folder_deleted_after_a_move_leaves_l("cache", ("cache", "other"), "other");
+}
+
+#[test]
+fn an_excluded_folder_in_a_renamed_folder_leaves_l_once_deleted() {
+    an_excluded_folder_deleted_after_a_move_leaves_l("sub/cache", ("sub", "moved"), "moved/cache");
+}
+
+fn an_excluded_folder_deleted_after_a_move_leaves_l(
+    folder: &str,
+    (from, to): (&str, &str),
+    moved: &str,
+) {
+    let mut remote = Remote::new();
+    let (site, mut b) = linked(&mut remote, "b");
+    fs::create_dir_all(site.root.join(folder)).unwrap();
+    b.create(
+        &mut remote,
+        &site.root.join(folder).join("file"),
+        b"kept remotely",
+    );
+    drop(b);
+    let sync = SyncRules {
+        include: Vec::new(),
+        exclude: vec!["cache/".into(), "other/".into()],
+    };
+    let mut b = site.start_with(&sync);
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    b.run(&mut remote);
+    b.settle();
+    fs::rename(site.root.join(from), site.root.join(to)).unwrap();
+    for _ in 0..3 {
+        b.settle();
+        b.run(&mut remote);
+    }
+    let name = moved.rsplit('/').next().unwrap();
+    let held = |b: &Device| {
+        (b.folder.engine.trees.local().iter()).any(|(_, node)| node.shape.name == name)
+    };
+    assert!(held(&b));
+    fs::remove_dir_all(site.root.join(moved)).unwrap();
+    for _ in 0..3 {
+        b.settle();
+        b.run(&mut remote);
+    }
+    assert!(!held(&b));
+}

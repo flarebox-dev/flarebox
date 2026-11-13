@@ -588,7 +588,8 @@ impl Snapshot {
     /// removed, or as renamed when the scan finds its identity at an included
     /// path.
     /// A removal whose entry the scan finds under a left-out entry is reported
-    /// as [`Change::Ignored`]. Each rescan looks at a bounded number of
+    /// as [`Change::Ignored`], and one found at such an entry's path is kept
+    /// in [`Snapshot::left_out`]. Each rescan looks at a bounded number of
     /// left-out entries ([`Rules::with_search_budget`]). A removal the search
     /// has not decided within that bound is held back: the snapshot drops its
     /// entry without a change, `rules` hold it at the path the renames of this
@@ -912,6 +913,14 @@ impl Snapshot {
             self.left_out.remove(path);
         }
         self.left_out.extend(still_left_out);
+        self.left_out.extend(changes.iter().filter_map(|change| {
+            match change {
+                Change::Ignored { to, kind, id, .. } => (scan.left_out.get(to))
+                    .filter(|now| now.kind == *kind && now.id == *id)
+                    .map(|now| (to.clone(), *now)),
+                _ => None,
+            }
+        }));
         let (rules, read) = match scan.rules.take() {
             Some(rules) => rules.finish(|dir| {
                 self.entries
