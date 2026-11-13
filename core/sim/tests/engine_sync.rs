@@ -644,16 +644,37 @@ impl Device {
             }
             (4, Some((id, node))) if !unseen(&id, node.shape.kind) => {
                 let mut doomed = vec![id];
+                let mut held = Vec::new();
                 let mut next = 0;
                 while let Some(current) = doomed.get(next).cloned() {
-                    doomed.extend(self.trees.local_children(&current).cloned());
+                    for child in self.trees.local_children(&current) {
+                        match self.trees.ignored_local().contains(child) {
+                            true => held.push(child.clone()),
+                            false => doomed.push(child.clone()),
+                        }
+                    }
                     next += 1;
                 }
-                for other in doomed {
-                    match self.trees.recorded_local(&other) {
-                        true => self.trees.displace_local(&other),
-                        false => self.trees.remove_local(&other),
+                let mut kept = BTreeSet::new();
+                for node in &held {
+                    let mut above = self.trees.local().get(node).map(|n| n.shape.parent.clone());
+                    while let Some(folder) = above.filter(|folder| doomed.contains(folder)) {
+                        if !kept.insert(folder.clone()) {
+                            break;
+                        }
+                        above = self
+                            .trees
+                            .local()
+                            .get(&folder)
+                            .map(|n| n.shape.parent.clone());
                     }
+                }
+                doomed.retain(|node| !kept.contains(node));
+                for folder in &kept {
+                    self.trees.ignore_local(folder);
+                }
+                for other in doomed {
+                    self.trees.remove_local(&other);
                 }
             }
             _ => {}
@@ -4019,4 +4040,48 @@ fn a_folder_deleted_here_that_holds_excluded_files_comes_back_for_a_folder_the_o
             .unwrap();
         }
     }
+}
+
+#[test]
+fn a_local_delete_keeps_a_recorded_entry_and_the_folders_above_it_as_the_driver_does() {
+    let mut device = Device {
+        trees: Trees::new("root"),
+        ids: IdGen::new(7),
+        inos: 0,
+        fresh_dir_names: false,
+        rules: Rules::default(),
+    };
+    for (id, parent, name) in [("d", "root", "d"), ("m", "d", "m"), ("c", "m", "c")] {
+        let shape = koidrive_engine::tree::Shape {
+            parent: parent.into(),
+            name: name.into(),
+            kind: Kind::Dir,
+            content: None,
+        };
+        let identity = device.identity();
+        device.trees.set_local(
+            id.into(),
+            LocalNode {
+                shape: shape.clone(),
+                identity,
+                parked: false,
+            },
+        );
+        device.trees.set_synced(id.into(), Some(shape.clone()));
+        device.trees.set_remote(
+            id.into(),
+            RemoteNode {
+                shape,
+                trashed: false,
+                content_rev: 1,
+                meta_rev: 1,
+                trash_group: String::new(),
+            },
+        );
+    }
+    device.trees.ignore_local("m");
+    device.act(&act(4, 0, 0, 0, 0));
+    assert!(device.trees.local().get("d").is_some());
+    assert!(device.trees.local().get("m").is_some());
+    assert!(device.trees.local().get("c").is_some());
 }
