@@ -14,6 +14,7 @@ extension Color {
     static let redLabel = Color(light: NSColor(hex: 0xD70015), dark: NSColor(hex: 0xFF6961),
                                 increasedContrast: (NSColor(hex: 0xB0000F), NSColor(hex: 0xFF8A82)))
     static let statusYellow = Color(light: 0xB07A00, dark: 0xFFD60A)
+    static let needsYou = statusYellow
     static let redTint = Color(light: NSColor(red: 224 / 255, green: 53 / 255, blue: 43 / 255, alpha: 0.1),
                                dark: NSColor(red: 1, green: 69 / 255, blue: 58 / 255, alpha: 0.16))
     static let redFill = Color(red: 0xD7 / 255, green: 0, blue: 0x15 / 255)
@@ -25,6 +26,16 @@ extension Color {
     static let separatorLine = Color(light: NSColor(white: 0, alpha: 0.1), dark: NSColor(white: 1, alpha: 0.1))
     static let fillStrong = Color(light: NSColor(white: 0, alpha: 0.1), dark: NSColor(white: 1, alpha: 0.14))
     static let accentRing = Color(red: 1, green: 106 / 255, blue: 19 / 255, opacity: 0.35)
+    static let label2 = Color(light: NSColor(white: 0, alpha: 0.52), dark: NSColor(white: 1, alpha: 0.56))
+
+    static let panel = Color(light: 0xF9F9FA, dark: 0x1F1F21)
+    static let group = Color(light: 0xEFEFF0, dark: 0x2A2A2C)
+    static let line = Color(light: 0xEDEDEE, dark: 0x2C2C2E)
+    static let lineStrong = Color(light: 0xDEDEDE, dark: 0x353538)
+    static let chipBorder = Color(light: 0xE3E3E5, dark: 0x3A3A3D)
+    static let text = Color(light: 0x1B1B1B, dark: 0xE3E4E6)
+    static let text2 = Color(light: 0x5C5C5E, dark: 0x959597)
+    static let text3 = Color(light: 0xA0A0A2, dark: 0x5C5D5F)
 
     init(light: Int, dark: Int) {
         self.init(light: NSColor(hex: light), dark: NSColor(hex: dark))
@@ -153,5 +164,76 @@ struct RowGroup<Content: View>: View {
         }
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.content))
         .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.separator))
+    }
+}
+
+struct StatusPill: View {
+    enum Mark {
+        case dot(Color)
+        case progress
+    }
+
+    let title: String
+    let mark: Mark
+
+    var body: some View {
+        HStack(spacing: 6) {
+            switch mark {
+            case .dot(let color):
+                Circle().fill(color).frame(width: 6, height: 6)
+            case .progress:
+                Circle()
+                    .trim(from: 0, to: 0.7)
+                    .stroke(Color.koi, style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                    .frame(width: 8, height: 8)
+            }
+            Text(verbatim: title)
+                .font(.callout.weight(.medium))
+                .foregroundStyle(Color.text)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 22)
+        .overlay(Capsule().strokeBorder(Color.chipBorder))
+    }
+}
+
+struct GroupBand<Trailing: View>: View {
+    let title: LocalizedStringKey
+    @ViewBuilder var trailing: Trailing
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.body.weight(.medium))
+                .foregroundStyle(Color.text)
+            Spacer(minLength: 0)
+            trailing
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 36)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.group))
+    }
+}
+
+extension GroupBand where Trailing == EmptyView {
+    init(_ title: LocalizedStringKey) {
+        self.init(title: title) { EmptyView() }
+    }
+}
+
+struct PathText: View {
+    let path: String
+
+    var body: some View {
+        let slash = path.lastIndex(of: "/").map { path.index(after: $0) } ?? path.startIndex
+        var folder = AttributedString(path[..<slash])
+        folder.foregroundColor = Color.text2
+        var name = AttributedString(path[slash...])
+        name.foregroundColor = Color.text
+        return Text(folder + name)
+            .lineLimit(1)
+            .truncationMode(.head)
     }
 }
