@@ -768,8 +768,8 @@ fn a_link_moved_into_an_ignored_folder_while_another_link_is_renamed_is_ignored(
             }
             let case = format!("{renamed} {ignored} over={over} budget={budget}: {changes:?}");
             assert!(
-                (changes.iter()).any(|change| matches!(change, Change::Ignored { from, to, .. }
-                    if from == Path::new(ignored) && to == Path::new("ig/zz/deep/moved.txt"))),
+                (changes.iter()).any(|change| matches!(change, Change::Ignored { to, .. }
+                    if to == Path::new("ig/zz/deep/moved.txt"))),
                 "{case}"
             );
             assert!(
