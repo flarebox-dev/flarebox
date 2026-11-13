@@ -27,8 +27,6 @@ const SCAN: Duration = Duration::from_secs(60 * 60);
 const INSTALL_SCRIPT: &str = "https://koidrive.com/install.sh";
 const INSTALL_SCRIPT_VARIABLE: &str = "KOIDRIVE_INSTALL_SCRIPT_URL";
 
-// Homebrew 7.0.13: Library/Homebrew/utils/lock.sh ("Another `brew update` process is already running.") and
-// Library/Homebrew/exceptions.rb, OperationInProgressError ("A `brew upgrade` process has already locked ...").
 const BREW_BUSY: [&str; 2] = ["process is already running", "process has already locked"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,7 +78,12 @@ impl Installs {
     }
 
     fn pick(&self, exists: impl Fn(&Path) -> bool, running: &[&Path]) -> Option<Install> {
-        if let Some(koi) = self.homebrew.iter().find(|koi| exists(koi)) {
+        let homebrew = self
+            .homebrew
+            .iter()
+            .cloned()
+            .chain(running.iter().filter_map(|koi| homebrew_link(koi)));
+        if let Some(koi) = homebrew.into_iter().find(|koi| exists(koi)) {
             let prefix = koi.ancestors().nth(4)?.to_path_buf();
             return Some(Install::Homebrew { prefix });
         }
@@ -105,6 +108,9 @@ impl Installs {
 }
 
 pub fn homebrew_link(binary: &Path) -> Option<PathBuf> {
+    if binary.ends_with("opt/koidrive/bin/koi") {
+        return Some(binary.to_path_buf());
+    }
     if !binary.ends_with("bin/koi") {
         return None;
     }
@@ -156,6 +162,12 @@ struct Echo {
     log: Option<File>,
 }
 
+#[derive(Clone, Copy)]
+enum Lifetime {
+    Cancellable,
+    Independent,
+}
+
 impl Echo {
     fn open(path: &Path, json: bool) -> Echo {
         let log = (path.parent().map(fs::create_dir_all).transpose().ok())
@@ -177,16 +189,24 @@ impl Echo {
         &mut self,
         mut command: Command,
         within: Duration,
+        lifetime: Lifetime,
     ) -> io::Result<Option<(ExitStatus, Vec<u8>, String)>> {
         let shown = format!("{:?}", command.as_std());
         if let Some(log) = &mut self.log {
             let _ = writeln!(log, "$ {shown}");
         }
+        let kill_on_drop = match lifetime {
+            Lifetime::Cancellable => true,
+            Lifetime::Independent => {
+                command.process_group(0);
+                false
+            }
+        };
         let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(kill_on_drop)
             .spawn()?;
         let mut stdout = BufReader::new(child.stdout.take().expect("stdout is piped")).lines();
         let mut stderr = BufReader::new(child.stderr.take().expect("stderr is piped")).lines();
@@ -258,7 +278,7 @@ async fn homebrew(prefix: &Path, echo: &mut Echo) -> Result<(), CliError> {
             .env("HOMEBREW_NO_ENV_HINTS", "1")
             .env("HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK", "1");
         let shown = format!("brew {}", args.join(" "));
-        let (status, _, errors) = (echo.run(command, BREW).await)
+        let (status, _, errors) = (echo.run(command, BREW, Lifetime::Cancellable).await)
             .map_err(|error| failed(format!("{shown} did not run: {error}")))?
             .ok_or_else(|| {
                 failed(format!(
@@ -332,7 +352,7 @@ async fn installer(
         .arg(file.path())
         .env("KOIDRIVE_INSTALL_DIR", dir)
         .env("KOIDRIVE_VERSION", format!("v{version}"));
-    let (status, _, _) = (echo.run(command, INSTALLER).await)
+    let (status, _, _) = (echo.run(command, INSTALLER, Lifetime::Cancellable).await)
         .map_err(|error| failed(format!("install.sh did not run: {error}")))?
         .ok_or_else(|| {
             failed(format!(
@@ -382,45 +402,77 @@ pub async fn run(paths: &Paths, json: bool) -> Result<Done, CliError> {
     let from = (install.as_ref())
         .and_then(|install| service::version_of(&install.koi(&installs)))
         .unwrap_or_else(service::this_version);
-    let data = |result, service| UpdatedData {
-        from: from.to_string(),
-        to: to.to_string(),
-        via: install.as_ref().map(Install::via),
-        result,
-        service,
-    };
-    if to.cmp_precedence(&from).is_le() {
-        let text = format!("Koidrive {from} is the newest release.\n");
-        return Ok(Done::ok(data(UpdateResult::Unchanged, None), text).unchanged());
-    }
+    let upgrading = to.cmp_precedence(&from).is_gt();
     let download = || failed(format!("Download Koidrive {to} from {url}"));
     let mut echo = Echo::open(&log_path(paths), json);
-    match &install {
-        Some(Install::Homebrew { prefix }) => homebrew(prefix, &mut echo).await?,
-        Some(Install::Script { dir }) => installer(script_url()?, dir, &to, &mut echo).await?,
-        Some(Install::App) | None => return Err(download()),
+    if upgrading {
+        match &install {
+            Some(Install::Homebrew { prefix }) => homebrew(prefix, &mut echo).await?,
+            Some(Install::Script { dir }) => installer(script_url()?, dir, &to, &mut echo).await?,
+            Some(Install::App) | None => return Err(download()),
+        }
     }
-    let koi = install
-        .as_ref()
-        .expect("an install was upgraded")
-        .koi(&installs);
+    let Some(install) = install else {
+        let text = format!("Koidrive {from} is the newest release.\n");
+        return Ok(Done::ok(
+            UpdatedData {
+                from: from.to_string(),
+                to: from.to_string(),
+                via: None,
+                result: UpdateResult::Unchanged,
+                service: None,
+            },
+            text,
+        )
+        .unchanged());
+    };
+    let koi = install.koi(&installs);
+    let actual = service::version_of(&koi).ok_or_else(|| {
+        failed(format!(
+            "{} is missing or did not report a Koidrive version after the update",
+            koi.display()
+        ))
+    })?;
+    if actual.cmp_precedence(&to).is_lt() {
+        return Err(failed(format!(
+            "{} is still Koidrive {actual}; the requested release is {to}. Try koi update again when the install source has that release.",
+            koi.display()
+        )));
+    }
     let service = service.map_err(failed)?;
     let args = ["_reconcile", "--json"];
     let mut command = Command::new(&koi);
     command.args(args);
-    let output = (echo.run(command, RECONCILE).await)
+    let output = (echo.run(command, RECONCILE, Lifetime::Independent).await)
         .map(|output| output.map(|(status, printed, _)| (status, printed)));
     let report =
         service::delegated_report(manager.as_ref(), &service, &koi, &args, RECONCILE, output);
+    let summary = match upgrading {
+        true => format!("Updated Koidrive from {from} to {actual}."),
+        false => format!("Koidrive {actual} is the newest release."),
+    };
     let text = format!(
-        "Updated Koidrive from {from} to {to}.\n{}",
+        "{summary}\n{}",
         match report.text() {
             text if text.is_empty() => report.status_line(),
             text => text,
         }
     );
     let failed_service = report.failed();
-    let done = Done::ok(data(UpdateResult::Updated, Some(report)), text);
+    let done = Done::ok(
+        UpdatedData {
+            from: from.to_string(),
+            to: actual.to_string(),
+            via: Some(install.via()),
+            result: if upgrading {
+                UpdateResult::Updated
+            } else {
+                UpdateResult::Unchanged
+            },
+            service: Some(report),
+        },
+        text,
+    );
     if failed_service {
         let reason = done.text.lines().last().unwrap_or_default().to_owned();
         return Err(CliError {
@@ -428,24 +480,28 @@ pub async fn run(paths: &Paths, json: bool) -> Result<Done, CliError> {
             ..CliError::new(Code::Failed, reason)
         });
     }
-    Ok(done)
+    Ok(if upgrading { done } else { done.unchanged() })
 }
 
 fn scan(
-    seen: &mut HashMap<PathBuf, SystemTime>,
+    seen: &mut HashMap<PathBuf, (SystemTime, Option<Version>)>,
     candidates: &[PathBuf],
     runs: &Version,
 ) -> Option<PathBuf> {
-    let changed: Vec<&PathBuf> = (candidates.iter())
-        .filter(|koi| {
+    (candidates.iter())
+        .filter_map(|koi| {
             let Ok(modified) = fs::metadata(koi).and_then(|metadata| metadata.modified()) else {
-                return false;
+                seen.remove(koi);
+                return None;
             };
-            seen.insert(koi.to_path_buf(), modified) != Some(modified)
+            let cached = seen
+                .entry(koi.clone())
+                .or_insert_with(|| (modified, service::version_of(koi)));
+            if cached.0 != modified {
+                *cached = (modified, service::version_of(koi));
+            }
+            Some((cached.1.clone()?, koi))
         })
-        .collect();
-    (changed.into_iter())
-        .filter_map(|koi| Some((service::version_of(koi)?, koi)))
         .filter(|(version, _)| version.cmp_precedence(runs).is_gt())
         .max_by(|(a, _), (b, _)| a.cmp_precedence(b))
         .map(|(_, koi)| koi.clone())
@@ -496,7 +552,10 @@ pub async fn follow_newest(paths: Paths) {
                 .map(PathBuf::from);
             let newer = installed.and_then(|installed| {
                 let mut candidates = Installs::of_this_machine().all();
-                candidates.push(installed);
+                let mut running = vec![installed];
+                running.extend(std::env::current_exe().ok());
+                candidates.extend(running.iter().filter_map(|koi| homebrew_link(koi)));
+                candidates.extend(running);
                 scan(&mut seen, &candidates, &service::this_version())
             });
             (seen, newer)
@@ -513,6 +572,7 @@ pub async fn follow_newest(paths: Paths) {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -598,6 +658,8 @@ mod tests {
             "/home/linuxbrew/.linuxbrew",
             "/srv/brew",
         ] {
+            let opt = Path::new(prefix).join("opt/koidrive/bin/koi");
+            assert_eq!(homebrew_link(&opt), Some(opt.clone()));
             for version in ["0.1.0", "0.1.0-alpha.3", "0.1.2_1"] {
                 let keg = format!("{prefix}/Cellar/koidrive/{version}/bin/koi");
                 assert_eq!(
@@ -608,7 +670,6 @@ mod tests {
             }
         }
         for other in [
-            "/opt/homebrew/opt/koidrive/bin/koi",
             "/opt/homebrew/bin/koi",
             "/opt/homebrew/Cellar/other/0.1.0/bin/koi",
             "/opt/homebrew/Cellar/koidrive/0.1.0/libexec/koi",
@@ -639,6 +700,146 @@ echo "==> brew $1"
 
     fn echo(dir: &Path) -> Echo {
         Echo::open(&dir.join("logs/update.log"), true)
+    }
+
+    #[test]
+    fn reconcile_subprocess() {
+        let Some(dir) = std::env::var_os("KOI_RECONCILE_TEST_DIR").map(PathBuf::from) else {
+            return;
+        };
+        let mode = std::env::var("KOI_RECONCILE_TEST_MODE").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut command = Command::new(dir.join("koi"));
+            command.arg(&dir);
+            let mut echo = echo(&dir);
+            if mode == "cancel" {
+                assert!(
+                    tokio::time::timeout(
+                        Duration::from_millis(100),
+                        echo.run(command, Duration::from_secs(10), Lifetime::Independent)
+                    )
+                    .await
+                    .is_err()
+                );
+            } else {
+                let within = if mode == "timeout" {
+                    Duration::from_millis(100)
+                } else {
+                    Duration::from_secs(10)
+                };
+                let result = echo
+                    .run(command, within, Lifetime::Independent)
+                    .await
+                    .unwrap();
+                assert!(result.is_none());
+            }
+        });
+    }
+
+    fn surviving_reconcile(mode: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        executable(
+            &dir.path().join("koi"),
+            "#!/bin/sh\ntouch \"$1/ready\"\ni=0\nwhile [ ! -f \"$1/continue\" ] && [ $i -lt 250 ]; do sleep 0.02; i=$((i+1)); done\n[ -f \"$1/continue\" ] && touch \"$1/completed\"\n",
+        );
+        let mut parent = std::process::Command::new(std::env::current_exe().unwrap());
+        parent
+            .args([
+                "--exact",
+                "update::tests::reconcile_subprocess",
+                "--nocapture",
+            ])
+            .env("KOI_RECONCILE_TEST_DIR", dir.path())
+            .env("KOI_RECONCILE_TEST_MODE", mode)
+            .process_group(0);
+        let mut parent = parent.spawn().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !dir.path().join("ready").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(dir.path().join("ready").exists());
+        if mode == "sigint" {
+            assert!(
+                std::process::Command::new("/bin/kill")
+                    .args(["-INT", "--", &format!("-{}", parent.id())])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        loop {
+            if let Some(status) = parent.try_wait().unwrap() {
+                if mode == "sigint" {
+                    assert!(!status.success());
+                } else {
+                    assert!(status.success());
+                }
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                parent.kill().unwrap();
+                parent.wait().unwrap();
+                panic!("foreground reconcile wait did not end");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        fs::write(dir.path().join("continue"), "").unwrap();
+        while !dir.path().join("completed").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            dir.path().join("completed").exists(),
+            "reconciliation must finish after {mode}"
+        );
+    }
+
+    #[test]
+    fn reconciliation_survives_foreground_process_group_interrupt() {
+        surviving_reconcile("sigint");
+    }
+
+    #[test]
+    fn reconciliation_survives_foreground_wait_timeout() {
+        surviving_reconcile("timeout");
+    }
+
+    #[test]
+    fn reconciliation_survives_foreground_wait_cancellation() {
+        surviving_reconcile("cancel");
+    }
+
+    #[tokio::test]
+    async fn cancellable_children_are_killed_when_the_wait_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = Command::new("/bin/sh");
+        let pid_file = dir.path().join("pid");
+        command
+            .args(["-c", "echo $$ > \"$1\"; exec sleep 30", "sh"])
+            .arg(&pid_file);
+        let result = echo(dir.path())
+            .run(command, Duration::from_millis(100), Lifetime::Cancellable)
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        let pid = fs::read_to_string(pid_file).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if !std::process::Command::new("/bin/kill")
+                .args(["-0", pid.trim()])
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancellable child is still alive"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]
@@ -796,8 +997,8 @@ echo "==> brew $1"
         assert_eq!(scan(&mut seen, &candidates, &runs), Some(app.clone()));
         assert_eq!(
             scan(&mut seen, &candidates, &runs),
-            None,
-            "nothing changed since"
+            Some(app.clone()),
+            "retry the handoff until the daemon changes"
         );
 
         let later = |seconds| SystemTime::now() + Duration::from_secs(seconds);
@@ -819,8 +1020,8 @@ echo "==> brew $1"
             .unwrap();
         assert_eq!(
             scan(&mut seen, &candidates, &runs),
-            None,
-            "an older koi takes nothing"
+            Some(brew.clone()),
+            "an older koi does not hide the cached newer install"
         );
         assert_eq!(
             scan(
@@ -830,5 +1031,52 @@ echo "==> brew $1"
             ),
             None
         );
+    }
+
+    #[test]
+    fn handoff_retries_cached_versions_without_running_unchanged_binaries_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let koi = dir.path().join("koi");
+        executable(
+            &koi,
+            "#!/bin/sh\necho probe >> \"$0.calls\"\necho 'koi 0.2.0'\n",
+        );
+        let mut seen = HashMap::new();
+        let candidates = [koi.clone()];
+        for _ in 0..3 {
+            assert_eq!(
+                scan(&mut seen, &candidates, &Version::parse("0.1.0").unwrap()),
+                Some(koi.clone())
+            );
+        }
+        assert_eq!(
+            scan(&mut seen, &candidates, &Version::parse("0.2.0").unwrap()),
+            None
+        );
+        assert_eq!(
+            fs::read_to_string(koi.with_extension("calls")).unwrap(),
+            "probe\n"
+        );
+    }
+
+    #[test]
+    fn homebrew_without_an_environment_prefix_is_found_from_the_running_koi() {
+        let dir = tempfile::tempdir().unwrap();
+        let opt = dir.path().join("custom/opt/koidrive/bin/koi");
+        executable(&opt, "#!/bin/sh\nexit 0\n");
+        let installs = Installs::under(None, None);
+        for running in [
+            opt.clone(),
+            dir.path().join("custom/Cellar/koidrive/0.1.0/bin/koi"),
+        ] {
+            assert_eq!(
+                installs.pick(|path| path == opt && path.is_file(), &[&running]),
+                Some(Install::Homebrew {
+                    prefix: dir.path().join("custom")
+                })
+            );
+        }
+        fs::remove_file(&opt).unwrap();
+        assert_eq!(installs.pick(Path::is_file, &[&opt]), None);
     }
 }

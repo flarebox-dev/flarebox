@@ -95,6 +95,8 @@ pub(crate) struct Checked {
     #[serde(default)]
     pub checked_at: Option<i64>,
     #[serde(default)]
+    pub successful_at: Option<i64>,
+    #[serde(default)]
     pub etag: Option<String>,
     #[serde(default)]
     pub release: Option<Release>,
@@ -122,24 +124,31 @@ impl Checked {
     }
 
     pub fn after(self, answer: Answer, now: i64) -> Checked {
+        let successful_at = self
+            .successful_at
+            .or_else(|| self.release.as_ref().and(self.checked_at));
         match answer {
             Answer::Releases { etag, release } => Checked {
                 checked_at: Some(now),
+                successful_at: Some(now),
                 etag,
                 release,
                 retry_after: None,
             },
             Answer::NotModified => Checked {
                 checked_at: Some(now),
+                successful_at: successful_at.map(|_| now),
                 retry_after: None,
                 ..self
             },
             Answer::Refused { until } => Checked {
                 checked_at: Some(now),
+                successful_at,
                 retry_after: until.filter(|until| *until > now.saturating_add(DAY_MS)),
                 ..self
             },
             Answer::Unreachable => Checked {
+                successful_at,
                 retry_after: Some(now.saturating_add(HOUR_MS)),
                 ..self
             },
@@ -147,7 +156,10 @@ impl Checked {
     }
 
     pub fn notice(&self, runs: &Version) -> Update {
-        let Some(checked_at_ms) = self.checked_at else {
+        let Some(checked_at_ms) = self
+            .successful_at
+            .or_else(|| self.release.as_ref().and(self.checked_at))
+        else {
             return Update::Unknown;
         };
         let newer = (self.release.as_ref())
@@ -250,7 +262,7 @@ pub(crate) fn answer(
 pub(crate) fn releases_url(base: Option<&str>) -> Option<(Url, bool)> {
     let mut base = Url::parse(base.unwrap_or(API)).ok()?;
     if !base.path().ends_with('/') {
-        base.set_path(&format!("{}/", base.path()));
+        base.path_segments_mut().ok()?.push("");
     }
     let loopback = matches!(base.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
     let https = match base.scheme() {
@@ -626,6 +638,94 @@ mod tests {
             headers.insert(*name, HeaderValue::from_str(value).unwrap());
         }
         headers
+    }
+
+    #[test]
+    fn failed_checks_back_off_without_claiming_a_successful_check() {
+        let runs = Version::parse("0.1.0").unwrap();
+        for (status, body) in [(500, b"".as_slice()), (403, b""), (200, b"not json")] {
+            let failure = || {
+                answer(
+                    StatusCode::from_u16(status).unwrap(),
+                    &HeaderMap::new(),
+                    body,
+                    ASSET,
+                    100,
+                )
+            };
+            let failed = Checked::default().after(failure(), 100);
+            assert_eq!(failed.notice(&runs), Update::Unknown, "{status}");
+            assert_eq!(failed.due(), 100 + DAY_MS);
+            for (version, expected) in [
+                (None, Update::UpToDate { checked_at_ms: 200 }),
+                (release("0.1.0"), Update::UpToDate { checked_at_ms: 200 }),
+                (
+                    release("0.1.2"),
+                    Update::Available {
+                        latest: "0.1.2".into(),
+                        url: "https://github.com/koidrive/koidrive/releases/tag/v0.1.2".into(),
+                        checked_at_ms: 200,
+                    },
+                ),
+            ] {
+                let success = failed.clone().after(
+                    Answer::Releases {
+                        etag: Some("e1".into()),
+                        release: version,
+                    },
+                    200,
+                );
+                assert_eq!(success.notice(&runs), expected);
+                let failed_again = success.after(failure(), 300);
+                assert_eq!(failed_again.notice(&runs), expected);
+                assert_eq!(failed_again.due(), 300 + DAY_MS);
+            }
+        }
+    }
+
+    #[test]
+    fn not_modified_without_a_successful_cache_does_not_claim_up_to_date() {
+        let runs = Version::parse("0.1.0").unwrap();
+        let checked = Checked::default().after(Answer::NotModified, 100);
+        assert_eq!(checked.notice(&runs), Update::Unknown);
+        assert_eq!(checked.due(), 100 + DAY_MS);
+    }
+
+    #[test]
+    fn legacy_caches_with_a_release_keep_their_success_time_after_failure() {
+        let runs = Version::parse("0.1.0").unwrap();
+        let legacy: Checked = serde_json::from_str(
+            r#"{"checked_at":100,"release":{"version":"0.1.0","url":"https://example.com"}}"#,
+        )
+        .unwrap();
+        let failed = legacy.after(Answer::Refused { until: None }, 200);
+        assert_eq!(
+            failed.notice(&runs),
+            Update::UpToDate { checked_at_ms: 100 }
+        );
+        let restored: Checked =
+            serde_json::from_slice(&serde_json::to_vec(&failed).unwrap()).unwrap();
+        assert_eq!(
+            restored.notice(&runs),
+            Update::UpToDate { checked_at_ms: 100 }
+        );
+        let same = restored.after(Answer::NotModified, 300);
+        assert_eq!(same.notice(&runs), Update::UpToDate { checked_at_ms: 300 });
+        let empty: Checked = serde_json::from_str(r#"{"checked_at":100,"release":null}"#).unwrap();
+        assert_eq!(empty.notice(&runs), Update::Unknown);
+        let answered = empty.after(
+            Answer::Releases {
+                etag: None,
+                release: None,
+            },
+            400,
+        );
+        let restored: Checked =
+            serde_json::from_slice(&serde_json::to_vec(&answered).unwrap()).unwrap();
+        assert_eq!(
+            restored.after(Answer::NotModified, 500).notice(&runs),
+            Update::UpToDate { checked_at_ms: 500 }
+        );
     }
 
     #[test]
