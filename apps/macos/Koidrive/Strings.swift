@@ -40,22 +40,21 @@ extension Question {
         }
     }
 
+    var listTitle: String {
+        switch kind {
+        case .massDelete: String(localized: "Delete many files")
+        default: title
+        }
+    }
+
     var explanation: String {
         switch kind {
-        case .massDelete(let deletions, let affectedFiles, let spaceFiles, let exceeded):
-            let limits = exceeded.map { limit in
-                switch limit {
-                case .deletions(let limit):
-                    String(localized: "more than \(limit.formatted()) deletions within 10 minutes")
-                case .shareOfSpace(let percent):
-                    percent == 50 ? String(localized: "more than half the folder, within 10 minutes") : String(localized: "more than \(percent)% of the folder, within 10 minutes")
-                }
-            }.formatted(.list(type: .or))
-            return String(localized: "Koidrive held \(deletionCount(deletions)) that would remove \(affectedFiles.formatted()) of \(fileCount(spaceFiles)), \(limits).")
+        case .massDelete(let deletions, let affectedFiles, let spaceFiles, _):
+            String(localized: "\(deletionCount(deletions)) would remove \(affectedFiles.formatted()) of \(fileCount(spaceFiles)).")
         case .ambiguousDisappearance:
-            return String(localized: "These files went missing while Koidrive wasn't watching. They may have moved to an ignored folder, so other devices keep them until you decide.")
+            String(localized: "These went missing while Koidrive wasn't running. Other devices keep them until you decide.")
         case .recovery(_, let group):
-            return group.explanation
+            group.explanation
         }
     }
 
@@ -74,13 +73,12 @@ extension Question {
         }
     }
 
+    var counts: String {
+        String(localized: "\(itemCount(items.count)), \(fileCount(affectedFiles))")
+    }
+
     var scope: String {
-        let files = fileCount(affectedFiles)
-        return switch items.count {
-        case 1: String(localized: "Applies to 1 item · \(files)")
-        case 2: String(localized: "Applies to both items · \(files)")
-        default: String(localized: "Applies to all \(items.count) items · \(files)")
-        }
+        String(localized: "Applies to \(itemCount(items.count)), \(fileCount(affectedFiles))")
     }
 
     func confirmation(for answer: Answer) -> String {
@@ -88,16 +86,16 @@ extension Question {
         case (.delete, .recovery): String(localized: "Delete \(itemCount(items.count)) on the server?")
         case (.delete, _): items.count == 1
             ? String(localized: "Delete 1 item everywhere?")
-            : String(localized: "Delete all \(items.count) items everywhere?")
+            : String(localized: "Delete all \(itemCount(items.count)) everywhere?")
         default: String(localized: "\(title(for: answer))?")
         }
     }
 
     func confirmationMessage(for answer: Answer) -> String {
         switch (answer, kind) {
-        case (.delete, .recovery): String(localized: "This deletes \(fileCount(affectedFiles)) on the server and every device. The server keeps them in its trash.")
-        case (.delete, _): String(localized: "This deletes \(fileCount(affectedFiles)) on every device. The server keeps them in its trash.")
-        default: String(localized: "This applies to all \(itemCount(items.count)), \(fileCount(affectedFiles)).")
+        case (.delete, .recovery): String(localized: "This deletes \(fileCount(affectedFiles)) on the server and every device. The server keeps them in Deleted Files.")
+        case (.delete, _): String(localized: "This deletes \(fileCount(affectedFiles)) on every device. The server keeps them in Deleted Files.")
+        default: String(localized: "This applies to \(itemCount(items.count)), \(fileCount(affectedFiles)).")
         }
     }
 
@@ -131,7 +129,7 @@ extension RecoveryGroup {
     var explanation: String {
         switch self {
         case .createdAfterRestorePoint:
-            String(localized: "The restore removed these from the server. This Mac still has them.")
+            String(localized: "Removed by the restore. This Mac still has them.")
         case .changedOnThisDevice:
             String(localized: "Edited or moved on this Mac since the last sync. Upload them, or trash them here and keep the server's.")
         case .createdOnThisDevice:
@@ -139,7 +137,7 @@ extension RecoveryGroup {
         case .deletedOnThisDevice:
             String(localized: "Deleted on this Mac but still on the server. Delete them there too, or download them again.")
         case .requestedBeforeReset:
-            String(localized: "The server lost these restore requests. Send them again or cancel them.")
+            String(localized: "The server lost these restore requests.")
         }
     }
 }
@@ -148,7 +146,7 @@ extension RecoveryCause {
     var text: String {
         if trigger == .spaceRewound, let ms = restorePointMs {
             let date = Date(milliseconds: ms).formatted(.dateTime.day().month(.abbreviated).year().hour().minute())
-            return String(localized: "This folder was restored on the server to \(date).")
+            return String(localized: "Restored on the server to \(date).")
         }
         let cause = switch trigger {
         case .spaceRewound: String(localized: "This folder was restored on the server.")
@@ -179,20 +177,22 @@ extension RecoveryCause {
 }
 
 extension Notice {
-    var title: String {
+    func title(spaceName: String?) -> String {
         switch kind {
-        case .recovery: String(localized: "Folder recovered")
-        case .remoteMassDelete: String(localized: "Many files deleted on another device")
+        case .recovery:
+            spaceName.map { String(localized: "\($0) was recovered") } ?? String(localized: "Folder recovered")
+        case .remoteMassDelete:
+            spaceName.map { String(localized: "Many files deleted from \($0) on another device") }
+                ?? String(localized: "Many files deleted on another device")
         }
     }
 
     var text: String {
         switch kind {
         case .recovery(let cause, let heldFiles):
-            let held = heldFiles == 0
-                ? String(localized: "Nothing needs your answer.")
-                : String(localized: "Answer in Needs You to finish.")
-            return cause.text + " " + String(localized: "Koidrive applied the server's changes and moved removed files to the local trash.") + " " + held
+            return heldFiles == 0
+                ? String(localized: "\(cause.shortText). Nothing needs your answer.")
+                : String(localized: "\(cause.shortText). Answer in Needs You.")
         case .remoteMassDelete(_, let affectedFiles, let spaceFiles, _):
             return String(localized: "\(affectedFiles.formatted()) of \(fileCount(spaceFiles)) removed. Copies are in the folder's local trash.")
         }
@@ -206,7 +206,7 @@ extension ItemDetail {
         case .edited: String(localized: "Edited")
         case .moved(let from): String(localized: "Moved from \(from)")
         case .editedAndMoved(let from): String(localized: "Edited and moved from \(from)")
-        case .restoreFromTrash: String(localized: "Restore from trash")
+        case .restoreFromTrash: String(localized: "Restore from Deleted Files")
         case .restoreVersion(let ms):
             String(localized: "Restore version from \(Date(milliseconds: ms).formatted(date: .abbreviated, time: .shortened))")
         }
@@ -286,7 +286,7 @@ extension SessionError {
     var message: String {
         switch self {
         case .InvalidServerUrl: String(localized: "Enter an address starting with https://.")
-        case .ServerUnreachable(let reason): String(localized: "Can't reach the server: \(reason)")
+        case .ServerUnreachable: String(localized: "Can't reach the server.")
         case .ServerIncompatible(let version): String(localized: "Update Koidrive to use this server (version \(version)).")
         case .NoServer: String(localized: "Connect to a server first.")
         case .AlreadyClaimed: String(localized: "This server has an owner. Sign in with a pairing code.")
@@ -315,6 +315,13 @@ extension SessionError {
         case .MarkerOfOtherSpace: String(localized: "This folder belongs to another space. Unlink it there first.")
         case .UnsupportedFileSystem: String(localized: "Choose a folder on your Mac's disk. This file system isn't supported.")
         case .Failed(let reason): reason
+        }
+    }
+
+    var detail: String? {
+        switch self {
+        case .ServerUnreachable(let reason), .NotRevoked(let reason), .NotSaved(let reason): reason
+        default: nil
         }
     }
 }

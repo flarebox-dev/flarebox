@@ -20,9 +20,10 @@ enum Snapshots {
                 await capture(MenuContent().environment(model).background(.background), width: 330, titled: nil,
                               dark: dark, to: directory.appending(path: "menubar-\(name)-\(suffix).png"))
             }
-            for (name, setup, app) in await setupStates() {
+            for (name, setup, app, afterAppearing) in await setupStates() {
                 await capture(SetupSteps(setup: setup).environment(app).frame(width: 480), width: 480,
-                              titled: "Set Up Koidrive", dark: dark, to: directory.appending(path: "setup-\(name)-\(suffix).png"))
+                              titled: "Set Up Koidrive", dark: dark, to: directory.appending(path: "setup-\(name)-\(suffix).png"),
+                              afterAppearing: afterAppearing)
             }
             for (name, scenario) in [("mass-delete", FakeScenario.massDelete), ("recovery", .recovery),
                                      ("ambiguous", .ambiguousDisappearance), ("two-spaces", .manyQuestions),
@@ -35,6 +36,15 @@ enum Snapshots {
             try? oneSpace.session.unlinkFolder(spaceId: "space-photos")
             await capture(QuestionsView().environment(oneSpace).frame(width: 860, height: 560), width: 860, height: 560,
                           titled: "Needs You", dark: dark, to: directory.appending(path: "questions-one-space-\(suffix).png"))
+            for (name, scenario, error, answering) in [("answer-failed", FakeScenario.ambiguousDisappearance, SessionError.QuestionNotFound, false),
+                                                       ("sending", .massDelete, nil, true)] {
+                let model = AppModel.preview(scenario)
+                if let question = model.state.questions.first {
+                    await capture(QuestionDetail(question: question, folder: model.folder(spaceID: question.spaceId), error: error, answering: answering)
+                        .environment(model).background(Color.panel).frame(width: 600, height: 528), width: 600, height: 528, titled: nil,
+                                  dark: dark, to: directory.appending(path: "questions-detail-\(name)-\(suffix).png"))
+                }
+            }
             let mass = AppModel.preview(.massDelete)
             if let question = mass.state.questions.first {
                 await capture(ConfirmSheet(title: question.confirmation(for: .delete),
@@ -63,6 +73,7 @@ enum Snapshots {
                 deletions: 214, affectedFiles: 1_086, spaceFiles: 1_840, exceeded: [.shareOfSpace(percent: 50)]))
         }
         states.append(("5-question", question))
+        states.append(("5b-recovery", .preview(.recovery)))
         let problem = AppModel.preview(.upToDate)
         if let fake = problem.session.fakeCore(), let folder = problem.state.folders.last {
             _ = try? fake.reportProblem(spaceId: folder.spaceId, path: nil, kind: .folderMissing)
@@ -70,11 +81,17 @@ enum Snapshots {
         }
         states.append(("6-problem", problem))
         states.append(("7-first-run", .preview(.firstRun)))
+        let connecting = AppModel.preview(.upToDate)
+        connecting.session.fakeCore()?.setActivity(activity: .connecting)
+        states.append(("8-connecting", connecting))
+        let stopped = AppModel.preview(.upToDate)
+        stopped.stop()
+        states.append(("9-stopped", stopped))
         try? await Task.sleep(for: .milliseconds(200))
         return states
     }
 
-    private static func setupStates() async -> [(String, SetupModel, AppModel)] {
+    private static func setupStates() async -> [(String, SetupModel, AppModel, (@MainActor () async -> Void)?)] {
         func start(claimed: Bool) -> (SetupModel, AppModel) {
             let app = AppModel.preview(.firstRun)
             try? app.session.fakeCore()?.setServerClaimed(claimed: claimed)
@@ -82,6 +99,11 @@ enum Snapshots {
         }
         let (server, serverApp) = start(claimed: false)
         server.serverURL = "https://koi.example.com"
+
+        let (unreachable, unreachableApp) = start(claimed: false)
+        unreachable.serverURL = "https://koi.exmaple.com"
+        unreachableApp.session.fakeCore()?.failNext(error: .ServerUnreachable(reason: "A server with the specified hostname could not be found."))
+        await unreachable.connect()
 
         let decidedApp = AppModel.preview(.firstRun, telemetry: TelemetrySetting(enabled: true, decided: true, locked: false))
         let decided = SetupModel(app: decidedApp, mode: .firstRun, deviceName: "Gunwoo's MacBook Pro")
@@ -93,6 +115,11 @@ enum Snapshots {
         pair.code = "K7Q4-M2XD"
         pairApp.session.fakeCore()?.failNext(error: .InvalidCode)
         await pair.signIn()
+
+        let (pairing, pairingApp) = start(claimed: true)
+        pairing.serverURL = "https://koi.example.com"
+        await pairing.connect()
+        pairing.code = "K7Q4-M2XD"
 
         let (claim, claimApp) = start(claimed: false)
         claim.serverURL = "https://koi.example.com"
@@ -111,6 +138,25 @@ enum Snapshots {
         try? FileManager.default.createDirectory(at: projects, withIntermediateDirectories: true)
         folder.folderPath = projects.path(percentEncoded: false)
 
+        func addFolder() -> (SetupModel, AppModel) {
+            let app = AppModel.preview(.upToDate)
+            return (SetupModel(app: app, mode: .addFolder, deviceName: "Gunwoo's MacBook Pro"), app)
+        }
+        let documents = FileManager.default.temporaryDirectory.appending(path: "Documents", directoryHint: .isDirectory)
+        try? FileManager.default.createDirectory(at: documents, withIntermediateDirectories: true)
+        let (existing, existingApp) = addFolder()
+        await existing.loadSpaces()
+        existing.folderPath = documents.path(percentEncoded: false)
+        let (noFolder, noFolderApp) = addFolder()
+        await noFolder.loadSpaces()
+        let (overlap, overlapApp) = addFolder()
+        await overlap.loadSpaces()
+        overlap.folderPath = documents.path(percentEncoded: false)
+        let failLinking: @MainActor () async -> Void = {
+            overlapApp.session.fakeCore()?.failNext(error: .FolderOverlaps(other: "~/Koidrive/Photos"))
+            await overlap.link()
+        }
+
         let (done, doneApp) = start(claimed: false)
         done.serverURL = "https://koi.example.com"
         await done.connect()
@@ -121,8 +167,12 @@ enum Snapshots {
         done.folderPath = projects.path(percentEncoded: false)
         await done.link()
 
-        return [("1-server", server, serverApp), ("1b-server-decided", decided, decidedApp), ("2a-sign-in-error", pair, pairApp), ("2b-claim", claim, claimApp),
-                ("3-folder", folder, folderApp), ("4-done", done, doneApp)]
+        return [("1-server", server, serverApp, nil), ("1a-server-error", unreachable, unreachableApp, nil),
+                ("1b-server-decided", decided, decidedApp, nil), ("2-sign-in", pairing, pairingApp, nil),
+                ("2a-sign-in-error", pair, pairApp, nil), ("2b-claim", claim, claimApp, nil),
+                ("3-folder", folder, folderApp, nil), ("3a-folder-existing", existing, existingApp, nil),
+                ("3b-folder-none", noFolder, noFolderApp, nil), ("3c-folder-overlap", overlap, overlapApp, failLinking),
+                ("4-done", done, doneApp, nil)]
     }
 
     private static func settingsStates() async -> [(String, AnyView)] {
@@ -149,7 +199,7 @@ enum Snapshots {
     }
 
     private static func capture(_ view: some View, width: CGFloat, height: CGFloat? = nil, titled: String?,
-                                dark: Bool, to url: URL) async {
+                                dark: Bool, to url: URL, afterAppearing: (@MainActor () async -> Void)? = nil) async {
         let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         let host = NSHostingView(rootView: view
             .buttonStyle(.secondary)
@@ -173,6 +223,9 @@ enum Snapshots {
             if window.contentRect(forFrameRect: window.frame).size != size {
                 window.setContentSize(size)
             }
+        }
+        if let afterAppearing {
+            await afterAppearing()
         }
         try? await Task.sleep(for: .milliseconds(300))
         let screencapture = Process()

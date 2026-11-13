@@ -46,36 +46,45 @@ struct FoldersSettings: View {
     @State private var error: SessionError?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 4) {
             if model.state.folders.isEmpty {
-                ContentUnavailableView {
-                    Label("No folders", systemImage: "folder")
-                } description: {
-                    Text(model.state.account == nil ? "Sign in first in the Account tab." : "Add a folder to start syncing.")
-                } actions: {
+                EmptyState(
+                    systemImage: "folder",
+                    title: "No folders",
+                    message: Text(model.state.account == nil ? "Sign in first in the Account tab." : "Add a folder to start syncing.")
+                ) {
                     addButton
                 }
             } else {
-                RowGroup {
-                    ForEach(Array(model.state.folders.enumerated()), id: \.element.spaceId) { index, folder in
-                        if index > 0 { Divider().padding(.leading, 44) }
-                        FolderRow(folder: folder) { unlinking = folder }
+                ScrollView {
+                    VStack(spacing: 4) {
+                        ForEach(model.state.folders, id: \.spaceId) { folder in
+                            FolderRow(folder: folder) { unlinking = folder }
+                        }
                     }
                 }
+                .frame(maxHeight: CGFloat(model.state.folders.count) * 48 - 4)
+                .layoutPriority(1)
                 if let error {
-                    Label(error.message, systemImage: "exclamationmark.triangle").foregroundStyle(Color.statusRed)
+                    ErrorLine(error)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
                 }
                 HStack {
                     Text("Linked folders can't be inside one another.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(.callout)
+                        .foregroundStyle(Color.text2)
                     Spacer()
                     addButton
                 }
-                Spacer()
+                .padding(.horizontal, 12)
+                .padding(.top, 12)
+                Spacer(minLength: 0)
             }
         }
-        .padding(20)
+        .padding(12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color.panel)
         .sheet(item: $adding) { setup in
             AddFolderSheet(setup: setup) { adding = nil }
         }
@@ -113,39 +122,33 @@ private struct FolderRow: View {
     let unlink: () -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 8) {
             Image(systemName: "folder")
-                .font(.title3)
-                .foregroundStyle(Color.koi)
+                .foregroundStyle(Color.label2)
                 .frame(width: 20)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(folder.spaceName)
-                    .fontWeight(.medium)
-                Text(verbatim: abbreviatingHome(folder.path))
-                    .font(.callout.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            Spacer()
-            HStack(spacing: 5) {
-                Circle()
-                    .fill(folder.state.color)
-                    .frame(width: 7, height: 7)
-                Text(folder.state.title)
-                    .foregroundStyle(folder.state == .halted ? Color.statusRed : .secondary)
-            }
-            .font(.callout)
-            Group {
+            Text(folder.spaceName)
+                .fontWeight(.medium)
+                .foregroundStyle(Color.text)
+                .lineLimit(1)
+                .frame(width: 76, alignment: .leading)
+            Text(verbatim: abbreviatingHome(folder.path))
+                .foregroundStyle(Color.text2)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            StatusPill(title: folder.state.title, mark: folder.state.mark)
+                .frame(width: 104, alignment: .leading)
+            HStack(spacing: 6) {
                 Button("Show in Finder") {
                     NSWorkspace.shared.open(URL(filePath: folder.path, directoryHint: .isDirectory))
                 }
                 Button("Unlink…", action: unlink)
             }
             .controlSize(.small)
+            .fixedSize()
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .frame(height: 44)
     }
 }
 
@@ -153,11 +156,15 @@ extension FolderState {
     var color: Color {
         switch self {
         case .upToDate: .statusGreen
-        case .syncing, .recovering: .koi
+        case .syncing: .koi
+        case .recovering, .waiting: .statusYellow
         case .halted: .statusRed
-        case .waiting: .statusYellow
-        case .readOnly: .secondary
+        case .readOnly: .text3
         }
+    }
+
+    var mark: StatusPill.Mark {
+        self == .syncing ? .progress : .dot(color)
     }
 }
 
@@ -168,19 +175,14 @@ private struct AddFolderSheet: View {
     let close: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            FolderStep(setup: setup)
-            HStack {
-                Button("Cancel", action: close).keyboardShortcut(.cancelAction)
-                Spacer()
+        FolderStep(setup: setup, cancel: close)
+            .padding(24)
+            .frame(width: 480)
+            .background(Color.panel)
+            .disabled(setup.isBusy)
+            .onChange(of: setup.step) { _, step in
+                if step == .done { close() }
             }
-        }
-        .padding(24)
-        .frame(width: 480)
-        .disabled(setup.isBusy)
-        .onChange(of: setup.step) { _, step in
-            if step == .done { close() }
-        }
     }
 }
 
@@ -202,67 +204,65 @@ struct AccountSettings: View {
         Group {
             if let account = model.state.account {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 8) {
-                        SectionHeading("Account")
-                        RowGroup {
-                            SettingsRow {
-                                Text("Server").foregroundStyle(.secondary)
-                                Spacer()
-                                Text(verbatim: account.serverUrl)
-                                    .font(.body.monospaced())
-                                    .textSelection(.enabled)
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                            }
-                            if !account.userName.isEmpty {
-                                Divider()
-                                SettingsRow {
-                                    Text("Owner").foregroundStyle(.secondary)
-                                    Spacer()
-                                    Text(verbatim: account.userName)
-                                }
+                    VStack(alignment: .leading, spacing: 4) {
+                        GroupBand("Account")
+                        PropertyRow("Server") {
+                            Text(verbatim: account.serverUrl)
+                                .font(.callout.monospaced())
+                                .textSelection(.enabled)
+                                .truncationMode(.middle)
+                        }
+                        if !account.userName.isEmpty {
+                            PropertyRow("Owner") {
+                                Text(verbatim: account.userName)
                             }
                         }
-                        SectionHeading("Devices")
-                            .padding(.top, 8)
-                        RowGroup {
-                            ForEach(devices, id: \.deviceId) { device in
-                                DeviceRow(device: device) { revoking = device }
-                                Divider()
-                            }
-                            SettingsRow {
-                                if let pairing {
+                        GroupBand("Devices")
+                        ForEach(devices, id: \.deviceId) { device in
+                            DeviceRow(device: device) { revoking = device }
+                        }
+                        HStack(spacing: 10) {
+                            if let pairing {
+                                VStack(alignment: .leading, spacing: 4) {
                                     PairingCodeLabel(code: pairing.code)
                                     Text("Enter it on the new device. Expires \(Date(milliseconds: pairing.expiresAtMs), format: .dateTime.hour().minute()).")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
+                                        .font(.callout)
+                                        .foregroundStyle(Color.text2)
                                         .fixedSize(horizontal: false, vertical: true)
                                 }
-                                Spacer()
-                                Button("Add a Device…") {
-                                    perform { pairing = try await model.startPairing() }
-                                }
-                                .controlSize(.small)
                             }
+                            Spacer()
+                            Button("Add a Device…") {
+                                perform { pairing = try await model.startPairing() }
+                            }
+                            .controlSize(.small)
                         }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
                         if let error {
-                            Label(error.message, systemImage: "exclamationmark.triangle").foregroundStyle(Color.statusRed)
+                            ErrorLine(error)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
                         }
                         HStack {
                             Spacer()
                             Button("Sign Out…", role: .destructive) { confirmingSignOut = true }
+                                .controlSize(.small)
                         }
-                        .padding(.top, 8)
+                        .padding(.horizontal, 12)
+                        .padding(.top, 4)
                     }
-                    .padding(20)
+                    .padding(12)
                 }
                 .task(id: account.deviceId) {
                     perform { devices = try await model.devices() }
                 }
             } else {
-                ContentUnavailableView("Not signed in", systemImage: "person.crop.circle.badge.questionmark")
+                EmptyState(systemImage: "person", title: "Not signed in")
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color.panel)
         .alert(
             "Remove \(revoking?.name ?? "")?",
             isPresented: Binding(get: { revoking != nil }, set: { if !$0 { revoking = nil } }),
@@ -292,7 +292,7 @@ struct AccountSettings: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This Mac stops syncing and unlinks every folder. Files stay in the folders and on the server.")
+            Text("Every folder is unlinked. Files stay on this Mac and the server.")
         }
         .alert("Sign out of your last device?", isPresented: $confirmingLastDevice) {
             Button("Sign Out", role: .destructive) {
@@ -300,7 +300,7 @@ struct AccountSettings: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("No other device is signed in. To get back in, run koi server add-device on any computer, as the guide's Devices page describes.")
+            Text("No other device is signed in. To get back in, run koi server add-device.")
         }
         .alert("Sign out without the server?", isPresented: $confirmingOffline) {
             Button("Sign Out", role: .destructive) {
@@ -308,7 +308,7 @@ struct AccountSettings: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Koidrive can't reach the server to check for other devices, and this Mac stays listed there until another device removes it. If it's the last device, run koi server add-device to get back in.")
+            Text("This Mac stays listed on the server until another device removes it.")
         }
     }
 
@@ -324,29 +324,26 @@ struct AccountSettings: View {
     }
 }
 
-private struct SectionHeading: View {
+private struct PropertyRow<Value: View>: View {
     let title: LocalizedStringKey
+    @ViewBuilder let value: Value
 
-    init(_ title: LocalizedStringKey) {
+    init(_ title: LocalizedStringKey, @ViewBuilder value: () -> Value) {
         self.title = title
+        self.value = value()
     }
-
-    var body: some View {
-        Text(title)
-            .fontWeight(.semibold)
-            .foregroundStyle(.secondary)
-    }
-}
-
-private struct SettingsRow<Content: View>: View {
-    @ViewBuilder let content: Content
 
     var body: some View {
         HStack(spacing: 10) {
-            content
+            Text(title)
+                .foregroundStyle(Color.text2)
+            Spacer()
+            value
+                .foregroundStyle(Color.text)
+                .lineLimit(1)
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .frame(height: 36)
     }
 }
 
@@ -355,20 +352,21 @@ private struct DeviceRow: View {
     let remove: () -> Void
 
     var body: some View {
-        SettingsRow {
+        HStack(spacing: 10) {
             Image(systemName: "laptopcomputer")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Color.label2)
                 .frame(width: 22)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
                     Text(verbatim: device.name)
+                        .foregroundStyle(Color.text)
                     if device.thisDevice {
-                        Text("(this Mac)").foregroundStyle(.secondary)
+                        Text("(this Mac)").foregroundStyle(Color.text2)
                     }
                 }
-                Text("\(device.platformName) · Added \(Date(milliseconds: device.addedAtMs), format: .dateTime.day().month(.abbreviated).year())")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text("\(device.platformName), added \(Date(milliseconds: device.addedAtMs), format: .dateTime.day().month(.abbreviated).year())")
+                    .font(.callout)
+                    .foregroundStyle(Color.text2)
             }
             Spacer()
             if !device.thisDevice {
@@ -376,6 +374,8 @@ private struct DeviceRow: View {
                     .controlSize(.small)
             }
         }
+        .padding(.horizontal, 12)
+        .frame(height: 48)
     }
 }
 
@@ -397,10 +397,11 @@ private struct PairingCodeLabel: View {
     var body: some View {
         HStack(spacing: 8) {
             Text("Pairing code")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .font(.callout)
+                .foregroundStyle(Color.text2)
             Text(verbatim: code)
                 .font(.body.monospaced().weight(.semibold))
+                .foregroundStyle(Color.text)
                 .textSelection(.enabled)
             Button {
                 NSPasteboard.general.clearContents()
@@ -410,12 +411,12 @@ private struct PairingCodeLabel: View {
                 Image(systemName: copied ? "checkmark" : "doc.on.doc")
             }
             .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(Color.text2)
             .help("Copy")
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
-        .background(RoundedRectangle(cornerRadius: 6).fill(.quaternary.opacity(0.6)))
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.group))
         .fixedSize()
         .onChange(of: code) { copied = false }
     }
@@ -428,41 +429,53 @@ struct StorageSettings: View {
     var body: some View {
         Group {
             if let account = model.state.account {
-                Form {
-                    let spaces = storage.spaces ?? []
-                    if spaces.count == 1 {
-                        Section { usage(of: spaces[0]) }
-                    } else {
-                        ForEach(spaces) { entry in
-                            Section(entry.space.name) { usage(of: entry) }
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 4) {
+                        let spaces = storage.spaces ?? []
+                        if spaces.count == 1 {
+                            usage(of: spaces[0])
+                        } else {
+                            ForEach(spaces) { entry in
+                                GroupBand(verbatim: entry.space.name)
+                                usage(of: entry)
+                            }
                         }
-                    }
-                    Section {
                         if storage.spaces?.isEmpty == true {
-                            Text("This account has no spaces yet.").foregroundStyle(.secondary)
+                            Text("This account has no spaces yet.")
+                                .foregroundStyle(Color.text2)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 10)
                         }
                         if let error = storage.error {
-                            Label(error.message, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                            ErrorLine(error)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 4)
                         }
-                        HStack {
-                            Text("Each stored chunk counts once, under the first of live files, trash and old versions that holds it. Unreferenced chunks are uploads not committed yet and chunks waiting out the grace period before deletion.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                        HStack(spacing: 12) {
+                            Text("Each chunk counts once. Unreferenced: uploads in progress and chunks awaiting deletion.")
+                                .font(.callout)
+                                .foregroundStyle(Color.text2)
+                                .fixedSize(horizontal: false, vertical: true)
                             Spacer()
                             if storage.isLoading {
                                 ProgressView().controlSize(.small)
                             } else {
                                 Button("Refresh") { Task { await storage.load(model.storage) } }
+                                    .controlSize(.small)
                             }
                         }
+                        .padding(.horizontal, 12)
+                        .padding(.top, 10)
                     }
+                    .padding(12)
                 }
-                .formStyle(.grouped)
                 .task(id: account.deviceId) { await storage.load(model.storage) }
             } else {
-                ContentUnavailableView("Not signed in", systemImage: "person.crop.circle.badge.questionmark")
+                EmptyState(systemImage: "person", title: "Not signed in")
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color.panel)
     }
 
     @ViewBuilder
@@ -470,12 +483,14 @@ struct StorageSettings: View {
         switch entry.usage {
         case .success(let usage):
             StorageRow(title: "Live files", count: "^[\(usage.liveFiles) file](inflect: true)", bytes: usage.liveBytes)
-            StorageRow(title: "Trash", count: "^[\(usage.trashedFiles) file](inflect: true)", bytes: usage.trashBytes)
+            StorageRow(title: "Deleted files", count: "^[\(usage.trashedFiles) file](inflect: true)", bytes: usage.trashBytes)
             StorageRow(title: "Old versions", count: "^[\(usage.oldVersions) version](inflect: true)", bytes: usage.oldVersionBytes)
             StorageRow(title: "Unreferenced", count: nil, bytes: usage.unreferencedBytes)
-            StorageRow(title: "Total", count: nil, bytes: usage.totalBytes).bold()
+            StorageRow(title: "Total", count: nil, bytes: usage.totalBytes, isTotal: true)
         case .failure(let refusal):
-            Label(refusal.message, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)
+            ErrorLine(message: refusal.message)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 4)
         }
     }
 }
@@ -484,18 +499,24 @@ private struct StorageRow: View {
     let title: LocalizedStringKey
     let count: LocalizedStringKey?
     let bytes: UInt64
+    var isTotal = false
 
     var body: some View {
-        LabeledContent(title) {
-            HStack(spacing: 12) {
-                if let count {
-                    Text(count).foregroundStyle(.secondary)
-                }
-                Text(Int64(clamping: bytes), format: .byteCount(style: .file))
-                    .monospacedDigit()
-                    .frame(minWidth: 70, alignment: .trailing)
+        HStack(spacing: 10) {
+            Text(title)
+                .foregroundStyle(isTotal ? Color.text : Color.text2)
+            Spacer()
+            if let count {
+                Text(count).foregroundStyle(Color.text2)
             }
+            Text(Int64(clamping: bytes), format: .byteCount(style: .file))
+                .monospacedDigit()
+                .foregroundStyle(Color.text)
+                .frame(minWidth: 70, alignment: .trailing)
         }
+        .fontWeight(isTotal ? .semibold : nil)
+        .padding(.horizontal, 12)
+        .frame(height: 36)
     }
 }
 
@@ -503,25 +524,43 @@ struct ProblemsSettings: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        if model.state.problems.isEmpty {
-            ContentUnavailableView("No problems", systemImage: "checkmark.circle")
-        } else {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(model.problemSections) { section in
-                        SpaceHeading(spaceID: section.spaceID, folder: section.folder)
-                            .fontWeight(.semibold)
-                            .foregroundStyle(.secondary)
-                            .padding(.top, section.id == model.problemSections.first?.id ? 0 : 8)
-                        RowGroup {
-                            ForEach(Array(section.problems.enumerated()), id: \.element.id) { index, problem in
-                                if index > 0 { Divider() }
+        Group {
+            if model.state.problems.isEmpty {
+                EmptyState(systemImage: "checkmark.circle", title: "No problems")
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(model.problemSections) { section in
+                            ProblemBand(spaceID: section.spaceID, folder: section.folder)
+                            ForEach(section.problems) { problem in
                                 ProblemRow(problem: problem, folder: section.folder)
                             }
                         }
                     }
+                    .padding(12)
                 }
-                .padding(20)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color.panel)
+    }
+}
+
+private struct ProblemBand: View {
+    let spaceID: String?
+    let folder: LinkedFolder?
+
+    var body: some View {
+        if let folder {
+            GroupBand(verbatim: folder.spaceName)
+        } else {
+            GroupBand(title: "Unlinked space") {
+                if let spaceID {
+                    Text(verbatim: spaceID)
+                        .foregroundStyle(Color.text2)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
             }
         }
     }
@@ -532,30 +571,32 @@ private struct ProblemRow: View {
     let folder: LinkedFolder?
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
+        HStack(alignment: .top, spacing: 10) {
             Image(systemName: "exclamationmark.triangle")
                 .foregroundStyle(Color.statusRed)
-            VStack(alignment: .leading, spacing: 4) {
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 3) {
                 Text(problem.kind.title)
                     .fontWeight(.semibold)
+                    .foregroundStyle(Color.text)
                 if let path = problem.path {
                     Text(verbatim: path)
-                        .font(.callout.monospaced())
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 12))
+                        .foregroundStyle(Color.text2)
                         .textSelection(.enabled)
                 } else if let folder, problem.kind.concernsTheFolder {
                     Text(verbatim: abbreviatingHome(folder.path))
-                        .font(.callout.monospaced())
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 12))
+                        .foregroundStyle(Color.text2)
                         .textSelection(.enabled)
                 }
                 Text(problem.kind.advice)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Color.text2)
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
                 Text("Since \(Date(milliseconds: problem.sinceMs), format: .dateTime.day().month(.abbreviated).hour().minute())")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(.callout)
+                    .foregroundStyle(Color.text3)
             }
             Spacer()
             if let folder {
@@ -576,7 +617,8 @@ private struct ProblemRow: View {
                 .controlSize(.small)
             }
         }
-        .padding(12)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
     }
 }
 
@@ -600,84 +642,90 @@ struct GeneralSettings: View {
     @State private var telemetryError: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            RowGroup {
-                SettingsRow {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Open Koidrive at login")
-                        if loginItemStatus == .requiresApproval {
-                            Text("Allow Koidrive in Login Items.")
-                                .font(.caption)
-                                .foregroundStyle(Color.koiText)
-                        }
-                        if let loginItemError {
-                            Text(loginItemError)
-                                .font(.caption)
-                                .foregroundStyle(Color.statusRed)
-                        }
-                    }
-                    Spacer()
-                    if loginItemStatus == .requiresApproval {
-                        Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
-                            .controlSize(.small)
-                    }
-                    Toggle("Open Koidrive at login", isOn: $openAtLogin)
-                        .labelsHidden()
-                        .toggleStyle(.switch)
-                        .tint(.koi)
-                        .onChange(of: openAtLogin) { _, on in
-                            if on != isRegistered {
-                                setOpenAtLogin(on)
-                            }
-                        }
-                }
-            }
-            RowGroup {
-                SettingsRow {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Send anonymous usage reports")
-                        Text("It never shares file names, paths or contents.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        if app.usageReportsTurnedOffByVariable {
-                            Text("Turned off by an environment variable.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        if let telemetryError {
-                            Text(telemetryError)
-                                .font(.caption)
-                                .foregroundStyle(Color.statusRed)
-                        }
-                    }
-                    Spacer()
-                    Toggle("Send anonymous usage reports", isOn: Binding(get: { app.telemetry.enabled }, set: setTelemetry))
-                        .labelsHidden()
-                        .toggleStyle(.switch)
-                        .tint(.koi)
-                        .disabled(app.telemetry.locked)
-                }
-            }
-            .padding(.top, 8)
-            SectionHeading("About")
-                .padding(.top, 8)
-            RowGroup {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(verbatim: "Koidrive " + (Bundle.main.object(forInfoDictionaryKey: "KoidriveVersion") as? String ?? KoidriveFFI.version()))
-                    Text("Command-line tool: koi")
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
+                    Text("Open Koidrive at login")
+                        .foregroundStyle(Color.text)
+                    if loginItemStatus == .requiresApproval {
+                        Text("Allow Koidrive in Login Items.")
+                            .font(.callout)
+                            .foregroundStyle(Color.text2)
+                    }
+                    if let loginItemError {
+                        Text(loginItemError)
+                            .font(.callout)
+                            .foregroundStyle(Color.statusRed)
+                    }
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .help(Text(verbatim: "Core \(KoidriveFFI.version())"))
+                Spacer()
+                if loginItemStatus == .requiresApproval {
+                    Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
+                        .controlSize(.small)
+                }
+                Toggle("Open Koidrive at login", isOn: $openAtLogin)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .tint(.koi)
+                    .onChange(of: openAtLogin) { _, on in
+                        if on != isRegistered {
+                            setOpenAtLogin(on)
+                        }
+                    }
             }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            Rectangle()
+                .fill(Color.line)
+                .frame(height: 1)
+                .padding(.horizontal, 12)
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Send anonymous usage reports")
+                        .foregroundStyle(Color.text)
+                    Text("It never shares file names, paths or contents.")
+                        .font(.callout)
+                        .foregroundStyle(Color.text2)
+                    if app.usageReportsTurnedOffByVariable {
+                        Text("Turned off by an environment variable.")
+                            .font(.callout)
+                            .foregroundStyle(Color.text2)
+                    }
+                    if let telemetryError {
+                        Text(telemetryError)
+                            .font(.callout)
+                            .foregroundStyle(Color.statusRed)
+                    }
+                }
+                Spacer()
+                Toggle("Send anonymous usage reports", isOn: Binding(get: { app.telemetry.enabled }, set: setTelemetry))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .tint(.koi)
+                    .disabled(app.telemetry.locked)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            GroupBand("About")
+            VStack(alignment: .leading, spacing: 2) {
+                Text(verbatim: "Koidrive " + (Bundle.main.object(forInfoDictionaryKey: "KoidriveVersion") as? String ?? KoidriveFFI.version()))
+                    .foregroundStyle(Color.text)
+                Text("Command-line tool: koi")
+                    .font(.callout.monospaced())
+                    .foregroundStyle(Color.text2)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .help(Text(verbatim: "Core \(KoidriveFFI.version())"))
             Spacer()
         }
-        .padding(20)
+        .padding(12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color.panel)
         .onAppear(perform: readStatus)
     }
-
     private var isRegistered: Bool {
         loginItemStatus == .enabled || loginItemStatus == .requiresApproval
     }
