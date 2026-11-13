@@ -1648,7 +1648,14 @@ impl World {
                     Ok(committed) => {
                         if let Some(record) = committed.record {
                             let placed: BTreeSet<&str> = (sent.ops.iter())
-                                .filter_map(|op| match &op.op {
+                                .zip(&committed.result.results)
+                                .filter(|(_, result)| {
+                                    matches!(
+                                        result.code(),
+                                        op_result::Code::Applied | op_result::Code::AppliedRenamed
+                                    )
+                                })
+                                .filter_map(|(op, _)| match &op.op {
                                     Some(op::Op::Move(moved)) => Some(moved.node_id.as_str()),
                                     Some(op::Op::CreateFile(made)) => Some(made.node_id.as_str()),
                                     Some(op::Op::CreateDir(made)) => Some(made.node_id.as_str()),
@@ -2355,6 +2362,48 @@ mod tests {
     use koidrive_engine::tree::{Kind, Shape};
 
     use super::*;
+
+    #[test]
+    fn a_rejected_move_with_an_applied_edit_does_not_record_a_placement() {
+        let mut world = World::new(1);
+        let action = |kind, name| {
+            Step::User(Action {
+                kind,
+                target: 0,
+                parent: 0,
+                name,
+                text: 0,
+            })
+        };
+        world.phase(0, &[(0, action(1, 0))]).unwrap();
+        let placed = world.placements[0].clone();
+        world
+            .run(1, &[(0, action(2, 0)), (0, action(3, 2)), (0, Step::Scan)])
+            .unwrap();
+        world.commit(0, Reply::Served).unwrap();
+        let mut state = world.devices[0].engine.commits.state();
+        let flight = state.in_flight.as_mut().unwrap();
+        let moved = flight
+            .commit
+            .ops
+            .iter_mut()
+            .find_map(|op| match &mut op.op {
+                Some(op::Op::Move(moved)) => Some(moved),
+                _ => None,
+            })
+            .unwrap();
+        moved.new_parent_id = "00000000-0000-7000-8000-000000000001".into();
+        world.devices[0].engine.commits = commit::Commits::from_state(state).unwrap();
+        world.commit(0, Reply::Served).unwrap();
+        let node = world
+            .space
+            .nodes()
+            .into_iter()
+            .find(|node| node.name == "a")
+            .unwrap();
+        assert_eq!(node.current.unwrap().content.unwrap().mtime_ns, 2);
+        assert!(world.placements[0] == placed);
+    }
 
     #[test]
     fn a_restore_matches_placement_commits_even_when_their_sequence_is_reused() {
