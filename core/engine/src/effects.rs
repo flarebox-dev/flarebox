@@ -533,11 +533,15 @@ pub(crate) fn kept_out(trees: &Trees, id: &str) -> bool {
 /// A node the planner considers: one whose only change is remote, one that is parked, one whose
 /// local position is reverted, or one whose S update waits and that R no longer has. A reverted or
 /// waiting node that R no longer has is removed only when it holds no unuploaded edit; otherwise
-/// the commit layer makes it a new node, so the edit is uploaded. A node whose waiting update forgets S
-/// ([`Trees::forget_lost`]) is never one: once the update is made, L holds a node S does not,
-/// which is created again. An excluded node is never one.
+/// the commit layer makes it a new node, so the edit is uploaded. A node whose waiting update
+/// removes it from S is one only when it is reverted and L no longer holds it: the keep rule could
+/// not clear it from S, and what S holds under it may wait for it to be back on disk. Any other
+/// such node is not one until the update is made: a node L holds is then one S does not, which is
+/// created again ([`Trees::forget_lost`]), and one L lacks is downloaded again. An excluded node
+/// is never one.
 fn candidate(trees: &Trees, id: &str) -> bool {
-    let forgets = (trees.waiting().get(id)).is_some_and(|waiting| waiting.shape.is_none());
+    let forgets = (trees.waiting().get(id)).is_some_and(|waiting| waiting.shape.is_none())
+        && (trees.local().get(id).is_some() || !trees.reverted().contains(id));
     let changed = remote_only(trees, id)
         || trees.local().get(id).is_some_and(|node| node.parked)
         || (trees.reverted().contains(id)
