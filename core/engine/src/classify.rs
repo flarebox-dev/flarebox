@@ -786,73 +786,107 @@ impl Trees {
     /// it, also when the node is parked. The effects move a parked node that is ignored back to
     /// the position L keeps for it, and it is excluded from then on.
     pub fn ignored(&self, id: &str) -> bool {
+        if let Some(ignored) = self.ignored_by_paths(id) {
+            return ignored;
+        }
+        let mut above = Vec::new();
+        let mut current = id;
+        for _ in 0..self.r.len() {
+            let Some(remote) = self.r.live(current) else {
+                break;
+            };
+            let folder = remote.parent.as_str();
+            let Some(placed) = self.r.live(folder).filter(|_| folder != self.r.root) else {
+                break;
+            };
+            let apart =
+                |shape: Option<&Shape>| shape.is_some_and(|shape| !shape.same_position(placed));
+            let apart = apart(self.l.get(folder).map(|node| &node.shape))
+                || apart(self.s.live(folder))
+                || self.outside.contains(folder)
+                || self.displaced.contains_key(folder);
+            above.push((folder, current, apart));
+            current = folder;
+        }
+        let Some(top) = above.iter().rposition(|(.., apart)| *apart) else {
+            return false;
+        };
+        above[..=top]
+            .iter()
+            .find_map(|&(folder, child, apart)| {
+                if apart {
+                    self.ignored_by_paths(folder)
+                } else {
+                    self.excluded_where_child_paths_miss(folder, child)
+                        .then_some(true)
+                }
+            })
+            .unwrap_or(false)
+    }
+
+    fn excluded_where_child_paths_miss(&self, folder: &str, child: &str) -> bool {
+        let there = path(&self.r, folder);
+        let synced = path(&self.s, folder).filter(|synced| {
+            Some(synced) != there.as_ref()
+                && self
+                    .s
+                    .live(child)
+                    .is_none_or(|shape| shape.parent != folder)
+        });
+        let written = (self.l.get(folder).is_none())
+            .then(|| self.written(folder))
+            .flatten()
+            .filter(|written| Some(written) != there.as_ref());
+        [synced, written]
+            .iter()
+            .flatten()
+            .any(|(names, kind)| self.ignores(names, *kind))
+    }
+
+    fn written(&self, id: &str) -> Option<(Vec<&str>, Kind)> {
+        let remote = self.r.live(id)?;
+        let mut names = vec![remote.name.as_str()];
+        let mut current = remote.parent.as_str();
+        for _ in 0..=self.l.len() {
+            if current == self.l.root {
+                names.reverse();
+                return Some((names, remote.kind));
+            }
+            if current == id {
+                return None;
+            }
+            let parent = &self.l.get(current)?.shape;
+            names.push(&parent.name);
+            current = &parent.parent;
+        }
+        None
+    }
+
+    fn ignored_by_paths(&self, id: &str) -> Option<bool> {
         if self.recorded_local(id) || self.displaced.contains_key(id) {
-            return true;
+            return Some(true);
         }
         let ignored =
             |path: Option<(Vec<&str>, Kind)>| path.map(|(names, kind)| self.ignores(&names, kind));
-        let local = ignored(path(&self.l, id));
+        let placed = path(&self.l, id);
+        let local = ignored(placed.clone());
         let moved = match (self.l.get(id), self.s.live(id)) {
             (Some(local), Some(synced)) => !local.shape.same_position(synced),
             _ => false,
         };
         if local == Some(false) && moved {
-            return false;
+            return Some(false);
         }
         let there = path(&self.r, id);
-        let written = self.r.live(id).and_then(|remote| {
-            let mut names = vec![remote.name.as_str()];
-            let mut current = remote.parent.as_str();
-            for _ in 0..=self.l.len() {
-                if current == self.l.root {
-                    names.reverse();
-                    return Some((names, remote.kind));
-                }
-                if current == id {
-                    return None;
-                }
-                let parent = &self.l.get(current)?.shape;
-                names.push(&parent.name);
-                current = &parent.parent;
-            }
-            None
-        });
+        let written = self.written(id);
         let matches = |path: &Option<(Vec<&str>, Kind)>| {
             (path.as_ref()).is_some_and(|(names, kind)| self.ignores(names, *kind))
         };
-        local == Some(true)
+        (local == Some(true)
             || ignored(path(&self.s, id)) == Some(true)
             || matches(&there)
-            || (written != there && matches(&written))
-            || self.r.live(id).is_some_and(|remote| {
-                remote.parent != self.r.root
-                    && self.placed_apart_above(id)
-                    && self.ignored(&remote.parent)
-            })
-    }
-
-    fn placed_apart_above(&self, id: &str) -> bool {
-        let mut current = id;
-        for _ in 0..self.r.len() {
-            let Some(remote) = self.r.live(current) else {
-                return false;
-            };
-            let folder = remote.parent.as_str();
-            let Some(placed) = self.r.live(folder) else {
-                return false;
-            };
-            let apart =
-                |shape: Option<&Shape>| shape.is_some_and(|shape| !shape.same_position(placed));
-            if apart(self.l.get(folder).map(|node| &node.shape))
-                || apart(self.s.live(folder))
-                || self.outside.contains(folder)
-                || self.displaced.contains_key(folder)
-            {
-                return true;
-            }
-            current = folder;
-        }
-        false
+            || (written != there && written != placed && matches(&written)))
+        .then_some(true)
     }
 
     pub(crate) fn ignored_in_remote(&self, id: &str) -> bool {
