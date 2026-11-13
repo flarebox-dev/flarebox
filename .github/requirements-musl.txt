@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+
+cargo-zigbuild==0.24.1 --hash=sha256:238a1ab54a95053a4eadc34775c81f795a8ad75f80bfed63f3f445f518102375
+ziglang==0.16.0 --hash=sha256:9fcda73f62b851dd72a54b710ad40a209896db14cfb13649e62191243556342b
