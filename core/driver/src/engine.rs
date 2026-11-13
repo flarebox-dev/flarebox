@@ -1334,11 +1334,15 @@ impl Staging {
 
     /// Holds `state` unless the node it holds is as new.
     fn take(&mut self, state: NodeState) {
+        let meta_edit_rev = |node: &NodeState| match node.meta_edit_rev {
+            0 => node.meta_rev,
+            rev => rev,
+        };
         let newer = self.nodes.get(&state.node_id).is_none_or(|held| {
             state.content_rev > held.content_rev
                 || state.meta_rev > held.meta_rev
                 || state.edit_rev > held.edit_rev
-                || state.meta_edit_rev > held.meta_edit_rev
+                || meta_edit_rev(&state) > meta_edit_rev(held)
         });
         if newer {
             self.nodes.insert(state.node_id.clone(), state);
@@ -3538,5 +3542,26 @@ mod tests {
                 Ok::<_, Stop>(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn a_listed_node_from_a_server_before_meta_edit_revisions_outranks_an_older_trashed_one() {
+        let at = |meta_rev, meta_edit_rev, status: NodeStatus| NodeState {
+            meta_rev,
+            meta_edit_rev,
+            status: status as i32,
+            ..node("d", "d")
+        };
+        let page = TreePage {
+            nodes: vec![at(10, 0, NodeStatus::Live)],
+            head_seq: 10,
+            ..Default::default()
+        };
+        let trash = TrashPage {
+            nodes: vec![at(8, 8, NodeStatus::Trashed)],
+            ..Default::default()
+        };
+        let staging = Staging::new("h".into(), vec![page], vec![trash]);
+        assert_eq!(staging.nodes.get("d").map(|d| d.meta_rev), Some(10));
     }
 }
