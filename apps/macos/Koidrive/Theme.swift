@@ -16,6 +16,13 @@ extension Color {
                                dark: NSColor(red: 1, green: 69 / 255, blue: 58 / 255, alpha: 0.16))
     static let redFill = Color(red: 0xD7 / 255, green: 0, blue: 0x15 / 255)
     static let content = Color(light: 0xFFFFFF, dark: 0x2C2C2E)
+    static let ink = Color(light: NSColor(hex: 0x1D1D1F), dark: NSColor(white: 1, alpha: 0.88))
+    static let onInk = Color(light: 0xFFFFFF, dark: 0x1F1F21)
+    static let label = Color(light: NSColor(white: 0, alpha: 0.85), dark: NSColor(white: 1, alpha: 0.88))
+    static let label3 = Color(light: NSColor(white: 0, alpha: 0.28), dark: NSColor(white: 1, alpha: 0.28))
+    static let separatorLine = Color(light: NSColor(white: 0, alpha: 0.1), dark: NSColor(white: 1, alpha: 0.1))
+    static let fillStrong = Color(light: NSColor(white: 0, alpha: 0.1), dark: NSColor(white: 1, alpha: 0.14))
+    static let accentRing = Color(red: 1, green: 106 / 255, blue: 19 / 255, opacity: 0.35)
 
     init(light: Int, dark: Int) {
         self.init(light: NSColor(hex: light), dark: NSColor(hex: dark))
@@ -35,22 +42,69 @@ extension NSColor {
     }
 }
 
-struct ProminentButtonStyle: ButtonStyle {
-    @Environment(\.isEnabled) private var isEnabled
+struct KoiButtonStyle: ButtonStyle {
+    enum Kind {
+        case primary, secondary, destructiveConfirm
+    }
+
+    let kind: Kind
 
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.body.weight(.medium))
-            .foregroundStyle(Color.onKoi)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 4)
-            .background(RoundedRectangle(cornerRadius: 6).fill(Color.koi.opacity(configuration.isPressed ? 0.8 : 1)))
-            .opacity(isEnabled ? 1 : 0.45)
+        KoiButton(kind: kind, configuration: configuration)
     }
 }
 
-extension ButtonStyle where Self == ProminentButtonStyle {
-    static var prominent: ProminentButtonStyle { ProminentButtonStyle() }
+extension ButtonStyle where Self == KoiButtonStyle {
+    static var primary: KoiButtonStyle { KoiButtonStyle(kind: .primary) }
+    static var secondary: KoiButtonStyle { KoiButtonStyle(kind: .secondary) }
+    static var destructiveConfirm: KoiButtonStyle { KoiButtonStyle(kind: .destructiveConfirm) }
+}
+
+private struct KoiButton: View {
+    let kind: KoiButtonStyle.Kind
+    let configuration: ButtonStyleConfiguration
+    @Environment(\.isEnabled) private var isEnabled
+    @Environment(\.isFocused) private var isFocused
+    @Environment(\.controlSize) private var controlSize
+
+    private var isSmall: Bool { controlSize <= .small }
+
+    var body: some View {
+        configuration.label
+            .font(isSmall ? .callout : kind == .secondary ? .body : .body.weight(.medium))
+            .lineLimit(1)
+            .foregroundStyle(labelColor)
+            .padding(.horizontal, isSmall ? 10 : 14)
+            .frame(height: isSmall ? 20 : 24)
+            .background {
+                ZStack {
+                    if kind == .secondary { Capsule().fill(Color.separatorLine) }
+                    Capsule().fill(fillColor).padding(kind == .secondary ? 1 : 0)
+                    if kind == .secondary && configuration.isPressed { Capsule().fill(Color.fillStrong).padding(1) }
+                }
+                .overlay { if isFocused { Capsule().inset(by: -3.5).strokeBorder(Color.accentRing, lineWidth: 3.5) } }
+            }
+            .opacity(kind != .secondary && !isEnabled ? 0.45 : 1)
+            .contentShape(Capsule())
+    }
+
+    private var labelColor: Color {
+        switch kind {
+        case .primary: .onInk
+        case .destructiveConfirm: .white
+        case .secondary where !isEnabled: .label3
+        case .secondary where configuration.role == .destructive: .statusRed
+        case .secondary: .label
+        }
+    }
+
+    private var fillColor: Color {
+        switch kind {
+        case .primary: .ink.opacity(configuration.isPressed ? 0.8 : 1)
+        case .destructiveConfirm: .redFill.opacity(configuration.isPressed ? 0.8 : 1)
+        case .secondary: .content
+        }
+    }
 }
 
 struct CountBadge: View {

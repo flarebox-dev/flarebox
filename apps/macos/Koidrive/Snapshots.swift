@@ -43,6 +43,8 @@ enum Snapshots {
                               width: 280, titled: nil, dark: dark,
                               to: directory.appending(path: "questions-confirm-\(suffix).png"))
             }
+            await capture(ButtonGallery(), width: 432, titled: nil, dark: dark,
+                          to: directory.appending(path: "buttons-\(suffix).png"))
             for (name, view) in await settingsStates() {
                 await capture(view.frame(width: 600, height: 380), width: 600, height: 380, titled: nil, dark: dark,
                               to: directory.appending(path: "settings-\(name)-\(suffix).png"))
@@ -150,6 +152,7 @@ enum Snapshots {
                                 dark: Bool, to url: URL) async {
         let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         let host = NSHostingView(rootView: view
+            .buttonStyle(.secondary)
             .background(Color(nsColor: .windowBackgroundColor))
             .environment(\.colorScheme, dark ? .dark : .light))
         host.appearance = appearance
@@ -172,15 +175,45 @@ enum Snapshots {
             }
         }
         try? await Task.sleep(for: .milliseconds(300))
-        let image = CGWindowListCreateImage(.null, .optionIncludingWindow, CGWindowID(window.windowNumber),
-                                            [.boundsIgnoreFraming, .bestResolution])
-        if let image, let data = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) {
-            try? data.write(to: url)
-        } else if let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
-            host.cacheDisplay(in: host.bounds, to: rep)
-            try? rep.representation(using: .png, properties: [:])?.write(to: url)
-        }
+        let screencapture = Process()
+        screencapture.executableURL = URL(filePath: "/usr/sbin/screencapture")
+        screencapture.arguments = ["-x", "-o", "-l", String(window.windowNumber), url.path(percentEncoded: false)]
+        try? screencapture.run()
+        screencapture.waitUntilExit()
         window.close()
+    }
+}
+
+private struct ButtonGallery: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            Button("Restore Version…") {}
+                .buttonStyle(.primary)
+            Button("Cancel") {}
+            HStack(spacing: 12) {
+                Button("Show in Finder") {}
+                Button("Remove…", role: .destructive) {}
+            }
+            .controlSize(.small)
+            HStack(spacing: 12) {
+                Button("Remove Device") {}
+                    .buttonStyle(.destructiveConfirm)
+                Button("Remove…", role: .destructive) {}
+            }
+            HStack(spacing: 12) {
+                Button("Restore Version…") {}
+                    .buttonStyle(.primary)
+                Button("Cancel") {}
+            }
+            .disabled(true)
+            HStack(spacing: 8) {
+                Spacer()
+                Button("Cancel") {}
+                Button("Restore Version…") {}
+                    .buttonStyle(.primary)
+            }
+        }
+        .padding(24)
     }
 }
 #endif

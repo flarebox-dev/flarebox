@@ -48,6 +48,7 @@ struct KoidriveApp: App {
         MenuBarExtra {
             MenuContent()
                 .environment(model)
+                .buttonStyle(.secondary)
         } label: {
             MenuBarLabel(model: model)
         }
@@ -56,18 +57,21 @@ struct KoidriveApp: App {
         Window("Set Up Koidrive", id: WindowID.setup) {
             SetupView()
                 .environment(model)
+                .buttonStyle(.secondary)
         }
         .windowResizability(.contentSize)
 
         Window("Needs You", id: WindowID.questions) {
             QuestionsView()
                 .environment(model)
+                .buttonStyle(.secondary)
         }
         .defaultSize(width: 860, height: 560)
 
         Settings {
             SettingsView()
                 .environment(model)
+                .buttonStyle(.secondary)
         }
     }
 }

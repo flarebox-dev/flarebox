@@ -163,7 +163,7 @@ private struct ServerStep: View {
             HStack {
                 Spacer()
                 Button("Connect", action: connect)
-                    .buttonStyle(.prominent)
+                    .buttonStyle(.primary)
                     .keyboardShortcut(.defaultAction)
                     .disabled(!setup.canConnect)
             }
@@ -232,7 +232,7 @@ private struct SignInStep: View {
                 Button("Change Server") { setup.changeServer() }
                 Spacer()
                 Button(setup.claimsServer ? "Claim Server" : "Sign In", action: signIn)
-                    .buttonStyle(.prominent)
+                    .buttonStyle(.primary)
                     .keyboardShortcut(.defaultAction)
                     .disabled(!setup.canSignIn)
             }
@@ -302,7 +302,7 @@ struct FolderStep: View {
                 Button("Link Folder") {
                     Task { await setup.link() }
                 }
-                .buttonStyle(.prominent)
+                .buttonStyle(.primary)
                 .keyboardShortcut(.defaultAction)
                 .disabled(!setup.canLink)
             }
@@ -363,7 +363,7 @@ private struct DoneStep: View {
             HStack {
                 Spacer()
                 Button("Done", action: close)
-                    .buttonStyle(.prominent)
+                    .buttonStyle(.primary)
                     .keyboardShortcut(.defaultAction)
             }
             .padding(.top, 8)
