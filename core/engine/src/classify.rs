@@ -459,7 +459,15 @@ impl Trees {
                 versions.remove(0);
             }
         }
+        let edited_here = made_here
+            && !node.trashed
+            && (self.r.get(&id)).is_some_and(|old| {
+                old.edit_rev != node.edit_rev && old.content_rev != node.content_rev
+            });
         let shape = node.shape.clone();
+        if edited_here {
+            self.edited_here.insert(id.clone(), node.edit_rev);
+        }
         self.place_remote(id.clone(), node);
         if hidden && !self.set_synced_if_valid(id.clone(), None) {
             self.wait(id.clone(), None, Origin::Other);
@@ -1369,13 +1377,16 @@ impl Trees {
     }
 
     /// The files whose content L and S hold alike, with no waiting S update to other content, while R
-    /// holds other content live: edits of other devices that this device has not taken yet, each
+    /// holds other content live that no edit of this device set ([`Trees::edited_here`]): edits of
+    /// other devices that this device has not taken yet, each
     /// with whether a commit of this device that the server lost made R's record of the file's
     /// position: `lost_here` tells whether a seq is one of those commits. For
     /// [`Trees::forget_lost`] once a bootstrap has replaced R.
     pub fn untaken_edits(&self, lost_here: impl Fn(u64) -> bool) -> Vec<(NodeId, bool)> {
         (self.s.iter())
-            .filter(|(id, _)| !self.unsent_edits.contains(*id))
+            .filter(|(id, _)| {
+                !self.unsent_edits.contains(*id) && !self.edited_here.contains_key(*id)
+            })
             .filter_map(|(id, synced)| {
                 let remote = self.r.get(id).filter(|remote| !remote.trashed)?;
                 let held = synced.content.as_ref()?;
@@ -1634,7 +1645,7 @@ impl Trees {
             .filter_map(|(id, moved_in_lost_commit)| {
                 let remote = self.r.get(&id)?;
                 let mut kept = self.s.get(&id)?.clone();
-                if moved_in_lost_commit && !remote.trashed {
+                if moved_in_lost_commit && !remote.trashed && remote.meta_rev <= held_through {
                     kept.parent = remote.shape.parent.clone();
                     kept.name = remote.shape.name.clone();
                 }
