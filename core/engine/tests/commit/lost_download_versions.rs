@@ -61,6 +61,55 @@ fn a_download_the_server_lost_is_not_sent_again_at_another_position() {
 }
 
 #[test]
+fn a_moved_download_the_server_lost_takes_the_position_another_device_sends_it_again_at() {
+    let mut trees = trees(&[synced("a", file(ROOT, "a", 1))]);
+    trees.set_remote("a".into(), version(remote(file(ROOT, "a", 1)), "v1"));
+    let moved = RemoteNode {
+        content_rev: 5,
+        edit_rev: 5,
+        meta_rev: 5,
+        ..version(remote(file(ROOT, "b", 2)), "v2")
+    };
+    trees.set_remote("a".into(), moved);
+    trees.set_local("a".into(), local(file(ROOT, "b", 2), 1));
+    trees.settle();
+    assert_eq!(trees.class("a"), Class::InSync);
+    let mut commits = Commits::default();
+    list_after_a_loss(
+        &mut trees,
+        &commits,
+        version(remote(file(ROOT, "a", 1)), "v1"),
+    );
+    let resent = RemoteNode {
+        content_rev: 2,
+        edit_rev: 2,
+        meta_rev: 2,
+        ..version(remote(file(ROOT, "c", 2)), "v2-resent")
+    };
+    trees.set_remote("a".into(), resent);
+    trees.settle();
+    assert_eq!(trees.class("a"), Class::Remote);
+    assert!(build(&mut commits, &mut trees, &mut IdGen::new(1)).is_none());
+}
+
+#[test]
+fn a_download_this_device_moved_in_a_lost_commit_is_listed_as_synced() {
+    let (_, mut trees, _) = downloaded_at_5();
+    trees.set_local("a".into(), local(file(ROOT, "b", 2), 1));
+    let moved = RemoteNode {
+        content_rev: 5,
+        edit_rev: 5,
+        meta_rev: 6,
+        ..version(remote(file(ROOT, "b", 2)), "v2")
+    };
+    trees.set_remote("a".into(), moved);
+    trees.settle();
+    assert_eq!(trees.class("a"), Class::InSync);
+    assert_eq!(trees.taken_from_others(|seq| seq == 6), ["a".to_string()]);
+    assert!(trees.taken_from_others(|seq| seq == 5).is_empty());
+}
+
+#[test]
 fn a_download_edited_since_is_not_listed_as_synced() {
     let (_, mut trees, _) = downloaded_at_5();
     trees.set_local("a".into(), local(file(ROOT, "a", 4), 1));

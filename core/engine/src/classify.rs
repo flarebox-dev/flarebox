@@ -504,16 +504,18 @@ impl Trees {
     }
 
     fn place_remote(&mut self, id: NodeId, node: RemoteNode) {
-        let created_over_resend = !node.trashed
-            && self.r.get(&id).is_none()
+        let sent_by_another = !node.trashed
             && self.resends.contains(&id)
             && (self.l.live(&id)).is_some_and(|local| {
-                let at = Shape {
-                    parent: node.shape.parent.clone(),
-                    name: node.shape.name.clone(),
-                    ..local.clone()
+                let holds_local = |remote: &Shape| {
+                    let at = Shape {
+                        parent: remote.parent.clone(),
+                        name: remote.name.clone(),
+                        ..local.clone()
+                    };
+                    at.same(remote)
                 };
-                at.same(&node.shape)
+                holds_local(&node.shape) && !self.r.live(&id).is_some_and(holds_local)
             });
         self.mark(&id);
         let trashed = node.trashed;
@@ -568,7 +570,7 @@ impl Trees {
         if trashed {
             self.yield_resends();
         }
-        if created_over_resend {
+        if sent_by_another {
             self.take_local(id);
         }
     }
@@ -1403,7 +1405,7 @@ impl Trees {
     }
 
     /// The nodes whose content L and S hold as R holds it live, a folder's as any folder's, where no
-    /// commit of this device that the server lost made R's record and L holds no unsent edit
+    /// commit of this device that the server lost set R's content and L holds no unsent edit
     /// ([`Trees::unsent_edits`]): `lost_here` tells whether a seq is one of those commits. For
     /// [`Trees::forget_lost`] once a bootstrap has replaced R.
     pub fn taken_from_others(&self, lost_here: impl Fn(u64) -> bool) -> Vec<NodeId> {
@@ -1418,9 +1420,7 @@ impl Trees {
                 };
                 let remote = (self.r.get(id))
                     .filter(|remote| !remote.trashed)
-                    .filter(|remote| {
-                        !lost_here(remote.content_rev.max(remote.meta_rev).max(remote.edit_rev))
-                    });
+                    .filter(|remote| !lost_here(remote.content_rev.max(remote.edit_rev)));
                 holds(remote.map(|remote| &remote.shape)) && holds(self.l.live(id))
             })
             .map(|(id, _)| id.clone())
@@ -1543,7 +1543,8 @@ impl Trees {
     /// restores it from the trash with L's bytes would otherwise make L, S and R agree.
     ///
     /// `synced` lists the nodes whose content L and S held as R did before the bootstrap, where no
-    /// commit of this device that the server lost made R's record ([`Trees::taken_from_others`]).
+    /// commit of this device that the server lost set R's content ([`Trees::taken_from_others`]).
+    /// A lost move of this device leaves the content another device's, so the node is listed.
     /// A file of it that R now holds live at the position S holds, at a version the log replaced for it before
     /// ([`TreesState::replaced_versions`]), holds content from before the loss that S's
     /// content replaced: nothing changed it since. S takes R's shape, so the content L holds is sent
@@ -1561,9 +1562,9 @@ impl Trees {
     /// R lacks, also one found after the folder gave way, sends the folder again at the next build,
     /// and a node S holds and R lacks that L changes itself is created again at L's position.
     /// Resends give way parents first, so S takes each folder before what it holds.
-    /// R taking a node it lacked again, live with the content L holds, ends its resend too: another
-    /// device sent it first, and its position is a remote move. The device that made the change
-    /// sends it again itself, as above.
+    /// R taking the node live with the content L holds, where it lacked the node or held other
+    /// content, ends its resend too: another device sent it first, and its position is a remote
+    /// move. The device that made the change sends it again itself, as above.
     ///
     /// `accepted` is the count of this device's commits the server still holds (*w*, section
     /// 2.8). An S update that waits ([`Trees::waiting`]) from a commit above it came from a commit
