@@ -251,6 +251,52 @@ class NewComments(unittest.TestCase):
         )
         self.assertEqual(code, 1, out)
 
+    def test_a_helper_between_a_pub_fn_and_its_doc_comment_fails(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "/// Acknowledges.\npub fn ack() {}\n"},
+            {"core/a/src/lib.rs": "/// Acknowledges.\nfn helper() {}\n\npub fn ack() {\n    helper();\n}\n"},
+            ("core/a/src/lib.rs", 2),
+            ("core/a/src/lib.rs", 4),
+        )
+
+    def test_a_documented_helper_between_a_pub_fn_and_its_doc_comment_fails(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "/// Acknowledges.\npub fn ack() {}\n"},
+            {"core/a/src/lib.rs": "/// Acknowledges.\n/// Helps.\nfn helper() {}\n\npub fn ack() {\n    helper();\n}\n"},
+            ("core/a/src/lib.rs", 3),
+            ("core/a/src/lib.rs", 5),
+        )
+
+    def test_deleting_a_pub_fn_doc_comment_passes(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "/// Acknowledges.\npub fn ack() {}\n"},
+            {"core/a/src/lib.rs": "pub fn ack() {}\n"},
+        )
+
+    def test_a_new_doc_comment_on_a_private_fn_outside_internal_code_passes(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "pub(crate) fn a() {}\n"},
+            {"core/a/src/lib.rs": "/// Explains a.\npub(crate) fn a() {}\n"},
+        )
+
+    def test_renaming_a_documented_private_fn_passes(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "/// Explains a.\n#[inline]\nfn a() {}\n"},
+            {"core/a/src/lib.rs": "/// Explains a.\n#[inline]\nfn b() {}\n"},
+        )
+
+    def test_a_helper_below_a_documented_pub_fn_passes(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "/// Acknowledges.\npub fn ack() {}\n"},
+            {"core/a/src/lib.rs": "/// Acknowledges.\npub fn ack() {\n    helper();\n}\n\nfn helper() {}\n"},
+        )
+
+    def test_clap_help_on_a_private_fn_passes(self):
+        self.assertFlags(
+            {"cli/src/a.rs": "#[derive(Parser)]\nstruct A;\nfn run() {}\n"},
+            {"cli/src/a.rs": "#[derive(Parser)]\nstruct A;\n/// Runs.\nfn run() {}\n"},
+        )
+
 
 class WorkflowBase(unittest.TestCase):
     def run_workflow(self, event):

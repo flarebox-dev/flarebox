@@ -28,11 +28,14 @@ IDENT = re.compile(r"[A-Za-z0-9_$]+")
 RUST_RAW = re.compile(r'[bc]?r(#*)"')
 RUST_CHAR = re.compile(r"'(\\.[^'\n]*|[^\\'\n])'")
 SWIFT_RAW = re.compile(r'(#+)("""|")')
+RUST_FN = re.compile(r'^\s*(pub(?:\([^)]*\))?\s+)?(?:(?:const|async|unsafe|extern\s+"[^"]*")\s+)*fn\s+(\w+)')
 REGEX_BEFORE = set("(,=:[!&|?{};+-*%<>~^") | {"", "return", "typeof", "case", "in", "of", "delete", "void", "throw", "yield", "await"}
 
 MESSAGES = {
     "marker": "TODO, FIXME, XXX, HACK and 'for now' belong in an issue, not in the code.",
     "doc": "New doc comment on internal code (tests, server/, the macOS app, cli/tests). Doc comments go only on API that other packages call, so let the name or the type say it.",
+    "private-doc": "A doc comment now sits on a private fn. Doc comments go only on public API. If a helper went in between a pub fn's doc comment and that fn, move the helper below the documented fn.",
+    "lost-doc": "This pub fn lost its doc comment. If a helper went in between the doc comment and this fn, move the helper below this fn.",
     "comment": "New comment. Say it in code: a name, a type, a test or an assertion message. A comment may stay only as a license header, a SAFETY: note, a tool pragma, or a line that links the source of an external constraint.",
 }
 
@@ -183,6 +186,43 @@ def comment_lines(src, lang):
     return lines
 
 
+def rust_fns(src):
+    lines = src.split("\n")
+    comments = comment_lines(src, "rust")
+    fns, seen = {}, {}
+    for number, text in enumerate(lines, 1):
+        m = RUST_FN.match(text)
+        if not m or number in comments and text.lstrip().startswith(("//", "/*", "*")):
+            continue
+        docs, above = [], number - 1
+        while above >= 1:
+            stripped = lines[above - 1].strip()
+            if any(doc for doc, _ in comments.get(above, [])) and not stripped.startswith("#"):
+                docs.insert(0, stripped)
+            elif not stripped.startswith("#["):
+                break
+            above -= 1
+        name = m.group(2)
+        seen[name] = seen.get(name, 0) + 1
+        fns[(name, seen[name])] = ((m.group(1) or "").strip() == "pub", "\n".join(docs), number, text, above + 1)
+    return fns
+
+
+def moved_docs(path, old_src, new_src):
+    old = rust_fns(old_src) if old_src is not None else {}
+    new = rust_fns(new_src)
+    public_docs = {docs for public, docs, *_ in old.values() if docs and public}
+    new_docs = {docs for _, docs, *_ in new.values() if docs}
+    problems = []
+    for key, (public, docs, number, text, top) in new.items():
+        before = old.get(key)
+        if not public and any(docs.startswith(moved) for moved in public_docs) and not (before and before[1] == docs):
+            problems.append((path, number, "private-doc", text, top))
+        if public and not docs and before and before[0] and before[1] and any(d.startswith(before[1]) for d in new_docs):
+            problems.append((path, number, "lost-doc", text, number))
+    return problems
+
+
 def git(*args):
     return subprocess.run(["git", *args], check=True, capture_output=True).stdout.decode("utf-8", "replace")
 
@@ -269,7 +309,7 @@ def check(base, head):
                 runs[-1].extend(w.lower() for w in WORD.findall(piece))
                 previous = number
 
-    problems = []
+    problems, moved = [], []
     for f in files:
         path = f.get("new")
         if not path or not f["added"] or "/gen/" in path:
@@ -278,6 +318,8 @@ def check(base, head):
         new_src = git("show", f"{head}:{path}")
         new_lines = comment_lines(new_src, lang)
         help_text = macro_docs(new_src, lang)
+        if lang == "rust" and not help_text:
+            moved.extend(moved_docs(path, git("show", f"{base}:{f['old']}") if f["old"] else None, new_src))
         for number in f["added"]:
             for doc, piece in new_lines.get(number, []):
                 words = [w.lower() for w in WORD.findall(piece)]
@@ -295,6 +337,10 @@ def check(base, head):
                     problems.append((path, number, "comment", piece))
                 elif INTERNAL.search(path):
                     problems.append((path, number, "doc", piece))
+    flagged = {(path, number) for path, number, _, _ in problems}
+    for path, number, kind, text, top in moved:
+        if not any((path, line) in flagged for line in range(top, number)):
+            problems.append((path, number, kind, text))
     return problems
 
 
@@ -320,7 +366,7 @@ def main():
         print(f"::error file={path},line={number}::{MESSAGES[kind]}")
         print(f"    {piece.strip()}")
     if problems:
-        print(f"{len(problems)} comment lines added between {args.base} and {args.head}. Remove them, or reshape the code so it reads without them.")
+        print(f"{len(problems)} comment problems between {args.base} and {args.head}. Remove the comments, or reshape the code so it reads without them.")
         return 1
     print(f"No new comments between {args.base} and {args.head}.")
     return 0
