@@ -2021,8 +2021,12 @@ fn folder_text(folder: &FolderStatus) -> String {
     );
     if let Some(problem) = &folder.problem {
         text.push_str(&format!("  {}\n", printable(problem)));
-    } else if let Some(cause) = &folder.recovery {
-        text.push_str(&format!("  {}\n", koidrive_driver::describe(cause)));
+    }
+    if let Some(cause) = &folder.recovery {
+        let described = koidrive_driver::describe(cause);
+        if folder.problem.as_deref() != Some(described.as_str()) {
+            text.push_str(&format!("  {described}\n"));
+        }
     }
     text
 }
@@ -2609,6 +2613,35 @@ mod tests {
             "{}",
             folder_text(&folder)
         );
+    }
+
+    #[test]
+    fn the_status_text_names_the_rewind_beside_a_problem_and_only_once() {
+        let cause = koidrive_engine::question::RecoveryCause::rewind(7, 1_794_442_424_000);
+        let rewound =
+            "the space was rewound on the server to seq 7 (requested 2026-11-12 00:13 UTC)";
+        let folder = |problem: &str| FolderStatus {
+            recovery: Some(cause),
+            space_id: "s1".into(),
+            space_name: "Home".into(),
+            path: "/home/ada/Docs".into(),
+            state: FolderState::UpToDate,
+            history_id: None,
+            last_seq: None,
+            head_seq: None,
+            remote_nodes: 0,
+            local_entries: None,
+            questions: 1,
+            problem: Some(problem.into()),
+            wait: None,
+        };
+        let text = folder_text(&folder("a.txt waits to be read again"));
+        assert!(
+            text.ends_with(&format!("\n  a.txt waits to be read again\n  {rewound}\n")),
+            "{text}"
+        );
+        let text = folder_text(&folder(rewound));
+        assert_eq!(text.matches(rewound).count(), 1, "{text}");
     }
 
     #[test]
