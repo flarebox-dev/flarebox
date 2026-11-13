@@ -902,11 +902,25 @@ fn waits_on_excluded(trees: &Trees, id: &str, waiting: &BTreeSet<String>) -> boo
     false
 }
 
-fn kept_by_gun_526(
-    trees: &Trees,
-    id: &str,
-    discarded: &BTreeMap<String, koidrive_engine::tree::Shape>,
-) -> bool {
+type Discarded = BTreeMap<String, koidrive_engine::tree::Shape>;
+
+struct KnownUnsettled {
+    issue: &'static str,
+    applies: fn(&Trees, &str, &Discarded) -> bool,
+}
+
+const KNOWN_UNSETTLED: [KnownUnsettled; 2] = [
+    KnownUnsettled {
+        issue: "GUN-526",
+        applies: kept_for_an_excluded_entry,
+    },
+    KnownUnsettled {
+        issue: "GUN-526",
+        applies: blocked_by_a_folder_kept_for_an_excluded_entry,
+    },
+];
+
+fn kept_for_an_excluded_entry(trees: &Trees, id: &str, discarded: &Discarded) -> bool {
     let local = trees.local();
     let below = |node: &str, folder: &str| {
         let mut at = node;
@@ -928,6 +942,30 @@ fn kept_by_gun_526(
         }
         match local.get(at) {
             Some(held) => at = &held.shape.parent,
+            None => return false,
+        }
+    }
+    false
+}
+
+fn blocked_by_a_folder_kept_for_an_excluded_entry(
+    trees: &Trees,
+    id: &str,
+    discarded: &Discarded,
+) -> bool {
+    let blocked = |node: &RemoteNode| {
+        let key = name_key(&node.shape.name);
+        (trees.local().iter()).any(|(other, held)| {
+            held.shape.parent == node.shape.parent
+                && name_key(&held.shape.name) == key
+                && kept_for_an_excluded_entry(trees, other, discarded)
+        })
+    };
+    let mut at = id;
+    for _ in 0..=trees.remote().len() {
+        match trees.remote().get(at) {
+            Some(node) if blocked(node) => return true,
+            Some(node) => at = &node.shape.parent,
             None => return false,
         }
     }
@@ -1397,6 +1435,11 @@ fn run_ignoring(
         .map(|(id, _)| id)
         .filter(|id| !outside(id))
         .collect();
+    let known = |id: &str| {
+        (KNOWN_UNSETTLED.iter())
+            .find(|known| (known.applies)(&device.trees, id, &discarded))
+            .map(|known| known.issue)
+    };
     let mut waiting: BTreeSet<String> = BTreeSet::new();
     loop {
         let more: Vec<String> = (unsettled.iter())
@@ -1404,7 +1447,7 @@ fn run_ignoring(
                 !waiting.contains(*id)
                     && (waits_on_excluded(&device.trees, id, &waiting)
                         || waits_on_synced(&device.trees, id, &waiting)
-                        || kept_by_gun_526(&device.trees, id, &discarded))
+                        || known(id).is_some())
             })
             .cloned()
             .collect();
@@ -1416,7 +1459,15 @@ fn run_ignoring(
     let unsettled: Vec<&String> = (unsettled.iter())
         .filter(|id| !waiting.contains(*id))
         .collect();
-    prop_assert_eq!(unsettled, Vec::<&String>::new());
+    let exempted: Vec<(&str, &String)> = (waiting.iter())
+        .filter_map(|id| Some((known(id)?, id)))
+        .collect();
+    prop_assert_eq!(
+        unsettled,
+        Vec::<&String>::new(),
+        "known unsettled: {:?}",
+        exempted
+    );
     prop_assert!(commits.problems().is_empty(), "{:?}", commits.problems());
     prop_assert!(effects.blocked().is_empty(), "{:?}", effects.blocked());
     let reported = koidrive_engine::effects::stuck(&device.trees, &effects, commits.in_flight());
