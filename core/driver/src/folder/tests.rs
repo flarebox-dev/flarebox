@@ -28,6 +28,14 @@ use crate::observe::Observed;
 use crate::question::Answer;
 
 const NOW: i64 = 1_700_000_000_000;
+const WAIT: Duration = Duration::from_secs(60);
+
+fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+    let started = Instant::now();
+    while !done() {
+        assert!(started.elapsed() < WAIT, "{what} within {WAIT:?}");
+    }
+}
 
 #[test]
 fn a_folder_brought_back_at_its_pending_name_takes_its_own_name() {
@@ -399,15 +407,17 @@ impl Device {
 
     /// Observes until `done`.
     fn scan_until(&mut self, done: impl Fn(&Device) -> bool) {
-        while !done(self) {
-            self.scan(Duration::from_millis(100));
-        }
+        eventually("the observer brings the awaited state", || {
+            done(self) || {
+                self.scan(Duration::from_millis(100));
+                false
+            }
+        });
     }
 
     fn settle(&mut self) {
-        let started = Instant::now();
         let mut caught_up = false;
-        loop {
+        eventually("the observer catches up with the disk", || {
             self.scan(Duration::from_millis(100));
             let mut known = self.observer.snapshot().clone();
             let rescan = known.rescan_with_rules(
@@ -419,15 +429,10 @@ impl Device {
                 !rescan.changes.is_empty() || !rescan.unsettled.is_empty()
             });
             let now = self.observer.answered() && self.observer.scanned().is_some() && !unseen;
-            if now && caught_up {
-                return;
-            }
+            let settled = now && caught_up;
             caught_up = now;
-            assert!(
-                started.elapsed() < Duration::from_secs(120),
-                "the observer does not catch up with the disk"
-            );
-        }
+            settled
+        });
     }
 
     /// What the session delivers after a `Resume`: the log after `since_seq`, with this device's own commits as
@@ -524,7 +529,12 @@ impl Device {
     /// Runs the work the folder asked for and the work that follows from it, until none is left. Returns what ran.
     fn try_run(&mut self, remote: &mut Remote) -> Result<Vec<&'static str>, Stop> {
         let mut ran = Vec::new();
+        let started = Instant::now();
         while let Some(work) = self.work.pop_front() {
+            assert!(
+                started.elapsed() < WAIT,
+                "the folder stops asking for work within {WAIT:?}"
+            );
             ran.push(match &work {
                 Work::Subscribe { .. } => "subscribe",
                 Work::List { .. } => "list",
@@ -546,13 +556,11 @@ impl Device {
     }
 
     fn rest(&mut self, remote: &mut Remote) {
-        loop {
+        eventually("the folder comes to rest", || {
             self.run(remote);
             self.settle();
-            if self.work.is_empty() {
-                return;
-            }
-        }
+            self.work.is_empty()
+        });
     }
 
     /// Writes a file and syncs it to the space.
@@ -953,12 +961,13 @@ fn a_move_onto_a_name_a_symlink_holds_still_lets_the_new_file_take_the_old_name(
     a.run(&mut remote);
     a.create(&mut remote, &site_a.root.join("d"), b"new remote file");
     b.pull(&remote);
-    while fs::read(site.root.join("d")).ok().as_deref() != Some(&b"new remote file"[..]) {
+    eventually("the new remote file lands at d", || {
         if let Some(work) = b.work.pop_front() {
             b.perform(work, &mut remote).unwrap();
         }
         b.scan(Duration::from_millis(100));
-    }
+        fs::read(site.root.join("d")).ok().as_deref() == Some(&b"new remote file"[..])
+    });
     assert_eq!(
         fs::read_link(site.root.join("e")).unwrap(),
         PathBuf::from("untouched")
@@ -3530,11 +3539,12 @@ fn a_batch_that_fails_the_root_check_stops_the_folder_before_l_loses_a_file() {
 
     fs::remove_file(site.root.join(koidrive_fs::PRIVATE_DIR).join("space.json")).unwrap();
     fs::remove_file(site.root.join("notes.txt")).unwrap();
-    let stop = loop {
-        if let Err(stop) = a.try_scan(Duration::from_millis(100)) {
-            break stop;
-        }
-    };
+    let mut stop = None;
+    eventually("the root check stops the folder", || {
+        stop = a.try_scan(Duration::from_millis(100)).err();
+        stop.is_some()
+    });
+    let stop = stop.unwrap();
     assert!(
         matches!(stop, Stop::Root(RootProblem::NoMarker)),
         "{stop:?}"
@@ -3561,11 +3571,11 @@ fn a_folder_the_scan_may_not_read_keeps_its_files_in_the_space() {
         eprintln!("SKIPPED: running as root, so permissions do not block reads");
         return;
     }
-    while !a
-        .try_scan(Duration::from_millis(100))
-        .unwrap()
-        .contains(&"private".into())
-    {}
+    eventually("the scan reports the folder it may not read", || {
+        a.try_scan(Duration::from_millis(100))
+            .unwrap()
+            .contains(&"private".into())
+    });
     a.settle();
     assert!(a.work.is_empty());
     assert_eq!(a.sent.len(), sent);
@@ -3726,12 +3736,14 @@ fn a_batch_scanned_before_a_rules_file_was_written_does_not_end_the_wait_for_its
     b.scan_until(|b| b.folder.scanned);
     fs::write(site.root.join("mine.txt"), b"mine").unwrap();
     let sections = b.folder.sections();
-    let batch = loop {
-        let wait = Duration::from_millis(100);
-        if let Some(batch) = sections.observe(&mut b.observer, wait).unwrap() {
-            break batch;
-        }
-    };
+    let mut batch = None;
+    eventually("the observer reports a batch", || {
+        batch = sections
+            .observe(&mut b.observer, Duration::from_millis(100))
+            .unwrap();
+        batch.is_some()
+    });
+    let batch = batch.unwrap();
     assert_eq!(b.run(&mut remote), ["list", "subscribe", "stage"]);
     assert!(b.folder.disk.awaits_rules());
 
@@ -6800,10 +6812,11 @@ fn a_question_asked_again_under_a_new_id_marks_the_questions_changed() {
     for i in 0..2 {
         fs::remove_file(site.root.join(format!("{i}.txt"))).unwrap();
     }
-    while asked(&site) == before {
+    eventually("the guard asks again", || {
         a.scan(Duration::from_millis(100));
         a.run(&mut remote);
-    }
+        asked(&site) != before
+    });
 
     let after = asked(&site);
     assert_eq!(after.len(), 1);
