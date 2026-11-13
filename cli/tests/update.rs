@@ -500,33 +500,57 @@ fn koi_update_uses_the_custom_homebrew_of_the_running_koi_without_a_prefix_varia
     );
 }
 
-#[test]
-fn the_daemon_checks_for_a_release_and_koi_status_names_it() {
+#[tokio::test]
+async fn the_daemon_checks_for_a_release_and_koi_status_names_it() {
+    use tokio::io::AsyncBufReadExt;
+
     let home = tempfile::tempdir().unwrap();
     let github = github("v99.0.0");
-    let mut daemon = koi(home.path(), &github, &["_daemon"])
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let status = loop {
-        let output = koi(home.path(), &github, &["status", "--json"])
-            .output()
+    let mut daemon =
+        tokio::process::Command::from(koi(home.path(), &github, &["_daemon", "--json"]))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
             .unwrap();
-        let envelope = envelope(&output);
-        let expected = if development_version() {
-            "off"
-        } else {
-            "available"
-        };
-        if envelope["data"]["update"]["state"] == expected || Instant::now() > deadline {
-            break envelope;
+    let mut events = tokio::io::BufReader::new(daemon.stdout.take().unwrap()).lines();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let started = events.next_line().await.unwrap().unwrap();
+        let started: Value = serde_json::from_str(&started).unwrap();
+        schema::check(&started);
+        assert_eq!(started["event"], "started", "{started}");
+        let mut changes = koidrive_ipc::watch(
+            Path::new(started["socket"].as_str().unwrap()),
+            rustix::process::getuid().as_raw(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        loop {
+            let response = changes.next().await.unwrap().unwrap();
+            let koidrive_ipc::Response::State { status, .. } = response else {
+                panic!("{response:?}");
+            };
+            if matches!(
+                (status.update, development_version()),
+                (koidrive_driver::Update::Off, true)
+                    | (koidrive_driver::Update::Available { .. }, false)
+            ) {
+                break;
+            }
         }
-        std::thread::sleep(Duration::from_millis(200));
-    };
+    })
+    .await
+    .expect("the daemon starts and publishes its release check");
+    let output = koi(home.path(), &github, &["status", "--json"])
+        .output()
+        .unwrap();
+    let status = envelope(&output);
     let text = koi(home.path(), &github, &["status"]).output().unwrap();
-    daemon.kill().unwrap();
-    daemon.wait().unwrap();
+    daemon.kill().await.unwrap();
+    daemon.wait().await.unwrap();
+    assert!(output.status.success(), "{status:#}");
+    assert_eq!(status["data"]["running"], true, "{status:#}");
     let update = &status["data"]["update"];
     if development_version() {
         assert_eq!(
