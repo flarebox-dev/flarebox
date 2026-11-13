@@ -111,11 +111,12 @@ async fn download(
     transfer
         .download(session, chunks, |c: &ChunkRef, bytes: Bytes| {
             assert!(matches(c, &bytes), "only verified bytes reach the caller");
-            received.push(bytes);
+            received.push((c.clone(), bytes));
             std::future::ready(Ok(()))
         })
         .await?;
-    Ok(received)
+    received.sort_by_key(|(c, _)| chunks.iter().position(|wanted| wanted.hash == c.hash));
+    Ok(received.into_iter().map(|(_, bytes)| bytes).collect())
 }
 
 fn applied(result: &CommitResult) -> bool {
