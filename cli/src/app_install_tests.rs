@@ -338,9 +338,13 @@ if [ "$last" = '{}' ] && [ -d '{}' ]; then
     printf '%s' "$n" > '{}'
     if [ "$n" = 4 ]; then printf OTHERTEAM > '{}/Signer'; fi
 fi"#,
-                    accepting.display(), f.installed().display(), user.display(),
-                    f.base().join("checks").display(), f.base().join("checks").display(),
-                    f.base().join("checks").display(), user.display()
+                    accepting.display(),
+                    f.installed().display(),
+                    user.display(),
+                    f.base().join("checks").display(),
+                    f.base().join("checks").display(),
+                    f.base().join("checks").display(),
+                    user.display()
                 ),
             );
             script(
@@ -352,17 +356,24 @@ fi"#,
             );
             fs::set_permissions(&f.config.system, fs::Permissions::from_mode(0o500)).unwrap();
             let result = ensure_with(
-                f.config.clone(), Version::parse(TARGET).unwrap(), launch,
+                f.config.clone(),
+                Version::parse(TARGET).unwrap(),
+                launch,
                 Instant::now() + Duration::from_secs(60),
-            ).await;
+            )
+            .await;
             fs::set_permissions(&f.config.system, fs::Permissions::from_mode(0o700)).unwrap();
             assert_eq!(
-                fs::read(user.join("Signer")).unwrap(), b"OTHERTEAM",
+                fs::read(user.join("Signer")).unwrap(),
+                b"OTHERTEAM",
                 "The source-change probe did not run: reuse={reuse}, launch={launch:?}"
             );
             assert_eq!(result.unwrap_err().kind, AppInstallFailure::Verification);
             let opened = fs::read_to_string(f.base().join("opened-signers")).unwrap_or_default();
-            assert!(!opened.contains("OTHERTEAM"), "Opened a changed app: {opened}");
+            assert!(
+                !opened.contains("OTHERTEAM"),
+                "Opened a changed app: {opened}"
+            );
             f.preserved();
         }
     }
@@ -1555,7 +1566,14 @@ async fn an_immovable_older_alternative_is_reported_and_preserved() {
     fs::set_permissions(&f.config.user, fs::Permissions::from_mode(0o500)).unwrap();
     let result = f.run().await;
     fs::set_permissions(&f.config.user, fs::Permissions::from_mode(0o700)).unwrap();
-    let AppInstall::Present { path, preserved, residue, retired, .. } = result.unwrap() else {
+    let AppInstall::Present {
+        path,
+        preserved,
+        residue,
+        retired,
+        ..
+    } = result.unwrap()
+    else {
         panic!()
     };
     assert_eq!(path, f.installed());
