@@ -241,6 +241,14 @@ impl Space {
         Ok(rustix::fs::openat(staging.fd(), id, flags, Mode::from_raw_mode(0o644))?.into())
     }
 
+    /// Opens the staged file of effect `id` that [`Space::stage`] created, to write more of its content.
+    pub fn open_staged(&self, id: &str) -> io::Result<File> {
+        check_name(OsStr::new(id))?;
+        let staging = self.private(&[STAGING_DIR])?;
+        let flags = OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        Ok(rustix::fs::openat(staging.fd(), id, flags, Mode::empty())?.into())
+    }
+
     /// Sets the staged file's executable bit and flushes it, which design
     /// §5.2 requires before the file is renamed into place. The caller has
     /// written and verified its content, and finishes the file before it

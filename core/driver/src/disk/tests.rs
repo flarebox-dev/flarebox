@@ -2882,3 +2882,66 @@ fn a_chunk_the_server_lost_fails_only_the_writes_of_the_batch_that_list_it() {
     assert_eq!(names(&folder, STAGING_DIR), Vec::<String>::new());
     assert!(running.engine.effects.blocked().contains_key(lost_node));
 }
+
+#[test]
+fn files_that_share_a_chunk_are_staged_within_a_small_descriptor_limit() {
+    const CHILD: &str = "KOIDRIVE_TEST_FEW_DESCRIPTORS";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "disk::tests::files_that_share_a_chunk_are_staged_within_a_small_descriptor_limit",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+    rustix::process::setrlimit(
+        rustix::process::Resource::Nofile,
+        rustix::process::Rlimit {
+            current: Some(128),
+            maximum: limit.maximum,
+        },
+    )
+    .unwrap();
+    let folder = Folder::new();
+    let mut server = Server::default();
+    let config = ChunkerConfig::new(64, 256, 1024, 0).unwrap();
+    let files: Vec<Vec<u8>> = (0..300)
+        .map(|index| {
+            let mut bytes = vec![b'x'; 2048];
+            bytes.extend(format!("the end of file {index}").as_bytes());
+            bytes
+        })
+        .collect();
+    let nodes: Vec<NodeState> = (files.iter().enumerate())
+        .map(|(index, bytes)| {
+            remote(
+                &format!("0190f0a0-0000-7000-8000-{:012x}", 0x10000 + index),
+                &format!("file-{index}.txt"),
+                Some(server.hold(bytes, config)),
+            )
+        })
+        .collect();
+    folder.seed(&nodes, &[], 0);
+    let mut running = folder.start(no_hook()).unwrap();
+
+    let settled = running.step_batch(&server).expect("a batch");
+
+    assert_eq!(settled.len(), files.len());
+    assert!(
+        settled.iter().all(|(_, settled)| *settled == Settled::Done),
+        "{settled:?}"
+    );
+    for (index, bytes) in files.iter().enumerate() {
+        assert_eq!(
+            fs::read(folder.root.join(format!("file-{index}.txt"))).unwrap(),
+            *bytes
+        );
+    }
+}

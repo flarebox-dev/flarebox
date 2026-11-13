@@ -31,7 +31,7 @@
 //! same window for parents). Nothing is ever written into a folder that replaced the root, since every write goes
 //! through the locked descriptor.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque, hash_map};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io;
@@ -858,7 +858,7 @@ impl Pending {
         let mut missing: Vec<usize> = (writes.iter())
             .map(|(_, _, manifest)| manifest.distinct.len())
             .collect();
-        let mut files: HashMap<usize, File> = HashMap::new();
+        let mut created: HashSet<usize> = HashSet::new();
         let mut received: HashSet<ChunkKey> = HashSet::new();
         let open = |unfetchable: &[Option<String>], missing: &[usize], write: usize| {
             unfetchable[writes[write].0].is_none() && missing[write] > 0
@@ -892,22 +892,20 @@ impl Pending {
                         if unfetchable[*index].is_some() {
                             continue;
                         }
-                        let file = match files.entry(*write) {
-                            hash_map::Entry::Occupied(file) => file.into_mut(),
-                            hash_map::Entry::Vacant(file) => {
-                                match self.space.stage(&self.effects[*index].record.effect_id) {
-                                    Ok(staged) => file.insert(staged),
-                                    Err(error) => return Err(local.insert(error).kind().into()),
-                                }
-                            }
+                        let id = &self.effects[*index].record.effect_id;
+                        let file = match created.insert(*write) {
+                            true => self.space.stage(id),
+                            false => self.space.open_staged(id),
+                        };
+                        let file = match file {
+                            Ok(file) => file,
+                            Err(error) => return Err(local.insert(error).kind().into()),
                         };
                         for offset in *offsets {
                             file.write_all_at(bytes, *offset)?;
                         }
                         missing[*write] -= 1;
-                        if missing[*write] == 0
-                            && let Some(file) = files.remove(write)
-                        {
+                        if missing[*write] == 0 {
                             match finish_file(&file, content) {
                                 Ok(why) => unfetchable[*index] = why,
                                 Err(error) => return Err(local.insert(error).kind().into()),
@@ -942,10 +940,8 @@ impl Pending {
             let why = failed_transfer(id, error, corrupt.is_some())?;
             for write in failing {
                 unfetchable[writes[write].0] = Some(why.clone());
-                files.remove(&write);
             }
         }
-        drop(files);
         for (write, (index, content, manifest)) in writes.iter().enumerate() {
             if unfetchable[*index].is_some() {
                 continue;
