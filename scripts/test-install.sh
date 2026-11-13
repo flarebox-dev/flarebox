@@ -75,7 +75,8 @@ fi
 cp "$release/SHA256SUMS" "$tmp/good-sums"
 ln -s ../download/v0.0.0 "$tmp/releases/latest/download"
 
-pass() { printf 'PASS %s\n' "$1"; }
+passed=0
+pass() { printf 'PASS %s\n' "$1"; passed=$((passed + 1)); }
 reject() {
     if sh "$root/install.sh" > "$tmp/rejected.log" 2>&1; then
         cat "$tmp/rejected.log"
@@ -222,36 +223,45 @@ if [ "$(uname -s)" = Linux ]; then
     pass 'an upgrade without a systemd user manager gives the command that restarts the unit'
 fi
 
-if [ "$(uname -s)" = Linux ]; then
-    printf 'Passed 20 installer tests on %s\n' "$(uname -s)"
-else
-    cat > "$tmp/bin/uname" <<'EOF'
+cat > "$tmp/bin/uname" <<'EOF'
 #!/bin/sh
 case "$1" in
-    -s) printf 'Darwin\n' ;;
-    -m) printf 'x86_64\n' ;;
+    -s) printf '%s\n' "$KOIDRIVE_TEST_OS" ;;
+    -m) printf '%s\n' "$KOIDRIVE_TEST_ARCH" ;;
     *) exit 1 ;;
 esac
 EOF
-    cat > "$tmp/bin/sysctl" <<'EOF'
+cat > "$tmp/bin/sysctl" <<'EOF'
 #!/bin/sh
 [ "$*" = '-n hw.optional.arm64' ] || exit 1
+[ "$KOIDRIVE_TEST_ARM64" != missing ] || exit 1
 printf '%s\n' "$KOIDRIVE_TEST_ARM64"
 EOF
-    chmod +x "$tmp/bin/uname" "$tmp/bin/sysctl"
-    hash=$(awk 'NR == 1 {print $1}' "$tmp/good-sums")
-    for candidate in aarch64 x86_64; do
-        selected=koidrive-$candidate-apple-darwin.tar.gz
-        if [ "$selected" != "$archive" ]; then
-            cp "$release/$archive" "$release/$selected"
-        fi
-        printf '%s  %s\n' "$hash" "$selected" > "$release/SHA256SUMS"
-        if [ "$candidate" = aarch64 ]; then arm64=1; else arm64=0; fi
-        PATH="$tmp/bin:$PATH" KOIDRIVE_TEST_ARM64=$arm64 sh "$root/install.sh" > "$tmp/arch.log" 2>&1
-        cat "$tmp/arch.log"
-        grep -F "Downloading $selected" "$tmp/arch.log"
-        cmp "$binary" "$HOME/.local/bin/koi"
-        pass "macOS x86_64 shell selects $candidate with hw.optional.arm64=$arm64"
-    done
-    printf 'Passed 20 installer tests on %s\n' "$(uname -s)"
-fi
+chmod +x "$tmp/bin/uname" "$tmp/bin/sysctl"
+hash=$(awk 'NR == 1 {print $1}' "$tmp/good-sums")
+for platform in aarch64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
+    selected=koidrive-$platform.tar.gz
+    if [ "$selected" != "$archive" ]; then
+        cp "$release/$archive" "$release/$selected"
+    fi
+    printf '%s  %s\n' "$hash" "$selected"
+done > "$release/SHA256SUMS"
+for platform in 'Darwin arm64 1 aarch64-apple-darwin' 'Darwin x86_64 1 aarch64-apple-darwin' 'Linux x86_64 0 x86_64-unknown-linux-musl' 'Linux aarch64 0 aarch64-unknown-linux-musl'; do
+    read -r os arch arm64 selected <<EOF
+$platform
+EOF
+    PATH="$tmp/bin:$PATH" KOIDRIVE_TEST_OS=$os KOIDRIVE_TEST_ARCH=$arch KOIDRIVE_TEST_ARM64=$arm64 sh "$root/install.sh" > "$tmp/arch.log" 2>&1
+    cat "$tmp/arch.log"
+    grep -F "Downloading koidrive-$selected.tar.gz" "$tmp/arch.log"
+    cmp "$binary" "$HOME/.local/bin/koi"
+    pass "$os $arch shell selects $selected with hw.optional.arm64=$arm64"
+done
+for arm64 in 0 missing; do
+    PATH="$tmp/bin:$PATH" KOIDRIVE_TEST_OS=Darwin KOIDRIVE_TEST_ARCH=x86_64 KOIDRIVE_TEST_ARM64=$arm64 reject \
+        "Intel Mac is refused with hw.optional.arm64=$arm64" 'macOS requires Apple silicon'
+    if grep -q Downloading "$tmp/rejected.log"; then
+        printf 'Expected an Intel Mac to be refused before downloading\n' >&2
+        exit 1
+    fi
+done
+printf 'Passed %s installer tests on %s\n' "$passed" "$(uname -s)"

@@ -32,7 +32,6 @@ fail() {
 sums() {
     printf '%s  %s\n' \
         1111111111111111111111111111111111111111111111111111111111111111 koidrive-aarch64-apple-darwin.tar.gz \
-        2222222222222222222222222222222222222222222222222222222222222222 koidrive-x86_64-apple-darwin.tar.gz \
         3333333333333333333333333333333333333333333333333333333333333333 koidrive-aarch64-unknown-linux-musl.tar.gz \
         4444444444444444444444444444444444444444444444444444444444444444 koidrive-x86_64-unknown-linux-musl.tar.gz \
         5555555555555555555555555555555555555555555555555555555555555555 Koidrive-0.1.0-alpha.3-arm64.dmg
@@ -59,13 +58,11 @@ class Koidrive < Formula
   license all_of: ["Apache-2.0", "AGPL-3.0-or-later"]
 
   on_macos do
+    depends_on arch: :arm64
+
     on_arm do
       url "https://github.com/koidrive/koidrive/releases/download/v0.1.0-alpha.3/koidrive-aarch64-apple-darwin.tar.gz"
       sha256 "1111111111111111111111111111111111111111111111111111111111111111"
-    end
-    on_intel do
-      url "https://github.com/koidrive/koidrive/releases/download/v0.1.0-alpha.3/koidrive-x86_64-apple-darwin.tar.gz"
-      sha256 "2222222222222222222222222222222222222222222222222222222222222222"
     end
   end
 
@@ -111,14 +108,14 @@ KOIDRIVE_RELEASE_BASE_URL=file:///srv/releases render v0.2.0 "$tmp/SHA256SUMS" \
     || fail 'KOIDRIVE_RELEASE_BASE_URL does not replace the release URL'
 pass 'KOIDRIVE_RELEASE_BASE_URL replaces the release URL'
 
-for target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
+for target in aarch64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
     sums | grep -v "koidrive-$target.tar.gz" > "$tmp/SHA256SUMS"
     expect_refused "has none or several for: koidrive-$target.tar.gz" "SHA256SUMS without koidrive-$target.tar.gz is refused" v0.2.0 "$tmp/SHA256SUMS"
 done
 sums | grep -v linux-musl > "$tmp/SHA256SUMS"
 expect_refused 'koidrive-aarch64-unknown-linux-musl.tar.gz koidrive-x86_64-unknown-linux-musl.tar.gz' 'every missing tarball is named' v0.2.0 "$tmp/SHA256SUMS"
-{ sums; sums | grep x86_64-apple-darwin; } > "$tmp/SHA256SUMS"
-expect_refused 'koidrive-x86_64-apple-darwin.tar.gz' 'a tarball listed twice is refused' v0.2.0 "$tmp/SHA256SUMS"
+{ sums; sums | grep aarch64-apple-darwin; } > "$tmp/SHA256SUMS"
+expect_refused 'koidrive-aarch64-apple-darwin.tar.gz' 'a tarball listed twice is refused' v0.2.0 "$tmp/SHA256SUMS"
 sums | sed 's/^1111111111111111111111111111111111111111111111111111111111111111 /invalid /' > "$tmp/SHA256SUMS"
 expect_refused 'koidrive-aarch64-apple-darwin.tar.gz' 'a malformed SHA-256 is refused' v0.2.0 "$tmp/SHA256SUMS"
 sums > "$tmp/SHA256SUMS"

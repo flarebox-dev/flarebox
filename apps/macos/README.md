@@ -4,7 +4,7 @@ A menu bar app that links the Rust core through [UniFFI](https://mozilla.github.
 
 ## Requirements
 
-- macOS 14 or later on Apple silicon or Intel.
+- macOS 26 or later on Apple silicon.
 - Xcode 16 or later, with its command-line tools selected (`xcode-select -p`).
 - Rust through [rustup](https://rustup.rs/). The toolchain version comes from `rust-toolchain.toml` at the repository root and is installed on first use.
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen) 2.46.0. You don't install it yourself: the first run of `scripts/generate-project.sh` downloads the release into `build/tools` and checks its SHA-256.

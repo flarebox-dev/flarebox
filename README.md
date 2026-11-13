@@ -64,7 +64,7 @@ Dropbox does much more, and charges per person for it. Koidrive does the core of
 | **Two-way sync of whole folders** | Yes | Yes |
 | **Both copies kept on a conflict** | Yes | Yes |
 | **Trash and version history** | 30 days | 30 days to 1 year |
-| **macOS** | Command line, and a menu bar app in progress | Yes |
+| **macOS on Apple silicon** | Command line, and a menu bar app in progress | Yes |
 | **Linux** | Command line and daemon | Yes |
 
 ### Where Dropbox does more

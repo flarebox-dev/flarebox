@@ -14,7 +14,7 @@ sha() {
 }
 
 missing=
-for target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
+for target in aarch64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
     [[ $(sha "$target") =~ ^[0-9a-f]{64}$ ]] || missing="$missing koidrive-$target.tar.gz"
 done
 if [ -n "$missing" ]; then
@@ -39,11 +39,10 @@ class Koidrive < Formula
   license all_of: ["Apache-2.0", "AGPL-3.0-or-later"]
 
   on_macos do
+    depends_on arch: :arm64
+
     on_arm do
 $(release aarch64-apple-darwin)
-    end
-    on_intel do
-$(release x86_64-apple-darwin)
     end
   end
 

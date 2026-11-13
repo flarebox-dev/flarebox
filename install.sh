@@ -21,7 +21,8 @@ main() {
         aarch64|arm64) arch=aarch64 ;;
         *) fail 'Supported architectures are x86_64 and arm64' ;;
     esac
-    if [ "$os" = apple-darwin ] && [ "$arch" = x86_64 ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null || true)" = 1 ]; then
+    if [ "$os" = apple-darwin ] && [ "$arch" = x86_64 ]; then
+        [ "$(sysctl -n hw.optional.arm64 2>/dev/null || true)" = 1 ] || fail 'macOS requires Apple silicon'
         arch=aarch64
     fi
 
