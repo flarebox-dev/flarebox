@@ -5,7 +5,16 @@ use koidrive_telemetry::Recorder;
 
 fn histograms(recorder: &Recorder) -> serde_json::Value {
     let day = koidrive_telemetry::today();
-    serde_json::to_value(recorder.take().days.get(&day)).unwrap()["histograms"].clone()
+    let histograms =
+        serde_json::to_value(recorder.take().days.get(&day)).unwrap()["histograms"].clone();
+    for metric in ["first_sync_ms", "remote_apply_ms", "syncing_ms"] {
+        if let Some(labels) = histograms[metric].as_object() {
+            for histogram in labels.values() {
+                assert!(histogram.get("sum").is_none());
+            }
+        }
+    }
+    histograms
 }
 
 #[test]

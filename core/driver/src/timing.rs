@@ -492,6 +492,15 @@ mod tests {
         serde_json::to_value(recorder.take().days).unwrap()
     }
 
+    fn assert_duration_bucket(histogram: &Value, bucket: usize) {
+        let mut buckets = [0; 16];
+        buckets[bucket] = 1;
+        assert_eq!(
+            histogram,
+            &json!({ "shift": 10, "buckets": buckets, "count": 1 })
+        );
+    }
+
     fn node(revision: u64) -> RemoteNode {
         RemoteNode::from_state(&NodeState {
             parent_id: "root".into(),
@@ -579,9 +588,9 @@ mod tests {
         reopened.enable(recorder.clone());
         reopened.first_sync(400_000, later(at, Duration::from_secs(100)));
         let value = reports(&recorder);
-        assert_eq!(
-            value["1"]["histograms"]["first_sync_ms"]["65536_131071"]["sum"],
-            5000
+        assert_duration_bucket(
+            &value["1"]["histograms"]["first_sync_ms"]["65536_131071"],
+            3,
         );
         assert_eq!(
             value["1"]["histograms"]["first_sync_ms"]
@@ -594,9 +603,9 @@ mod tests {
         let mut relinked = Timing::open_at(&store, at.unix_ms, at);
         relinked.enable(recorder.clone());
         relinked.first_sync(400_000, later(at, Duration::from_secs(1)));
-        assert_eq!(
-            reports(&recorder)["1"]["histograms"]["first_sync_ms"]["262144_524287"]["count"],
-            1
+        assert_duration_bucket(
+            &reports(&recorder)["1"]["histograms"]["first_sync_ms"]["262144_524287"],
+            0,
         );
     }
 
@@ -635,9 +644,9 @@ mod tests {
         timing.status(FolderState::Offline, later(at, Duration::from_secs(90)));
         timing.status(FolderState::Halted, later(at, Duration::from_secs(100)));
         timing.status(FolderState::Stopped, later(at, Duration::from_secs(110)));
-        assert_eq!(
-            reports(&recorder)["2"]["histograms"]["syncing_ms"]["completed"]["sum"],
-            90_000
+        assert_duration_bucket(
+            &reports(&recorder)["2"]["histograms"]["syncing_ms"]["completed"],
+            7,
         );
         let off = Recorder::off();
         let mut timing = tracker(&off);
@@ -650,7 +659,7 @@ mod tests {
 
     #[test]
     fn complete_report_histories_do_not_reveal_a_midnight_crossing() {
-        for seconds in [90, 3600] {
+        for (seconds, bucket) in [(90, 7), (3600, 12)] {
             let mut histories = Vec::new();
             for linked_ms in [
                 20_001 * 86_400_000 - seconds * 500,
@@ -685,8 +694,7 @@ mod tests {
                     ("syncing_ms", "completed"),
                 ] {
                     let histogram = &value["20001"]["histograms"][metric][label];
-                    assert_eq!(histogram["count"], 1);
-                    assert_eq!(histogram["sum"], seconds * 1000);
+                    assert_duration_bucket(histogram, bucket);
                 }
                 history.push(value);
                 histories.push(history);
@@ -742,9 +750,9 @@ mod tests {
         first.enable(recorder.clone());
         first.first_sync(1, jumped);
         let value = reports(&recorder);
-        assert_eq!(
-            value[jumped.day().to_string()]["histograms"]["first_sync_ms"]["1"]["sum"],
-            1000
+        assert_duration_bucket(
+            &value[jumped.day().to_string()]["histograms"]["first_sync_ms"]["1"],
+            0,
         );
         let recorder = Recorder::on();
         let mut timing = tracker(&recorder);
@@ -763,7 +771,7 @@ mod tests {
         let value = reports(&recorder);
         let histogram =
             &value[corrected.day().to_string()]["histograms"]["remote_apply_ms"]["effect"];
-        assert_eq!(histogram["sum"], 2000);
+        assert_duration_bucket(histogram, 1);
     }
 
     #[test]
@@ -914,10 +922,7 @@ mod tests {
         timing.planned(&record, Some(&remote), at);
         timing.applied(&record.effect_id, true, later(at, Duration::from_secs(2)));
         let value = reports(&recorder);
-        assert_eq!(
-            value["1"]["histograms"]["remote_apply_ms"]["effect"]["sum"],
-            3000
-        );
+        assert_duration_bucket(&value["1"]["histograms"]["remote_apply_ms"]["effect"], 2);
         timing.applied(&record.effect_id, true, later(at, Duration::from_secs(3)));
         assert!(recorder.take().days.is_empty());
         timing.planned(&record, Some(&remote), at);
@@ -961,9 +966,9 @@ mod tests {
         let effect = effect("newest");
         timing.planned(&effect, Some(&node(2)), at);
         timing.applied(&effect.effect_id, true, at);
-        assert_eq!(
-            reports(&recorder)["1"]["histograms"]["remote_apply_ms"]["effect"]["sum"],
-            10
+        assert_duration_bucket(
+            &reports(&recorder)["1"]["histograms"]["remote_apply_ms"]["effect"],
+            0,
         );
     }
 
@@ -1068,9 +1073,9 @@ mod tests {
             true,
             later(at, Duration::from_millis(100)),
         );
-        assert_eq!(
-            reports(&recorder)["1"]["histograms"]["remote_apply_ms"]["effect"]["sum"],
-            1100
+        assert_duration_bucket(
+            &reports(&recorder)["1"]["histograms"]["remote_apply_ms"]["effect"],
+            1,
         );
         let write = effect("write");
         add_bytes(&timing.planned(&write, Some(&node(1)), at), 13);
@@ -1092,10 +1097,7 @@ mod tests {
         timing.applied(&write.effect_id, true, later(at, Duration::from_secs(1)));
         timing.drained(later(at, Duration::from_secs(1)));
         let value = reports(&recorder);
-        assert_eq!(
-            value["1"]["histograms"]["remote_apply_ms"]["effect"]["sum"],
-            2000
-        );
+        assert_duration_bucket(&value["1"]["histograms"]["remote_apply_ms"]["effect"], 1);
         assert_eq!(
             value["1"]["histograms"]["download_per_second"]["files"]["sum"],
             1

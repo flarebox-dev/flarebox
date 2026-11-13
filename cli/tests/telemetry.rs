@@ -49,6 +49,15 @@ fn preview_round_trips_every_timing_field_and_drops_private_fixture_fields() {
         json!({"shift": 10, "buckets": vec![0;16], "count": 1, "sum": 1794527123456u64});
     day["histograms"]["syncing_ms"]["active_age"] =
         json!({"shift": 10, "buckets": vec![0;16], "count": 1, "sum": 1794527123456u64});
+    for metric in ["first_sync_ms", "remote_apply_ms", "syncing_ms"] {
+        for histogram in day["histograms"][metric]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+        {
+            histogram["sum"] = json!(1794527123456u64);
+        }
+    }
     std::fs::write(&queue, serde_json::to_vec(&value).unwrap()).unwrap();
     let preview = stdout(&koi(home.path(), &["telemetry", "preview"], &[]));
     let body: Value = serde_json::from_str(&preview).unwrap();
@@ -68,10 +77,19 @@ fn preview_round_trips_every_timing_field_and_drops_private_fixture_fields() {
             assert_eq!(histogram["buckets"][bucket], 1);
         }
         assert_eq!(histogram["count"], 4);
+        assert!(histogram.get("sum").is_none());
     }
     for (metric, labels) in expected["histograms"].as_object().unwrap() {
         for (label, histogram) in labels.as_object().unwrap() {
             assert_eq!(&properties[format!("h.{metric}.{label}")], histogram);
+            if matches!(
+                metric.as_str(),
+                "first_sync_ms" | "remote_apply_ms" | "syncing_ms"
+            ) {
+                assert!(histogram.get("sum").is_none());
+            } else {
+                assert_eq!(histogram["sum"], 1234);
+            }
         }
     }
     fn private_free(value: &Value, secrets: &[String]) {

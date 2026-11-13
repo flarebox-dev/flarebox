@@ -51,7 +51,7 @@ On top of that, reports hold:
 - Where Koidrive panicked: the source file and line in Koidrive's own code. Never the panic's message.
 - Exact daily totals from the daemon: commits sent and received, bytes of file content uploaded and downloaded, and the day's highest number of linked spaces and of the files and folders they hold, trash included. Only totals over all your spaces, never a count per space or per file.
 - How many times each kind of error happened in a day: why a folder stopped syncing, how an upload or download failed, the code of a server refusal and of each item a refused commit left out, each commit too large to send and each item it left out, which kind of question a folder asked, and why the daemon could not start. Never the error's message.
-- Daily distributions of sync timings, described below. Each holds 16 power-of-two buckets, a sample count, and a sum, without identifying a folder.
+- Daily distributions of sync timings, described below. Each holds 16 power-of-two buckets and a sample count, without identifying a folder. Duration histograms omit exact sums; throughput histograms retain sums.
 - The daemon's user and system CPU time in milliseconds, summed between ten-minute samples on the same UTC day and at shutdown. Intervals crossing midnight and unavailable clock readings are omitted.
 
 ### Sync timing distributions
