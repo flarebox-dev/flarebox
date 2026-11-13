@@ -3411,6 +3411,41 @@ fn an_edit_sent_after_a_loss_and_lost_in_a_second_one_is_sent_again() {
 }
 
 #[test]
+fn an_edit_the_server_took_first_from_another_device_is_sent_again_as_an_edit_after_a_loss() {
+    let mut trees = trees(&[]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    commit_file(&mut trees, &mut commits, &mut ids, "n", 1);
+    trees.set_local("n".into(), local(file(ROOT, "n", 2), 101));
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 2)]);
+    let taken = RemoteNode {
+        content_rev: 2,
+        edit_rev: 2,
+        ..remote(file(ROOT, "n", 2))
+    };
+    trees.set_remote("n".into(), taken);
+    let results = vec![outcome(op_result::Code::Applied)];
+    commits.received(result(3, results)).unwrap();
+    assert!(commits.acknowledge(&mut trees, 3));
+    trees.settle();
+    assert_eq!(commits.connected(&welcome(1)), Reconnect::AheadOfServer);
+    let (trashed, edited) = (trees.trashed_here(), trees.edited_here());
+    let synced = trees.taken_from_others(|seq| commits.made_here(seq));
+    trees.set_remote("n".into(), remote_at(file(ROOT, "n", 7), 1));
+    trees.forget_lost(
+        trashed,
+        edited,
+        synced,
+        commits.held_through(),
+        commits.accepted(),
+    );
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 2)]);
+}
+
+#[test]
 fn an_edit_the_server_kept_is_not_sent_again_after_a_loss() {
     let mut trees = trees(&[synced("n", file(ROOT, "n", 3))]);
     let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
@@ -6303,8 +6338,9 @@ fn an_edit_of_a_file_whose_chunk_list_r_leaves_out_counts_for_loss_recovery() {
         edit_rev: 4,
         ..remote(file(ROOT, "n", 2))
     };
+    let sent = listed.content.clone();
     let mut trees = trees(&[("n", Some(listed.clone()), Some(listed), Some(unlisted))]);
-    trees.record_edited("n", 4);
+    trees.record_edited("n", sent.as_ref());
     assert_eq!(trees.edited_here(), [("n".to_owned(), 4)]);
 }
 
@@ -6954,6 +6990,41 @@ fn list_after_a_loss(trees: &mut Trees, commits: &Commits, restored: RemoteNode)
         commits.accepted(),
     );
     trees.settle();
+}
+
+#[test]
+fn a_resend_lost_in_a_second_loss_is_not_sent_again_as_this_devices_edit() {
+    let (mut commits, mut trees, mut ids) = downloaded_at_5();
+    list_after_a_loss(
+        &mut trees,
+        &commits,
+        version(remote(file(ROOT, "a", 1)), "v1"),
+    );
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [resend("a", 2)]);
+    let resent = RemoteNode {
+        content_rev: 6,
+        ..version(remote(file(ROOT, "a", 2)), "v6")
+    };
+    trees.set_remote("a".into(), resent);
+    let results = vec![outcome(op_result::Code::Applied)];
+    commits.received(result(6, results)).unwrap();
+    assert!(commits.acknowledge(&mut trees, 6));
+    trees.settle();
+    assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
+    let (trashed, edited) = (trees.trashed_here(), trees.edited_here());
+    let synced = trees.taken_from_others(|seq| commits.made_here(seq));
+    trees.set_listed_remote("a".into(), version(remote(file(ROOT, "a", 1)), "v1"));
+    trees.forget_lost(
+        trashed,
+        edited,
+        synced,
+        commits.held_through(),
+        commits.accepted(),
+    );
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(!ops(&commit).contains(&update("a", 2)));
 }
 
 #[test]

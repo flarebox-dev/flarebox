@@ -1128,8 +1128,8 @@ impl Commits {
                         synced.set(id, None);
                         rekey(trees, id, &outcome.node_id);
                     }
-                    if applied {
-                        trees.record_edited(id, result.seq);
+                    if applied && !update.resend {
+                        trees.record_edited(id, update.content.as_ref());
                     }
                     if applied || code == Code::ConflictCopy {
                         trees.sent_edit(id, update.content.as_ref());
@@ -1295,7 +1295,7 @@ impl Commits {
                     closed.insert(id);
                 }
                 (op::Op::UpdateContent(update), Code::Applied) => {
-                    trees.record_edited(&update.node_id, result.seq);
+                    trees.record_edited(&update.node_id, update.content.as_ref());
                     let remote = trees.remote().get(&original.node_id);
                     let took = remote.filter(|node| {
                         (node.shape.content.as_ref().zip(update.content.as_ref()))

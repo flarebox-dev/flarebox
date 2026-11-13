@@ -1177,11 +1177,16 @@ impl Trees {
         })
     }
 
-    /// Records that an edit of this device, in the commit at `seq`, set the content of `id`, if R's
-    /// edit revision is that commit.
-    pub fn record_edited(&mut self, id: &str, seq: u64) {
-        if (self.r.get(id)).is_some_and(|remote| !remote.trashed && remote.edit_rev == seq) {
-            self.edited_here.insert(id.to_owned(), seq);
+    /// Records that an edit of this device set the content of `id` to `sent`, at R's edit
+    /// revision, if R holds that content live.
+    pub fn record_edited(&mut self, id: &str, sent: Option<&Content>) {
+        let Some(remote) = (self.r.get(id)).filter(|remote| !remote.trashed) else {
+            return;
+        };
+        if (remote.shape.content.as_ref().zip(sent))
+            .is_some_and(|(held, sent)| same_content(held, sent))
+        {
+            self.edited_here.insert(id.to_owned(), remote.edit_rev);
         }
     }
 
