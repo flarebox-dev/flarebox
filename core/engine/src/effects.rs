@@ -520,6 +520,12 @@ impl Effects {
             _ => same(local, base),
         };
         let finished = finishing_move(trees, &record);
+        let to_pending = matches!(record.effect, Effect::Move { .. })
+            && (record.after.as_ref()).is_some_and(|after| {
+                (trees.pending_finishes().get(&record.node)).is_some_and(|finish| {
+                    finish.parent == after.parent && finish.pending == after.name
+                })
+            });
         if (unchanged && !finished) || record.after.is_none() {
             let synced = match (&record.effect, &record.after, base) {
                 (Effect::Move { .. }, Some(after), Some(base)) => Some(Shape {
@@ -552,6 +558,9 @@ impl Effects {
         }
         if finished {
             trees.start_finish(&record.node);
+        }
+        if to_pending {
+            trees.undo_disk_first(&record.node);
         }
         self.failed.remove(&record.node);
         self.cleared.set(*self.cleared + 1);
