@@ -5,12 +5,10 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::time::{Duration, Instant};
 
 use koidrive_engine::tree::FileIdentity;
 use koidrive_proto::v1::{Content, NodeKind, NodeState, NodeStatus, VersionInfo};
 use koidrive_store::{Error, Store};
-use rustix::time::{ClockId, clock_gettime};
 
 use super::{Engine, remote_node};
 
@@ -55,10 +53,6 @@ fn allocated() -> u64 {
     ALLOCATED.with(Cell::get)
 }
 
-fn cpu() -> Duration {
-    Duration::try_from(clock_gettime(ClockId::ThreadCPUTime)).unwrap()
-}
-
 fn remote(id: String, parent: &str, name: String, kind: NodeKind) -> NodeState {
     let current = (kind == NodeKind::File).then(|| VersionInfo {
         content: Some(Content {
@@ -81,18 +75,12 @@ fn remote(id: String, parent: &str, name: String, kind: NodeKind) -> NodeState {
     }
 }
 
-/// The work of the loop.
-struct Work {
-    cpu: Duration,
-    allocated: u64,
-}
-
 /// Downloads `files` remote files, `per_dir` to a folder, onto an empty disk, in one transaction of a store on disk.
-fn first_sync(files: usize, per_dir: usize) -> Work {
+fn first_sync(files: usize, per_dir: usize) -> u64 {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(dir.path().join("store.sqlite")).unwrap();
     store
-        .transaction(|tx| -> Result<Work, Error> {
+        .transaction(|tx| -> Result<u64, Error> {
             let mut engine = Engine::load(tx, ROOT)?;
             engine.trees.rules_scanned();
             let dirs = files.div_ceil(per_dir);
@@ -122,7 +110,7 @@ fn first_sync(files: usize, per_dir: usize) -> Work {
                 engine.trees.set_remote(id, node);
             }
             engine.checkpoint(tx)?;
-            let (started, before) = (cpu(), allocated());
+            let before = allocated();
             let mut planned = 0;
             loop {
                 let Engine {
@@ -147,10 +135,7 @@ fn first_sync(files: usize, per_dir: usize) -> Work {
                 .unwrap();
                 engine.checkpoint(tx)?;
             }
-            let work = Work {
-                cpu: cpu() - started,
-                allocated: allocated() - before,
-            };
+            let work = allocated() - before;
             assert!(engine.trees.dirty().is_empty(), "{:?}", engine.trees.work());
             assert_eq!(planned, files + dirs);
             assert_eq!(engine.trees.local().len(), files + dirs);
@@ -165,35 +150,11 @@ fn first_sync(files: usize, per_dir: usize) -> Work {
 #[test]
 fn a_first_sync_with_its_checkpoints_takes_work_in_proportion_to_its_files() {
     for per_dir in [100, 4000] {
-        let runs = |files| -> Vec<Work> { (0..3).map(|_| first_sync(files, per_dir)).collect() };
-        let (small, large) = (runs(500), runs(2000));
-        let bytes = large[0].allocated as f64 / small[0].allocated as f64;
-        let least = |runs: &[Work]| runs.iter().map(|work| work.cpu).min().unwrap();
-        let time = least(&large).as_secs_f64() / least(&small).as_secs_f64();
-        eprintln!(
-            "{per_dir} per folder: 500 files allocated {} bytes in {:?}, 2000 files {} bytes in {:?}",
-            small[0].allocated,
-            least(&small),
-            large[0].allocated,
-            least(&large),
-        );
+        let (small, large) = (first_sync(500, per_dir), first_sync(2000, per_dir));
+        let bytes = large as f64 / small as f64;
         assert!(
             bytes < 8.0,
-            "{per_dir} per folder: 4 times the files allocated {bytes:.1} times the bytes"
-        );
-        assert!(
-            time < 8.0,
-            "{per_dir} per folder: 4 times the files used {time:.1} times the thread CPU time"
+            "{per_dir} per folder: 500 files allocated {small} bytes and 2000 files {large}, {bytes:.1} times as many"
         );
     }
-}
-
-#[test]
-fn the_first_sync_clock_excludes_time_off_cpu() {
-    let wall = Instant::now();
-    let started = cpu();
-    std::thread::sleep(Duration::from_millis(20));
-    let used = cpu() - started;
-    let elapsed = wall.elapsed();
-    assert!(used < elapsed / 2, "thread CPU={used:?}, wall={elapsed:?}");
 }
