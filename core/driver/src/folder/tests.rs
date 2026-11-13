@@ -7948,3 +7948,30 @@ fn a_link_moved_into_an_ignored_folder_while_another_link_is_renamed_keeps_its_n
         assert_eq!(a.folder.engine.trees.check(), Ok(()));
     }
 }
+
+#[test]
+fn a_file_moved_over_another_with_an_older_link_in_an_ignored_folder_leaves_the_server() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    let settled = |a: &mut Device, remote: &mut Remote| {
+        for _ in 0..3 {
+            a.settle();
+            a.run(remote);
+        }
+    };
+    a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
+    a.create(&mut remote, &site.root.join("a"), b"kept");
+    a.create(&mut remote, &site.root.join("x"), b"other");
+    fs::create_dir(site.root.join("ignored")).unwrap();
+    fs::hard_link(site.root.join("a"), site.root.join("ignored/l")).unwrap();
+    settled(&mut a, &mut remote);
+
+    fs::rename(site.root.join("a"), site.root.join("x")).unwrap();
+    settled(&mut a, &mut remote);
+    let after = server_nodes(&remote);
+    assert!(
+        !after.iter().any(|(name, _, live)| name == "a" && *live),
+        "{after:?}"
+    );
+    assert_eq!(a.folder.engine.trees.check(), Ok(()));
+}

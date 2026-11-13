@@ -772,10 +772,10 @@ fn a_link_moved_into_an_ignored_folder_while_another_link_is_renamed_is_ignored(
                     if to == Path::new("ig/zz/deep/moved.txt"))),
                 "{case}"
             );
-            assert!(
-                !(changes.iter()).any(|change| matches!(change, Change::Removed { .. })),
-                "{case}"
-            );
+            let removals = (changes.iter())
+                .filter(|change| matches!(change, Change::Removed { .. }))
+                .count();
+            assert_eq!(removals, usize::from(over), "{case}");
         }
     }
 }
@@ -805,6 +805,27 @@ fn two_links_moved_into_an_ignored_folder_beside_a_new_included_link_are_not_rem
         !(rescan.changes.iter()).any(|change| matches!(change, Change::Removed { .. })),
         "{:?}",
         rescan.changes
+    );
+}
+
+#[test]
+fn a_file_moved_over_another_with_an_older_link_in_an_ignored_folder_is_removed() {
+    let (dir, mut snapshot, mut rules) = tree_with_an_ignored_folder();
+    let root = dir.path();
+    write(root, "a", "a");
+    write(root, "x", "x");
+    fs::hard_link(root.join("a"), root.join("ig/l")).unwrap();
+    snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    fs::rename(root.join("a"), root.join("x")).unwrap();
+
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(
+        rescan.changes,
+        [removed("a", File), Change::Modified { path: "x".into() }]
     );
 }
 
