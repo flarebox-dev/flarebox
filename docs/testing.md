@@ -1,39 +1,70 @@
 # Testing
 
-The Rust checks that run on each pull request are the `rust` job of [CI](../.github/workflows/ci.yml), which skips a pull request whose changed files are all under `site/`. This page covers the property tests and the heavier runs that check them at scale.
+[CI](../.github/workflows/ci.yml) runs every test suite on each pull request, in the merge queue and on `main`. The [property battery](#the-property-battery-runs-nightly-and-on-demand) runs the property tests at high case counts every night and when you start it. To run the Rust checks that CI runs:
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked --features koidrive-cli/test-install-inventory -- -D warnings
+cargo test --workspace --locked --features koidrive-cli/test-install-inventory
+```
+
+## CI runs these jobs
+
+Each job runs on Ubuntu, and the jobs marked macOS run on macOS. A change whose files are all under `site/` skips the build and test jobs.
+
+| Job | What it checks | Run it locally |
+|---|---|---|
+| `rust` | The three commands above | The three commands above |
+| `server` | Type checks, the Worker's Vitest suite, and the unit tests of the deploy-test scripts | In `server/`: `pnpm install --frozen-lockfile`, `pnpm typecheck`, `pnpm test`, then `pnpm exec vitest run --config scripts/deploy-test/vitest.config.ts run.unit e2e.unit load.unit bench.unit` |
+| `server deploy check` | A copy of `server/` deploys on its own (a dry run, then `wrangler dev` and a claim), and the server bundle that the CLI embeds packs cleanly | `node server/scripts/check-deploy.mjs` |
+| `net integration`, `driver integration`, `cli integration`, `ffi integration` | The tests whose `#[ignore]` reason says they need the Worker, against the Worker under `wrangler dev` | After `pnpm install` in `server/`: `core/net/scripts/integration-test.sh`, `core/driver/scripts/integration-test.sh`, `cli/scripts/integration-test.sh` or `core/ffi/scripts/integration-test.sh` |
+| `spec` | `buf lint`, generated code that matches `spec/proto`, and no breaking change against the base | In `spec/`: `buf lint`, then `buf generate` and check that `git status` shows no change |
+| `comments` | The change adds no code comments outside the allowed kinds | `python3 scripts/check-new-comments.py origin/main HEAD` |
+| `macos app` (macOS) | The app builds, the Swift bindings' tests pass, and an unsigned disk image packages and verifies | In `apps/macos/`: `scripts/build-ffi.sh`, then `swift test --package-path KoidriveFFI` |
+| `runner hook` (macOS) | The self-hosted runners' job-started hook and its installer | `.github/runner/test-job-started.sh` and `.github/runner/test-install-hook.sh` |
+
+On a pull request, CI adds macOS jobs only where a change needs them. `rust (macos)` and `macos app` run when the change touches a file that builds or behaves differently on macOS, as `scripts/macos-changes.sh` lists them. `runner hook` runs when it touches `.github/runner/`. Every macOS job, `server (macos)` and `spec (macos)` included, runs when it touches `ci.yml`. The merge queue runs every macOS job, and a push to `main` runs each one the merge queue did not pass on the same commit. The macOS jobs run on GitHub-hosted runners unless the `MACOS_RUNS_ON` variable selects the [self-hosted runners](../.github/runner/README.md).
+
+One test in `cli/tests/server.rs` also needs a systemd user instance. The `cli integration` job starts one, and locally the test is skipped unless `KOIDRIVE_TEST_SYSTEMD=1` is set.
+
+Two other workflows run on pull requests. [CLI distribution](../.github/workflows/release-cli.yml) builds the CLI tarballs, tests the installer and installs the CLI from a local Homebrew tap. [DCO](../.github/workflows/dco.yml) checks the `Signed-off-by` line of every commit.
+
+## Some tests run only on request
+
+`cargo test` skips a test marked `#[ignore]`. Each ignore reason says how to run the test:
+
+- The integration tests that need a Worker run through the scripts in the table above.
+- `upload_benchmark` in `core/net/tests/upload_bench.rs` runs in the [deploy test's bench mode](deploy-test.md#modes), or against a local Worker with `KOIDRIVE_BENCH_MIB=64`.
+- The timing probe in `core/fs/tests/ignore.rs` runs with `cargo test -p koidrive-fs --release --test ignore -- --ignored`.
+- Two tests in `core/sim/tests/devices.rs` are known failures: the property `devices_converge_across_server_restores` and the fixed schedule `a_resend_applied_before_a_delete_built_without_it_yields_to_it`. The fix for each removes its `#[ignore]`.
 
 ## Property tests
 
-The property tests use [proptest](https://docs.rs/proptest/1.12.0/proptest/). They live in the integration test files of `core/chunk`, `core/engine` and `core/sim` that contain a `proptest!` block; the largest is the interleaving oracle in `core/sim/tests/engine_sync.rs`. Each file sets its own case count for `cargo test`. Two environment variables override every file's settings:
+The property tests use [proptest](https://docs.rs/proptest/1.12.0/proptest/). They are the `proptest!` blocks in the integration tests of `core/chunk`, `core/engine`, `core/ignore` and `core/sim`, and in the unit tests of `core/driver/src/engine.rs` and `core/net/src/session/tests.rs`. The largest is the interleaving property in `core/sim/tests/engine_sync.rs`. Each block sets its own case count. Two environment variables override every block:
 
-- `PROPTEST_CASES`: the number of cases each property test runs.
-- `PROPTEST_RNG_SEED`: a fixed seed (a whole number). The same seed, case count and commit produce the same cases. Without it, each run picks a random seed.
+- `PROPTEST_CASES`: the number of cases each property runs.
+- `PROPTEST_RNG_SEED`: a fixed seed, a whole number. The same seed, case count and commit give the same cases. Without it, each run picks a random seed.
 
-When a property fails, proptest prints the shrunk input and saves a line to a `.proptest-regressions` file next to the test file, for example `core/sim/tests/engine_sync.proptest-regressions`. Later runs replay the saved cases first. Commit the file when the failure is fixed so the case keeps being checked.
+When a property fails, proptest prints the shrunk input and saves a `cc` line to a `.proptest-regressions` file next to the test file, for example `core/sim/tests/engine_sync.proptest-regressions`. Later runs replay the saved cases first. Replay a failure by its `cc` line rather than by its seed, because a seed finds other cases once the strategies change. Commit the file with the fix so the case keeps being checked.
 
 ### Several devices
 
-`core/sim/tests/devices.rs` runs two or three devices against one reference server while effects fail, messages are lost, repeated or reordered, commits are refused, and devices crash between store transactions or in the middle of an effect (`core/sim/src/world`). It has two properties:
+`core/sim/tests/devices.rs` runs two or three devices against one reference server while effects fail, messages are lost, repeated or reordered, commits are refused, and devices crash between store transactions or in the middle of an effect (`core/sim/src/world`). Its properties come in pairs:
 
-- `devices_lose_no_write` fails when a write leaves a disk or the server's tree and no user overwrote or deleted it, or when the engine, the store or the server refuses a state. It runs on every pull request and in the battery.
-- `devices_converge_once_the_faults_stop` also fails when the devices do not reach the server's tree, or when a commit makes a change that the user of its device never made.
+- `devices_lose_no_write...` fails when a write is lost, or when the engine, the store or the server refuses a state.
+- `devices_converge...` also fails when a device does not reach the server's tree once the faults stop, or when a commit makes a change that the user of its device never made.
 
-The second can fail on `main`, because the reference server puts files into the trash that no user deleted (GUN-333). It is marked `#[ignore]`, together with the two fixed schedules of that failure. Neither `cargo test` nor the battery runs these tests. Until they pass, nothing checks convergence under every interleaving.
-
-To run the ignored tests, and to print the state after every step of one of them:
+The plain pair runs without server losses. The `..._across_server_restores` pair adds servers restored from backups, and the `..._across_rewinds_and_rollbacks` pair adds rewinds, copied stores and rolled-back stores. `cargo test` and the battery run all six except `devices_converge_across_server_restores`. To print the state after every step of one test:
 
 ```sh
-cargo test -p koidrive-sim --test devices -- --ignored
-KOIDRIVE_SIM_TRACE=1 cargo test -p koidrive-sim --test devices <test name> -- --ignored --nocapture
+KOIDRIVE_SIM_TRACE=1 cargo test -p koidrive-sim --test devices <test name> -- --nocapture
 ```
 
-A pull request that fixes one of the issues removes the `#[ignore]` of its schedules.
+Add `--ignored` to run an ignored test.
 
-## The property battery
+## The property battery runs nightly and on demand
 
-The battery runs the property tests at high case counts on GitHub Actions instead of a local machine (`.github/workflows/property-battery.yml`). One job builds the test binaries of every package that depends on proptest and keeps each binary that compiles a file with a `proptest!` block, including files it pulls in with `mod` or `include!` and library unit tests. The build fails if a file with a `proptest!` block is in no test binary, or if the filter selects no test. Then many shards run those binaries with the same case count and a different seed each, and a shard fails if a binary runs a different number of tests than it lists for the filter. Shard `k` uses `PROPTEST_RNG_SEED` = run ID × 1000 + `k`, so every run covers new cases and every failure can be reproduced. A summary job lists each shard's seed, result and log, and the number of cases run.
-
-It runs every night on `main` with the defaults: 24 shards of 8192 cases. Start it for a branch with `scripts/battery.sh`, which needs [gh](https://cli.github.com/) signed in to an account that can run workflows on the repository:
+The [property battery](../.github/workflows/property-battery.yml) runs every property test at a high case count on GitHub Actions. It runs every night on `main` with 24 shards of 8192 cases. To start it for a branch, use `scripts/battery.sh`. It needs [gh](https://cli.github.com/) signed in to an account that can run workflows on the repository:
 
 ```sh
 scripts/battery.sh                         # the current branch, as pushed
@@ -41,17 +72,19 @@ scripts/battery.sh --cases 16384 --shards 48 feat/my-branch
 scripts/battery.sh --filter a_device --wait
 ```
 
-It prints the run URL and returns; with `--wait` it follows the run and exits with its result. The options:
+The script prints the run URL and returns. With `--wait` it follows the run and exits with its result.
 
 | Option | Workflow input | Default |
 |---|---|---|
-| `REF` | the branch or tag the workflow runs on, which is the code it tests | the current branch |
-| `--cases N` | `cases`: `PROPTEST_CASES` on each shard | 8192 |
-| `--shards N` | `shards`: the number of shards, at most 256 | 24 |
-| `--filter TEXT` | `filter`: a test name filter, as for `cargo test` | none |
-| `--mutations` | `mutations`: also run the mutation set | off |
+| `REF` | The branch or tag to test | The current branch |
+| `--cases N` | `cases`, the `PROPTEST_CASES` of each shard | 8192 |
+| `--shards N` | `shards`, at most 256 | 24 |
+| `--filter TEXT` | `filter`, a test name filter as for `cargo test` | None |
+| `--mutations` | `mutations`, which also runs the [mutation set](#the-mutation-set) | Off |
 
-The workflow always runs on the branch or tag it tests, using that ref's own copy of the workflow file, so the ref must contain it. This keeps untrusted code out of other branches' caches: any job can write the Actions cache of the ref its run belongs to, so a branch's battery can only write that branch's cache, never `main`'s.
+The build job compiles every test binary that contains a `proptest!` block, including blocks pulled in with `mod` or `include!` and library unit tests. It fails if a `proptest!` block is in no binary or if the filter selects no test. Each shard then runs those binaries with its own seed, `PROPTEST_RNG_SEED` = run ID × 1000 + shard number, so every run covers new cases. A shard fails if a binary runs a different number of tests than it lists. The summary job lists each shard's seed, result and log.
+
+The workflow runs on the ref it tests, with that ref's own copy of the workflow file, so the ref must contain it. A branch's battery can then write only that branch's Actions cache, never `main`'s.
 
 ### When a shard fails
 
@@ -61,23 +94,23 @@ The shard's job summary prints one command per failing test target, for example:
 git checkout <commit> && PROPTEST_CASES=8192 PROPTEST_RNG_SEED=<seed> cargo test --locked -p koidrive-sim --test engine_sync
 ```
 
-Running it reproduces the failure locally. The shard's `failure-shard-k` artifact holds the seed, the commands, the test logs and any new `.proptest-regressions` files. Copying a regression file into the checkout replays the shrunk case directly, without the full case count.
+The command reproduces the failure locally. The `failure-shard-<k>` artifact holds the seed, the commands, the test logs and any new `.proptest-regressions` files. Copy a regression file into the checkout to replay the shrunk case without the full case count.
 
 ## The mutation set
 
-`scripts/engine-mutations.sh` lists mutations of the engine's commit and effects code that the tests must catch, each a perl substitution on one file. `scripts/mutations.sh` applies them one at a time, runs the unit tests (`cargo test -p koidrive-engine --test commit`), the interleaving property (`cargo test -p koidrive-sim --test engine_sync`, up to three runs of 4096 cases), both, or the tests of several devices (`cargo test -p koidrive-sim --test devices`, up to three runs of 4096 cases), and restores the file. It first checks that the tests pass without mutations. A mutation fails the run when:
+`scripts/engine-mutations.sh` lists mutations of the engine's commit and effects code that the tests must catch, each a perl substitution in one file. `scripts/mutations.sh` applies them one at a time, runs the tests each mutation names, and restores the file. Those tests are the commit tests (`cargo test -p koidrive-engine --test commit`), the interleaving property (`cargo test -p koidrive-sim --test engine_sync`, up to three runs of 4096 cases), both, or the tests of several devices (`cargo test -p koidrive-sim --test devices`, up to three runs). The script first checks that the tests pass without mutations. A mutation fails the run when:
 
 - no test catches it (`SURVIVED`),
 - its pattern no longer matches the source (`STALE`), or
 - the mutated code does not compile (`BROKEN`).
 
-Update a stale mutation when the code it targets changes. When the code is removed, remove the mutation as well.
+When the code a mutation targets changes, update the mutation. When the code is removed, remove the mutation too.
 
-The battery runs the set with `--mutations`, spread over up to as many jobs as there are shards. To run it locally on a clean checkout (it edits files and restores them with git):
+The battery runs the set with `--mutations`, spread over up to as many jobs as there are shards. The script edits files and restores them with git, so it refuses a checkout with uncommitted changes. To run it locally:
 
 ```sh
 scripts/mutations.sh               # every mutation
 scripts/mutations.sh --shard 0/4   # every fourth mutation, starting with the first
 ```
 
-`MUTATION_CASES` changes the property case count and `MUTATION_SEED` fixes the seeds.
+`MUTATION_CASES` sets the property case count, and `MUTATION_SEED` fixes the seeds.
