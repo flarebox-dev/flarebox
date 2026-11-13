@@ -21,11 +21,12 @@ reported=$("$binary" --version)
 version=${reported#koi }
 tag=v$version
 upgrade=v999.0.0
+releases=$tmp/github.com/koidrive/koidrive/releases
 mkdir -p "$tmp/package" "$tmp/other"
 cp "$binary" "$tmp/package/koi"
 printf '#!/bin/sh\nexit 1\n' > "$tmp/other/koi"
 for each in "$tag" "$upgrade"; do
-    release=$tmp/releases/download/$each
+    release=$releases/download/$each
     mkdir -p "$release"
     for platform in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
         if [ "$platform" = "$target" ]; then source=$tmp/package; else source=$tmp/other; fi
@@ -33,10 +34,10 @@ for each in "$tag" "$upgrade"; do
     done
     (cd "$release" && "${sha256[@]}" koidrive-*.tar.gz > SHA256SUMS)
 done
-grep -q "  koidrive-$target.tar.gz$" "$tmp/releases/download/$tag/SHA256SUMS" || { echo "FAIL $target is not one of the targets the formula installs" >&2; exit 1; }
+grep -q "  koidrive-$target.tar.gz$" "$releases/download/$tag/SHA256SUMS" || { echo "FAIL $target is not one of the targets the formula installs" >&2; exit 1; }
 
 render() {
-    KOIDRIVE_RELEASE_BASE_URL="file://$tmp/releases" bash "$root/scripts/homebrew-formula.sh" "$1" "$tmp/releases/download/$tag/SHA256SUMS" \
+    KOIDRIVE_RELEASE_BASE_URL="file://$releases" bash "$root/scripts/homebrew-formula.sh" "$1" "$releases/download/${2:-$1}/SHA256SUMS" \
         > "$(brew --repository "$tap")/Formula/koidrive.rb"
 }
 
@@ -48,7 +49,7 @@ brew test "$formula"
 installed=$("$(brew --prefix)/bin/koi" --version)
 [ "$installed" = "koi $version" ] || { echo "FAIL the installed koi --version prints '$installed', expected 'koi $version'" >&2; exit 1; }
 for each in v1.2.3 v1.2.3-alpha.4 "$tag"; do
-    render "$each"
+    render "$each" "$tag"
     brew style "$formula"
     brew audit --strict --formula "$formula"
 done
