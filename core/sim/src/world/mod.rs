@@ -430,6 +430,7 @@ pub struct World {
     writers: BTreeMap<i64, usize>,
     /// For each device, the writes its user overwrote or deleted on its disk.
     removed: Vec<BTreeSet<i64>>,
+    deleted: Vec<BTreeSet<i64>>,
     /// For each device, the names its user gave to entries on its disk.
     named: Vec<BTreeSet<&'static str>>,
     /// The writes the server's live tree has held at some time.
@@ -511,6 +512,7 @@ impl World {
         Self {
             space,
             removed: vec![BTreeSet::new(); count],
+            deleted: vec![BTreeSet::new(); count],
             named: vec![BTreeSet::new(); devices.len()],
             restored_names: vec![BTreeMap::new(); devices.len()],
             devices,
@@ -780,6 +782,7 @@ impl World {
             (4, Some(ino)) => {
                 let deleted = disk.delete(ino);
                 self.removed[d].extend(deleted.iter().map(|content| content.mtime_ns));
+                self.deleted[d].extend(deleted.iter().map(|content| content.mtime_ns));
             }
             _ => {}
         }
@@ -1631,6 +1634,10 @@ impl World {
                                     .as_ref()
                                     .and_then(|current| current.content.as_ref())
                                     .is_some_and(|content| content.manifest_digest == *digest)
+                            }) && self.deleted[d].iter().any(|write| {
+                                self.exposed.get(write).is_some_and(|exposure| {
+                                    exposure.nodes.contains_key(&node.node_id)
+                                })
                             })
                     })
                     .map(|node| node.node_id)

@@ -2915,6 +2915,56 @@ fn a_delete_at_the_restored_version_stays_deleted_without_the_authors_edit() {
 }
 
 #[test]
+fn an_unasked_delete_of_restored_content_is_rejected_after_an_older_overwrite() {
+    for overwrite_lost in [false, true] {
+        let mut world = converge(
+            3,
+            &[
+                vec![(0, file("a"))],
+                vec![(1, overwrite(0))],
+                vec![(2, overwrite(0))],
+                vec![(0, BACKUP), (0, overwrite(0))],
+            ],
+        )
+        .unwrap();
+        let mut steps = connect(&[1, 0, 2]);
+        if overwrite_lost {
+            steps.push((1, overwrite(0)));
+        }
+        steps.extend([(1, SCAN), (1, COMMIT)]);
+        world.run(4, &steps).unwrap();
+        let device = &mut world.devices[1];
+        let mut state = device.engine.commits.state();
+        let op = state
+            .in_flight
+            .as_mut()
+            .unwrap()
+            .commit
+            .ops
+            .iter_mut()
+            .find(|op| matches!(op.op, Some(koidrive_proto::v1::op::Op::UpdateContent(_))))
+            .unwrap();
+        let Some(koidrive_proto::v1::op::Op::UpdateContent(update)) = &op.op else {
+            unreachable!()
+        };
+        assert_eq!(update.resend, !overwrite_lost);
+        op.op = Some(koidrive_proto::v1::op::Op::Delete(
+            koidrive_proto::v1::Delete {
+                node_id: update.node_id.clone(),
+                requires: None,
+            },
+        ));
+        device.engine.commits = koidrive_engine::commit::Commits::from_state(state).unwrap();
+        device.persist().unwrap();
+        world.run(4, &[(1, COMMIT)]).unwrap();
+        let failure = world.phase(4, &[]).unwrap_err();
+        assert!(
+            matches!(failure, Failure::Diverged(why) if why.contains("took write 3 out of the server's tree"))
+        );
+    }
+}
+
+#[test]
 fn the_authors_resent_edit_beats_a_delete_built_before_it() {
     let mut world = a_lost_edit_three_devices_held(overwrite(0));
     let mut steps = connect(&[1, 0, 2]);
