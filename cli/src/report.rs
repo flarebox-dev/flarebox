@@ -1070,7 +1070,7 @@ pub enum Auth {
     Cloudflare,
 }
 
-/// What it prints on stdout with `--json`. Only `share create --password` reads stdin, or asks on a terminal.
+/// What it prints on stdout with `--json`. It reads stdin only when an explicit input flag requests it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Output {
