@@ -144,17 +144,11 @@ private struct SetupErrorLine: View {
     let message: String
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: "exclamationmark.triangle")
-                .foregroundStyle(Color.statusRed)
-            Text(verbatim: message)
-                .foregroundStyle(Color.text)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(RoundedRectangle(cornerRadius: 6).fill(Color.redTint))
+        ErrorLine(message: message)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.redTint))
     }
 }
 

@@ -168,19 +168,14 @@ private struct AddFolderSheet: View {
     let close: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            FolderStep(setup: setup)
-            HStack {
-                Button("Cancel", action: close).keyboardShortcut(.cancelAction)
-                Spacer()
+        FolderStep(setup: setup, cancel: close)
+            .padding(24)
+            .frame(width: 480)
+            .background(Color.panel)
+            .disabled(setup.isBusy)
+            .onChange(of: setup.step) { _, step in
+                if step == .done { close() }
             }
-        }
-        .padding(24)
-        .frame(width: 480)
-        .disabled(setup.isBusy)
-        .onChange(of: setup.step) { _, step in
-            if step == .done { close() }
-        }
     }
 }
 
