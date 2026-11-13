@@ -2955,7 +2955,7 @@ fn an_unasked_delete_of_restored_content_is_rejected_after_an_older_overwrite() 
             },
         ));
         device.engine.commits = koidrive_engine::commit::Commits::from_state(state).unwrap();
-        device.persist().unwrap();
+        device.store = device.engine.clone();
         world.run(4, &[(1, COMMIT)]).unwrap();
         let failure = world.phase(4, &[]).unwrap_err();
         assert!(
