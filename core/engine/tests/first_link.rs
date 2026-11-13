@@ -899,3 +899,213 @@ fn a_discard_whose_s_update_waits_stays_after_a_server_loss() {
     let sent = ops(&mut commits, &mut trees, &mut ids);
     assert!(!sent.iter().any(|(_, id)| id == "l-A"), "{sent:?}");
 }
+
+#[test]
+fn a_discarded_entry_the_rules_leave_out_for_a_while_goes_to_the_local_trash_once_they_let_it_in() {
+    let (mut commits, mut trees, mut ids) = linked();
+    let asked = question(&commits);
+    assert!(commits.decide(&asked.id, Answer::Discard));
+    assert_eq!(ops(&mut commits, &mut trees, &mut ids), []);
+    let parked = LocalNode {
+        parked: true,
+        ..trees.local().get("l-b").unwrap().clone()
+    };
+    trees.set_local("l-b".into(), parked);
+    let root: [&str; 0] = [];
+    trees.set_rules(&root, Some(RuleFile::parse(b"b\n")));
+    trees.settle();
+    assert!(trees.synced().get("l-b").is_none());
+    assert_eq!(ops(&mut commits, &mut trees, &mut ids), []);
+
+    trees.set_rules(&root, None);
+    let mut effects = Effects::default();
+    let mut done = Vec::new();
+    for ino in 200.. {
+        trees.settle();
+        assert_eq!(
+            ops(&mut commits, &mut trees, &mut ids),
+            [],
+            "a discarded entry is not sent: {done:?}"
+        );
+        let Some(record) = effects
+            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .cloned()
+        else {
+            break;
+        };
+        let identity = FileIdentity {
+            dev: 1,
+            ino,
+            birth_ns: Some(0),
+        };
+        effects
+            .done(
+                &mut trees,
+                commits.in_flight(),
+                &record.effect_id,
+                Some(identity),
+            )
+            .unwrap();
+        done.push((record.node, record.effect));
+    }
+    assert!(trees.local().get("l-b").is_none(), "{done:?}");
+    assert!(
+        (done.iter())
+            .any(|(node, effect)| node == "l-b" && matches!(effect, Effect::RemoveFile { .. })),
+        "{done:?}"
+    );
+}
+
+#[test]
+fn a_discarded_entry_stays_discarded_when_the_server_merges_its_folder_into_another() {
+    let (mut commits, mut trees, mut ids) = linked();
+    assert!(commits.decide(&question(&commits).id, Answer::Discard));
+    assert_eq!(ops(&mut commits, &mut trees, &mut ids), []);
+    let root: [&str; 0] = [];
+    trees.set_rules(
+        &root,
+        Some(RuleFile::parse(
+            b"inside
+",
+        )),
+    );
+    let identity = FileIdentity {
+        dev: 1,
+        ino: 99,
+        birth_ns: Some(0),
+    };
+    let later = LocalNode {
+        shape: file("l-new", "later", 6),
+        identity,
+        parked: false,
+    };
+    trees.set_local("l-later".into(), later);
+    let mut effects = Effects::default();
+    for ino in 100.. {
+        trees.settle();
+        let Some(record) = effects
+            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .cloned()
+        else {
+            break;
+        };
+        let identity = FileIdentity { ino, ..identity };
+        effects
+            .done(
+                &mut trees,
+                commits.in_flight(),
+                &record.effect_id,
+                Some(identity),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        ops(&mut commits, &mut trees, &mut ids),
+        [
+            ("create dir", "l-new".into()),
+            ("create file", "l-later".into())
+        ]
+    );
+
+    let remote = |shape| RemoteNode {
+        shape,
+        trashed: false,
+        content_rev: 2,
+        meta_rev: 2,
+        trash_group: String::new(),
+        version_id: String::new(),
+    };
+    trees.set_remote("r-new".into(), remote(dir(ROOT, "new")));
+    trees.set_remote("l-later".into(), remote(file("r-new", "later", 6)));
+    let merged = OpResult {
+        code: op_result::Code::MergedInto as i32,
+        node_id: "r-new".into(),
+        ..Default::default()
+    };
+    let applied = OpResult {
+        code: op_result::Code::Applied as i32,
+        ..Default::default()
+    };
+    let result = CommitResult {
+        seq: 2,
+        results: vec![merged, applied],
+        ..Default::default()
+    };
+    commits.received(result).unwrap();
+    assert!(commits.acknowledge(&mut trees, 2));
+    assert_eq!(trees.local().get("l-inside").unwrap().shape.parent, "r-new");
+
+    trees.set_rules(&root, None);
+    trees.settle();
+    let sent = commits.build(&mut trees, &mut ids, NOW, HISTORY, 2);
+    assert!(sent.is_none(), "{sent:?}");
+}
+
+#[test]
+fn a_file_the_user_took_back_from_a_discard_is_sent_again_once_the_server_loses_it() {
+    let (mut commits, mut trees, mut ids) = linked();
+    assert!(commits.decide(&question(&commits).id, Answer::Discard));
+    assert_eq!(ops(&mut commits, &mut trees, &mut ids), []);
+    let edit = |trees: &mut Trees, digest| {
+        let mut node = trees.local().get("l-b").unwrap().clone();
+        node.shape.content = Some(content(digest));
+        trees.set_local("l-b".into(), node);
+        trees.settle();
+    };
+    let applied = |commits: &mut Commits, trees: &mut Trees, seq, digest| {
+        let node = RemoteNode {
+            shape: file("r-docs", "b", digest),
+            trashed: false,
+            content_rev: seq,
+            meta_rev: 2,
+            trash_group: String::new(),
+            version_id: String::new(),
+        };
+        trees.set_remote("l-b".into(), node);
+        let applied = OpResult {
+            code: op_result::Code::Applied as i32,
+            ..Default::default()
+        };
+        let result = CommitResult {
+            seq,
+            results: vec![applied],
+            ..Default::default()
+        };
+        commits.received(result).unwrap();
+        assert!(commits.acknowledge(trees, seq));
+    };
+    let sent = |commits: &mut Commits, trees: &mut Trees, ids: &mut IdGen, base| {
+        let commit = commits.build(trees, ids, NOW, HISTORY, base);
+        (commit.into_iter().flat_map(|commit| &commit.ops))
+            .map(|op| match &op.op {
+                Some(op::Op::CreateFile(create)) => ("create file", create.node_id.clone()),
+                Some(op::Op::UpdateContent(update)) => ("update", update.node_id.clone()),
+                other => panic!("unexpected op {other:?}"),
+            })
+            .collect::<Vec<_>>()
+    };
+    edit(&mut trees, 7);
+    assert_eq!(
+        sent(&mut commits, &mut trees, &mut ids, 1),
+        [("create file", "l-b".into())]
+    );
+    applied(&mut commits, &mut trees, 2, 7);
+    edit(&mut trees, 2);
+    assert_eq!(
+        sent(&mut commits, &mut trees, &mut ids, 2),
+        [("update", "l-b".into())]
+    );
+    applied(&mut commits, &mut trees, 3, 2);
+
+    trees.remove_remote("l-b");
+    trees.forget_lost(Vec::new(), Vec::new(), Vec::new(), 0, 0);
+    trees.settle();
+    let mut effects = Effects::default();
+    if let Some(record) = effects.plan(&trees, commits.in_flight(), &mut ids, NOW) {
+        assert_ne!(record.node, "l-b", "{record:?}");
+    }
+    assert_eq!(
+        sent(&mut commits, &mut trees, &mut ids, 3),
+        [("create file", "l-b".into())]
+    );
+}

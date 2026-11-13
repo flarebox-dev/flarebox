@@ -19,7 +19,7 @@ use crate::effects::{Effect, EffectRecord};
 use crate::guard::GuardState;
 use crate::question::Question;
 use crate::restore::{Resolved, RestoreId, RestoreIntent};
-use crate::tree::{FileIdentity, NodeId, TreeError};
+use crate::tree::{FileIdentity, NodeId, Shape, TreeError};
 
 /// A position L and R agreed on, with the revision of R's record that held it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,9 +53,9 @@ pub struct TreesState {
     /// The nodes a delete of this device trashed, each with the seq of its commit, while R holds
     /// them trashed by that commit.
     pub trashed_here: BTreeMap<NodeId, u64>,
-    /// The nodes S took from a Discard answer to a first-link question (section 6.4), while S, or
-    /// the S update waiting for them, still holds them.
-    pub discarded: BTreeSet<NodeId>,
+    /// The nodes the person discarded in answer to a first-link question (section 6.4), each with
+    /// the shape the question showed, while L, S or the S update waiting for them holds them.
+    pub discarded: BTreeMap<NodeId, Shape>,
     /// The nodes whose local copy the user moved into an ignored folder that is no node, and the folders L keeps
     /// for them. L holds each at the position it had before.
     pub outside: BTreeSet<NodeId>,

@@ -188,7 +188,7 @@ pub struct Trees {
     /// them trashed by that commit.
     trashed_here: BTreeMap<NodeId, u64>,
     /// See [`TreesState::discarded`].
-    discarded: BTreeSet<NodeId>,
+    discarded: BTreeMap<NodeId, Shape>,
     /// The files whose content an edit of this device set, each with the seq of its commit, while
     /// R holds that content.
     edited_here: BTreeMap<NodeId, u64>,
@@ -263,7 +263,7 @@ impl Trees {
             watched: BTreeMap::new(),
             watched_positions: BTreeMap::new(),
             trashed_here: BTreeMap::new(),
-            discarded: BTreeSet::new(),
+            discarded: BTreeMap::new(),
             edited_here: BTreeMap::new(),
             unsent_edits: BTreeSet::new(),
             replaced_versions: BTreeMap::new(),
@@ -676,50 +676,81 @@ impl Trees {
     }
 
     /// Whether `id` is an entry the person discarded on a first link (section 6.4), that R does not
-    /// hold and the user changed since: L holds it at another place or with other content than S,
-    /// or its waiting S update, or holds an entry below it that S does not hold there or that is
-    /// reclaimed itself. The entry is the user's again, so it is not removed: the commit planner
-    /// drops it from S, with every reclaimed folder above it, and sends them again.
+    /// hold and the user changed since: L holds it at another place or with other content than
+    /// the person discarded, or holds an entry below it, held by no question, that was not
+    /// discarded there or that is reclaimed itself. The entry is the user's again, so it is not
+    /// removed: the commit planner drops it from S, with every reclaimed folder above it, and
+    /// sends them again.
     pub fn reclaimed(&self, id: &str) -> bool {
-        let synced = |id: &str| match self.waiting.get(id) {
-            Some(waiting) => waiting.shape.as_ref(),
-            None => self.s.live(id),
-        };
-        let (Some(local), Some(shape)) = (self.l.get(id), synced(id)) else {
+        let (Some(local), Some(discarded)) = (self.l.get(id), self.discarded.get(id)) else {
             return false;
         };
-        self.discarded.contains(id)
-            && self.r.get(id).is_none()
+        self.r.get(id).is_none()
             && !self.excluded(id)
-            && (!local.shape.same(shape)
+            && (!local.shape.same(discarded)
                 || (self.local_children(id)).any(|child| {
                     !self.excluded(child)
-                        && (synced(child).is_none_or(|shape| shape.parent != id)
+                        && !self.held(child)
+                        && ((self.discarded.get(child)).is_none_or(|shape| shape.parent != id)
                             || self.reclaimed(child))
                 }))
     }
 
-    /// Records that S took `ids` from a Discard answer to a first-link question.
-    pub(crate) fn discard(&mut self, ids: impl IntoIterator<Item = NodeId>) {
-        self.discarded.extend(ids);
+    pub(crate) fn is_discarded(&self, id: &str) -> bool {
+        self.discarded.contains_key(id) && !self.reclaimed(id)
     }
 
-    /// S drops every reclaimed entry ([`Trees::reclaimed`]), and the S update waiting for it, once
-    /// S stays a valid tree without it, so an entry below a reclaimed folder goes first. A
-    /// discarded node that neither S nor a waiting update holds any more is forgotten.
+    pub(crate) fn rekey_discarded(&mut self, from: &str, to: &str) {
+        if let Some(shape) = self.discarded.remove(from) {
+            self.discarded.insert(to.to_owned(), shape);
+        }
+        for shape in self
+            .discarded
+            .values_mut()
+            .filter(|shape| shape.parent == from)
+        {
+            shape.parent = to.to_owned();
+        }
+    }
+
+    pub(crate) fn discard(&mut self, shapes: impl IntoIterator<Item = (NodeId, Shape)>) {
+        self.discarded.extend(shapes);
+    }
+
     pub(crate) fn reclaim(&mut self) {
-        let discarded = self.discarded.iter();
-        let mut reclaimed: Vec<NodeId> =
-            discarded.filter(|id| self.reclaimed(id)).cloned().collect();
+        let reclaimed: BTreeSet<NodeId> = (self.discarded.keys())
+            .filter(|id| self.reclaimed(id))
+            .cloned()
+            .collect();
+        let below_reclaimed = |id: &str| {
+            let mut parent = self.s.get(id).map(|shape| &shape.parent);
+            for _ in 0..self.s.len() {
+                match parent {
+                    Some(dir) if reclaimed.contains(dir) => return true,
+                    Some(dir) => parent = self.s.get(dir).map(|shape| &shape.parent),
+                    None => return false,
+                }
+            }
+            false
+        };
+        let excluded_below: Vec<NodeId> = (self.discarded.keys())
+            .filter(|id| self.excluded(id) && below_reclaimed(id))
+            .cloned()
+            .collect();
+        let mut left: Vec<NodeId> = reclaimed.iter().cloned().chain(excluded_below).collect();
         loop {
-            let before = reclaimed.len();
-            reclaimed.retain(|id| !self.set_synced_if_valid(id.clone(), None));
-            if reclaimed.len() == before {
+            let before = left.len();
+            left.retain(|id| !self.set_synced_if_valid(id.clone(), None));
+            if left.len() == before {
                 break;
             }
         }
-        let (s, waiting) = (&self.s, &self.waiting);
-        (self.discarded).retain(|id| s.live(id).is_some() || waiting.contains_key(id));
+        for id in reclaimed.iter().filter(|id| !left.contains(id)) {
+            self.discarded.remove(id);
+        }
+        let (l, s, waiting) = (&self.l, &self.s, &self.waiting);
+        (self.discarded)
+            .retain(|id, _| l.get(id).is_some() || s.get(id).is_some() || waiting.contains_key(id));
     }
 
     /// The caller has passed the rules files of a full scan made since the last restore, and the

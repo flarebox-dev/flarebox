@@ -2268,6 +2268,38 @@ fn discarding_what_a_first_link_holds_moves_it_to_the_local_trash_and_downloads_
     assert_eq!(b.state(), FolderState::UpToDate);
 }
 
+#[test]
+fn a_question_the_engine_holds_without_its_row_is_shown_and_answered_once_the_folder_opens() {
+    let mut remote = Remote::new();
+    let (site, b) = a_first_link_with_a_name_clash(&mut remote, "notes.txt", "Notes.txt");
+    drop(b);
+    let mut store = Store::open(&site.db).unwrap();
+    store
+        .transaction(|tx| {
+            let [stored] = &tx.questions()?[..] else {
+                panic!("one question");
+            };
+            assert!(tx.remove_question(&stored.question_id)?);
+            Ok::<_, koidrive_store::Error>(())
+        })
+        .unwrap();
+    drop(store);
+
+    let mut b = restarted(&site, &mut remote);
+    b.settle();
+    b.run(&mut remote);
+    assert!(b.sent.is_empty(), "nothing is sent before an answer");
+    let question = answer(&site, Answer::Publish);
+    assert_eq!(question.items.len(), 2);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    assert_eq!(remote.names().len(), 3);
+    assert_eq!(b.folder.view().questions, 0);
+}
+
 /// Discard on a first link whose held folder also holds an entry L does not know: a file the device's rules exclude,
 /// or a symlink. Discard moves the listed file to the local trash and keeps the folder with that entry. The folder's
 /// removal is not planned again on a timer, and the status names the entry.

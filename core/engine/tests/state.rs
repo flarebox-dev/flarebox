@@ -96,7 +96,7 @@ fn trees_state() -> TreesState {
         ]
         .into(),
         trashed_here: [("t".into(), 5)].into(),
-        discarded: ["a".into()].into(),
+        discarded: [("a".into(), dir(ROOT, "x"))].into(),
         outside: ["a".into()].into(),
         lost: ["a".into()].into(),
         displaced: Default::default(),
