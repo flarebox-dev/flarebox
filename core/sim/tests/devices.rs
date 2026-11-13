@@ -4695,9 +4695,7 @@ fn devices_that_converge_without_a_loss_record_no_change_l_and_s_agree_on() {
     let mut recorded = Vec::new();
     for _ in 0..64 {
         let (devices, phases) = strategy.new_tree(&mut runner).unwrap().current();
-        let Ok(world) = keep(devices, &phases) else {
-            continue;
-        };
+        let world = keep(devices, &phases).unwrap_or_else(|failure| panic!("{failure}"));
         recorded.extend((0..devices).flat_map(|device| recorded_in_sync(&world, device)));
     }
     assert_eq!(recorded, Vec::<String>::new());
