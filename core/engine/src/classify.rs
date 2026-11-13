@@ -152,6 +152,7 @@ impl ByName {
 pub struct Trashed {
     pub id: NodeId,
     pub shape: Shape,
+    pub kept: Option<NodeId>,
 }
 
 /// R, L and S of one space, and the nodes whose entries changed since they were last found in sync.
@@ -196,6 +197,7 @@ pub struct Trees {
     unsent_edits: BTreeSet<NodeId>,
     replaced_versions: BTreeMap<NodeId, Vec<String>>,
     resends: BTreeSet<NodeId>,
+    kept_originals: BTreeMap<NodeId, NodeId>,
     ignore: Matcher,
     /// Nodes whose local copy the user moved into an ignored folder that is no node. L keeps the
     /// entry each had before the move.
@@ -268,6 +270,7 @@ impl Trees {
             unsent_edits: BTreeSet::new(),
             replaced_versions: BTreeMap::new(),
             resends: BTreeSet::new(),
+            kept_originals: BTreeMap::new(),
             ignore: Matcher::new(LocalRules::default()),
             outside: BTreeSet::new(),
             lost: BTreeSet::new(),
@@ -451,6 +454,10 @@ impl Trees {
         if (self.trashed_here.get(&id)).is_some_and(|&seq| !(node.trashed && node.meta_rev == seq))
         {
             self.trashed_here.remove(&id);
+            self.kept_originals.remove(&id);
+        }
+        if node.trashed && !self.trashed_here.contains_key(&id) {
+            self.kept_originals.remove(&id);
         }
         if node.trashed {
             self.displaced.remove(&id);
@@ -530,6 +537,7 @@ impl Trees {
     pub fn remove_remote(&mut self, id: &str) {
         self.remote_rules_files.remove(id);
         self.trashed_here.remove(id);
+        self.kept_originals.remove(id);
         self.count_held_trash(id, false);
         self.count_trashed(id, false);
         self.displaced.remove(id);
@@ -582,6 +590,7 @@ impl Trees {
             self.outside.extend(children);
         }
         self.displaced.remove(&id);
+        self.kept_originals.remove(&id);
         (self.l_identities.entry(node.identity).or_default()).insert(id.clone());
         self.mark(&id);
         self.count_held_trash(&id, false);
@@ -1120,10 +1129,21 @@ impl Trees {
 
     /// Records that a delete of this device, in the commit at `seq`, trashed `id`, if R holds it
     /// trashed by that commit.
-    pub fn record_trashed(&mut self, id: &str, seq: u64) {
+    pub fn record_trashed(&mut self, id: &str, seq: u64, kept: Option<&str>) {
         if (self.r.get(id)).is_some_and(|remote| remote.trashed && remote.meta_rev == seq) {
             self.trashed_here.insert(id.to_owned(), seq);
+            match kept {
+                Some(kept) => self.kept_originals.insert(id.to_owned(), kept.to_owned()),
+                None => self.kept_originals.remove(id),
+            };
         }
+    }
+
+    pub fn kept_original(&self, id: &str) -> Option<&NodeId> {
+        (self.kept_originals.get(id)).filter(|kept| {
+            self.l.get(kept).is_some()
+                || (self.s.get(kept).is_none() && !self.trashed_here.contains_key(*kept))
+        })
     }
 
     /// Records that an edit of this device, in the commit at `seq`, set the content of `id`, if R
@@ -1181,6 +1201,7 @@ impl Trees {
                 Some(Trashed {
                     id: id.clone(),
                     shape: remote.shape.clone(),
+                    kept: self.kept_originals.get(id).cloned(),
                 })
             })
             .collect()
@@ -1275,22 +1296,31 @@ impl Trees {
             .filter(|(_, seq)| *seq > held_through)
             .map(|(id, _)| id.clone())
             .collect();
-        let mut deletes: Vec<(NodeId, Shape)> = (trashed.into_iter())
+        let deleted_here: BTreeSet<NodeId> =
+            (trashed.iter()).map(|deleted| deleted.id.clone()).collect();
+        let mut deletes: Vec<(NodeId, Shape, Option<NodeId>)> = (trashed.into_iter())
             .filter(|deleted| {
                 self.l.get(&deleted.id).is_none() && self.s.get(&deleted.id).is_none()
+            })
+            .filter(|deleted| {
+                (deleted.kept.as_ref())
+                    .is_none_or(|kept| deleted_here.contains(kept) || self.r.live(kept).is_some())
             })
             .filter_map(|deleted| {
                 let remote = (self.r.get(&deleted.id))
                     .filter(|remote| !remote.trashed && remote.shape.same(&deleted.shape))
                     .filter(|remote| remote.content_rev.max(remote.meta_rev) <= held_through)?;
-                Some((deleted.id, remote.shape.clone()))
+                Some((deleted.id, remote.shape.clone(), deleted.kept))
             })
             .collect();
         while let Some(at) = (0..deletes.len()).find(|&at| {
-            let (id, shape) = &deletes[at];
+            let (id, shape, _) = &deletes[at];
             self.fits_synced(id, Some(shape))
         }) {
-            let (id, shape) = deletes.swap_remove(at);
+            let (id, shape, kept) = deletes.swap_remove(at);
+            if let Some(kept) = kept.filter(|kept| !deleted_here.contains(kept)) {
+                self.kept_originals.insert(id.clone(), kept);
+            }
             self.set_synced(id, Some(shape));
         }
         for (id, _) in edited {
@@ -2014,6 +2044,7 @@ impl Trees {
             unsent_edits: self.unsent_edits.clone(),
             replaced_versions: self.replaced_versions.clone(),
             resends: self.resends.clone(),
+            kept_originals: self.kept_originals.clone(),
         }
     }
 
@@ -2099,6 +2130,7 @@ impl Trees {
             unsent_edits,
             replaced_versions,
             resends,
+            kept_originals,
         } = state;
         self.unsettled = dirty.clone();
         self.same.clear();
@@ -2119,6 +2151,7 @@ impl Trees {
         self.unsent_edits = unsent_edits;
         self.replaced_versions = replaced_versions;
         self.resends = resends;
+        self.kept_originals = kept_originals;
         self.rules_known = false;
         self.unknown_rules.clear();
         Ok(())

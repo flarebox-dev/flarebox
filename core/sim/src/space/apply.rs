@@ -615,16 +615,33 @@ impl<'a> Applier<'a> {
         if node.status == NodeStatus::Trashed {
             return result(op_result::Code::Applied, "", "");
         }
-        let kept = self.trash_subtree(&node, &format!("{}:{index}", self.ctx.commit_id));
-        result(
-            if kept {
-                op_result::Code::Superseded
-            } else {
-                op_result::Code::Applied
+        let required = match &op.requires {
+            None => None,
+            Some(required) => match self.node(&required.node_id) {
+                Some(kept)
+                    if kept.status == NodeStatus::Live
+                        && kept.content_rev == required.content_rev
+                        && kept.meta_rev == required.meta_rev =>
+                {
+                    Some(kept.node_id)
+                }
+                _ => return result(op_result::Code::Superseded, "", ""),
             },
-            "",
-            "",
-        )
+        };
+        if self.trash_subtree(&node, &format!("{}:{index}", self.ctx.commit_id)) {
+            return result(op_result::Code::Superseded, "", "");
+        }
+        if let Some(required) = required {
+            let (seq, dev) = (self.ctx.seq, self.dev().to_string());
+            let stored = self
+                .st
+                .nodes
+                .get_mut(&required)
+                .expect("required node exists");
+            stored.parent_rev = seq;
+            stored.parent_dev = dev;
+        }
+        result(op_result::Code::Applied, "", "")
     }
 
     fn restore(&mut self, op: &Restore) -> Result<OpResult, Error> {

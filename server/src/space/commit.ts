@@ -500,8 +500,22 @@ export class CommitApplier {
     if (!node) return rejected("NOT_FOUND");
     if (!node.parent_id) return rejected("ROOT");
     if (node.status === NodeStatusValue.TRASHED) return result(OpResult_Code.APPLIED);
-    const kept = this.trashSubtree(node, `${this.ctx.commitId}:${index}`);
-    return result(kept ? OpResult_Code.SUPERSEDED : OpResult_Code.APPLIED);
+    const required = op.requires && this.node(op.requires.nodeId);
+    if (
+      op.requires &&
+      !(
+        required?.status === NodeStatusValue.LIVE &&
+        BigInt(required.content_rev) === op.requires.contentRev &&
+        BigInt(required.meta_rev) === op.requires.metaRev
+      )
+    ) {
+      return result(OpResult_Code.SUPERSEDED);
+    }
+    if (this.trashSubtree(node, `${this.ctx.commitId}:${index}`)) return result(OpResult_Code.SUPERSEDED);
+    if (required) {
+      this.sql.exec("UPDATE nodes SET parent_rev = ?, parent_dev = ? WHERE node_id = ?", this.ctx.seq, this.dev, required.node_id);
+    }
+    return result(OpResult_Code.APPLIED);
   }
 
   private restore(op: Restore): OpResult {

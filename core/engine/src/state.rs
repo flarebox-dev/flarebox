@@ -70,6 +70,10 @@ pub struct TreesState {
     /// The files whose content in L is an edit of this device that the server does not hold,
     /// although S and R may hold the same bytes (section 4.4).
     pub unsent_edits: BTreeSet<NodeId>,
+    /// The nodes a delete of a conflict answer removes, each with the file the answer keeps, which the delete
+    /// requires live (RFC 0015). Each is held while R holds the node trashed by that delete, or while its delete is
+    /// sent again after the server lost it (section 4.4).
+    pub kept_originals: BTreeMap<NodeId, NodeId>,
     /// For each file of R, the `version_id`s it held before its current one as the log moved it
     /// forward, oldest first, at most
     /// [`REPLACED_VERSIONS_KEPT`](crate::classify::REPLACED_VERSIONS_KEPT). A server never gives a

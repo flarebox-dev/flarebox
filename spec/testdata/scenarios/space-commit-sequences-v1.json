@@ -1,7 +1,7 @@
 {
   "format": "koidrive.space-conformance",
   "version": 1,
-  "spec": "Koidrive spec v0 with RFC 0001, RFC 0002 sections 1 to 4, 9 and 11, RFC 0006 section 8, and RFC 0016",
+  "spec": "Koidrive spec v0 with RFC 0001, RFC 0002 sections 1 to 4, 9 and 11, RFC 0006 section 8, RFC 0015 and RFC 0016",
   "unicode": "18.0.0",
   "now_ms": 1794268740000,
   "mtime_ns": "1794268740123456789",

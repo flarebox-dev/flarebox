@@ -487,7 +487,7 @@ class Run {
         move: ["node", "parent", "name"],
         create_file: ["node", "parent", "name", "content"],
         update_content: ["node", "content"],
-        delete: ["node"],
+        delete: ["node", "requires"],
         restore: ["node", "version", "parent", "name"],
         empty: [],
       };
@@ -511,7 +511,15 @@ class Run {
       else if (kind === "create_file") op = create(OpSchema, { op: { case: "createFile", value: { nodeId, parentId, name, content: content() } } });
       else if (kind === "update_content") op = create(OpSchema, { op: { case: "updateContent", value: { nodeId, content: content() } } });
       else if (kind === "move") op = create(OpSchema, { op: { case: "move", value: { nodeId, newParentId: parentId, newName: name } } });
-      else if (kind === "delete") op = create(OpSchema, { op: { case: "delete", value: { nodeId } } });
+      else if (kind === "delete") {
+        const found = "requires" in body ? keys(body.requires, "requires", ["node", "content_rev", "meta_rev"]) : undefined;
+        const requires = found && {
+          nodeId: this.id(space, req(optStr(found, "node"), "node")),
+          contentRev: BigInt(req(optUint(found, "content_rev"), "content_rev")),
+          metaRev: BigInt(req(optUint(found, "meta_rev"), "meta_rev")),
+        };
+        op = create(OpSchema, { op: { case: "delete", value: { nodeId, requires } } });
+      }
       else {
         const version = optStr(body, "version");
         const versionId = version === undefined ? "" : this.id(space, version);

@@ -7094,3 +7094,234 @@ fn a_lost_create_under_a_folder_deleted_after_the_loss_is_not_sent_again() {
     assert_eq!(trees.class("c"), Class::Remote);
     assert!(build(&mut commits, &mut trees, &mut ids).is_none());
 }
+
+fn answered_conflict(answer: Answer) -> (Commits, Trees, IdGen, Shape) {
+    let mut trees = trees(&[(
+        "f",
+        Some(file(ROOT, "f", 2)),
+        Some(file(ROOT, "f", 1)),
+        Some(remote(file(ROOT, "f", 1))),
+    )]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    let copy = file(ROOT, "f (conflict)", 2);
+    let original = RemoteNode {
+        content_rev: 4,
+        ..remote_at(file(ROOT, "f", 3), 3)
+    };
+    trees.set_remote("f".into(), original);
+    trees.set_remote("y".into(), remote_at(copy.clone(), 5));
+    let made = OpResult {
+        node_id: "y".into(),
+        ..outcome(op_result::Code::ConflictCopy)
+    };
+    acknowledge(&mut commits, &mut trees, vec![made]);
+    for (id, shape, ino) in [("f", file(ROOT, "f", 3), 1), ("y", copy.clone(), 2)] {
+        trees.set_local(id.into(), local(shape.clone(), ino));
+        trees.set_synced(id.into(), Some(shape));
+    }
+    trees.settle();
+    let question = commits.questions()[0].id.clone();
+    assert!(commits.decide(&question, answer));
+    (commits, trees, ids, copy)
+}
+
+fn delete_copy_requiring(content_rev: u64, meta_rev: u64) -> op::Op {
+    op::Op::Delete(proto::Delete {
+        node_id: "y".into(),
+        requires: Some(proto::NodeRevisions {
+            node_id: "f".into(),
+            content_rev,
+            meta_rev,
+        }),
+    })
+}
+
+#[test]
+fn keep_the_original_deletes_the_copy_only_while_the_original_is_at_the_revisions_r_holds() {
+    let (mut commits, mut trees, mut ids, _) = answered_conflict(Answer::KeepOriginal);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [delete_copy_requiring(4, 3)]);
+}
+
+#[test]
+fn keep_the_copy_deletes_the_copy_only_while_the_original_holds_the_content_it_took() {
+    let (mut commits, mut trees, mut ids, copy) = answered_conflict(Answer::KeepCopy);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(matches!(ops(&commit)[..], [op::Op::UpdateContent(_)]));
+    let took = Shape {
+        name: "f".into(),
+        ..copy
+    };
+    trees.set_remote(
+        "f".into(),
+        RemoteNode {
+            content_rev: 6,
+            ..remote_at(took.clone(), 3)
+        },
+    );
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    trees.set_local("f".into(), local(took.clone(), 1));
+    trees.set_synced("f".into(), Some(took));
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [delete_copy_requiring(6, 3)]);
+}
+
+#[test]
+fn a_folder_delete_waits_while_a_resent_answer_delete_below_it_requires_the_original() {
+    let mut trees = trees(&[
+        synced("f", file(ROOT, "f", 1)),
+        (
+            "d",
+            None,
+            Some(dir(ROOT, "d")),
+            Some(remote(dir(ROOT, "d"))),
+        ),
+        (
+            "y",
+            None,
+            Some(file("d", "y", 2)),
+            Some(remote(file("d", "y", 2))),
+        ),
+    ]);
+    let mut state = trees.state();
+    state.kept_originals.insert("y".into(), "f".into());
+    trees.restore(state).unwrap();
+    trees.set_rules::<&str>(&[], None);
+    trees.rules_scanned();
+    let held = trees.remote().get("f").unwrap();
+    let required = delete_copy_requiring(held.content_rev, held.meta_rev);
+    let commit = build(&mut Commits::default(), &mut trees, &mut IdGen::new(1)).unwrap();
+    assert_eq!(ops(&commit), [required]);
+}
+
+fn kept_original_recorded() -> Trees {
+    let (mut commits, mut trees, mut ids, copy) = answered_conflict(Answer::KeepOriginal);
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    let in_trash = RemoteNode {
+        trashed: true,
+        trash_group: "1:0".into(),
+        ..remote_at(copy, 1)
+    };
+    trees.set_remote("y".into(), in_trash);
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    assert_eq!(kept_originals(&trees), [("y".into(), "f".into())]);
+    trees
+}
+
+fn kept_originals(trees: &Trees) -> Vec<(String, String)> {
+    trees.state().kept_originals.into_iter().collect()
+}
+
+#[test]
+fn a_kept_original_is_forgotten_once_another_device_restores_the_copy() {
+    let mut trees = kept_original_recorded();
+    trees.set_remote("y".into(), remote_at(file(ROOT, "f (conflict)", 2), 7));
+    assert_eq!(kept_originals(&trees), []);
+}
+
+#[test]
+fn a_kept_original_is_forgotten_once_l_holds_the_copy_again() {
+    let mut trees = kept_original_recorded();
+    trees.set_local("y".into(), local(file(ROOT, "f (conflict)", 2), 2));
+    assert_eq!(kept_originals(&trees), []);
+}
+
+#[test]
+fn a_kept_original_waiting_to_be_sent_again_is_forgotten_once_another_device_trashes_the_copy() {
+    let mut trees = trees(&[
+        synced("f", file(ROOT, "f", 1)),
+        (
+            "y",
+            None,
+            Some(file(ROOT, "y", 2)),
+            Some(remote(file(ROOT, "y", 2))),
+        ),
+    ]);
+    let mut state = trees.state();
+    state.kept_originals.insert("y".into(), "f".into());
+    trees.restore(state).unwrap();
+    let in_trash = RemoteNode {
+        trashed: true,
+        trash_group: "7:0".into(),
+        ..remote_at(file(ROOT, "y", 2), 7)
+    };
+    trees.set_remote("y".into(), in_trash);
+    assert_eq!(kept_originals(&trees), []);
+}
+
+#[test]
+fn a_resent_answer_delete_keeps_its_precondition_when_another_device_removed_the_kept_file_here() {
+    let mut trees = trees(&[
+        ("f", None, None, Some(remote(file(ROOT, "f", 1)))),
+        (
+            "y",
+            None,
+            Some(file(ROOT, "y", 2)),
+            Some(remote(file(ROOT, "y", 2))),
+        ),
+    ]);
+    let mut state = trees.state();
+    state.kept_originals.insert("y".into(), "f".into());
+    trees.restore(state).unwrap();
+    trees.set_rules::<&str>(&[], None);
+    trees.rules_scanned();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    trees.set_local("f".into(), local(file(ROOT, "f", 1), 1));
+    trees.set_synced("f".into(), Some(file(ROOT, "f", 1)));
+    trees.settle();
+    let held = trees.remote().get("f").unwrap();
+    let required = delete_copy_requiring(held.content_rev, held.meta_rev);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [required]);
+}
+
+#[test]
+fn a_resent_answer_delete_drops_its_precondition_once_a_delete_of_this_device_trashed_the_kept_file()
+ {
+    let mut trees = trees(&[
+        synced("f", file(ROOT, "f", 1)),
+        (
+            "a",
+            None,
+            Some(file(ROOT, "a", 2)),
+            Some(remote(file(ROOT, "a", 2))),
+        ),
+    ]);
+    let mut state = trees.state();
+    state.kept_originals.insert("a".into(), "f".into());
+    trees.restore(state).unwrap();
+    trees.set_rules::<&str>(&[], None);
+    trees.rules_scanned();
+    trees.remove_local("f");
+    let state = koidrive_engine::state::CommitsState {
+        cap: Some(1),
+        ..Commits::default().state()
+    };
+    let (mut commits, mut ids) = (Commits::from_state(state).unwrap(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [delete("f")]);
+    let in_trash = RemoteNode {
+        trashed: true,
+        trash_group: "1:0".into(),
+        ..remote_at(file(ROOT, "f", 1), 1)
+    };
+    trees.set_remote("f".into(), in_trash);
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [delete("a")]);
+}

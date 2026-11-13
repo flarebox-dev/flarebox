@@ -99,6 +99,7 @@ fn migrations_apply_from_empty() {
             "guard_ledger",
             "guard_remote",
             "guard_remote_dismissed",
+            "kept_originals",
             "link",
             "local_nodes",
             "migrations",
@@ -1204,6 +1205,7 @@ fn engine_state() -> EngineState {
                     "0190a6b2-0000-7000-8000-000000000002".into(),
                 ],
             )]),
+            kept_originals: BTreeMap::from([("t".into(), "kept".into())]),
         },
         commits: CommitsState {
             accepted: 4,
@@ -1404,7 +1406,7 @@ fn engine_state_survives_a_reopen() {
 }
 
 /// The tables of the engine state besides the nodes of R, L and S.
-const ENGINE_TABLES: [&str; 28] = [
+const ENGINE_TABLES: [&str; 29] = [
     "node_sets",
     "node_maps",
     "waiting_updates",
@@ -1419,6 +1421,7 @@ const ENGINE_TABLES: [&str; 28] = [
     "edited_here",
     "replaced_versions",
     "resends",
+    "kept_originals",
     "effect_state",
     "failed_effects",
     "restore_intents",
@@ -3163,4 +3166,29 @@ fn a_discarded_folder_is_not_sent_while_a_question_asks_again_about_what_it_hold
         };
         assert_eq!(sent, expected, "{answer:?}");
     }
+}
+
+#[test]
+fn a_store_from_before_kept_originals_were_recorded_opens_with_none_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let mut before = engine_state();
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| tx.set_engine_state(&before))
+        .unwrap();
+    store_before(&path, "kept_originals");
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(applied(&path), all_migrations());
+    let after = before.clone();
+    before.trees.kept_originals.clear();
+    assert!(!after.trees.kept_originals.is_empty());
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
+    store
+        .transaction(|tx| tx.update_engine_state(&before, &after))
+        .unwrap();
+    drop(store);
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), after);
 }
