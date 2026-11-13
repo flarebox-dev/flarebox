@@ -116,15 +116,6 @@ enum Method {
 }
 
 impl Method {
-    fn command(self) -> Option<&'static [&'static str]> {
-        match self {
-            Method::Cask => Some(&["brew", "upgrade", "--cask", "koidrive"]),
-            Method::Formula => Some(&["brew", "upgrade", "koidrive"]),
-            Method::Installer => Some(&["koi", "update"]),
-            Method::App | Method::Development => None,
-        }
-    }
-
     fn via(&self) -> Option<Via> {
         match self {
             Method::Cask | Method::Formula => Some(Via::Homebrew),
@@ -212,12 +203,23 @@ impl Install {
         })
     }
 
-    fn command(&self) -> Option<&'static [&'static str]> {
-        self.method.command()
+    fn command(&self) -> Option<Vec<&str>> {
+        match self.method {
+            Method::Cask => Some(vec!["brew", "upgrade", "--cask", "koidrive"]),
+            Method::Formula => Some(vec!["brew", "upgrade", "koidrive"]),
+            Method::Installer => Some(vec![self.binary.to_str()?, "update"]),
+            Method::App | Method::Development => None,
+        }
     }
 
     pub(crate) fn notice(&self, update: &update::Update, version: &str) -> UpdateNoticeData {
-        let command = self.command().map(|command| command.join(" "));
+        let command = self.command().map(|command| {
+            command
+                .iter()
+                .map(|word| crate::pairing::shell_word(word))
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
         let update = if self.method == Method::Development {
             &update::Update::Off
         } else {
@@ -535,7 +537,7 @@ pub async fn run(paths: &Paths, json: bool) -> Result<Done, CliError> {
             ),
         )
         .unchanged()
-        .then(command));
+        .then(&command));
     }
     let release = update::check_now(paths)
         .await
@@ -1004,8 +1006,10 @@ mod tests {
             .path()
             .join("Applications/Koidrive.app/Contents/Helpers/koi");
         let formula = dir.path().join("brew/Cellar/koidrive/0.1.0/bin/koi");
+        executable(&script, "#!/bin/sh\nexit 0\n");
+        let script_command = format!("{} update", fs::canonicalize(&script).unwrap().display());
         for (binary, method, command) in [
-            (&script, Method::Installer, Some("koi update")),
+            (&script, Method::Installer, Some(script_command.as_str())),
             (&app, Method::App, None),
             (&formula, Method::Formula, Some("brew upgrade koidrive")),
         ] {
@@ -2163,7 +2167,7 @@ mod tests {
         let cask = classify();
         assert_eq!(cask.method, Method::Cask);
         assert_eq!(
-            cask.command(),
+            cask.command().as_deref(),
             Some(["brew", "upgrade", "--cask", "koidrive"].as_slice())
         );
         let available = update::Update::Available {
@@ -2409,7 +2413,7 @@ mod tests {
             let install = Install::resolve(binary, "0.1.0", &[]).unwrap();
             assert_eq!(install.method, Method::Formula);
             assert_eq!(
-                install.command(),
+                install.command().as_deref(),
                 Some(["brew", "upgrade", "koidrive"].as_slice())
             );
         }

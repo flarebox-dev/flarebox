@@ -1978,7 +1978,7 @@ fn status_text(
             printable(&notice.version),
         ));
         if let Some(command) = &notice.command {
-            text.push_str(&format!(" Run: {command}\n"));
+            text.push_str(&format!(" Run: {}\n", printable(command)));
         } else if let Some(url) = &notice.url {
             text.push_str(&format!(" Download: {}\n", printable(url)));
         } else {

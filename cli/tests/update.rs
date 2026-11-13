@@ -903,7 +903,11 @@ async fn the_daemon_checks_for_a_release_and_koi_status_names_it() {
         update["url"],
         "https://github.com/koidrive/koidrive/releases/tag/v99.0.0"
     );
-    assert_eq!(update["command"], "koi update");
+    let command = format!(
+        "{} update",
+        std::fs::canonicalize(&binary).unwrap().display()
+    );
+    assert_eq!(update["command"], command);
     assert!(
         update["checked_at"].as_str().unwrap().ends_with('Z'),
         "{update}"
@@ -911,7 +915,7 @@ async fn the_daemon_checks_for_a_release_and_koi_status_names_it() {
     let text = String::from_utf8(text.stdout).unwrap();
     assert!(
         text.contains(&format!(
-            "Update: Koidrive 99.0.0 is out (this device runs {}). Run: koi update\n",
+            "Update: Koidrive 99.0.0 is out (this device runs {}). Run: {command}\n",
             env!("CARGO_PKG_VERSION")
         )),
         "{text}"
@@ -1045,4 +1049,74 @@ fn cached_status_uses_the_current_homebrew_formula_or_cask_upgrade_command() {
             cached
         );
     }
+}
+
+#[test]
+fn an_installer_notice_names_its_real_binary_despite_another_koi_on_path() {
+    let home = tempfile::tempdir().unwrap();
+    let github = github("v99.0.0");
+    let binary = copy_koi(&home.path().join("standalone copy's/bin/koi"));
+    let alias = home.path().join("installer-alias");
+    std::os::unix::fs::symlink(&binary, &alias).unwrap();
+    let bin = home.path().join("path/bin");
+    let other = bin.join("koi");
+    executable(
+        &other,
+        "#!/bin/sh\necho selected >> \"$0.calls\"\nexit 99\n",
+    );
+    let state = home.path().join("state/koidrive");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        state.join("update-check.json"),
+        serde_json::json!({
+            "asset": asset(),
+            "checked_at": 1763006400000_i64,
+            "release": { "version": "99.0.0", "url": "https://example.com/v99.0.0" },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let status = koi_at(&alias, home.path(), &github, &["status", "--json"])
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    let update = envelope(&status)["data"]["update"].clone();
+    if development_version() {
+        assert_eq!(update["state"], "off");
+        assert!(update.get("command").is_none());
+        return;
+    }
+    let resolved = std::fs::canonicalize(&binary).unwrap();
+    let expected = format!(
+        "'{}' update",
+        resolved.to_str().unwrap().replace('\'', "'\\''")
+    );
+    assert_eq!(update["command"], expected);
+    let status = koi_at(&alias, home.path(), &github, &["status"])
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8(status.stdout)
+            .unwrap()
+            .contains(&format!("Run: {expected}\n"))
+    );
+    let output = koi_at(
+        Path::new("/bin/sh"),
+        home.path(),
+        &github,
+        &["-c", &expected],
+    )
+    .env("PATH", &bin)
+    .env("KOIDRIVE_INSTALL_SCRIPT_URL", "not a URL")
+    .output()
+    .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("not a URL")
+    );
+    assert!(!other.with_extension("calls").exists());
+    assert_eq!(std::fs::read_link(alias).unwrap(), binary);
 }

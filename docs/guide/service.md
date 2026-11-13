@@ -77,10 +77,10 @@ The daemon also looks every hour for a newer `koi` from Homebrew, the installer 
 The daemon asks GitHub once a day whether a newer release is out, and keeps the answer in `update-check.json` in the state folder. When one is out, `koi status` shows it after the background service:
 
 ```
-Update: Koidrive 0.1.2 is out (this device runs 0.1.0). Run: koi update
+Update: Koidrive 0.1.2 is out (this device runs 0.1.0). Run: /home/ada/.local/bin/koi update
 ```
 
-The command matches the running executable's installation method. A Homebrew cask shows `brew upgrade --cask koidrive`, and a formula shows `brew upgrade koidrive`.
+The command matches the running executable's installation method. An installer copy names its resolved executable, with shell quoting when needed. A Homebrew cask shows `brew upgrade --cask koidrive`, and a formula shows `brew upgrade koidrive`.
 
 Each check reads Koidrive's public list of releases, `https://api.github.com/repos/koidrive/koidrive/releases`, following its pages with ordinary GitHub requests. It sends the user agent `koidrive` and, for a cached single-page list, the list's ETag, a hash that is the same for everyone. It sends no version, device, account or server address. GitHub sees your IP address, as it does for any download. The check isn't a [usage report](telemetry.md): nothing goes to Koidrive, and turning reports off leaves the check on.
 
