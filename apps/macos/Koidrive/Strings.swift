@@ -179,20 +179,22 @@ extension RecoveryCause {
 }
 
 extension Notice {
-    var title: String {
+    func title(spaceName: String?) -> String {
         switch kind {
-        case .recovery: String(localized: "Folder recovered")
-        case .remoteMassDelete: String(localized: "Many files deleted on another device")
+        case .recovery:
+            spaceName.map { String(localized: "\($0) was recovered") } ?? String(localized: "Folder recovered")
+        case .remoteMassDelete:
+            spaceName.map { String(localized: "Many files deleted from \($0) on another device") }
+                ?? String(localized: "Many files deleted on another device")
         }
     }
 
     var text: String {
         switch kind {
         case .recovery(let cause, let heldFiles):
-            let held = heldFiles == 0
-                ? String(localized: "Nothing needs your answer.")
-                : String(localized: "Answer in Needs You to finish.")
-            return cause.text + " " + String(localized: "Koidrive applied the server's changes and moved removed files to the local trash.") + " " + held
+            return heldFiles == 0
+                ? String(localized: "\(cause.shortText). Nothing needs your answer.")
+                : String(localized: "\(cause.shortText). Answer in Needs You.")
         case .remoteMassDelete(_, let affectedFiles, let spaceFiles, _):
             return String(localized: "\(affectedFiles.formatted()) of \(fileCount(spaceFiles)) removed. Copies are in the folder's local trash.")
         }

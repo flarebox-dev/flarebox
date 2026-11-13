@@ -63,6 +63,7 @@ enum Snapshots {
                 deletions: 214, affectedFiles: 1_086, spaceFiles: 1_840, exceeded: [.shareOfSpace(percent: 50)]))
         }
         states.append(("5-question", question))
+        states.append(("5b-recovery", .preview(.recovery)))
         let problem = AppModel.preview(.upToDate)
         if let fake = problem.session.fakeCore(), let folder = problem.state.folders.last {
             _ = try? fake.reportProblem(spaceId: folder.spaceId, path: nil, kind: .folderMissing)
@@ -70,6 +71,12 @@ enum Snapshots {
         }
         states.append(("6-problem", problem))
         states.append(("7-first-run", .preview(.firstRun)))
+        let connecting = AppModel.preview(.upToDate)
+        connecting.session.fakeCore()?.setActivity(activity: .connecting)
+        states.append(("8-connecting", connecting))
+        let stopped = AppModel.preview(.upToDate)
+        stopped.stop()
+        states.append(("9-stopped", stopped))
         try? await Task.sleep(for: .milliseconds(200))
         return states
     }
