@@ -178,8 +178,15 @@ enum Snapshots {
         let screencapture = Process()
         screencapture.executableURL = URL(filePath: "/usr/sbin/screencapture")
         screencapture.arguments = ["-x", "-o", "-l", String(window.windowNumber), url.path(percentEncoded: false)]
-        try? screencapture.run()
+        do {
+            try screencapture.run()
+        } catch {
+            fatalError("screencapture could not start for \(url.lastPathComponent): \(error)")
+        }
         screencapture.waitUntilExit()
+        guard screencapture.terminationStatus == 0 else {
+            fatalError("screencapture failed for \(url.lastPathComponent) with status \(screencapture.terminationStatus)")
+        }
         window.close()
     }
 }
