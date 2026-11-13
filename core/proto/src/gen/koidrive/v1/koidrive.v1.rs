@@ -372,6 +372,10 @@ pub struct NodeState {
     pub trash_group: ::prost::alloc::string::String,
     #[prost(message, optional, tag="9")]
     pub current: ::core::option::Option<VersionInfo>,
+    /// The seq of the newest commit that created the node, changed its content other than by a resend, or carried a user's
+    /// edit of content a resend brought (RFC 0018). 0 from a server before RFC 0018, read as content_rev.
+    #[prost(uint64, tag="12")]
+    pub edit_rev: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ChangeRecord {
@@ -534,6 +538,11 @@ pub struct UpdateContent {
     pub node_id: ::prost::alloc::string::String,
     #[prost(message, optional, tag="2")]
     pub content: ::core::option::Option<Content>,
+    /// Set on an edit that sends again content another device made and the server lost, with no change of the sending
+    /// device's user in it. It leaves the node's edit_rev as it was, and a trashed target answers it with CODE_SUPERSEDED
+    /// (RFC 0018).
+    #[prost(bool, tag="3")]
+    pub resend: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Move {

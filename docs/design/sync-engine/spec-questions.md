@@ -15,6 +15,7 @@ The spec changes this design needs:
 9. **Trash groups across a loss** (§6.1, GUN-404; RFC 0012). The server names a trash group `<commit_id>:<op index>` instead of `<seq>:<op index>`, so a commit that takes the seq of a lost commit takes none of its groups, and clients treat a group as an opaque string.
 10. **Commit tokens** (§4.4, GUN-423, GUN-454; RFC 0013). `Resume` and `Commit` name the commit at their seq by its `commit_id` and `committed_at_ms`, and the server answers `AHEAD_OF_SERVER` when it holds another commit there, so a loss the head has caught up with is still seen. `CaughtUp`, `TreePage` and `CommitResult` carry the token clients learn.
 11. **Equal content after a loss** (§4.4, GUN-389; RFC 0016). An `UpdateContent` that meets unseen content equal to its own is applied without a change instead of making a conflict copy, so the author and another device can both send a lost edit again. A server never gives one version ID to two versions, also across a loss, which lets a device show that the restored content is older than its own.
+12. **Resends and deletes** (§4.4, GUN-552; RFC 0018). `UpdateContent` carries `resend`, and each node an edit revision that a resend leaves as it was. R7 reads the edit revision, so a delete beats a resend it did not see, and the author's equal send after another device's resend records an edit, so it still beats the delete.
 
 `.koiignore` (§5.10) needs no protocol change: it is an ordinary file, and ignoring is per device.
 

@@ -60,6 +60,7 @@ fn remote(shape: Shape) -> RemoteNode {
         meta_rev: 1,
         trash_group: String::new(),
         version_id: String::new(),
+        edit_rev: 1,
     }
 }
 
@@ -140,6 +141,7 @@ fn update(node: &str, digest: u8) -> op::Op {
     op::Op::UpdateContent(proto::UpdateContent {
         node_id: node.into(),
         content: Some(content(digest)),
+        resend: false,
     })
 }
 

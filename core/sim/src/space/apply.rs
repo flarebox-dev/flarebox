@@ -91,7 +91,7 @@ impl<'a> Applier<'a> {
             Some(op::Op::CreateFile(op)) => self.create_file(op),
             Some(op::Op::UpdateContent(op)) => {
                 let content = op.content.as_ref().expect("checked before applying");
-                self.update_content(&op.node_id, content, &content.chunks)
+                self.update_content(&op.node_id, content, &content.chunks, op.resend)
             }
             Some(op::Op::Move(op)) => self.move_node(op),
             Some(op::Op::Delete(op)) => Ok(self.delete(op, index)),
@@ -126,6 +126,10 @@ impl<'a> Applier<'a> {
 
     fn unseen_content(&self, node: &Node) -> bool {
         node.content_rev > self.ctx.base_seq && node.content_dev != self.dev()
+    }
+
+    fn unseen_edit(&self, node: &Node) -> bool {
+        node.edit_rev > self.ctx.base_seq && node.edit_dev != self.dev()
     }
 
     fn unseen_meta(&self, node: &Node) -> bool {
@@ -343,6 +347,8 @@ impl<'a> Applier<'a> {
             status: NodeStatus::Live,
             content_rev: self.ctx.seq,
             content_dev: self.dev().into(),
+            edit_rev: self.ctx.seq,
+            edit_dev: self.dev().into(),
             meta_rev: self.ctx.seq,
             meta_dev: self.dev().into(),
             parent_rev: self.ctx.seq,
@@ -452,6 +458,7 @@ impl<'a> Applier<'a> {
         node_id: &str,
         content: &Content,
         chunks: &[ChunkRef],
+        resend: bool,
     ) -> Result<OpResult, Error> {
         let Some(found) = self.node(node_id) else {
             return Ok(rejected("NOT_FOUND"));
@@ -459,11 +466,27 @@ impl<'a> Applier<'a> {
         if found.kind != NodeKind::File {
             return Ok(rejected("NOT_FILE"));
         }
+        if resend && found.status == NodeStatus::Trashed {
+            return Ok(result(op_result::Code::Superseded, "", ""));
+        }
         let current = (found.cur_version_id.as_ref()).map(|id| &self.st.versions[id].content);
         if self.unseen_content(&found)
             && current.is_some_and(|current| same_content(current, content))
         {
-            return Ok(applied(false, &found.name));
+            if resend || found.edit_rev >= found.content_rev {
+                return Ok(applied(false, &found.name));
+            }
+            let (node, renamed) = self.revive_target(found);
+            let (seq, dev) = (self.ctx.seq, self.dev().to_string());
+            let stored = self
+                .st
+                .nodes
+                .get_mut(&node.node_id)
+                .expect("updated node exists");
+            stored.edit_rev = seq;
+            stored.edit_dev = dev;
+            self.touch(&node.node_id);
+            return Ok(applied(renamed, &node.name));
         }
         let (node, renamed) = self.revive_target(found);
         let parent_id = node.parent_id.clone().expect("a file has a parent");
@@ -489,6 +512,10 @@ impl<'a> Applier<'a> {
             .get_mut(&node.node_id)
             .expect("updated node exists");
         stored.cur_version_id = Some(version_id);
+        if !resend {
+            stored.edit_rev = seq;
+            stored.edit_dev = dev.clone();
+        }
         stored.content_rev = seq;
         stored.content_dev = dev;
         self.touch(&node.node_id);
@@ -584,7 +611,7 @@ impl<'a> Applier<'a> {
         if self.unseen_parent(node) {
             return true;
         }
-        let mut keep = self.unseen_content(node) || self.unseen_meta(node);
+        let mut keep = self.unseen_edit(node) || self.unseen_meta(node);
         for child in self.st.children(&node.node_id, NodeStatus::Live) {
             keep = self.trash_subtree(&child, group) || keep;
         }
@@ -666,6 +693,7 @@ impl<'a> Applier<'a> {
                     ..version.content
                 },
                 &chunks,
+                false,
             );
         }
         let Some(original_parent) = node.parent_id.clone() else {

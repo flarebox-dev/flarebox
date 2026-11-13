@@ -177,6 +177,7 @@ fn remote_action(space: &mut SpaceDo, ids: &mut IdGen, device: u8, action: &Acti
             Some(node_id) => op::Op::UpdateContent(UpdateContent {
                 node_id,
                 content: Some(content(device, action.text)),
+                resend: false,
             }),
             None => return,
         },
@@ -4345,6 +4346,7 @@ fn a_local_delete_keeps_a_recorded_entry_and_the_folders_above_it_as_the_driver_
                 meta_rev: 1,
                 trash_group: String::new(),
                 version_id: String::new(),
+                edit_rev: 1,
             },
         );
     }
@@ -4442,6 +4444,7 @@ fn the_gun_526_exemption_covers_only_a_server_node_another_kept_folder_blocks() 
         content_rev: 1,
         trash_group: String::new(),
         version_id: String::new(),
+        edit_rev: 1,
     };
     let mut trees = Trees::new("root");
     for (ino, (id, shape)) in [

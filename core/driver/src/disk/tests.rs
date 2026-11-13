@@ -516,6 +516,7 @@ fn remote(id: &str, name: &str, content: Option<Content>) -> NodeState {
         status: NodeStatus::Live as i32,
         content_rev: 1,
         meta_rev: 1,
+        edit_rev: 1,
         trash_group: String::new(),
         current: content.map(|content| VersionInfo {
             version_id: format!("version-{id}"),

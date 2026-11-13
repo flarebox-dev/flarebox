@@ -157,7 +157,7 @@ export class CommitApplier {
       case "createFile":
         return this.createFile(op.op.value);
       case "updateContent":
-        return this.updateContent(op.op.value.nodeId, op.op.value.content!, op.op.value.content!.chunks);
+        return this.updateContent(op.op.value.nodeId, op.op.value.content!, op.op.value.content!.chunks, op.op.value.resend);
       case "move":
         return this.move(op.op.value);
       case "delete":
@@ -193,6 +193,10 @@ export class CommitApplier {
 
   private unseenContent(node: NodeRow): boolean {
     return node.content_rev > this.ctx.baseSeq && node.content_dev !== this.dev;
+  }
+
+  private unseenEdit(node: NodeRow): boolean {
+    return node.edit_rev > this.ctx.baseSeq && node.edit_dev !== this.dev;
   }
 
   private unseenMeta(node: NodeRow): boolean {
@@ -317,8 +321,8 @@ export class CommitApplier {
 
   private insertNode(nodeId: string, parentId: string, name: string, kind: number, versionId: string | null, parentDev: string): void {
     this.sql.exec(
-      `INSERT INTO nodes (node_id, parent_id, parent_rev, parent_dev, name, name_key, kind, status, content_rev, content_dev, meta_rev,
-         meta_dev, cur_version_id) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`,
+      `INSERT INTO nodes (node_id, parent_id, parent_rev, parent_dev, name, name_key, kind, status, content_rev, content_dev, edit_rev,
+         edit_dev, meta_rev, meta_dev, cur_version_id) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)`,
       nodeId,
       parentId,
       this.ctx.seq,
@@ -326,6 +330,8 @@ export class CommitApplier {
       name,
       nameKey(name),
       kind,
+      this.ctx.seq,
+      this.dev,
       this.ctx.seq,
       this.dev,
       this.ctx.seq,
@@ -401,11 +407,18 @@ export class CommitApplier {
     return result(picked.renamed ? OpResult_Code.APPLIED_RENAMED : OpResult_Code.APPLIED, "", picked.name);
   }
 
-  private updateContent(nodeId: string, content: Content, chunks: readonly ChunkRef[]): OpResult {
+  private updateContent(nodeId: string, content: Content, chunks: readonly ChunkRef[], resend = false): OpResult {
     const found = this.node(nodeId);
     if (!found) return rejected("NOT_FOUND");
     if (found.kind !== NodeKindValue.FILE) return rejected("NOT_FILE");
-    if (this.unseenContent(found) && this.holds(found, content)) return result(OpResult_Code.APPLIED, "", found.name);
+    if (resend && found.status === NodeStatusValue.TRASHED) return result(OpResult_Code.SUPERSEDED);
+    if (this.unseenContent(found) && this.holds(found, content)) {
+      if (resend || found.edit_rev >= found.content_rev) return result(OpResult_Code.APPLIED, "", found.name);
+      const { node, renamed } = this.reviveTarget(found);
+      this.sql.exec("UPDATE nodes SET edit_rev = ?, edit_dev = ? WHERE node_id = ?", this.ctx.seq, this.dev, node.node_id);
+      this.touch(node.node_id);
+      return result(renamed ? OpResult_Code.APPLIED_RENAMED : OpResult_Code.APPLIED, "", node.name);
+    }
     const { node, renamed } = this.reviveTarget(found);
     if (this.unseenContent(node)) {
       const copyId = uuidv7(this.ctx.nowMs);
@@ -416,11 +429,14 @@ export class CommitApplier {
     }
     this.sql.exec("UPDATE versions SET superseded_at_ms = ? WHERE version_id = ?", this.ctx.nowMs, node.cur_version_id);
     const versionId = this.insertVersion(node.node_id, content, chunks);
+    const [editRev, editDev] = resend ? [node.edit_rev, node.edit_dev] : [this.ctx.seq, this.dev];
     this.sql.exec(
-      "UPDATE nodes SET cur_version_id = ?, content_rev = ?, content_dev = ? WHERE node_id = ?",
+      "UPDATE nodes SET cur_version_id = ?, content_rev = ?, content_dev = ?, edit_rev = ?, edit_dev = ? WHERE node_id = ?",
       versionId,
       this.ctx.seq,
       this.dev,
+      editRev,
+      editDev,
       node.node_id,
     );
     this.touch(node.node_id);
@@ -478,7 +494,7 @@ export class CommitApplier {
 
   private trashSubtree(node: NodeRow, group: string): boolean {
     if (this.unseenParent(node)) return true;
-    let keep = this.unseenContent(node) || this.unseenMeta(node);
+    let keep = this.unseenEdit(node) || this.unseenMeta(node);
     const children = rows<NodeRow>(this.sql.exec("SELECT * FROM nodes WHERE parent_id = ? AND status = 1", node.node_id));
     for (const child of children) keep = this.trashSubtree(child, group) || keep;
     if (keep) return true;

@@ -63,7 +63,7 @@ import { fromHex, isUuidV7, toHex, uuidv7 } from "../ids";
 import { policy } from "../policy";
 import { quotaRefusal } from "../quota";
 import { type ApplyContext, CallFailure, CommitApplier } from "./commit";
-import { commitDigest } from "./digest";
+import { type DigestVersion, type Digests, commitDigests } from "./digest";
 import { descriptorDurable, Exporter, noteCommitted, startExport } from "./export";
 import type { ShareInfo, ShareListing } from "../gen/koidrive/v1/share_pb";
 import type { ShareOutcome } from "../share/links";
@@ -741,10 +741,14 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       }
     }
 
-    private storedResult(commitId: string): { result: CommitResult; deviceId: string; digest: Uint8Array | null } | undefined {
+    private storedResult(
+      commitId: string,
+    ): { result: CommitResult; deviceId: string; digest: Uint8Array | null; digestVersion: DigestVersion } | undefined {
       const row =
-        this.sql.exec("SELECT results, device_id, request_digest FROM commits WHERE commit_id = ?", commitId).toArray()[0] ??
-        this.sql.exec("SELECT results, device_id, request_digest FROM device_commits WHERE commit_id = ?", commitId).toArray()[0];
+        this.sql.exec("SELECT results, device_id, request_digest, digest_version FROM commits WHERE commit_id = ?", commitId).toArray()[0] ??
+        this.sql
+          .exec("SELECT results, device_id, request_digest, digest_version FROM device_commits WHERE commit_id = ?", commitId)
+          .toArray()[0];
       if (!row) return undefined;
       const result = fromBinary(CommitResultSchema, new Uint8Array(row.results as ArrayBuffer));
       if (result.committedAtMs === 0n) {
@@ -755,6 +759,7 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
         result,
         deviceId: String(row.device_id ?? ""),
         digest: row.request_digest === null ? null : new Uint8Array(row.request_digest as ArrayBuffer),
+        digestVersion: Number(row.digest_version) === 1 ? 1 : 2,
       };
     }
 
@@ -774,12 +779,12 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       return BigInt(Number(row?.device_seq ?? 0));
     }
 
-    private checkCommitOrder(deviceId: string, commit: Commit, digest: Uint8Array): CommitResult | undefined {
+    private checkCommitOrder(deviceId: string, commit: Commit, digests: Digests): CommitResult | undefined {
       if (commit.historyId !== getMeta(this.sql, "history_id")) fail(Error_Code.HISTORY_MISMATCH, "the commit was built in another history of this space");
       const stored = this.storedResult(commit.commitId);
       if (stored) {
         if (stored.deviceId !== deviceId) fail(Error_Code.INVALID_ARGUMENT, "commit_id belongs to a commit of another device");
-        if (stored.digest && !sameBytes(stored.digest, digest)) fail(Error_Code.INVALID_ARGUMENT, "commit_id belongs to a different commit");
+        if (stored.digest && !sameBytes(stored.digest, digests[stored.digestVersion])) fail(Error_Code.INVALID_ARGUMENT, "commit_id belongs to a different commit");
         return stored.result;
       }
       const accepted = this.acceptedDeviceSeq(deviceId);
@@ -809,7 +814,7 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
         fail(Error_Code.LIMIT_EXCEEDED, "the commit's change records do not fit in one 1 MiB message; split the commit");
       }
       this.sql.exec(
-        "INSERT INTO commits (seq, commit_id, device_id, user_id, committed_at_ms, record, results, request_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO commits (seq, commit_id, device_id, user_id, committed_at_ms, record, results, request_digest, digest_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 2)",
         Number(record.seq),
         record.commitId,
         record.deviceId,
@@ -823,8 +828,8 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
     }
 
     private async commit(session: Session, commit: Commit): Promise<{ result: CommitResult; record?: CommitRecord }> {
-      const digest = await commitDigest(commit);
-      const stored = this.checkCommitOrder(session.deviceId, commit, digest);
+      const digests = await commitDigests(commit);
+      const stored = this.checkCommitOrder(session.deviceId, commit, digests);
       if (stored) {
         await this.armAfterCommit();
         return { result: stored };
@@ -851,7 +856,7 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       const done = this.db.transactionSync((): { result: CommitResult; record?: CommitRecord; rearm?: boolean } => {
         if (this.revoked(session.deviceId)) fail(Error_Code.UNAUTHENTICATED, "device revoked");
         this.checkOpen();
-        const again = this.checkCommitOrder(session.deviceId, commit, digest);
+        const again = this.checkCommitOrder(session.deviceId, commit, digests);
         if (again) return { result: again };
         const head = this.headSeq;
 
@@ -891,16 +896,16 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
           changes,
         });
         const result = create(CommitResultSchema, { seq: BigInt(ctx.seq), results, changes, committedAtMs: BigInt(nowMs) });
-        this.appendCommit(record, result, digest);
+        this.appendCommit(record, result, digests[2]);
         this.sql.exec(
-          `INSERT INTO device_commits (device_id, device_seq, commit_id, results, request_digest) VALUES (?, ?, ?, ?, ?)
+          `INSERT INTO device_commits (device_id, device_seq, commit_id, results, request_digest, digest_version) VALUES (?, ?, ?, ?, ?, 2)
            ON CONFLICT (device_id) DO UPDATE SET device_seq = excluded.device_seq, commit_id = excluded.commit_id, results = excluded.results,
-             request_digest = excluded.request_digest`,
+             request_digest = excluded.request_digest, digest_version = excluded.digest_version`,
           session.deviceId,
           Number(commit.deviceSeq),
           commit.commitId,
           toBinary(CommitResultSchema, result),
-          digest,
+          digests[2],
         );
         return { result, record, rearm: noteCommitted(this.sql, record) };
       });

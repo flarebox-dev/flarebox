@@ -49,6 +49,7 @@ fn remote(shape: Shape) -> RemoteNode {
         meta_rev: 1,
         trash_group: String::new(),
         version_id: String::new(),
+        edit_rev: 1,
     }
 }
 
@@ -183,6 +184,7 @@ fn reads_node_states_and_refuses_kinds_this_version_does_not_sync() {
             content: Some(content(1, 3)),
             ..Default::default()
         }),
+        edit_rev: 0,
     };
     let (id, node) = RemoteNode::from_state(&state).unwrap();
     assert_eq!(id, "n");

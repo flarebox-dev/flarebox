@@ -294,6 +294,13 @@ impl Commits {
         self.slots.values().any(|&made| made == seq)
     }
 
+    /// Whether the commit of `seq` and `commit_id` is this device's: an acknowledged one, or the
+    /// commit in flight, whose record can arrive before its result.
+    pub fn made_record(&self, seq: u64, commit_id: &str) -> bool {
+        self.made_here(seq)
+            || (self.in_flight.as_ref()).is_some_and(|flight| flight.commit.commit_id == commit_id)
+    }
+
     /// Forgets the slots above the accepted counter, those of the commits a loss took, once R is
     /// listed again and [`Trees::forget_lost`] no longer needs them.
     pub fn forget_lost_slots(&mut self) {
@@ -816,6 +823,7 @@ impl Commits {
                         Some(op::Op::UpdateContent(proto::UpdateContent {
                             node_id: original.node_id.clone(),
                             content: Some(copied),
+                            resend: false,
                         }))
                     }
                     _ => {
@@ -2322,6 +2330,7 @@ fn plan(
             Want::Content { id, content } => {
                 scratch.revive(&id);
                 op::Op::UpdateContent(proto::UpdateContent {
+                    resend: trees.resends().contains(&id),
                     node_id: id,
                     content: Some(content),
                 })

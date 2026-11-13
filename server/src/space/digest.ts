@@ -18,7 +18,11 @@ function content(value: Content | undefined): Content | undefined {
   });
 }
 
-function op({ op }: Op): Op {
+export type DigestVersion = 1 | 2;
+
+export type Digests = Record<DigestVersion, Uint8Array>;
+
+function op({ op }: Op, version: DigestVersion): Op {
   switch (op.case) {
     case "createDir":
       return create(OpSchema, { op: { case: op.case, value: { nodeId: op.value.nodeId, parentId: op.value.parentId, name: op.value.name } } });
@@ -27,7 +31,12 @@ function op({ op }: Op): Op {
       return create(OpSchema, { op: { case: op.case, value: { nodeId, parentId, name, content: content(op.value.content) } } });
     }
     case "updateContent":
-      return create(OpSchema, { op: { case: op.case, value: { nodeId: op.value.nodeId, content: content(op.value.content) } } });
+      return create(OpSchema, {
+        op: {
+          case: op.case,
+          value: { nodeId: op.value.nodeId, content: content(op.value.content), resend: version >= 2 && op.value.resend },
+        },
+      });
     case "move": {
       const { nodeId, newParentId, newName } = op.value;
       return create(OpSchema, { op: { case: op.case, value: { nodeId, newParentId, newName } } });
@@ -43,12 +52,16 @@ function op({ op }: Op): Op {
   }
 }
 
-export async function commitDigest(commit: Commit): Promise<Uint8Array> {
+export async function commitDigest(commit: Commit, version: DigestVersion = 2): Promise<Uint8Array> {
   const projected = create(CommitSchema, {
     baseSeq: commit.baseSeq,
-    ops: commit.ops.map(op),
+    ops: commit.ops.map((each) => op(each, version)),
     deviceSeq: commit.deviceSeq,
     requireHead: commit.requireHead,
   });
   return sha256(toBinary(CommitSchema, projected, { writeUnknownFields: false }));
+}
+
+export async function commitDigests(commit: Commit): Promise<Digests> {
+  return { 1: await commitDigest(commit, 1), 2: await commitDigest(commit, 2) };
 }

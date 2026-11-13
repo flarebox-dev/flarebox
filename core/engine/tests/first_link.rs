@@ -67,6 +67,7 @@ fn trees(local: &[(&str, Shape)], remote: &[(&str, Shape)]) -> Trees {
             meta_rev: 1,
             trash_group: String::new(),
             version_id: String::new(),
+            edit_rev: 1,
         };
         trees.set_remote((*id).into(), node);
     }
@@ -433,6 +434,7 @@ fn renamed_create(commits: &mut Commits, trees: &mut Trees, id: &str, name: &str
         meta_rev: seq,
         trash_group: String::new(),
         version_id: String::new(),
+        edit_rev: seq,
     };
     trees.set_remote(id.into(), node);
     let renamed = OpResult {
@@ -499,6 +501,7 @@ fn a_published_create_that_takes_a_conflict_name_asks_nothing_and_a_later_create
         meta_rev: 3,
         trash_group: String::new(),
         version_id: String::new(),
+        edit_rev: 3,
     };
     trees.set_remote("r-later".into(), theirs);
     renamed_create(&mut commits, &mut trees, "l-later", "later (conflict)", 3);
@@ -861,6 +864,7 @@ fn a_discard_whose_s_update_waits_stays_after_a_server_loss() {
         meta_rev: 2,
         trash_group: String::new(),
         version_id: String::new(),
+        edit_rev: 2,
     };
     trees.set_remote("pad".into(), pad);
     let applied = OpResult {
@@ -1014,6 +1018,7 @@ fn a_discarded_entry_stays_discarded_when_the_server_merges_its_folder_into_anot
         meta_rev: 2,
         trash_group: String::new(),
         version_id: String::new(),
+        edit_rev: 2,
     };
     trees.set_remote("r-new".into(), remote(dir(ROOT, "new")));
     trees.set_remote("l-later".into(), remote(file("r-new", "later", 6)));
@@ -1060,6 +1065,7 @@ fn a_file_the_user_took_back_from_a_discard_is_sent_again_once_the_server_loses_
             meta_rev: 2,
             trash_group: String::new(),
             version_id: String::new(),
+            edit_rev: seq,
         };
         trees.set_remote("l-b".into(), node);
         let applied = OpResult {

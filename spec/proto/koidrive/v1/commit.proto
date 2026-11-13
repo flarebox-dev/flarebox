@@ -34,6 +34,10 @@ message CreateFile {
 message UpdateContent {
   string node_id = 1;
   Content content = 2;
+  // Set on an edit that sends again content another device made and the server lost, with no change of the sending
+  // device's user in it. It leaves the node's edit_rev as it was, and a trashed target answers it with CODE_SUPERSEDED
+  // (RFC 0018).
+  bool resend = 3;
 }
 
 message Move {

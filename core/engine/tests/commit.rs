@@ -57,6 +57,7 @@ fn remote(shape: Shape) -> RemoteNode {
         meta_rev: 1,
         trash_group: String::new(),
         version_id: String::new(),
+        edit_rev: 1,
     }
 }
 
@@ -149,6 +150,15 @@ fn update(node: &str, digest: u8) -> op::Op {
     op::Op::UpdateContent(proto::UpdateContent {
         node_id: node.into(),
         content: Some(content(digest)),
+        resend: false,
+    })
+}
+
+fn resend(node: &str, digest: u8) -> op::Op {
+    op::Op::UpdateContent(proto::UpdateContent {
+        node_id: node.into(),
+        content: Some(content(digest)),
+        resend: true,
     })
 }
 
@@ -1107,6 +1117,7 @@ fn deleted_at_5_then_lost(rows: &[Row]) -> (Commits, Trees, IdGen, Vec<op::Op>) 
     build(&mut commits, &mut trees, &mut ids).unwrap();
     let pad = RemoteNode {
         content_rev: 2,
+        edit_rev: 2,
         meta_rev: 2,
         ..remote(file(ROOT, "pad", 9))
     };
@@ -1188,6 +1199,7 @@ fn a_delete_the_server_lost_is_sent_again_only_for_what_it_saw() {
     trees.set_remote("same".into(), remote(file(ROOT, "same", 1)));
     let edited = RemoteNode {
         content_rev: 2,
+        edit_rev: 2,
         meta_rev: 2,
         ..remote(file(ROOT, "edited", 2))
     };
@@ -1229,6 +1241,7 @@ fn edited_at_5_then_lost() -> (Commits, Trees, IdGen) {
     build(&mut commits, &mut trees, &mut ids).unwrap();
     let pad = RemoteNode {
         content_rev: 2,
+        edit_rev: 2,
         meta_rev: 2,
         ..remote(file(ROOT, "pad", 9))
     };
@@ -1243,6 +1256,7 @@ fn edited_at_5_then_lost() -> (Commits, Trees, IdGen) {
     assert_eq!(ops(&commit), [update("a", 2)]);
     let edited = RemoteNode {
         content_rev: 5,
+        edit_rev: 5,
         ..remote(file(ROOT, "a", 2))
     };
     trees.set_remote("a".into(), edited);
@@ -1290,6 +1304,7 @@ fn an_edit_the_server_lost_is_not_sent_again_over_a_later_edit() {
     let edited = trees.edited_here();
     let later = RemoteNode {
         content_rev: 3,
+        edit_rev: 3,
         ..remote(file(ROOT, "a", 3))
     };
     trees.set_remote("a".into(), later);
@@ -2004,6 +2019,7 @@ fn a_conflict_answer_counts_toward_the_change_records_of_its_commit() {
     let answer = op::Op::UpdateContent(proto::UpdateContent {
         node_id: "f".into(),
         content: Some(copied.clone()),
+        resend: false,
     });
     let sent = ops(&commit);
     assert!(sent.contains(&answer));
@@ -2012,6 +2028,7 @@ fn a_conflict_answer_counts_toward_the_change_records_of_its_commit() {
     let mut took = remote(file(ROOT, "f", 3));
     took.shape.content = Some(copied);
     took.content_rev = 2;
+    took.edit_rev = 2;
     trees.set_remote("f".into(), took);
     acknowledge(
         &mut commits,
@@ -2661,6 +2678,7 @@ fn a_policy_halt_takes_a_server_loss_once() {
     build(&mut commits, &mut trees, &mut ids).unwrap();
     let a = RemoteNode {
         content_rev: 4,
+        edit_rev: 4,
         meta_rev: 4,
         ..remote(file(ROOT, "x", 1))
     };
@@ -3018,6 +3036,7 @@ fn a_move_and_edit_whose_s_update_waits_lost_at_5() -> (Trees, Commits, IdGen) {
     build(&mut commits, &mut trees, &mut ids).unwrap();
     let pad = RemoteNode {
         content_rev: 2,
+        edit_rev: 2,
         meta_rev: 2,
         ..remote(file(ROOT, "pad", 7))
     };
@@ -3032,6 +3051,7 @@ fn a_move_and_edit_whose_s_update_waits_lost_at_5() -> (Trees, Commits, IdGen) {
     assert_eq!(ops(&commit), [mv("n", ROOT, "x"), update("n", 1)]);
     let moved = RemoteNode {
         content_rev: 5,
+        edit_rev: 5,
         meta_rev: 5,
         ..remote(file(ROOT, "x", 1))
     };
@@ -3155,6 +3175,7 @@ fn an_edit_to_the_content_a_lost_commit_replaced_is_sent_after_the_loss() {
     assert_eq!(ops(&commit), [update("n", 2)]);
     let sent = RemoteNode {
         content_rev: 3,
+        edit_rev: 3,
         ..remote(file(ROOT, "n", 2))
     };
     trees.set_remote("n".into(), sent);
@@ -3172,6 +3193,7 @@ fn a_remote_edit_before_an_edit_to_the_content_a_lost_commit_replaced_is_sent_ke
     let (mut trees, mut commits, mut ids) = an_edit_to_the_content_a_lost_commit_replaced();
     let resent = RemoteNode {
         content_rev: 2,
+        edit_rev: 2,
         ..remote(file(ROOT, "n", 3))
     };
     trees.set_remote("n".into(), resent);
@@ -3190,6 +3212,7 @@ fn a_remote_edit_before_an_edit_to_the_content_a_lost_commit_replaced_is_sent_ke
 fn an_edit_of_a_file_the_server_went_back_to_holding_in_the_trash_is_kept_from_a_resend() {
     let edited = RemoteNode {
         content_rev: 2,
+        edit_rev: 2,
         ..remote(file(ROOT, "n", 3))
     };
     let mut trees = trees(&[(
@@ -3217,6 +3240,7 @@ fn an_edit_of_a_file_the_server_went_back_to_holding_in_the_trash_is_kept_from_a
     assert_eq!(trees.class("n"), Class::Local);
     let resent = RemoteNode {
         content_rev: 4,
+        edit_rev: 4,
         ..remote_at(file(ROOT, "n", 3), 3)
     };
     trees.set_remote("n".into(), resent);
@@ -3252,6 +3276,7 @@ fn a_file_in_the_trash_after_a_loss_that_l_did_not_edit_is_not_recorded() {
 fn an_edit_to_the_content_a_lost_commit_replaced() -> (Trees, Commits, IdGen) {
     let edited = RemoteNode {
         content_rev: 2,
+        edit_rev: 2,
         ..remote(file(ROOT, "n", 3))
     };
     let mut trees = trees(&[(
@@ -3281,6 +3306,7 @@ fn an_edit_to_the_content_a_lost_commit_replaced() -> (Trees, Commits, IdGen) {
 fn an_edit_this_device_committed_to_the_content_a_lost_commit_replaced_is_sent_again() {
     let edited = RemoteNode {
         content_rev: 2,
+        edit_rev: 2,
         ..remote(file(ROOT, "n", 3))
     };
     let mut trees = trees(&[(
@@ -3296,6 +3322,7 @@ fn an_edit_this_device_committed_to_the_content_a_lost_commit_replaced_is_sent_a
     assert_eq!(ops(&commit), [update("n", 2)]);
     let applied = RemoteNode {
         content_rev: 3,
+        edit_rev: 3,
         ..remote(file(ROOT, "n", 2))
     };
     trees.set_remote("n".into(), applied);
@@ -3324,6 +3351,7 @@ fn an_edit_this_device_committed_to_the_content_a_lost_commit_replaced_is_sent_a
 fn a_write_to_the_content_the_server_went_back_to_seen_after_the_bootstrap_is_sent() {
     let edited = RemoteNode {
         content_rev: 2,
+        edit_rev: 2,
         ..remote(file(ROOT, "n", 3))
     };
     let mut trees = trees(&[(
@@ -3357,6 +3385,7 @@ fn an_edit_sent_after_a_loss_and_lost_in_a_second_one_is_sent_again() {
     assert_eq!(ops(&commit), [update("n", 2)]);
     let applied = RemoteNode {
         content_rev: 3,
+        edit_rev: 3,
         ..remote(file(ROOT, "n", 2))
     };
     trees.set_remote("n".into(), applied);
@@ -3390,6 +3419,7 @@ fn an_edit_the_server_kept_is_not_sent_again_after_a_loss() {
     build(&mut commits, &mut trees, &mut ids).unwrap();
     let applied = RemoteNode {
         content_rev: 2,
+        edit_rev: 2,
         ..remote(file(ROOT, "n", 2))
     };
     trees.set_remote("n".into(), applied);
@@ -3468,6 +3498,7 @@ fn a_recorded_file_whose_s_update_waits_gets_no_download() {
     let restored = |unsent: bool| {
         let edited = RemoteNode {
             content_rev: 2,
+            edit_rev: 2,
             ..remote(file(ROOT, "n", 3))
         };
         let mut trees = Trees::new(ROOT);
@@ -3518,6 +3549,7 @@ fn commit_file(trees: &mut Trees, commits: &mut Commits, ids: &mut IdGen, id: &s
     );
     let created = RemoteNode {
         content_rev: seq,
+        edit_rev: seq,
         meta_rev: seq,
         ..remote(file(ROOT, id, 7))
     };
@@ -3546,6 +3578,7 @@ fn a_kept_move_that_another_device_reverses_before_a_loss_is_not_sent_again() {
     let (mut trees, mut commits, mut ids) = a_move_and_edit_whose_s_update_waits();
     let reversed = RemoteNode {
         content_rev: 2,
+        edit_rev: 2,
         meta_rev: 2,
         ..remote(file(ROOT, "old", 0))
     };
@@ -3677,6 +3710,7 @@ fn an_effect_on_a_node_whose_update_waits_keeps_its_slot_for_a_loss() {
     assert_eq!(ops(&commit), [mv("n", ROOT, "x"), update("n", 1)]);
     let moved = RemoteNode {
         content_rev: 5,
+        edit_rev: 5,
         meta_rev: 5,
         ..remote(file(ROOT, "x", 1))
     };
@@ -3694,6 +3728,7 @@ fn an_effect_on_a_node_whose_update_waits_keeps_its_slot_for_a_loss() {
     trees.set_remote("k".into(), k_moved);
     let moved_again = RemoteNode {
         content_rev: 5,
+        edit_rev: 5,
         meta_rev: 7,
         ..remote(file(ROOT, "z", 1))
     };
@@ -3766,6 +3801,7 @@ fn a_lost_update_is_not_made_when_another_device_restores_the_node() {
     let (mut trees, mut commits, mut ids) = a_move_and_edit_lost_while_r_holds_it_in_the_trash();
     let restored = RemoteNode {
         content_rev: 2,
+        edit_rev: 2,
         meta_rev: 2,
         ..remote(file(ROOT, "old", 7))
     };
@@ -3802,6 +3838,7 @@ fn a_lost_update_is_not_the_effects_base_while_it_cannot_fit() {
     let mut commits = Commits::from_state(state).unwrap();
     let restored = RemoteNode {
         content_rev: 2,
+        edit_rev: 2,
         meta_rev: 2,
         ..remote(file(ROOT, "old", 7))
     };
@@ -5370,6 +5407,7 @@ fn a_late_create_acknowledgement_that_keeps_a_position_takes_the_sent_content() 
     for (rev, name) in [(8, "b"), (9, "c"), (10, "b")] {
         let node = RemoteNode {
             content_rev: 8,
+            edit_rev: 8,
             ..remote_at(file(ROOT, name, 3), rev)
         };
         trees.set_remote("n".into(), node);
@@ -5410,6 +5448,7 @@ fn a_late_create_acknowledgement_keeps_the_content_s_took_after_the_commit() {
     trees.set_local("n".into(), local(file(ROOT, "c", 2), 1));
     let node = RemoteNode {
         content_rev: 9,
+        edit_rev: 9,
         ..remote_at(file(ROOT, "c", 2), 9)
     };
     trees.set_remote("n".into(), node);
@@ -5462,6 +5501,7 @@ fn a_late_acknowledgement_converges_on_a_remote_edit_made_at_the_position_l_took
     trees.set_local("n".into(), local(file(ROOT, "c", 1), 1));
     let edited = |name: &str, rev: u64| RemoteNode {
         content_rev: 3,
+        edit_rev: 3,
         ..remote_at(file(ROOT, name, 2), rev)
     };
     trees.set_remote("n".into(), edited("c", 3));
@@ -5524,6 +5564,7 @@ fn a_late_move_acknowledgement_keeps_a_later_remote_move_after_l_took_the_positi
     assert_eq!(ops(&commit), [mv("n", ROOT, "b")]);
     let edited = |name: &str, rev: u64| RemoteNode {
         content_rev: 3,
+        edit_rev: 3,
         ..remote_at(file(ROOT, name, 2), rev)
     };
     trees.set_remote("n".into(), remote_at(file(ROOT, "b", 1), 2));
@@ -5695,6 +5736,7 @@ fn a_late_create_acknowledgement_follows_a_purge_after_l_and_r_agreed_on_a_posit
     trees.set_local("n".into(), local(file(ROOT, "c", 1), 1));
     let edited = RemoteNode {
         content_rev: 9,
+        edit_rev: 9,
         ..remote_at(file(ROOT, "c", 2), 9)
     };
     trees.set_remote("n".into(), edited.clone());
@@ -5799,6 +5841,7 @@ fn a_late_acknowledgement_takes_an_agreed_position_only_where_s_can_hold_it() {
                 trees.set_local("n".into(), local(file(ROOT, "c", 1), 1));
                 let edited = RemoteNode {
                     content_rev: 4,
+                    edit_rev: 4,
                     ..remote_at(file(ROOT, "c", 3), 4)
                 };
                 trees.set_remote("n".into(), edited.clone());
@@ -5888,6 +5931,7 @@ fn a_late_acknowledgement_keeps_the_sent_content_when_s_cannot_hold_the_agreed_p
     assert_eq!(ops(&commit), [mv("n", ROOT, "b"), update("n", 2)]);
     let at = |name: &str, digest: u8, rev: u64, content_rev: u64| RemoteNode {
         content_rev,
+        edit_rev: content_rev,
         ..remote_at(file(ROOT, name, digest), rev)
     };
     trees.set_remote("n".into(), at("b", 2, 2, 2));
@@ -5966,6 +6010,7 @@ fn a_late_create_acknowledgement_after_a_rollback_keeps_an_agreement_r_still_hol
         "n".into(),
         RemoteNode {
             content_rev: 10,
+            edit_rev: 10,
             ..remote_at(file(ROOT, "c", 2), 10)
         },
     );
@@ -5999,6 +6044,7 @@ fn a_late_create_acknowledgement_after_a_rollback_drops_the_agreement_the_server
         "n".into(),
         RemoteNode {
             content_rev: 10,
+            edit_rev: 10,
             ..remote_at(file(ROOT, "c", 2), 10)
         },
     );
@@ -6035,6 +6081,7 @@ fn a_reused_revision_does_not_keep_an_agreement_the_server_lost() {
         "n".into(),
         RemoteNode {
             content_rev: 10,
+            edit_rev: 10,
             ..remote_at(file(ROOT, "c", 2), 10)
         },
     );
@@ -6044,6 +6091,7 @@ fn a_reused_revision_does_not_keep_an_agreement_the_server_lost() {
         "n".into(),
         RemoteNode {
             content_rev: 12,
+            edit_rev: 12,
             ..remote_at(file(ROOT, "b", 2), 12)
         },
     );
@@ -6215,6 +6263,7 @@ fn an_edit_made_while_an_unsent_edit_is_out_stays_unsent_when_that_edit_is_ackno
     trees.set_local("n".into(), local(file(ROOT, "n", 5), 1));
     let other = RemoteNode {
         content_rev: 4,
+        edit_rev: 4,
         ..remote(file(ROOT, "n", 5))
     };
     trees.set_remote("n".into(), other);
@@ -6226,6 +6275,7 @@ fn an_edit_made_while_an_unsent_edit_is_out_stays_unsent_when_that_edit_is_ackno
     assert_eq!(trees.unsent_edits().iter().collect::<Vec<_>>(), ["n"]);
     let resent = RemoteNode {
         content_rev: 5,
+        edit_rev: 5,
         ..remote(file(ROOT, "n", 6))
     };
     trees.set_remote("n".into(), resent);
@@ -6250,6 +6300,7 @@ fn an_edit_of_a_file_whose_chunk_list_r_leaves_out_counts_for_loss_recovery() {
     };
     let unlisted = RemoteNode {
         content_rev: 4,
+        edit_rev: 4,
         ..remote(file(ROOT, "n", 2))
     };
     let mut trees = trees(&[("n", Some(listed.clone()), Some(listed), Some(unlisted))]);
@@ -6278,6 +6329,7 @@ fn an_edit_of_a_file_in_the_trash_after_a_loss_is_kept_from_a_resend_after_a_res
     trees.settle();
     let resent = RemoteNode {
         content_rev: 4,
+        edit_rev: 4,
         ..remote_at(file(ROOT, "n", 3), 3)
     };
     trees.set_remote("n".into(), resent);
@@ -6874,6 +6926,7 @@ fn downloaded_at_5() -> (Commits, Trees, IdGen) {
     trees.set_remote("a".into(), version(remote(file(ROOT, "a", 1)), "v1"));
     let edited = RemoteNode {
         content_rev: 5,
+        edit_rev: 5,
         ..version(remote(file(ROOT, "a", 2)), "v2")
     };
     trees.set_remote("a".into(), edited);
@@ -6913,7 +6966,7 @@ fn a_download_the_server_lost_is_sent_again_over_the_version_it_replaced() {
     );
     assert_eq!(trees.class("a"), Class::Local);
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
-    assert_eq!(ops(&commit), [update("a", 2)]);
+    assert_eq!(ops(&commit), [resend("a", 2)]);
 }
 
 #[test]
@@ -6921,6 +6974,7 @@ fn a_download_the_server_lost_is_not_sent_again_over_a_later_edit() {
     let (_, mut trees, _) = downloaded_at_5();
     let later = RemoteNode {
         content_rev: 3,
+        edit_rev: 3,
         ..version(remote(file(ROOT, "a", 3)), "v3")
     };
     let commits = Commits::default();
@@ -6933,6 +6987,7 @@ fn a_download_the_server_lost_is_not_sent_again_over_a_restored_version() {
     let (commits, mut trees, _) = downloaded_at_5();
     let restored = RemoteNode {
         content_rev: 3,
+        edit_rev: 3,
         ..version(remote(file(ROOT, "a", 1)), "v1-restored")
     };
     list_after_a_loss(&mut trees, &commits, restored);
@@ -6981,6 +7036,7 @@ fn a_download_the_server_lost_is_not_sent_again_without_a_recorded_version() {
     trees.settle();
     let edited = RemoteNode {
         content_rev: 4,
+        edit_rev: 4,
         ..remote(file(ROOT, "b", 2))
     };
     trees.set_remote("b".into(), edited);
@@ -7007,6 +7063,7 @@ fn a_version_a_listing_took_r_back_from_is_not_sent_over() {
     trees.set_remote("a".into(), version(remote(file(ROOT, "a", 1)), "v1"));
     let lost = RemoteNode {
         content_rev: 5,
+        edit_rev: 5,
         ..version(remote(file(ROOT, "a", 2)), "v2")
     };
     trees.set_remote("a".into(), lost.clone());

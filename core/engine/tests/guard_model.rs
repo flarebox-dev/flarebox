@@ -760,6 +760,7 @@ fn remote(node: &ServerNode) -> RemoteNode {
         meta_rev: node.meta_rev,
         trash_group: (node.trash.as_ref()).map_or_else(String::new, |t| t.group.clone()),
         version_id: String::new(),
+        edit_rev: 1,
     }
 }
 

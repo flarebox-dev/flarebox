@@ -1207,7 +1207,7 @@ impl Run {
             let allowed: &[&str] = match kind.as_str() {
                 "create_dir" | "move" => &["node", "parent", "name"],
                 "create_file" => &["node", "parent", "name", "content"],
-                "update_content" => &["node", "content"],
+                "update_content" => &["node", "content", "resend"],
                 "delete" => &["node", "requires"],
                 "restore" => &["node", "version", "parent", "name"],
                 "empty" => &[],
@@ -1246,6 +1246,7 @@ impl Run {
                 "update_content" => op::Op::UpdateContent(UpdateContent {
                     node_id: node,
                     content: Some(req(content(), "content")?),
+                    resend: opt_bool(body, "resend")?.unwrap_or(false),
                 }),
                 "move" => op::Op::Move(Move {
                     node_id: node,
@@ -1482,6 +1483,7 @@ impl Run {
             meta_rev,
             trash_group,
             current,
+            edit_rev: _,
         } = node;
         let trash_group = if trash_group.is_empty() {
             Value::Null
@@ -1936,13 +1938,13 @@ impl Run {
         complete: bool,
     ) -> Outcome {
         if complete {
-            keys(want, "a node", NODE_FIELDS)?;
+            keys(want, "a node", &[NODE_FIELDS, &["edit_rev"]].concat())?;
             every(want, NODE_FIELDS)?;
         } else {
             keys(
                 want,
                 "a node",
-                &[NODE_FIELDS, &["absent", "content"]].concat(),
+                &[NODE_FIELDS, &["absent", "content", "edit_rev"]].concat(),
             )?;
         }
         let NodeState {
@@ -1955,6 +1957,7 @@ impl Run {
             meta_rev,
             trash_group,
             current,
+            edit_rev,
         } = got;
         let symbol = req(opt_str(want, "node"), "node")?;
         self.expect_id(space, symbol, node_id)
@@ -1990,6 +1993,11 @@ impl Run {
             && *meta_rev != rev
         {
             return Err(differs("meta_rev", meta_rev));
+        }
+        if let Some(rev) = opt_u64(want, "edit_rev")?
+            && *edit_rev != rev
+        {
+            return Err(differs("edit_rev", edit_rev));
         }
         match want.get("trash_group") {
             None => {}

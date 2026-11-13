@@ -2177,7 +2177,6 @@ fn a_resend_built_before_a_delete_reaches_the_server_yields_to_it() {
 }
 
 #[test]
-#[ignore = "a resend the server applies before a delete built without it keeps the file (GUN-552)"]
 fn a_resend_applied_before_a_delete_built_without_it_yields_to_it() {
     let mut world = converge(
         2,
@@ -2420,4 +2419,178 @@ fn the_author_of_a_lost_first_edit_sends_it_again_at_its_name() {
             .collect();
         assert_eq!(names, ["a"]);
     }
+}
+
+fn a_lost_edit_three_devices_held(lost: Step) -> World {
+    converge(3, &[vec![(0, file("a"))], vec![(0, BACKUP), (0, lost)]]).unwrap()
+}
+
+fn connect(devices: &[usize]) -> Vec<(usize, Step)> {
+    let mut steps = vec![(0, RESTORE)];
+    for &device in devices {
+        steps.push((device, Step::Connect));
+        steps.extend([(device, DELIVER); 8]);
+    }
+    steps
+}
+
+fn every_device_holds_a_file(world: &World) -> bool {
+    (world.devices.iter()).all(|device| !device.disk.entries().is_empty())
+}
+
+fn no_device_holds_a_file(world: &World) -> bool {
+    (world.devices.iter()).all(|device| device.disk.entries().is_empty())
+}
+
+#[test]
+fn the_authors_edit_sent_after_another_devices_resend_beats_a_delete_built_before_both() {
+    let mut world = a_lost_edit_three_devices_held(overwrite(0));
+    let mut steps = connect(&[1, 0, 2]);
+    steps.extend([(2, delete(0)), (2, SCAN), (2, COMMIT)]);
+    steps.extend([(1, COMMIT), (1, COMMIT)]);
+    steps.extend([(0, SCAN), (0, COMMIT), (0, COMMIT)]);
+    steps.push((2, COMMIT));
+    world.phase(2, &steps).unwrap();
+    assert!(every_device_holds_a_file(&world));
+}
+
+#[test]
+fn the_authors_edit_sent_after_another_devices_resend_revives_the_file_a_delete_trashed() {
+    let mut world = a_lost_edit_three_devices_held(overwrite(0));
+    let mut steps = connect(&[1, 0, 2]);
+    steps.extend([(2, delete(0)), (2, SCAN), (2, COMMIT)]);
+    steps.extend([(1, COMMIT), (1, COMMIT)]);
+    steps.push((2, COMMIT));
+    steps.extend([(0, SCAN), (0, COMMIT), (0, COMMIT)]);
+    world.phase(2, &steps).unwrap();
+    assert!(every_device_holds_a_file(&world));
+}
+
+#[test]
+fn the_authors_resent_edit_beats_a_delete_built_before_it() {
+    let mut world = a_lost_edit_three_devices_held(overwrite(0));
+    let mut steps = connect(&[1, 0, 2]);
+    steps.extend([(2, delete(0)), (2, SCAN), (2, COMMIT)]);
+    steps.extend([(0, SCAN), (0, COMMIT), (0, COMMIT)]);
+    steps.push((2, COMMIT));
+    world.phase(2, &steps).unwrap();
+    assert!(every_device_holds_a_file(&world));
+}
+
+fn a_delete_pulled_after_the_authors_edit(resend_first: bool) -> World {
+    let mut world = a_lost_edit_three_devices_held(overwrite(0));
+    let mut steps = connect(&[1, 0, 2]);
+    steps.extend([(2, delete(0)), (2, SCAN)]);
+    if resend_first {
+        steps.extend([(1, COMMIT), (1, COMMIT)]);
+    }
+    steps.extend([(0, SCAN), (0, COMMIT), (0, COMMIT)]);
+    steps.extend([(2, DELIVER); 8]);
+    steps.extend(commit(2));
+    world.phase(2, &steps).unwrap();
+    world
+}
+
+#[test]
+fn a_device_that_deleted_the_file_keeps_the_authors_edit_that_follows_a_resend_it_planned_against()
+{
+    assert!(every_device_holds_a_file(
+        &a_delete_pulled_after_the_authors_edit(true)
+    ));
+}
+
+#[test]
+fn a_device_that_deleted_the_file_keeps_the_authors_resent_edit_it_pulled() {
+    assert!(every_device_holds_a_file(
+        &a_delete_pulled_after_the_authors_edit(false)
+    ));
+}
+
+#[test]
+fn a_delete_planned_against_a_resend_it_pulled_trashes_the_file() {
+    let mut world = converge(
+        2,
+        &[vec![(0, file("a"))], vec![(0, BACKUP), (0, overwrite(0))]],
+    )
+    .unwrap();
+    let mut steps = vec![(0, RESTORE), (1, Step::Connect)];
+    steps.extend([(1, DELIVER); 8]);
+    steps.push((0, Step::Connect));
+    steps.extend([(0, DELIVER); 8]);
+    steps.extend([(0, delete(0)), (0, SCAN)]);
+    steps.extend([(1, COMMIT), (1, COMMIT)]);
+    steps.extend([(0, DELIVER); 8]);
+    steps.extend(commit(0));
+    steps.extend([(1, DELIVER); 8]);
+    world.phase(2, &steps).unwrap();
+    assert!(no_device_holds_a_file(&world));
+}
+
+#[test]
+#[ignore = "a resent rename beats a delete built without it (GUN-580)"]
+fn a_resent_rename_yields_to_a_delete_built_without_it() {
+    let mut world = converge(
+        2,
+        &[
+            vec![(0, file("a"))],
+            vec![(0, BACKUP), (0, rename(0, 0, "b"))],
+        ],
+    )
+    .unwrap();
+    let mut steps = vec![(0, RESTORE), (1, Step::Connect)];
+    steps.extend([(1, DELIVER); 8]);
+    steps.push((0, Step::Connect));
+    steps.extend([(0, DELIVER); 8]);
+    steps.extend([(0, delete(0)), (0, SCAN), (0, COMMIT)]);
+    steps.extend([(1, COMMIT), (1, COMMIT), (0, COMMIT)]);
+    steps.extend([(0, DELIVER); 8]);
+    steps.extend([(1, DELIVER); 8]);
+    world.phase(2, &steps).unwrap();
+    assert!(no_device_holds_a_file(&world));
+}
+
+#[test]
+fn the_author_deleting_its_own_edit_after_another_devices_resend_keeps_the_delete() {
+    let mut world = a_lost_edit_three_devices_held(overwrite(0));
+    let mut steps = connect(&[1, 0, 2]);
+    steps.extend([(1, COMMIT), (1, COMMIT)]);
+    steps.extend([(0, SCAN), (0, COMMIT), (0, COMMIT)]);
+    steps.extend([(0, delete(0)), (0, SCAN)]);
+    steps.extend([(0, DELIVER); 8]);
+    steps.extend(commit(0));
+    world.phase(2, &steps).unwrap();
+    assert!(no_device_holds_a_file(&world));
+}
+
+fn the_authors_edit_after_two_losses(resend_first: bool) -> World {
+    let mut world = a_lost_edit_three_devices_held(overwrite(0));
+    let mut first = connect(&[1, 0, 2]);
+    if resend_first {
+        first.extend([(1, COMMIT), (1, COMMIT)]);
+    }
+    first.extend([(0, SCAN), (0, COMMIT), (0, COMMIT)]);
+    first.extend([(0, DELIVER); 8]);
+    first.extend([(1, DELIVER); 8]);
+    first.extend([(2, DELIVER); 8]);
+    world.run(2, &first).unwrap();
+    world.run(3, &connect(&[0, 2])).unwrap();
+    let mut second = vec![(2, delete(0)), (2, SCAN), (2, COMMIT)];
+    second.extend([(0, SCAN), (0, COMMIT), (0, COMMIT)]);
+    second.push((2, COMMIT));
+    world.phase(3, &second).unwrap();
+    world
+}
+
+#[test]
+fn the_authors_edit_recorded_after_another_devices_resend_survives_a_second_loss_and_a_delete() {
+    assert!(every_device_holds_a_file(
+        &the_authors_edit_after_two_losses(true)
+    ));
+}
+
+#[test]
+fn the_authors_edit_survives_a_second_loss_and_a_delete() {
+    assert!(every_device_holds_a_file(
+        &the_authors_edit_after_two_losses(false)
+    ));
 }

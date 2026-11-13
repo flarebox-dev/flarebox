@@ -455,7 +455,7 @@ describe("owner claim, pairing and tokens", () => {
       version: state.storage.sql.exec("SELECT value FROM meta WHERE key = 'schema_version'").one().value,
       revoked: state.storage.sql.exec("SELECT device_id FROM revoked_devices").toArray(),
     }));
-    expect(after).toEqual({ version: 7, revoked: [{ device_id: device }] });
+    expect(after).toEqual({ version: 8, revoked: [{ device_id: device }] });
   });
 
   it("adds revoked_devices to a version-one Space database and keeps its data", async () => {
@@ -481,7 +481,7 @@ describe("owner claim, pairing and tokens", () => {
       node: state.storage.sql.exec("SELECT name FROM nodes WHERE node_id = ?", dir).toArray(),
       revoked: state.storage.sql.exec("SELECT device_id FROM revoked_devices").toArray(),
     }));
-    expect(after).toEqual({ version: 7, head: 1, commits: [{ seq: 1 }], node: [{ name: "kept" }], revoked: [{ device_id: device }] });
+    expect(after).toEqual({ version: 8, head: 1, commits: [{ seq: 1 }], node: [{ name: "kept" }], revoked: [{ device_id: device }] });
   });
 });
 
