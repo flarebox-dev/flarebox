@@ -110,6 +110,7 @@ impl Driver {
         {
             return Err(DriverError::PasswordLength);
         }
+        let auth = self.signed_in()?;
         let folders = self.status().folders;
         let (folder, names) = locate(&folders, path)?;
         let nodes = self.remote_nodes(&folder.space_id)?;
@@ -120,7 +121,6 @@ impl Driver {
                 Err(_) => DriverError::PathNotFound(path.to_owned()),
             });
         };
-        let auth = self.signed_in()?;
         let now = now_ms();
         let request = CreateShareLinkRequest {
             node_id: node_id.to_owned(),
@@ -158,8 +158,8 @@ impl Driver {
     /// Ends the link that `link` names: its [`SharedLink::id`], its URL, or the secret in its URL. Revoking a link
     /// that is already revoked changes nothing.
     pub async fn revoke_share_link(&self, link: &Secret) -> Result<Revoked, DriverError> {
-        let wanted = LinkRef::parse(&link.0).ok_or(DriverError::NotAShareLink)?;
         let auth = self.signed_in()?;
+        let wanted = LinkRef::parse(&link.0).ok_or(DriverError::NotAShareLink)?;
         let mut matched: Vec<(SpaceInfo, ShareLink)> = Vec::new();
         for (space, links) in links_by_space(&auth).await? {
             for link in links.into_iter().filter(|link| wanted.matches(link)) {
@@ -689,7 +689,7 @@ mod tests {
             .share(dir.path(), Expiry::Default, Some(Secret("é".repeat(8))))
             .await;
         assert!(
-            matches!(outcome, Err(DriverError::OutsideLinkedFolders(_))),
+            matches!(outcome, Err(DriverError::NotPaired)),
             "{outcome:?}"
         );
     }

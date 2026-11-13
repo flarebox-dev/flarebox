@@ -56,7 +56,7 @@ fn sample(arg: &clap::Arg) -> String {
             .arg(value_arg);
         probe.try_get_matches_from([value]).is_ok()
     };
-    let fits = ["x", "1", "0190f0a0-0000-7000-8000-00000000000a"]
+    let fits = ["x", "1", "7d", "0190f0a0-0000-7000-8000-00000000000a"]
         .into_iter()
         .find(parses);
     (possible.or(default))
