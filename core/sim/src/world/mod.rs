@@ -1180,13 +1180,21 @@ impl World {
         }
         let device = &mut self.devices[d];
         let batch = device.engine.effects.in_flight().to_vec();
+        let mut recovered = Vec::with_capacity(batch.len());
         for record in &batch {
-            let record = record.clone();
             let quarantined = device.disk.quarantine.contains_key(&record.effect_id);
-            let applied = device.disk.recover(&record);
-            if !resent_over_revert(&self.exposed, &self.rolled_back, &record, &applied) {
-                lost(&self.held, d, &record, &applied)?;
+            let applied = device.disk.recover(record);
+            if !resent_over_revert(&self.exposed, &self.rolled_back, record, &applied) {
+                lost(&self.held, d, record, &applied)?;
             }
+            let engine = &device.engine;
+            let refuted = matches!(
+                &applied.outcome,
+                Ok(identity) if !engine.effects.confirms(&engine.trees, &record.effect_id, identity.as_ref())
+            );
+            recovered.push((quarantined, applied, refuted));
+        }
+        for (record, (quarantined, applied, refuted)) in batch.iter().zip(recovered) {
             let Engine {
                 trees,
                 effects,
@@ -1200,10 +1208,6 @@ impl World {
                 _ => None,
             };
             let applies = record.applies(trees, commits.in_flight());
-            let refuted = matches!(
-                &applied.outcome,
-                Ok(identity) if !effects.confirms(trees, &record.effect_id, identity.as_ref())
-            );
             let reported = match applied.outcome {
                 Ok(identity) if applies && !refuted => {
                     // A file that the user made with the bytes of the download counts as the
