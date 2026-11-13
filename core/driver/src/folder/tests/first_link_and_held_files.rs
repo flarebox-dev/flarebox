@@ -17,6 +17,8 @@ fn a_first_link_records_its_proven_cause_with_the_stored_question() {
         question.kind,
         crate::QuestionKind::Recovery {
             group: crate::RecoveryGroup::CreatedOnThisDevice,
+            sent_in: None,
+            cause: None,
         }
     );
 }
@@ -38,6 +40,8 @@ fn a_first_link_holds_what_the_space_lacks_and_publishing_it_keeps_both_files_of
             question.kind,
             crate::question::QuestionKind::Recovery {
                 group: crate::question::RecoveryGroup::CreatedOnThisDevice,
+                sent_in: None,
+                cause: None,
             }
         );
         let held: Vec<_> = (question.items.iter())

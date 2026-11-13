@@ -312,10 +312,18 @@ fn errors_forget_the_commit_only_when_nothing_was_applied() {
         (Code::UnsupportedVersion, Failure::Abandoned, false),
         (Code::AheadOfServer, Failure::Resync, false),
         (Code::ReadOnly, Failure::Halted(Halt::ReadOnly), false),
-        (Code::HistoryMismatch, Failure::Halted(Halt::Recovery), true),
+        (
+            Code::HistoryMismatch,
+            Failure::Halted(Halt::Recovery(RecoveryCause::of(
+                RecoveryTrigger::SpaceRewound,
+            ))),
+            true,
+        ),
         (
             Code::StaleDeviceState,
-            Failure::Halted(Halt::Recovery),
+            Failure::Halted(Halt::Recovery(RecoveryCause::of(
+                RecoveryTrigger::StoreRolledBack,
+            ))),
             true,
         ),
     ];
@@ -356,7 +364,7 @@ fn reconnecting_compares_the_device_counter_and_the_history() {
     for w in [2, 5] {
         let mut commits = fresh();
         assert_eq!(commits.connected(&welcome(w)), Reconnect::Recovery);
-        assert_eq!(commits.halted(), Some(Halt::Recovery));
+        assert!(matches!(commits.halted(), Some(Halt::Recovery(_))));
         assert!(commits.in_flight().is_some(), "kept as evidence");
         assert_eq!(commits.connected(&welcome(1)), Reconnect::Recovery);
     }

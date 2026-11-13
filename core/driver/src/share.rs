@@ -702,6 +702,7 @@ mod tests {
             questions: 0,
             problem: None,
             wait: None,
+            recovery: None,
         }
     }
 

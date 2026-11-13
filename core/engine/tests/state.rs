@@ -9,7 +9,9 @@ use koidrive_engine::commit::{Commits, Halt, InFlight, MAX_OPS};
 use koidrive_engine::effects::{Effect, EffectRecord, Effects, Location};
 use koidrive_engine::guard::{Counted, GuardState, RemoteDeletion, Trash};
 use koidrive_engine::ids::uuid_v7;
-use koidrive_engine::question::{Answer, Held, Limit, Question, QuestionKind, Revisions};
+use koidrive_engine::question::{
+    Answer, Held, Limit, Question, QuestionKind, RecoveryCause, Revisions,
+};
 use koidrive_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
 use koidrive_engine::state::{
     Agreed, CommitsState, EffectsState, MovedHere, Pending, StateError, TreesState,
@@ -258,7 +260,7 @@ fn commits_state() -> CommitsState {
             }),
         }),
         problems: ["p".into()].into(),
-        halted: Some(Halt::Recovery),
+        halted: Some(Halt::Recovery(RecoveryCause::rewind(4, 1_700_000_000_000))),
         cap: Some(4),
         split: ["s".into()].into(),
         aliases: [("f".into(), "g".into())].into(),

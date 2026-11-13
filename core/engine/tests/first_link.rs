@@ -3,13 +3,14 @@
 //! Matching a first link's local entries against the server's tree (docs/design/sync-engine.md
 //! section 6.4).
 
-use koidrive_engine::classify::Trees;
+use koidrive_engine::classify::{Origin, Trees, Waiting};
 use koidrive_engine::commit::{Commits, Failure, Reconnect};
 use koidrive_engine::effects::{BatchLimit, Effect, Effects, Stuck, stuck};
 use koidrive_engine::first_link::adopt;
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::ignore::RuleFile;
 use koidrive_engine::question::{Answer, Question, QuestionKind, RecoveryGroup};
+use koidrive_engine::state::CommitsState;
 use koidrive_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
 use koidrive_proto::v1::{CommitResult, Error, OpResult, Welcome, error, op, op_result};
 
@@ -102,7 +103,7 @@ fn an_entry_the_server_holds_with_the_same_name_and_bytes_is_adopted() {
             ("r-a", file("r-docs", "a", 1)),
         ],
     );
-    assert_eq!(adopt(&mut trees), Vec::<String>::new());
+    assert_eq!(adopt(&mut trees, false), Vec::<String>::new());
     assert_eq!(
         local(&trees),
         [
@@ -112,6 +113,65 @@ fn an_entry_the_server_holds_with_the_same_name_and_bytes_is_adopted() {
     );
     trees.settle();
     assert!(trees.dirty().is_empty(), "{:?}", trees.dirty());
+}
+
+#[test]
+fn a_first_link_holds_an_entry_like_one_in_the_servers_trash() {
+    let mut trees = trees(
+        &[("l-a", file(ROOT, "a", 1))],
+        &[("r-b", file(ROOT, "b", 2))],
+    );
+    let trashed = RemoteNode {
+        shape: file(ROOT, "a", 1),
+        trashed: true,
+        content_rev: 1,
+        edit_rev: 1,
+        meta_rev: 1,
+        meta_edit_rev: 1,
+        trash_group: String::new(),
+        version_id: String::new(),
+    };
+    trees.set_remote("r-a".into(), trashed);
+    trees.settle();
+    let mut commits = Commits::default();
+    commits.first_link(&mut trees, &mut IdGen::new(7), NOW);
+    let held: Vec<&String> = (commits.questions().iter())
+        .flat_map(|question| question.holds())
+        .collect();
+    assert_eq!(held, ["l-a"]);
+    assert!(trees.local().get("l-a").is_some());
+}
+
+#[test]
+fn a_folder_is_adopted_under_its_pending_name_when_a_file_holds_its_name() {
+    let mut trees = trees(
+        &[("l-docs", dir(ROOT, "docs"))],
+        &[
+            ("r-file", file(ROOT, "docs", 1)),
+            ("r-docs", dir(ROOT, "docs (pending)")),
+        ],
+    );
+    assert_eq!(adopt(&mut trees, false), Vec::<String>::new());
+    assert_eq!(
+        local(&trees),
+        [("r-docs".into(), ROOT.into(), "docs".into())]
+    );
+}
+
+#[test]
+fn a_folder_two_pending_names_could_belong_to_is_held() {
+    let mut trees = trees(
+        &[("l-docs", dir(ROOT, "docs"))],
+        &[
+            ("r-one", dir(ROOT, "docs (pending)")),
+            ("r-two", dir(ROOT, "docs (pending 2)")),
+        ],
+    );
+    assert_eq!(adopt(&mut trees, false), ["l-docs"]);
+    assert_eq!(
+        local(&trees),
+        [("l-docs".into(), ROOT.into(), "docs".into())]
+    );
 }
 
 /// A folder both hold is adopted although its contents differ, and its children are matched one
@@ -133,7 +193,7 @@ fn a_shared_folder_is_adopted_and_its_children_are_matched_one_by_one() {
             ("r-theirs", file("r-docs", "theirs", 4)),
         ],
     );
-    let mut held = adopt(&mut trees);
+    let mut held = adopt(&mut trees, false);
     held.sort();
     assert_eq!(held, ["l-edited", "l-mine"]);
     assert!(trees.local().get("r-docs").is_some());
@@ -161,7 +221,7 @@ fn a_new_folder_a_name_that_only_folds_alike_and_another_kind_are_held() {
             ("r-notes", dir(ROOT, "notes")),
         ],
     );
-    let mut held = adopt(&mut trees);
+    let mut held = adopt(&mut trees, false);
     held.sort();
     assert_eq!(held, ["l-new", "l-notes", "l-report"]);
     assert!(trees.synced().iter().next().is_none());
@@ -180,7 +240,7 @@ fn an_excluded_entry_is_neither_adopted_nor_held() {
         &[("r-logs", dir(ROOT, "logs"))],
     );
     trees.set_rules(&[] as &[&str], Some(RuleFile::parse(b"*.log\n")));
-    assert_eq!(adopt(&mut trees), Vec::<String>::new());
+    assert_eq!(adopt(&mut trees, false), Vec::<String>::new());
     assert!(trees.local().get("r-logs").is_some());
     assert!(trees.local().get("l-cache").is_some());
     assert!(trees.synced().get("l-cache").is_none());
@@ -212,7 +272,9 @@ fn question(commits: &Commits) -> Question {
     assert_eq!(
         question.kind,
         QuestionKind::Recovery {
-            group: RecoveryGroup::CreatedOnThisDevice
+            group: RecoveryGroup::CreatedOnThisDevice,
+            sent_in: None,
+            cause: None,
         }
     );
     question.clone()
@@ -622,10 +684,8 @@ fn an_answer_to_a_replaced_question_changes_nothing() {
     assert!(trees.held("l-notes"));
 }
 
-/// A folder the user puts a new entry in after discarding it, before the effects removed it, is
-/// the user's again: it is neither removed nor parked, and it is sent with the entry.
 #[test]
-fn a_discarded_folder_the_user_puts_an_entry_in_is_sent_with_it() {
+fn a_discarded_folder_the_user_puts_an_entry_in_is_asked_about_again() {
     let (mut commits, mut trees, mut ids) = linked();
     let asked = question(&commits);
     assert!(commits.decide(&asked.id, Answer::Discard));
@@ -672,6 +732,10 @@ fn a_discarded_folder_the_user_puts_an_entry_in_is_sent_with_it() {
     }
     removed.sort();
     assert_eq!(removed, ["l-b", "l-inside", "l-notes"], "the folder stays");
+    assert_eq!(ops(&mut commits, &mut trees, &mut ids), []);
+    let again = question(&commits);
+    assert!(again.id != asked.id && again.answer.is_none());
+    assert!(commits.decide(&again.id, Answer::Publish));
     let mut sent = ops(&mut commits, &mut trees, &mut ids);
     sent.retain(|(_, node)| node == "l-new" || node == "l-later");
     assert_eq!(
@@ -683,10 +747,38 @@ fn a_discarded_folder_the_user_puts_an_entry_in_is_sent_with_it() {
     );
 }
 
-/// A folder whose discarded subfolder the user puts a new entry in is the user's again as well:
-/// the effects remove neither folder, and both are sent with the entry.
 #[test]
-fn a_discarded_folder_whose_subfolder_the_user_puts_an_entry_in_is_sent_with_it() {
+fn a_discarded_folder_that_already_holds_a_synced_entry_is_kept_and_sent() {
+    let mut trees = trees(
+        &[
+            ("l-new", dir(ROOT, "new")),
+            ("l-notes", file(ROOT, "notes", 9)),
+        ],
+        &[("r-notes", file(ROOT, "notes", 9))],
+    );
+    let mut commits = Commits::default();
+    let mut ids = IdGen::new(7);
+    commits.first_link(&mut trees, &mut ids, NOW);
+    trees.settle();
+    let mut moved = trees.local().get("r-notes").unwrap().clone();
+    moved.shape.parent = "l-new".into();
+    trees.set_local("r-notes".into(), moved);
+    trees.settle();
+    assert_eq!(ops(&mut commits, &mut trees, &mut ids), []);
+    let asked = question(&commits);
+    assert!(commits.decide(&asked.id, Answer::Discard));
+    assert_eq!(
+        ops(&mut commits, &mut trees, &mut ids),
+        [
+            ("create dir", "l-new".to_owned()),
+            ("move", "r-notes".to_owned())
+        ]
+    );
+    assert!(commits.questions().is_empty(), "{:?}", commits.questions());
+}
+
+#[test]
+fn a_discarded_folder_whose_subfolder_the_user_puts_an_entry_in_is_asked_about_again() {
     let mut trees = trees(
         &[
             ("l-new", dir(ROOT, "new")),
@@ -739,6 +831,10 @@ fn a_discarded_folder_whose_subfolder_the_user_puts_an_entry_in_is_sent_with_it(
     }
     touched.retain(|node| node != "r-notes");
     assert_eq!(touched, ["l-inside"], "both folders stay where they are");
+    assert_eq!(ops(&mut commits, &mut trees, &mut ids), []);
+    let again = question(&commits);
+    assert!(again.id != asked.id && again.answer.is_none());
+    assert!(commits.decide(&again.id, Answer::Publish));
     let mut sent = ops(&mut commits, &mut trees, &mut ids);
     sent.retain(|(_, node)| node != "l-inside");
     assert_eq!(
@@ -751,10 +847,8 @@ fn a_discarded_folder_whose_subfolder_the_user_puts_an_entry_in_is_sent_with_it(
     );
 }
 
-/// A discarded file the user edits before the effects removed it is the user's again, and so is
-/// the discarded folder it is in: the effects remove neither, and both are sent.
 #[test]
-fn a_discarded_file_the_user_edits_is_sent_with_its_folder() {
+fn a_discarded_file_the_user_edits_is_asked_about_again_with_its_folder() {
     let mut trees = trees(
         &[
             ("l-new", dir(ROOT, "new")),
@@ -804,6 +898,10 @@ fn a_discarded_file_the_user_edits_is_sent_with_its_folder() {
         trees.settle();
     }
     assert_eq!(touched, ["r-notes"], "the file and its folder stay");
+    assert_eq!(ops(&mut commits, &mut trees, &mut ids), []);
+    let again = question(&commits);
+    assert!(again.id != asked.id && again.answer.is_none());
+    assert!(commits.decide(&again.id, Answer::Publish));
     assert_eq!(
         ops(&mut commits, &mut trees, &mut ids),
         [
@@ -923,6 +1021,63 @@ fn a_discard_whose_s_update_waits_stays_after_a_server_loss() {
     assert!(trees.waiting().contains_key("l-A"));
     let sent = ops(&mut commits, &mut trees, &mut ids);
     assert!(!sent.iter().any(|(_, id)| id == "l-A"), "{sent:?}");
+}
+
+#[test]
+fn a_reclaimed_folder_that_cannot_leave_s_yet_keeps_its_childs_waiting_update() {
+    let mut trees = Trees::new(ROOT);
+    for (id, shape, ino) in [("f", dir(ROOT, "a"), 1), ("c", dir("f", "child"), 2)] {
+        trees.set_synced(id.into(), Some(shape.clone()));
+        trees.set_local(
+            id.into(),
+            LocalNode {
+                shape,
+                identity: FileIdentity {
+                    dev: 1,
+                    ino,
+                    birth_ns: Some(0),
+                },
+                parked: false,
+            },
+        );
+    }
+    let remote = |shape: Shape| RemoteNode {
+        shape,
+        trashed: false,
+        content_rev: 1,
+        edit_rev: 1,
+        meta_rev: 1,
+        meta_edit_rev: 1,
+        trash_group: String::new(),
+        version_id: String::new(),
+    };
+    trees.set_remote("p".into(), remote(dir(ROOT, "a")));
+    trees.set_remote("c".into(), remote(dir("p", "child")));
+    trees.settle();
+    let mut state = trees.state();
+    state.discarded.insert("f".into(), dir(ROOT, "a"));
+    let waiting = Waiting {
+        shape: Some(dir("p", "child")),
+        origin: Origin::Commit(7),
+    };
+    state.waiting.insert("c".into(), waiting.clone());
+    trees.restore(state).unwrap();
+    trees.rules_scanned();
+    assert!(trees.reclaimed("f"));
+    let mut commits = Commits::from_state(CommitsState {
+        accepted: 7,
+        ..Default::default()
+    })
+    .unwrap();
+    commits.build(
+        &mut trees,
+        &mut IdGen::new(7),
+        1_794_268_740_000,
+        "history",
+        1,
+    );
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(trees.waiting().get("c"), Some(&waiting));
 }
 
 #[test]

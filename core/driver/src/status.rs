@@ -3,6 +3,9 @@
 //! What the driver reports about itself: the signed-in device and each linked folder. The CLI prints it and the
 //! macOS app will map it onto its `SessionState`.
 
+use std::time::{Duration, UNIX_EPOCH};
+
+use koidrive_engine::question::{RecoveryCause, RecoveryTrigger};
 use serde::{Deserialize, Serialize};
 
 use crate::update::Update;
@@ -62,6 +65,34 @@ pub struct FolderStatus {
     /// long or keeps failing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait: Option<Wait>,
+    /// Why the folder is recovering (design §6.4), while it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<RecoveryCause>,
+}
+
+/// What a person reads about `cause`.
+pub fn describe(cause: &RecoveryCause) -> String {
+    match (cause.trigger, cause.restore_seq, cause.restore_point_ms) {
+        (RecoveryTrigger::SpaceRewound, Some(seq), Some(requested)) => {
+            let at = UNIX_EPOCH + Duration::from_millis(requested.unsigned_abs());
+            let seconds = requested.unsigned_abs() / 1_000 % 86_400;
+            format!(
+                "the space was rewound on the server to seq {seq} (requested {} {:02}:{:02} UTC)",
+                koidrive_fs::utc_date(at),
+                seconds / 3_600,
+                seconds / 60 % 60
+            )
+        }
+        (RecoveryTrigger::SpaceRewound, ..) => {
+            "the space was rewound or restored on the server".into()
+        }
+        (RecoveryTrigger::StoreRolledBack, ..) => {
+            "the folder's sync state is older than its history on the server".into()
+        }
+        (RecoveryTrigger::StoreOlderThanDisk, ..) => {
+            "the folder's sync state is older than the files on disk".into()
+        }
+    }
 }
 
 /// A call a folder sends again later, after the server put it off or it kept failing.

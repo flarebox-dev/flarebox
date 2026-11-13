@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use koidrive_chunk::{ChunkerConfig, chunks, content};
 use koidrive_engine::classify::Trees;
+use koidrive_engine::commit::Halt as CommitHalt;
 use koidrive_engine::effects::{Base as EngineBase, Dir as EngineDir};
 use koidrive_engine::state::{EffectsState, TreesState};
 use koidrive_engine::tree::{FileIdentity, Kind, LocalNode, Shape};
@@ -1175,41 +1176,46 @@ fn a_marker_one_above_with_an_effect_in_flight_is_recovered() {
 }
 
 #[test]
-fn a_marker_above_what_the_store_accounts_for_keeps_every_trace() {
+fn a_marker_above_what_the_store_accounts_for_continues_from_the_marker_and_recovers() {
     let (folder, _, effect_id) = three_cleared_and_one_in_flight();
     set_marker(&folder.root, 6);
-    fs::create_dir_all(folder.private(STAGING_DIR)).unwrap();
-    fs::write(folder.private(STAGING_DIR).join(&effect_id), b"staged").unwrap();
     fs::create_dir_all(folder.private(QUARANTINE_DIR)).unwrap();
     fs::write(folder.private(QUARANTINE_DIR).join(&effect_id), SYNCED).unwrap();
-    let before = tree(&folder.root);
-    assert!(matches!(
-        folder.start(no_hook()),
-        Err(Stop::StoreBehind {
-            marker: 6,
-            upper: 4
-        })
-    ));
-    assert_eq!(tree(&folder.root), before);
-    let (_, engine) = folder.open();
+    let report = fs::read(folder.root.join("report.txt")).ok();
+    let running = folder.start(no_hook()).unwrap();
+    assert_eq!(running.engine.effects.cleared(), 6);
+    assert!(running.engine.effects.in_flight().is_empty());
+    assert_eq!(folder.marker(), 6);
+    assert_eq!(fs::read(folder.root.join("report.txt")).ok(), report);
     assert_eq!(
-        engine
-            .effects
-            .in_flight()
-            .first()
-            .map(|record| &record.effect_id),
-        Some(&effect_id)
+        fs::read_dir(folder.private(QUARANTINE_DIR))
+            .unwrap()
+            .count(),
+        0
     );
+    let back: Vec<Vec<u8>> = (fs::read_dir(&folder.root).unwrap())
+        .map(|entry| entry.unwrap())
+        .filter(|entry| entry.file_name().to_string_lossy().contains(" (recovered "))
+        .map(|entry| fs::read(entry.path()).unwrap())
+        .collect();
+    assert_eq!(back, [SYNCED]);
+    drop(running);
+    let (_, engine) = folder.open();
+    assert_eq!(engine.effects.cleared(), 6);
+    assert!(engine.effects.in_flight().is_empty());
+    assert!(matches!(
+        engine.commits.halted(),
+        Some(CommitHalt::Recovery(_))
+    ));
 
     let idle = Folder::new();
     idle.seed(&[], &[], 3);
     set_marker(&idle.root, 4);
+    let running = idle.start(no_hook()).unwrap();
+    assert_eq!(running.engine.effects.cleared(), 4);
     assert!(matches!(
-        idle.start(no_hook()),
-        Err(Stop::StoreBehind {
-            marker: 4,
-            upper: 3
-        })
+        running.engine.commits.halted(),
+        Some(CommitHalt::Recovery(_))
     ));
 }
 

@@ -980,6 +980,62 @@ fn nothing_is_recovered_from_a_folder_moved_out_of_the_root() {
     assert_eq!(names, [PRIVATE_DIR]);
 }
 
+#[test]
+fn every_parked_entry_is_moved_to_the_root_under_a_recovered_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    let space = Space::bind(open_root(&root).unwrap(), &root).unwrap();
+    space.private(&[PARKED_DIR]).unwrap();
+    let parked = root.join(PRIVATE_DIR).join(PARKED_DIR);
+    fs::create_dir(parked.join("n1")).unwrap();
+    fs::write(parked.join("n1/inside.txt"), "kept").unwrap();
+    fs::write(parked.join("n2"), "also kept").unwrap();
+
+    let now = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let name = |parked: &std::ffi::OsStr, _| match parked.to_str() {
+        Some("n1") => "docs".into(),
+        _ => parked.to_owned(),
+    };
+    let mut moved = space.bring_back_all(name, now).unwrap();
+    moved.sort();
+
+    let docs = recovered::recovered_name("docs".as_ref(), true, "2023-11-14", 1);
+    let n2 = recovered::recovered_name("n2".as_ref(), false, "2023-11-14", 1);
+    assert_eq!(moved, [PathBuf::from(&docs), PathBuf::from(&n2)]);
+    assert_eq!(
+        fs::read(root.join(&docs).join("inside.txt")).unwrap(),
+        b"kept"
+    );
+    assert_eq!(fs::read(root.join(&n2)).unwrap(), b"also kept");
+    assert_eq!(fs::read_dir(&parked).unwrap().count(), 0);
+}
+
+#[test]
+fn an_entry_an_effect_left_in_quarantine_is_moved_to_the_root_under_its_recovered_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    let space = Space::bind(open_root(&root).unwrap(), &root).unwrap();
+    space.private(&[QUARANTINE_DIR]).unwrap();
+    let quarantine = root.join(PRIVATE_DIR).join(QUARANTINE_DIR);
+    fs::write(quarantine.join("effect-7"), "displaced").unwrap();
+    let ino =
+        std::os::unix::fs::MetadataExt::ino(&fs::metadata(quarantine.join("effect-7")).unwrap());
+
+    let now = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let name = |held: &std::ffi::OsStr, id: FileId| match id.ino == u128::from(ino) {
+        true => "notes.txt".into(),
+        false => held.to_owned(),
+    };
+    let moved = space.bring_back_all(name, now).unwrap();
+
+    let notes = recovered::recovered_name("notes.txt".as_ref(), false, "2023-11-14", 1);
+    assert_eq!(moved, [PathBuf::from(&notes)]);
+    assert_eq!(fs::read(root.join(&notes)).unwrap(), b"displaced");
+    assert_eq!(fs::read_dir(&quarantine).unwrap().count(), 0);
+}
+
 #[derive(Clone, Default)]
 struct Lines(std::sync::Arc<std::sync::Mutex<BTreeMap<PathBuf, Vec<u8>>>>);
 

@@ -233,6 +233,15 @@ impl Effects {
         *self.cleared
     }
 
+    /// Continues from the root marker's count `marker` when the store is older than the disk
+    /// (sections 2.8 and 6.4). The disk carried out every effect it counts, the one in flight
+    /// included, so none is recovered, and what they did is read from the disk by the next scan.
+    pub fn catch_up(&mut self, marker: u64) {
+        self.in_flight.set(Vec::new());
+        self.failed.clear();
+        self.cleared.set(marker);
+    }
+
     /// The nodes whose last effect failed, with that effect. Each stays blocked until the effect
     /// planned for it differs, or until [`Effects::unblock`].
     pub fn blocked(&self) -> &BTreeMap<NodeId, Effect> {
@@ -1149,7 +1158,7 @@ impl<'a> View<'a> {
 
     fn parkable(&self, id: &str) -> bool {
         let trees = self.trees;
-        (candidate(trees, id) || trees.waiting().contains_key(id))
+        (candidate(trees, id) || trees.waiting().contains_key(id) || trees.reclaimed(id))
             && !trees.excluded(id)
             && !trees.held(id)
             && trees.local().get(id).is_some_and(|node| {

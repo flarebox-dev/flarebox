@@ -516,7 +516,11 @@ fn a_held_file_changed_on_the_server_leaves_the_question_and_is_downloaded() {
 fn nothing_is_counted_while_committing_has_stopped() {
     let mut trees = space(10, 15);
     let mut commits = Commits::from_state(CommitsState {
-        halted: Some(koidrive_engine::commit::Halt::Recovery),
+        halted: Some(koidrive_engine::commit::Halt::Recovery(
+            koidrive_engine::question::RecoveryCause::of(
+                koidrive_engine::question::RecoveryTrigger::StoreRolledBack,
+            ),
+        )),
         ..Default::default()
     })
     .unwrap();
@@ -526,8 +530,6 @@ fn nothing_is_counted_while_committing_has_stopped() {
     assert!(commits.state().guard.ledger.is_empty());
 }
 
-/// An open question of another kind, as GUN-324's first-link hold will ask, holding `d` and
-/// everything below it.
 fn recovery_question(trees: &Trees) -> CommitsState {
     let members = (trees.synced().iter())
         .filter(|(id, _)| id.as_str() == "d" || id.starts_with("d/"))
@@ -539,6 +541,8 @@ fn recovery_question(trees: &Trees) -> CommitsState {
             asked_at_ms: NOW,
             kind: QuestionKind::Recovery {
                 group: RecoveryGroup::ChangedOnThisDevice,
+                sent_in: None,
+                cause: None,
             },
             held: [("d".into(), Held { members, files: 15 })].into(),
             answer: None,
@@ -563,13 +567,13 @@ fn nodes_an_open_question_of_any_kind_holds_get_no_op_and_are_not_counted() {
 }
 
 #[test]
-fn an_answer_to_a_kind_the_engine_does_not_take_yet_changes_nothing() {
+fn an_answer_a_recovery_question_does_not_offer_changes_nothing() {
     let trees = space(10, 15);
     let state = recovery_question(&trees);
     let mut commits = Commits::from_state(state.clone()).unwrap();
 
-    assert!(!commits.decide("other", Answer::Publish));
     assert!(!commits.decide("other", Answer::Delete));
+    assert!(!commits.decide("other", Answer::Keep));
     assert_eq!(commits.state(), state);
 }
 

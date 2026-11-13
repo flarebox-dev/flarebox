@@ -37,6 +37,20 @@ pub struct RecoveryCause {
     pub restore_point_ms: Option<i64>,
 }
 
+impl From<&koidrive_engine::question::RecoveryCause> for RecoveryCause {
+    fn from(cause: &koidrive_engine::question::RecoveryCause) -> Self {
+        use koidrive_engine::question::RecoveryTrigger as Engine;
+        RecoveryCause {
+            trigger: match cause.trigger {
+                Engine::SpaceRewound => RecoveryTrigger::SpaceRewound,
+                Engine::StoreRolledBack => RecoveryTrigger::StoreRolledBack,
+                Engine::StoreOlderThanDisk => RecoveryTrigger::StoreOlderThanDisk,
+            },
+            restore_point_ms: cause.restore_point_ms,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryTrigger {

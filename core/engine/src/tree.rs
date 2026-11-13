@@ -314,3 +314,9 @@ impl<N: Node> Tree<N> {
         false
     }
 }
+
+pub(crate) fn pending_stem(name: &str) -> Option<&str> {
+    let (stem, suffix) = name.rsplit_once(" (pending")?;
+    let n = suffix.strip_suffix(')')?.trim_start();
+    (n.is_empty() || n.parse::<u32>().is_ok_and(|n| n > 1)).then_some(stem)
+}

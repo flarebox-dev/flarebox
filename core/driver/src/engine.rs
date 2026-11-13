@@ -13,7 +13,7 @@ use std::hash::BuildHasher;
 use std::path::{Component, Path, PathBuf};
 
 use koidrive_engine::classify::Trees;
-use koidrive_engine::commit::{Base, Commits};
+use koidrive_engine::commit::{Base, Commits, Halt};
 use koidrive_engine::effects::Effects;
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::question as engine;
@@ -323,6 +323,12 @@ impl Engine {
         if let engine::QuestionKind::Conflict { sent_in, .. } = &mut kind {
             *sent_in = None;
         }
+        let recovery_cause = match &asked.kind {
+            engine::QuestionKind::Recovery {
+                cause: Some(cause), ..
+            } => Some(cause.into()),
+            _ => recovery_cause,
+        };
         Ok(Question {
             id: asked.id.clone(),
             space_id: space_id.to_owned(),
@@ -516,7 +522,8 @@ impl Engine {
         }
         let commits = &self.commits;
         (self.trees).listed_removals(removed, |seq| commits.listed_here(seq));
-        if behind {
+        let recovering = matches!(self.commits.halted(), Some(Halt::Recovery(_)));
+        if behind && !recovering {
             (self.trees).forget_lost(
                 trashed,
                 edited,
@@ -541,7 +548,9 @@ impl Engine {
             ahead_of_server: false,
         };
         tx.set_cursor(&cursor)?;
-        self.commits.acknowledge(&mut self.trees, cursor.last_seq);
+        if !recovering {
+            self.commits.acknowledge(&mut self.trees, cursor.last_seq);
+        }
         self.cursor = Some(cursor);
         Ok(())
     }
@@ -1446,8 +1455,8 @@ pub(crate) fn file_id(identity: FileIdentity) -> FileId {
 fn same_kind(before: &engine::QuestionKind, after: &engine::QuestionKind) -> bool {
     match (before, after) {
         (
-            engine::QuestionKind::Recovery { group: a },
-            engine::QuestionKind::Recovery { group: b },
+            engine::QuestionKind::Recovery { group: a, .. },
+            engine::QuestionKind::Recovery { group: b, .. },
         ) => a == b,
         (
             engine::QuestionKind::Conflict { original, copy, .. },
@@ -1741,6 +1750,8 @@ mod tests {
                 asked_at_ms: 1,
                 kind: engine::QuestionKind::Recovery {
                     group: engine::RecoveryGroup::CreatedAfterRestorePoint,
+                    sent_in: None,
+                    cause: None,
                 },
                 held: BTreeMap::new(),
                 answer: None,

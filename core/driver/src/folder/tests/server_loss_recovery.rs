@@ -964,42 +964,6 @@ fn a_commit_the_session_did_not_send_again_to_a_server_that_lost_commits_waits_f
     assert_eq!(a.state(), FolderState::UpToDate);
 }
 
-/// The store is put back to a copy taken before the folder downloaded a file, and the server's storage is restored
-/// from before this device's commit, so the server counts fewer commits than the store and the store is older than
-/// the disk. The root marker shows the latter when the folder opens, before any \`Welcome\`, and the task stops for
-/// recovery instead of sending what the store holds.
-#[test]
-fn a_store_older_than_the_disk_stops_for_recovery_even_when_the_server_lost_its_commits() {
-    let mut remote = Remote::new();
-    let (site, mut a) = linked(&mut remote, "a");
-    a.create(&mut remote, &site.root.join("one.txt"), b"one");
-    drop(a);
-    let copy = site.db.with_extension("copy");
-    fs::copy(&site.db, &copy).unwrap();
-    let (other, mut b) = linked(&mut remote, "b");
-    b.create(&mut remote, &other.root.join("two.txt"), b"two");
-    let mut a = site.start();
-    a.connect(&remote);
-    a.run(&mut remote);
-    a.settle();
-    a.run(&mut remote);
-    assert_eq!(names(&site.root), ["one.txt", "two.txt"]);
-    drop(a);
-    fs::copy(&copy, &site.db).unwrap();
-    let restored = Remote::new();
-    assert_eq!(restored.space.welcome(&site.caller).device_seq, 0);
-
-    let lock = claim::lock(&site.root)
-        .unwrap()
-        .expect("the folder is not locked");
-    let local = local_rules(&SyncRules::default()).unwrap();
-    match Folder::open(site.link.clone(), &lock, &site.db, local) {
-        Err(Stop::StoreBehind { .. }) => {}
-        Err(stop) => panic!("{stop}"),
-        Ok(_) => panic!("the folder opened with a store older than the disk"),
-    }
-}
-
 #[test]
 fn an_edit_whose_commit_is_abandoned_after_the_server_reported_a_loss_is_sent_again() {
     let mut remote = Remote::new();

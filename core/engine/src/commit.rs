@@ -15,7 +15,11 @@ use crate::first_link;
 use crate::guard::{self, Guard, RemoteRemoval};
 use crate::ids::{IdGen, unix_ms};
 use crate::names::{MAX_NAME_BYTES, name_key, nfc};
-use crate::question::{Answer, ConflictFile, Question, QuestionKind, Revisions};
+use crate::question::{
+    Answer, ConflictFile, Question, QuestionKind, RecoveryCause, RecoveryGroup, RecoveryTrigger,
+    Revisions,
+};
+use crate::recovery;
 use crate::restore::{Outcome, RESOLVED_KEPT, Rejection, Resolved, RestoreId, RestoreIntent};
 use crate::state::{Agreed, CommitsChanges, CommitsState, Pending, StateError};
 use crate::tracked::{Marked, TrackedMap, TrackedSet};
@@ -82,7 +86,7 @@ pub enum Halt {
     ReadOnly,
     /// The store cannot account for the server's state (sections 2.8 and 6.4). The commit in flight
     /// is kept as evidence and nothing is planned from this store.
-    Recovery,
+    Recovery(RecoveryCause),
     /// A policy halt (RFC 0006 section 1): the server refused the commit with `code`, which only
     /// the user or a client update can resolve. The commit in flight is kept with its slot and
     /// never resent, nothing more is planned, and downloads continue. No `Welcome` lifts it, and
@@ -499,10 +503,106 @@ impl Commits {
         if trees.remote().iter().all(|(_, node)| node.trashed) {
             return;
         }
-        let tops = first_link::adopt(trees);
-        if let Some(question) = first_link::ask(trees, tops, None, ids, now_ms) {
+        let tops = first_link::adopt(trees, false);
+        if let Some(question) = first_link::ask(trees, tops, None, None, ids, now_ms) {
             self.questions.get_mut().push(question);
         }
+        self.hold(trees);
+    }
+
+    /// Stops committing for a recovery (section 6.4). The commit in flight is never sent again, and
+    /// nothing is planned until [`Commits::recover`].
+    pub fn enter_recovery(&mut self, cause: RecoveryCause) {
+        self.halted.set(Some(Halt::Recovery(cause)));
+    }
+
+    /// Recovers once R holds the server's tree in the history the device recovers into, and L a
+    /// scan of the disk (section 6.4). `device_seq` is the server's count of this device's commits
+    /// there, which the next commit continues. The commit in flight is dropped: the tree changes it
+    /// carried are still differences between L and S. Every node is classified by whether this
+    /// device changed it since S. What is certain is left to the planner, and the rest is held, one
+    /// question per group, with S kept as it was, so a held node is classified again against the
+    /// same S whenever L or R changes. A restore asked for before the reset that R shows done ends
+    /// as restored, and the others are held under one question.
+    pub fn recover(
+        &mut self,
+        trees: &mut Trees,
+        device_seq: u64,
+        cause: &RecoveryCause,
+        ids: &mut IdGen,
+        now_ms: u64,
+    ) {
+        self.halted.set(None);
+        self.in_flight.set(None);
+        self.accepted.set(device_seq);
+        self.slots.clear();
+        self.problems.clear();
+        self.cap.set(None);
+        self.split.clear();
+        self.aliases.clear();
+        self.published.clear();
+        trees.rewound();
+        (self.questions.get_mut())
+            .retain(|question| matches!(question.kind, QuestionKind::RemoteMassDelete { .. }));
+        first_link::adopt(trees, true);
+        let agreed: Vec<(NodeId, Option<Shape>)> = (trees.local().iter().map(|(id, _)| id))
+            .chain(trees.synced().iter().map(|(id, _)| id))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|id| {
+                let local = trees.local().get(id).map(|node| &node.shape);
+                let live = trees.remote().live(id);
+                let last = trees.remote().get(id).map(|node| &node.shape);
+                let shape = if same(local, live) {
+                    live
+                } else if local.is_some() && same(local, last) {
+                    last
+                } else {
+                    return None;
+                };
+                Some((id.clone(), shape.cloned()))
+            })
+            .collect();
+        for (id, shape) in &agreed {
+            trees.sent_edit(id, shape.as_ref().and_then(|shape| shape.content.as_ref()));
+        }
+        let agreed = (agreed.into_iter()).filter(|(id, shape)| {
+            !same(trees.synced().live(id), shape.as_ref()) && trees.waiting().get(id).is_none()
+        });
+        for (id, shape) in update_synced(trees, agreed.collect()) {
+            trees.wait(id, shape, Origin::Other);
+        }
+        let mut groups = recovery::classify(trees);
+        if let Some(created) = groups.remove(&RecoveryGroup::CreatedOnThisDevice) {
+            let tops = (created.iter())
+                .filter(|id| {
+                    let parent = &trees.local().get(id).expect("created here").shape.parent;
+                    !created.contains(parent)
+                })
+                .cloned();
+            let question = first_link::ask(
+                trees,
+                tops.collect::<Vec<_>>(),
+                None,
+                Some(cause),
+                ids,
+                now_ms,
+            );
+            self.questions.get_mut().extend(question);
+        }
+        for (group, nodes) in groups {
+            let question = recovery::ask(trees, group, &nodes, None, Some(cause), ids, now_ms);
+            self.questions.get_mut().extend(question);
+        }
+        let done: Vec<RestoreId> = (self.restores.iter())
+            .filter(|(_, intent)| recovery::done(trees, intent))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in done {
+            self.resolve(id, Outcome::Restored);
+        }
+        let intents = recovery::ask_intents(self.restores.keys(), Some(cause), ids, now_ms);
+        self.questions.get_mut().extend(intents);
         self.hold(trees);
     }
 
@@ -539,7 +639,8 @@ impl Commits {
                     QuestionKind::MassDelete { .. }
                         | QuestionKind::RemoteMassDelete { .. }
                         | QuestionKind::Conflict { .. }
-                ) || first_link::asks(question))
+                        | QuestionKind::Recovery { .. }
+                ))
         }) else {
             return false;
         };
@@ -613,46 +714,193 @@ impl Commits {
         }
     }
 
-    fn ask_again(&mut self, trees: &mut Trees, ids: &mut IdGen, now_ms: u64) {
+    fn ask_again(&mut self, trees: &mut Trees, ids: &mut IdGen, now_ms: u64) -> Vec<NodeId> {
         let shows = |question: &Question| first_link::asks(question) && !question.shown.is_empty();
-        let Some(index) = self.questions.iter().position(shows) else {
-            return;
-        };
-        let asked = &self.questions[index];
-        let held = asked.holds().cloned().collect::<Vec<_>>();
-        match first_link::ask(trees, held, Some(asked), ids, now_ms) {
-            Some(question) if question.answer.is_none() => {
-                self.questions.get_mut()[index] = question
+        let mut left = Vec::new();
+        let mut index = 0;
+        while index < self.questions.len() {
+            if !shows(&self.questions[index]) {
+                index += 1;
+                continue;
             }
-            Some(question) => {
-                self.questions.get_mut().remove(index);
-                if question.answer == Some(Answer::Discard) {
-                    trees.discard(question.shown.clone());
-                    let updates = (question.shown.into_iter())
-                        .map(|(id, shape)| (id, Some(shape)))
-                        .collect();
-                    for (id, shape) in update_synced(trees, updates) {
-                        trees.wait(id, shape, Origin::Other);
-                    }
-                } else {
-                    self.published.extend(question.shown.into_keys());
+            let asked = &self.questions[index];
+            let held = asked.holds().cloned().collect::<Vec<_>>();
+            let question =
+                first_link::ask(trees, held.clone(), Some(asked), asked.cause(), ids, now_ms);
+            match (asked.cause(), &question) {
+                (None, _) => {}
+                (Some(_), Some(question)) => left.extend(
+                    (held.into_iter()).filter(|id| !question.holds().any(|held| held == id)),
+                ),
+                (Some(_), None) => left.extend(held),
+            }
+            match question {
+                Some(question) if question.answer.is_none() => {
+                    self.questions.get_mut()[index] = question;
+                    index += 1;
                 }
-            }
-            None => {
-                self.questions.get_mut().remove(index);
+                Some(question) => {
+                    self.questions.get_mut().remove(index);
+                    if question.answer == Some(Answer::Discard) {
+                        let shown: BTreeSet<NodeId> = question.shown.keys().cloned().collect();
+                        trees.discard(shown.iter().cloned(), &question.shown);
+                        let updates = (question.shown.into_iter())
+                            .map(|(id, shape)| (id, Some(shape)))
+                            .collect();
+                        for (id, shape) in update_synced(trees, updates) {
+                            trees.wait(id, shape, Origin::Other);
+                        }
+                        trees.reclaim(|id| shown.contains(id));
+                    } else {
+                        self.published.extend(question.shown.into_keys());
+                    }
+                }
+                None => {
+                    self.questions.get_mut().remove(index);
+                }
             }
         }
         self.hold(trees);
+        left
+    }
+
+    /// Classifies the nodes the recovery questions hold again, against the same S (section 6.4).
+    /// A node a certain case now applies to leaves its question, one whose group changed moves to
+    /// that group's question, and a question that holds other nodes, or the same nodes at other
+    /// revisions or shapes, is asked again under a new ID without its answer. A question that
+    /// still holds what it showed is carried out when it has an answer, and returned: the commit
+    /// that sends it carries the precondition that the head is still its base. No commit is in
+    /// flight here, so an answer sent in one that the server refused or that was dropped is
+    /// asked again.
+    fn ask_recovery(
+        &mut self,
+        trees: &mut Trees,
+        cause: Option<RecoveryCause>,
+        left: Vec<NodeId>,
+        ids: &mut IdGen,
+        now_ms: u64,
+    ) -> Vec<Question> {
+        let mut asked: BTreeMap<RecoveryGroup, Question> = BTreeMap::new();
+        let mut groups = recovery::regroup(trees, left);
+        groups.remove(&RecoveryGroup::CreatedOnThisDevice);
+        let mut intents = None;
+        for mut question in std::mem::take(self.questions.get_mut()) {
+            let QuestionKind::Recovery { group, sent_in, .. } = &mut question.kind else {
+                self.questions.get_mut().push(question);
+                continue;
+            };
+            let group = *group;
+            if group == RecoveryGroup::CreatedOnThisDevice {
+                self.questions.get_mut().push(question);
+                continue;
+            }
+            if sent_in.take().is_some() {
+                question.answer = None;
+            }
+            if group == RecoveryGroup::RequestedBeforeReset {
+                intents = Some(question);
+                continue;
+            }
+            for id in question.holds() {
+                let Some(now) = recovery::group(trees, id) else {
+                    continue;
+                };
+                let now = match now {
+                    RecoveryGroup::CreatedOnThisDevice => group,
+                    now => now,
+                };
+                groups.entry(now).or_default().insert(id.clone());
+            }
+            asked.entry(group).or_insert(question);
+        }
+        let owned: BTreeSet<NodeId> = (self.questions.iter())
+            .filter(|question| first_link::asks(question))
+            .flat_map(|question| question.held.values().flat_map(|item| item.members.keys()))
+            .cloned()
+            .collect();
+        for nodes in groups.values_mut() {
+            nodes.retain(|id| !owned.contains(id));
+        }
+        let mut updates = Vec::new();
+        let mut released = Vec::new();
+        for (group, nodes) in groups {
+            let Some(question) = recovery::ask(
+                trees,
+                group,
+                &nodes,
+                asked.get(&group),
+                cause.as_ref(),
+                ids,
+                now_ms,
+            ) else {
+                continue;
+            };
+            let Some(answer) = question.answer else {
+                self.questions.get_mut().push(question);
+                continue;
+            };
+            match answer {
+                Answer::Discard => trees.discard(question.holds().cloned(), &question.shown),
+                Answer::Publish | Answer::Keep => trees.approve(question.holds().cloned()),
+                _ => {}
+            }
+            updates.extend(recovery::release(trees, &question, answer));
+            if matches!(answer, Answer::Publish | Answer::Keep | Answer::Delete) {
+                released.push(question);
+            }
+        }
+        if let Some(question) = intents {
+            let queued: Vec<RestoreId> = (question.held.keys())
+                .filter(|id| self.restores.contains_key(*id))
+                .cloned()
+                .collect();
+            match question.answer {
+                Some(Answer::Cancel) => {
+                    for id in queued {
+                        self.resolve(id, Outcome::Rejected(Rejection::Cancelled));
+                    }
+                }
+                Some(Answer::Repeat) if !queued.is_empty() => released.push(question),
+                None if !queued.is_empty() => self.questions.get_mut().push(question),
+                _ => {}
+            }
+        }
+        for (id, shape) in update_synced(trees, updates) {
+            trees.wait(id, shape, Origin::Other);
+        }
+        self.hold(trees);
+        released
+    }
+
+    /// Keeps each answered question of `answered` for the members no acknowledged commit carried
+    /// out yet: a node a group still holds, or a restore still queued. Its answer stays bound to
+    /// what the person was shown, so the next build sends them only while that still holds.
+    fn keep_unsent(&mut self, trees: &Trees, answered: Vec<Question>) {
+        for question in answered {
+            let intents = matches!(
+                question.kind,
+                QuestionKind::Recovery {
+                    group: RecoveryGroup::RequestedBeforeReset,
+                    ..
+                }
+            );
+            let kept = |id: &str| match intents {
+                true => self.restores.contains_key(id),
+                false => recovery::group(trees, id).is_some(),
+            };
+            let kept = recovery::narrow(trees, question, kept);
+            self.questions.get_mut().extend(kept);
+        }
     }
 
     /// Tells the trees which local entries the open questions hold ([`Question::shown`],
     /// [`Trees::set_asked`]). The planner does whenever its questions change; a caller that
     /// restores it from a state calls this.
     pub fn hold(&self, trees: &mut Trees) {
-        let shown = self
-            .questions
-            .iter()
-            .flat_map(|question| question.shown.keys());
+        let shown = (self.questions.iter()).flat_map(|question| {
+            let held = recovery::asks(question).then(|| question.holds());
+            question.shown.keys().chain(held.into_iter().flatten())
+        });
         trees.set_asked(shown.cloned().collect());
     }
 
@@ -763,14 +1011,26 @@ impl Commits {
         if self.halted.is_some() || !trees.rules_known() {
             return None;
         }
-        self.ask_again(trees, ids, now_ms);
-        trees.reclaim();
+        let cause = self.questions.iter().find_map(Question::cause).cloned();
+        let left = self.ask_again(trees, ids, now_ms);
+        let released = self.ask_recovery(trees, cause, left, ids, now_ms);
+        let reclaimed = trees.reclaim(|_| true);
+        if let Some(question) = first_link::ask(trees, reclaimed, None, cause.as_ref(), ids, now_ms)
+        {
+            self.questions.get_mut().push(question);
+            self.hold(trees);
+        }
         let waiting = (trees.waiting().keys()).filter(|id| !changed_locally(trees, id));
         let mut skip: BTreeSet<NodeId> = self
             .problems
             .iter()
             .chain(waiting)
             .chain(parked_until_moved(trees))
+            .chain(
+                (self.questions.iter())
+                    .filter(|q| recovery::asks(q) || first_link::asks(q))
+                    .flat_map(Question::holds),
+            )
             .cloned()
             .collect();
         let (needed, agreed) = rebase(trees, ids, now_ms, &skip);
@@ -821,6 +1081,16 @@ impl Commits {
         self.aliases
             .retain(|id, _| trees.local().get(id).is_some() && trees.reverted().contains(id));
         self.retire_pending(trees);
+        let intents = RecoveryGroup::RequestedBeforeReset;
+        let held_restores: BTreeSet<&RestoreId> = (self.questions.iter())
+            .filter(|question| matches!(question.kind, QuestionKind::Recovery { group, .. } if group == intents))
+            .flat_map(|question| question.held.keys())
+            .collect();
+        let restores = (self.restores.iter())
+            .filter(|(id, _)| !held_restores.contains(id))
+            .map(|(id, intent)| (id.clone(), intent.clone()))
+            .collect();
+        let answers = released.iter().flat_map(Question::holds).cloned().collect();
         let (planned, deletes, reverts, pending) = plan(
             trees,
             &skip,
@@ -829,8 +1099,9 @@ impl Commits {
             &answered,
             &self.split,
             &self.aliases,
-            &self.restores,
+            &restores,
             &self.pending,
+            &answers,
         );
         for id in reverts {
             trees.revert(id);
@@ -838,6 +1109,7 @@ impl Commits {
         self.pending.extend(pending);
         let ops: Vec<proto::Op> = planned.into_iter().chain(answered).collect();
         if ops.is_empty() {
+            self.keep_unsent(trees, released);
             return None;
         }
         trees.watch_content(ops.iter().filter_map(|op| match &op.op {
@@ -851,8 +1123,9 @@ impl Commits {
             .map(ToOwned::to_owned),
         );
 
-        let require_head = (ops.iter().filter_map(|op| op.op.as_ref()))
-            .any(|op| trees.resends().contains(op_node(op)));
+        let require_head = !released.is_empty()
+            || (ops.iter().filter_map(|op| op.op.as_ref()))
+                .any(|op| trees.resends().contains(op_node(op)));
         let restores = (ops.iter().enumerate())
             .filter_map(|(index, op)| match &op.op {
                 Some(op::Op::Restore(restore)) => Some((index, restore)),
@@ -865,6 +1138,12 @@ impl Commits {
             .filter(|(_, removed)| !removed.is_empty())
             .collect();
         let commit_id = ids.uuid_v7(now_ms);
+        for mut question in released {
+            if let QuestionKind::Recovery { sent_in, .. } = &mut question.kind {
+                *sent_in = Some(commit_id.clone());
+            }
+            self.questions.get_mut().push(question);
+        }
         for question in self.questions.get_mut() {
             if let QuestionKind::Conflict { sent_in, .. } = &mut question.kind
                 && asking.contains(&question.id)
@@ -1222,6 +1501,11 @@ impl Commits {
         };
         let result = flight.result.expect("taken with a result");
         let sent_under = self.pending.clone();
+        let commit_id = &flight.commit.commit_id;
+        let (sent, questions): (Vec<Question>, Vec<Question>) = std::mem::take(self.questions.get_mut()).into_iter().partition(|question| {
+            matches!(&question.kind, QuestionKind::Recovery { sent_in: Some(sent), .. } if sent == commit_id)
+        });
+        self.questions.set(questions);
         let mut synced = Synced::default();
         let mut merged: BTreeMap<NodeId, NodeId> = BTreeMap::new();
         let mut agreed: BTreeMap<NodeId, Agreed> = BTreeMap::new();
@@ -1233,6 +1517,12 @@ impl Commits {
             .filter_map(|op| match &op.op {
                 Some(op::Op::Move(moved)) => Some(moved.node_id.as_str()),
                 Some(op::Op::Restore(restore)) => Some(restore.node_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let placed: BTreeSet<&NodeId> = (flight.commit.ops.iter())
+            .filter_map(|op| match &op.op {
+                Some(op::Op::Move(moved)) => Some(&moved.node_id),
                 _ => None,
             })
             .collect();
@@ -1410,7 +1700,10 @@ impl Commits {
                                 synced.set(id, Some(revived.shape.clone()));
                                 continue;
                             }
-                            synced.set(id, None);
+                            let retrashed = placed.contains(id) && trees.local().get(id).is_some();
+                            if !retrashed {
+                                synced.set(id, None);
+                            }
                             let kept = kept.filter(|_| *id == delete.node_id);
                             trees.record_trashed(id, result.seq, kept);
                         }
@@ -1591,6 +1884,7 @@ impl Commits {
         trees.watch_content([]);
         trees.watch_positions([]);
         self.retry_waiting(trees, BTreeSet::new(), Vec::new());
+        self.keep_unsent(trees, sent);
         self.accepted.set(flight.commit.device_seq);
         self.slots.insert(flight.commit.device_seq, result.seq);
         while self.slots.len() > SLOTS_KEPT {
@@ -1660,7 +1954,12 @@ impl Commits {
             return Err(CommitError::NotInFlight);
         }
         let failure = match Code::try_from(error.code) {
-            Ok(Code::HistoryMismatch | Code::StaleDeviceState) => Failure::Halted(Halt::Recovery),
+            Ok(Code::HistoryMismatch) => Failure::Halted(Halt::Recovery(RecoveryCause::of(
+                RecoveryTrigger::SpaceRewound,
+            ))),
+            Ok(Code::StaleDeviceState) => Failure::Halted(Halt::Recovery(RecoveryCause::of(
+                RecoveryTrigger::StoreRolledBack,
+            ))),
             Ok(Code::ReadOnly) => Failure::Halted(Halt::ReadOnly),
             Ok(Code::AheadOfServer) => Failure::Resync,
             Ok(Code::LimitExceeded) => Failure::Split,
@@ -1672,7 +1971,7 @@ impl Commits {
             _ => Failure::Halted(Halt::Policy { code: error.code }),
         };
         match failure {
-            Failure::Halted(halt @ (Halt::Recovery | Halt::Policy { .. })) => {
+            Failure::Halted(halt @ (Halt::Recovery(_) | Halt::Policy { .. })) => {
                 self.halted.set(Some(halt))
             }
             Failure::Resend => {}
@@ -1748,7 +2047,7 @@ impl Commits {
         let reconnect = match &*self.in_flight {
             _ if policy && w >= a => return Reconnect::Idle,
             _ if policy => Reconnect::AheadOfServer,
-            _ if *self.halted == Some(Halt::Recovery) => Reconnect::Recovery,
+            _ if matches!(*self.halted, Some(Halt::Recovery(_))) => Reconnect::Recovery,
             Some(flight) if flight.commit.history_id != welcome.history_id => Reconnect::Recovery,
             None if w == a => Reconnect::Idle,
             Some(flight) if flight.result.is_none() && (w == a || w == a + 1) => Reconnect::Resend,
@@ -1758,7 +2057,16 @@ impl Commits {
             _ => Reconnect::Recovery,
         };
         if reconnect == Reconnect::Recovery {
-            self.halted.set(Some(Halt::Recovery));
+            let rewound = (self.in_flight.as_ref())
+                .is_some_and(|flight| flight.commit.history_id != welcome.history_id);
+            let cause = match *self.halted {
+                Some(Halt::Recovery(cause)) => cause,
+                _ if rewound => {
+                    RecoveryCause::rewind(welcome.restore_seq, welcome.restore_point_ms)
+                }
+                _ => RecoveryCause::of(RecoveryTrigger::StoreRolledBack),
+            };
+            self.halted.set(Some(Halt::Recovery(cause)));
             return reconnect;
         }
         if reconnect == Reconnect::AheadOfServer {
@@ -2040,6 +2348,22 @@ pub(crate) fn rekey(trees: &mut Trees, from: &str, to: &str) {
         let mut child = trees.local().get(&id).cloned().expect("listed above");
         child.shape.parent = to.to_owned();
         trees.set_local(id, child);
+    }
+    let waiting: Vec<(NodeId, Shape, Origin)> = (trees.waiting().iter())
+        .filter_map(|(id, waiting)| {
+            let shape = waiting
+                .shape
+                .as_ref()
+                .filter(|shape| shape.parent == from)?;
+            let shape = Shape {
+                parent: to.to_owned(),
+                ..shape.clone()
+            };
+            Some((id.clone(), shape, waiting.origin))
+        })
+        .collect();
+    for (id, shape, origin) in waiting {
+        trees.wait(id, Some(shape), origin);
     }
 }
 
@@ -2426,6 +2750,10 @@ fn cost(trees: &Trees, want: &Want) -> usize {
             .iter()
             .map(|node| record_cost(trees.synced().live(node)))
             .sum(),
+        Want::Retrash { members, .. } => members
+            .iter()
+            .map(|node| 2 * record_cost(trees.remote().get(node).map(|node| &node.shape)))
+            .sum(),
         Want::Restore { cost, .. } => *cost,
     }
 }
@@ -2449,6 +2777,13 @@ enum Want {
         id: NodeId,
         members: BTreeSet<NodeId>,
     },
+    /// Trashing again the nodes under `id` that an answer's op brought back from the trash with
+    /// their trash group (R8) outside what the person answered (section 6.4): a move of each to
+    /// where it is, so that the commit has seen its placement, and a delete of `id`.
+    Retrash {
+        id: NodeId,
+        members: BTreeSet<NodeId>,
+    },
     /// A restore a person asked for, with the bytes of change records it makes, roughly: for a
     /// node R holds as trashed, a record for every node trashed with it, and otherwise one.
     Restore {
@@ -2464,10 +2799,17 @@ impl Want {
             Want::Create { id, .. } | Want::Move { id, .. } | Want::Content { id, .. } => {
                 (Some(id), None)
             }
-            Want::Delete { members, .. } => (None, Some(members)),
+            Want::Delete { members, .. } | Want::Retrash { members, .. } => (None, Some(members)),
             Want::Restore { .. } => (None, None),
         };
         one.into_iter().chain(many.into_iter().flatten())
+    }
+
+    fn ops(&self) -> usize {
+        match self {
+            Want::Retrash { members, .. } => members.len() + 1,
+            _ => 1,
+        }
     }
 }
 
@@ -2498,6 +2840,7 @@ fn plan(
     aliases: &BTreeMap<NodeId, NodeId>,
     restores: &BTreeMap<RestoreId, RestoreIntent>,
     owed: &BTreeMap<NodeId, Pending>,
+    answers: &BTreeSet<NodeId>,
 ) -> Planned {
     let mut wants = Vec::new();
     if !restores.is_empty() {
@@ -2758,6 +3101,24 @@ fn plan(
                     requires,
                 })
             }
+            Want::Retrash { id, members } => {
+                for node in &members {
+                    let shape = &trees.remote().get(node).expect("revived from R").shape;
+                    let placed = op::Op::Move(proto::Move {
+                        node_id: node.clone(),
+                        new_parent_id: shape.parent.clone(),
+                        new_name: shape.name.clone(),
+                        from: None,
+                    });
+                    ops.push(proto::Op { op: Some(placed) });
+                }
+                scratch.trash(&id);
+                deletes.insert(id.clone(), members.into_iter().collect());
+                op::Op::Delete(proto::Delete {
+                    node_id: id,
+                    requires: None,
+                })
+            }
             Want::Restore { op, .. } => {
                 scratch.restoring.remove(&op.node_id);
                 let trashed = (trees.remote().get(&op.node_id))
@@ -2796,37 +3157,41 @@ fn plan(
     };
     let room = |emitted: &mut usize, bytes: &mut usize, want: &Want| {
         let cost = cost(trees, want);
-        if !fits(*emitted, *bytes, 1, cost) {
+        if !fits(*emitted, *bytes, want.ops(), cost) {
             return false;
         }
-        *emitted += 1;
+        *emitted += want.ops();
         *bytes += cost;
         true
     };
     let capped = loop {
         let (mut progress, mut full) = (false, false);
         for at in 0..wants.len() {
-            if !(wants[at].as_ref()).is_some_and(|want| scratch.fit(want, &moving) == Fit::Valid) {
+            let Some(want) =
+                (wants[at].as_ref()).filter(|want| scratch.fit(want, &moving) == Fit::Valid)
+            else {
                 continue;
-            }
-            let mut order = match &wants[at] {
-                Some(Want::Create { shape, .. }) if shape.kind == Kind::Dir => {
+            };
+            let Some(bundle) = scratch.compensation(want, answers, trees) else {
+                continue;
+            };
+            let order = match want {
+                Want::Create { shape, .. } if shape.kind == Kind::Dir => {
                     deletes_before_create(&wants, &scratch, &moving, &shape.parent)
                 }
                 _ => Vec::new(),
             };
-            order.push(at);
-            for at in order {
+            for before in order {
                 if !room(
                     &mut emitted,
                     &mut bytes,
-                    wants[at].as_ref().expect("checked"),
+                    wants[before].as_ref().expect("checked"),
                 ) {
                     full = true;
                     break;
                 }
                 emit(
-                    wants[at].take().expect("checked"),
+                    wants[before].take().expect("checked"),
                     &mut scratch,
                     &mut moving,
                 );
@@ -2835,6 +3200,26 @@ fn plan(
             if full {
                 break;
             }
+            let want = wants[at].as_ref().expect("checked");
+            let ops = want.ops() + bundle.iter().map(Want::ops).sum::<usize>();
+            let cost =
+                cost(trees, want) + bundle.iter().map(|other| cost(trees, other)).sum::<usize>();
+            let alone = emitted == 0 && !bundle.is_empty();
+            if !alone && !fits(emitted, bytes, ops, cost) {
+                full = true;
+                break;
+            }
+            emitted += ops;
+            bytes += cost;
+            emit(
+                wants[at].take().expect("checked"),
+                &mut scratch,
+                &mut moving,
+            );
+            for retrash in bundle {
+                emit(retrash, &mut scratch, &mut moving);
+            }
+            progress = true;
         }
         if full {
             break true;
@@ -2872,7 +3257,10 @@ fn plan(
                 .map(|want| cost(trees, want))
                 .sum();
             let whole = fits(emitted, bytes, cycle.len() + 1, all + cost(trees, &aside));
-            if (emitted > 0 && !whole) || !room(&mut emitted, &mut bytes, &aside) {
+            let bundled = scratch
+                .compensation(&aside, answers, trees)
+                .is_none_or(|bundle| !bundle.is_empty());
+            if bundled || (emitted > 0 && !whole) || !room(&mut emitted, &mut bytes, &aside) {
                 break true;
             }
             let id = id.clone();
@@ -2907,21 +3295,30 @@ fn plan(
                 _ => None,
             })
             .collect();
-        let forced = wants.iter_mut().find(|slot| {
-            slot.as_ref().is_some_and(|want| {
-                scratch.fit(want, &moving) == Fit::NameTaken
-                    && !(scratch.name_holders(want)).any(|holder| {
-                        scratch.owed.contains(holder)
-                            || held.iter().any(|id| scratch.inside(holder, id))
-                    })
-            })
+        let forced = wants.iter_mut().find_map(|slot| {
+            let want = slot.as_ref()?;
+            if scratch.fit(want, &moving) != Fit::NameTaken
+                || (scratch.name_holders(want)).any(|holder| {
+                    scratch.owed.contains(holder)
+                        || held.iter().any(|id| scratch.inside(holder, id))
+                })
+            {
+                return None;
+            }
+            let bundle = scratch.compensation(want, answers, trees)?;
+            Some((slot, bundle))
         });
-        let Some(slot) = forced else {
+        let Some((slot, bundle)) = forced else {
             break false;
         };
-        if !room(&mut emitted, &mut bytes, slot.as_ref().expect("checked")) {
+        let want = slot.as_ref().expect("checked");
+        let ops = want.ops() + bundle.iter().map(Want::ops).sum::<usize>();
+        let cost = cost(trees, want) + bundle.iter().map(|other| cost(trees, other)).sum::<usize>();
+        if !(emitted == 0 && !bundle.is_empty()) && !fits(emitted, bytes, ops, cost) {
             break true;
         }
+        emitted += ops;
+        bytes += cost;
         if let Some(Want::Create { id, shape }) = slot.as_mut()
             && shape.kind == Kind::Dir
             && (scratch.holders(&shape.parent, &shape.name)).any(|other| moving.contains(other))
@@ -2938,6 +3335,9 @@ fn plan(
             );
         }
         emit(slot.take().expect("checked"), &mut scratch, &mut moving);
+        for retrash in bundle {
+            emit(retrash, &mut scratch, &mut moving);
+        }
     };
     if !capped {
         for want in wants.iter().flatten() {
@@ -3093,6 +3493,7 @@ fn return_cycle(
     })
 }
 
+#[derive(Clone)]
 struct Entry {
     parent: NodeId,
     name: String,
@@ -3103,6 +3504,7 @@ struct Entry {
 }
 
 /// R as the ops emitted so far leave it on the server, as far as their order depends on it.
+#[derive(Clone)]
 struct Scratch {
     root: NodeId,
     nodes: BTreeMap<NodeId, Entry>,
@@ -3202,7 +3604,7 @@ impl Scratch {
             } => self.fit_at(id, parent, name),
             Want::Content { id, .. } if moving.contains(id) => Fit::Wait,
             Want::Content { .. } => Fit::Valid,
-            Want::Delete { id, members } => {
+            Want::Delete { id, members } | Want::Retrash { id, members } => {
                 let subtree = self.subtree(id);
                 if !subtree.iter().all(|node| members.contains(node)) {
                     Fit::Wait
@@ -3238,7 +3640,7 @@ impl Scratch {
                     .map(|parent| target.unwrap_or(parent))
                     .filter(|to| !self.inside(to, &op.node_id))
             }
-            Want::Delete { .. } => None,
+            Want::Delete { .. } | Want::Retrash { .. } => None,
         };
         revived.and_then(|id| self.returning_from_trash(id, moving))
     }
@@ -3332,6 +3734,12 @@ impl Scratch {
         self.revive(parent);
     }
 
+    fn group(&self, id: &str) -> Option<&String> {
+        (self.nodes.get(id))
+            .filter(|entry| !entry.live)
+            .and_then(|entry| entry.group.as_ref())
+    }
+
     fn revive_group(&mut self, id: &str, group: &str) -> Vec<NodeId> {
         let mut revived = Vec::new();
         let mut parents = vec![id.to_owned()];
@@ -3423,7 +3831,69 @@ impl Scratch {
 
     fn trash(&mut self, id: &str) {
         for node in self.subtree(id).into_iter().chain([id.to_owned()]) {
+            if let Some(entry) = self.nodes.get_mut(&node) {
+                entry.group = None;
+            }
             self.unlink(&node);
         }
+    }
+
+    /// The wants that must go into the same commit right after `want`, so that what it brings
+    /// back from the trash with an answered node's trash group (R8) outside `answers` is trashed
+    /// again (section 6.4), or none when one of them would not apply after it.
+    fn compensation(
+        &self,
+        want: &Want,
+        answers: &BTreeSet<NodeId>,
+        trees: &Trees,
+    ) -> Option<Vec<Want>> {
+        let Want::Move {
+            id, parent, name, ..
+        } = want
+        else {
+            return Some(Vec::new());
+        };
+        let Some(group) = self.group(id).filter(|_| answers.contains(id)) else {
+            return Some(Vec::new());
+        };
+        let mut scratch = self.clone();
+        scratch.place(id, parent, name, scratch.nodes[id].kind);
+        let revived: BTreeSet<NodeId> = scratch.revive_group(id, group).into_iter().collect();
+        let placed = |node: &NodeId| match answers.contains(node) {
+            true => trees.local().get(node).map(|local| &local.shape.parent),
+            false => Some(&scratch.nodes[node].parent),
+        };
+        let mut needed = BTreeSet::new();
+        for answered in revived.iter().filter(|node| answers.contains(*node)) {
+            let mut at = placed(answered);
+            while let Some(parent) = at.filter(|parent| revived.contains(*parent))
+                && needed.insert(parent.clone())
+            {
+                at = placed(parent);
+            }
+        }
+        let outside: BTreeSet<NodeId> = (revived.into_iter())
+            .filter(|node| !answers.contains(node) && !needed.contains(node))
+            .collect();
+        let mut bundle = Vec::new();
+        for top in &outside {
+            if outside.contains(&scratch.nodes[top].parent) {
+                continue;
+            }
+            let members = (scratch.subtree(top).into_iter())
+                .filter(|node| outside.contains(node))
+                .chain([top.clone()])
+                .collect();
+            let retrash = Want::Retrash {
+                id: top.clone(),
+                members,
+            };
+            if scratch.fit(&retrash, &BTreeSet::new()) != Fit::Valid {
+                return None;
+            }
+            scratch.trash(top);
+            bundle.push(retrash);
+        }
+        Some(bundle)
     }
 }

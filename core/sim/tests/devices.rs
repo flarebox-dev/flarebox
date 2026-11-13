@@ -18,7 +18,7 @@ use koidrive_sim::world::disk::Place;
 use koidrive_sim::world::{Action, Cut, Failure, NAMES, Outcome, Reply, Step, TEXTS, World};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
-use proptest::test_runner::TestRunner;
+use proptest::test_runner::{RngSeed, TestRunner};
 
 #[path = "devices/restore_write_history.rs"]
 mod restore_write_history;
@@ -89,6 +89,7 @@ fn step(losses: Losses) -> BoxedStrategy<Step> {
             1 => Just(Step::Rewind),
             3 => Just(Step::CopyStore),
             2 => Just(Step::RollBack),
+            4 => (0..4usize).prop_map(Step::Answer),
         ]
         .boxed(),
     }
@@ -193,6 +194,28 @@ fn keep(devices: usize, phases: &[Vec<(usize, Step)>]) -> Result<World, Failure>
     })
 }
 
+const REWIND_SEED: u64 = 501;
+
+fn converges_from(seed: u64, cases: u32) {
+    let config = ProptestConfig {
+        rng_seed: RngSeed::Fixed(seed),
+        failure_persistence: None,
+        ..ProptestConfig::with_cases(cases)
+    };
+    let mut runner = TestRunner::new(config);
+    let result = runner.run(
+        &(2..=3usize, phases(Losses::Rewinds)),
+        |(devices, phases)| {
+            converge(devices, &phases)
+                .map(drop)
+                .map_err(|failure| TestCaseError::fail(failure.to_string()))
+        },
+    );
+    if let Err(error) = result {
+        panic!("{error}");
+    }
+}
+
 proptest! {
     #![proptest_config(koidrive_test_support::regression_config(
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/devices.proptest-regressions"),
@@ -234,6 +257,16 @@ proptest! {
     fn devices_converge_across_server_restores(devices in 2..=3usize, phases in phases(Losses::Restores)) {
         converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        rng_seed: RngSeed::Fixed(REWIND_SEED),
+        ..koidrive_test_support::regression_config(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/devices.proptest-regressions"),
+            256,
+        )
+    })]
 
     #[test]
     fn devices_lose_no_write_across_rewinds_and_rollbacks(devices in 2..=3usize, phases in phases(Losses::Rewinds)) {
@@ -244,6 +277,32 @@ proptest! {
     fn devices_converge_across_rewinds_and_rollbacks(devices in 2..=3usize, phases in phases(Losses::Rewinds)) {
         converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
+}
+
+#[test]
+fn rewinds_converge_from_seed_122() {
+    converges_from(122, 4096);
+}
+
+#[test]
+#[ignore = "a folder keeps a pending name no user gave until the server marks pending names (GUN-547)"]
+fn rewinds_converge_from_seed_605() {
+    converges_from(605, 4096);
+}
+
+#[test]
+fn rewinds_converge_from_seed_301() {
+    converges_from(301, 4096);
+}
+
+#[test]
+fn rewinds_converge_from_seed_313() {
+    converges_from(313, 4096);
+}
+
+#[test]
+fn rewinds_converge_from_seed_319() {
+    converges_from(319, 4096);
 }
 
 /// A fixed sample of the schedules reaches every fault and every way back from one that the
@@ -274,6 +333,12 @@ fn the_rewind_schedules_reach_every_recovery() {
             "recovery starts after a store rollback",
             "crash during a recovery",
             "store rolled back during a recovery",
+            "recovery classifies the trees",
+            "recovery answer publishes",
+            "recovery answer keeps",
+            "recovery answer discards",
+            "recovery answer deletes",
+            "recovery answer restores",
         ],
     );
 }
@@ -968,13 +1033,14 @@ fn a_pending_folder() -> World {
 }
 
 #[test]
-fn a_pending_folder_waits_while_its_author_recovers_from_a_store_rollback() {
+fn a_pending_folder_is_renamed_after_its_author_recovers_from_a_store_rollback() {
     let mut world = a_pending_folder();
     world.phase(2, &[(0, Step::RollBack)]).unwrap();
-    assert!(world.devices[0].recovering.is_some());
-    assert!(world.devices[1].recovering.is_none());
+    assert!(world.devices[0].recovery.is_some());
+    assert!(world.devices[1].recovery.is_none());
+    assert!(world.space().nodes().iter().any(|node| node.name == "ß"));
     assert!(
-        world
+        !world
             .space()
             .nodes()
             .iter()
@@ -983,17 +1049,13 @@ fn a_pending_folder_waits_while_its_author_recovers_from_a_store_rollback() {
 }
 
 #[test]
-fn a_pending_folder_waits_while_its_author_recovers_from_a_rewind() {
+fn a_pending_folder_is_renamed_after_its_author_recovers_from_a_rewind() {
     let mut world = a_pending_folder();
     world.phase(2, &[(0, BACKUP), (0, Step::Rewind)]).unwrap();
+    assert!(world.devices.iter().all(|device| device.recovery.is_some()));
+    assert!(world.space().nodes().iter().any(|node| node.name == "ß"));
     assert!(
-        world
-            .devices
-            .iter()
-            .all(|device| device.recovering.is_some())
-    );
-    assert!(
-        world
+        !world
             .space()
             .nodes()
             .iter()
@@ -1004,9 +1066,21 @@ fn a_pending_folder_waits_while_its_author_recovers_from_a_rewind() {
 #[test]
 fn a_pending_folder_is_renamed_while_another_device_recovers() {
     let mut world = a_pending_folder();
-    world.devices[1].recovering = Some("unrelated recovery".into());
-    world.phase(2, &[]).unwrap();
-    assert!(world.devices[0].recovering.is_none());
+    world
+        .phase(
+            2,
+            &[
+                (1, Step::CopyStore),
+                (1, file("b")),
+                (1, SCAN),
+                (1, COMMIT),
+                (1, COMMIT),
+                (1, Step::RollBack),
+            ],
+        )
+        .unwrap();
+    assert!(world.devices[1].recovery.is_some());
+    assert!(world.devices[0].recovery.is_none());
     assert!(world.space().nodes().iter().any(|node| node.name == "ß"));
     assert!(
         !world

@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Debug;
 
 use koidrive_engine::classify::Trees;
-use koidrive_engine::commit::{Base, Commits};
+use koidrive_engine::commit::{Base, Commits, Halt};
 use koidrive_engine::effects::Effects;
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::state::{CommitsChanges, EffectsChanges, TreesChanges};
@@ -220,13 +220,19 @@ pub struct Device {
     /// Crashed and not restarted yet.
     pub down: bool,
     pub link: Option<Link>,
-    /// Why the device stopped for recovery (section 6.4).
-    pub recovering: Option<String>,
+    /// Why the device last started a recovery (section 6.4).
+    pub recovery: Option<String>,
     pub store_copy: Option<Engine>,
     pub rolled_back: bool,
 }
 
 impl Device {
+    /// Whether the device started a recovery and has not classified the trees for it yet.
+    pub fn recovering(&self) -> bool {
+        let engine = if self.down { &self.store } else { &self.engine };
+        matches!(engine.commits.halted(), Some(Halt::Recovery(_)))
+    }
+
     /// The end of one call into the engine: what needs no decision is settled, and the state goes
     /// to the store in one transaction.
     pub fn persist(&mut self) -> Result<(), Failure> {

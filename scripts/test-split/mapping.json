@@ -300,7 +300,20 @@
     "fn:a_file_moved_into_an_ignored_folder_while_its_overwrite_is_held_stays_on_the_other_device": "ignored_entries_and_moves",
     "fn:a_bulk_delete_with_a_file_moved_over_another_keeps_the_file_at_its_path": "moves_and_name_collisions",
     "mod:telemetry_tests": "root",
-    "fn:a_file_moved_below_an_ignored_folder_while_a_new_file_takes_its_name_stays_on_the_server_on_macos": "ignored_entries_and_moves"
+    "fn:a_file_moved_below_an_ignored_folder_while_a_new_file_takes_its_name_stays_on_the_server_on_macos": "ignored_entries_and_moves",
+    "use:crate :: status :: describe": "common",
+    "use:koidrive_engine :: question :: { RecoveryCause , RecoveryTrigger }": "common",
+    "fn:a_rewound_space_recovers_at_welcome_and_names_the_seq_it_was_rewound_to": "device_counter_and_recovery",
+    "fn:a_history_changed_resync_on_a_live_session_recovers_through_a_new_connection": "device_counter_and_recovery",
+    "fn:a_recovery_question_records_the_rewind_it_comes_from": "device_counter_and_recovery",
+    "fn:an_upload_that_ends_after_a_recovery_leaves_the_next_commit_in_flight": "device_counter_and_recovery",
+    "fn:a_synced_store_recovers_when_the_server_counts_a_commit_it_does_not_hold": "device_counter_and_recovery",
+    "fn:a_store_with_a_commit_in_flight_recovers_and_holds_it_when_the_server_counts_past_its_slot": "device_counter_and_recovery",
+    "fn:a_recovery_after_a_refusal_in_the_session_continues_from_the_servers_count": "device_counter_and_recovery",
+    "fn:a_rewind_on_the_server_holds_the_writes_it_took_until_the_person_keeps_them": "device_counter_and_recovery",
+    "fn:a_store_older_than_the_disk_recovers_even_when_the_server_lost_its_commits": "device_counter_and_recovery",
+    "fn:a_welcome_during_a_recovery_keeps_its_cause": "device_counter_and_recovery",
+    "fn:a_recovery_keeps_its_cause_across_a_restart": "device_counter_and_recovery"
   },
   "core/engine/tests/commit.rs": {
     "fn:resend": "common",
@@ -614,7 +627,8 @@
     "fn:a_delete_made_after_a_move_was_sent_goes_out_after_the_moves_own_record": "commit_moves_and_conflicts",
     "fn:a_superseded_owed_rename_ends_the_debt_and_leaves_the_change_it_met_to_reach_the_disk": "parked_edits_and_pending_names",
     "fn:a_superseded_owed_rename_of_a_node_another_device_deleted_keeps_the_debt": "parked_edits_and_pending_names",
-    "fn:another_devices_resend_of_a_place_and_its_content_sends_nothing_back": "commit_moves_and_conflicts"
+    "fn:another_devices_resend_of_a_place_and_its_content_sends_nothing_back": "commit_moves_and_conflicts",
+    "use:koidrive_engine :: question :: { Answer , RecoveryCause , RecoveryTrigger }": "common"
   },
   "core/sim/tests/engine_sync.rs": {
     "use:std :: collections :: { BTreeMap , BTreeSet }": "common",
@@ -719,7 +733,8 @@
     "fn:a_server_entry_below_a_folder_moved_out_of_what_the_rules_include_here_is_left_out": "rules_and_held_entries",
     "fn:a_discarded_entry_the_rules_leave_out_for_a_while_stays_discarded_once_they_let_it_in": "rules_and_held_entries",
     "fn:a_discarded_folder_the_user_moves_a_server_folder_into_is_sent_without_what_the_rules_leave_out": "rules_and_held_entries",
-    "fn:a_discarded_folder_parked_where_an_excluded_folder_holds_its_name_goes_to_the_local_trash": "rules_and_held_entries"
+    "fn:a_discarded_folder_parked_where_an_excluded_folder_holds_its_name_goes_to_the_local_trash": "rules_and_held_entries",
+    "fn:a_discarded_folder_the_user_moved_a_synced_file_into_before_the_answer_converges": "first_link"
   },
   "core/fs/tests/ignore.rs": {
     "use:std :: collections :: { BTreeMap , BTreeSet }": "common",

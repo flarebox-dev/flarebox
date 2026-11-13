@@ -2021,6 +2021,8 @@ fn folder_text(folder: &FolderStatus) -> String {
     );
     if let Some(problem) = &folder.problem {
         text.push_str(&format!("  {}\n", printable(problem)));
+    } else if let Some(cause) = &folder.recovery {
+        text.push_str(&format!("  {}\n", koidrive_driver::describe(cause)));
     }
     text
 }
@@ -2075,7 +2077,7 @@ fn question_summary(question: &Question) -> String {
         QuestionKind::AmbiguousDisappearance => {
             "files disappeared while changes were not tracked".to_owned()
         }
-        QuestionKind::Recovery { group } => match group {
+        QuestionKind::Recovery { group, .. } => match group {
             RecoveryGroup::CreatedAfterRestorePoint => {
                 "files created after the restore point, which the restore removed from the server"
             }
@@ -2089,7 +2091,7 @@ fn question_summary(question: &Question) -> String {
                 "files deleted on this device that the server still holds"
             }
             RecoveryGroup::RequestedBeforeReset => {
-                "restores asked for before the reset, which the server does not show"
+                "restores asked for before recovery began, which the server does not show"
             }
         }
         .to_owned(),
@@ -2540,6 +2542,7 @@ mod tests {
     #[test]
     fn the_status_text_escapes_every_name_path_and_problem() {
         let folder = FolderStatus {
+            recovery: None,
             space_id: "s\u{1b}[2J".into(),
             space_name: "Home\u{202e}gpj.exe".into(),
             path: "/home/ada/\u{1b}]0;owned\u{7}Docs\nFake: up to date".into(),
@@ -2580,6 +2583,35 @@ mod tests {
     }
 
     #[test]
+    fn the_status_text_names_the_rewind_a_folder_recovers_from() {
+        let folder = FolderStatus {
+            recovery: Some(koidrive_engine::question::RecoveryCause::rewind(
+                7,
+                1_794_442_424_000,
+            )),
+            space_id: "s1".into(),
+            space_name: "Home".into(),
+            path: "/home/ada/Docs".into(),
+            state: FolderState::UpToDate,
+            history_id: None,
+            last_seq: None,
+            head_seq: None,
+            remote_nodes: 0,
+            local_entries: None,
+            questions: 1,
+            problem: None,
+            wait: None,
+        };
+        assert!(
+            folder_text(&folder).ends_with(
+                "\n  the space was rewound on the server to seq 7 (requested 2026-11-12 00:13 UTC)\n"
+            ),
+            "{}",
+            folder_text(&folder)
+        );
+    }
+
+    #[test]
     fn logs_carry_colours_only_on_a_terminal_and_never_under_json() {
         assert!(log_ansi(true, false));
         assert!(!log_ansi(true, true));
@@ -2590,6 +2622,7 @@ mod tests {
     #[test]
     fn the_restart_report_escapes_the_folder_and_its_problem() {
         let folder = |state, problem: Option<&str>| FolderStatus {
+            recovery: None,
             space_id: "s1".into(),
             space_name: "Home".into(),
             path: "/home/ada/Docs\u{1b}[31m\nFORGED".into(),
@@ -3679,6 +3712,8 @@ mod tests {
         let mut question = held((0, 0, 0), &[], 1);
         question.kind = QuestionKind::Recovery {
             group: RecoveryGroup::CreatedOnThisDevice,
+            sent_in: None,
+            cause: None,
         };
         let text = question_text(&question);
         assert_eq!(
