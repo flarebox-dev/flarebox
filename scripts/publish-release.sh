@@ -48,7 +48,7 @@ for path in "$files"/*; do
 done
 entries=$(awk 'NF { count++ } END { print count + 0 }' "$sums")
 [ "$entries" = "$assets" ] || { echo "::error::SHA256SUMS has $entries entries, but $files has $assets files to publish."; exit 1; }
-(cd "$files" && sha256sum -c SHA256SUMS) || { echo "::error::A file in $files does not match its SHA256SUMS entry."; exit 1; }
+(cd "$files" && sha256sum --strict -c SHA256SUMS) || { echo "::error::A file in $files does not match its SHA256SUMS entry."; exit 1; }
 
 before=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name 2>/dev/null) || before=none
 

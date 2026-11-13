@@ -138,6 +138,9 @@ stage v0.2.0
 echo changed > "$tmp/dist/Koidrive-0.2.0-arm64.dmg"
 expect_refused v0.2.0 'does not match its SHA256SUMS entry' 'a dmg that does not match SHA256SUMS is refused'
 stage v0.2.0
+sed -i.bak 's/^[0-9a-f]*  Koidrive-0.2.0-arm64.dmg$/invalid  Koidrive-0.2.0-arm64.dmg/' "$tmp/dist/SHA256SUMS" && rm "$tmp/dist/SHA256SUMS.bak"
+expect_refused v0.2.0 'does not match its SHA256SUMS entry' 'a malformed SHA256SUMS entry is refused'
+stage v0.2.0
 rm "$tmp/dist/SHA256SUMS"
 expect_refused v0.2.0 'has no SHA256SUMS' 'a release without SHA256SUMS is refused'
 
