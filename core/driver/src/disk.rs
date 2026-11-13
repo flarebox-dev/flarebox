@@ -644,6 +644,7 @@ impl Disk {
                 }
             }
         }
+        let whole = observation.whole;
         let dropped: BTreeSet<PathBuf> = (observation.changes.iter().zip(&stale))
             .filter(|(_, stale)| **stale)
             .flat_map(|(change, _)| paths(change).map(Path::to_path_buf))
@@ -657,7 +658,10 @@ impl Disk {
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |since| since.as_millis() as u64);
             store.transaction(|tx| -> Result<(), Stop> {
-                engine.observe(&changes, now_ms);
+                match whole {
+                    true => engine.observe(&changes, now_ms),
+                    false => engine.observe_part(&changes, now_ms),
+                };
                 Ok(engine.checkpoint(tx)?)
             })?;
         }

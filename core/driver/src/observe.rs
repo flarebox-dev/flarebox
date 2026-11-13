@@ -74,6 +74,8 @@ pub struct Observation {
     /// platform watcher failed and a rescanning one took over. Rules known from before are stale then, since the new
     /// scans compare with no earlier rules and report no rules file as gone.
     pub all_rules: bool,
+    /// Whether the scan of `changes` covered the whole tree ([`koidrive_fs::Poll::whole`]).
+    pub whole: bool,
 }
 
 /// The rules of the `.koiignore` file in `dir`, a folder relative to the root and empty for the root, or `None` when
@@ -553,6 +555,7 @@ impl Observer for FsObserver {
             busy: reads.busy,
             rules,
             all_rules: first,
+            whole: poll.whole,
         }))
     }
 

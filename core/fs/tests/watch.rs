@@ -149,7 +149,10 @@ fn rescan_watcher_catches_changes_made_while_nothing_watched() {
     assert_eq!(watcher.poll(WAIT).unwrap().changes, expected);
     assert_eq!(
         watcher.poll(Duration::from_millis(100)).unwrap(),
-        quiet(dir.path())
+        Poll {
+            whole: true,
+            ..quiet(dir.path())
+        }
     );
     assert_eq!(watcher.snapshot(), &Snapshot::scan(dir.path()).unwrap());
 }
@@ -250,10 +253,13 @@ fn expect(watcher: &mut dyn Watcher, expected: &[Change]) {
     );
 }
 
-fn live_changes(watcher: &mut dyn Watcher, root: &Path) {
+fn live_changes(watcher: &mut dyn Watcher, root: &Path, whole: bool) {
     assert_eq!(
         watcher.poll(Duration::from_millis(300)).unwrap(),
-        quiet(root)
+        Poll {
+            whole,
+            ..quiet(root)
+        }
     );
 
     fs::write(root.join("a.txt"), "one").unwrap();
@@ -302,7 +308,7 @@ fn live_changes(watcher: &mut dyn Watcher, root: &Path) {
 fn native_watcher_reports_live_changes_to_files_and_folders() {
     let dir = tempfile::tempdir().unwrap();
     let mut watcher = NativeWatcher::start(dir.path(), Snapshot::default()).unwrap();
-    live_changes(&mut watcher, dir.path());
+    live_changes(&mut watcher, dir.path(), false);
 }
 
 #[test]
@@ -310,7 +316,7 @@ fn rescan_watcher_reports_live_changes_to_files_and_folders() {
     let dir = tempfile::tempdir().unwrap();
     let mut watcher =
         RescanWatcher::new(dir.path(), Snapshot::default(), Duration::from_millis(20)).unwrap();
-    live_changes(&mut watcher, dir.path());
+    live_changes(&mut watcher, dir.path(), true);
 }
 
 #[test]
@@ -530,6 +536,7 @@ fn unreadable_folder_is_kept_and_reported() {
             watcher.poll(Duration::from_millis(100)).unwrap(),
             Poll {
                 unreadable: blocked.clone(),
+                whole: true,
                 ..quiet(root)
             },
             "{mode:o}"
@@ -711,10 +718,13 @@ fn two_folders() -> tempfile::TempDir {
 /// Resets `d` to nothing in a watcher that has caught up with the tree, then
 /// polls without waiting for events. Nothing on disk changed, so the poll can
 /// only report `d` because the watcher rescans it on its own.
-fn forgotten_scope_is_reported(watcher: &mut dyn Watcher, root: &Path) {
+fn forgotten_scope_is_reported(watcher: &mut dyn Watcher, root: &Path, whole: bool) {
     assert_eq!(
         watcher.poll(Duration::from_millis(300)).unwrap(),
-        quiet(root)
+        Poll {
+            whole,
+            ..quiet(root)
+        }
     );
 
     watcher.reset(Path::new("d"), BTreeMap::new());
@@ -727,6 +737,7 @@ fn forgotten_scope_is_reported(watcher: &mut dyn Watcher, root: &Path) {
                 created("d/sub/y", File),
                 created("d/x", File),
             ],
+            whole,
             ..quiet(root)
         }
     );
@@ -738,7 +749,7 @@ fn native_watcher_rescans_a_forgotten_scope_without_an_event() {
     let dir = two_folders();
     let root = fs::canonicalize(dir.path()).unwrap();
     let mut watcher = NativeWatcher::start(&root, Snapshot::scan(&root).unwrap()).unwrap();
-    forgotten_scope_is_reported(&mut watcher, &root);
+    forgotten_scope_is_reported(&mut watcher, &root, false);
 }
 
 #[test]
@@ -751,7 +762,7 @@ fn rescan_watcher_reports_only_a_forgotten_scope() {
         Duration::from_millis(20),
     )
     .unwrap();
-    forgotten_scope_is_reported(&mut watcher, &root);
+    forgotten_scope_is_reported(&mut watcher, &root, true);
 }
 
 /// A tree as `two_folders` makes it, and what was under `d` before
@@ -779,10 +790,14 @@ fn reset_entry_the_disk_lacks_is_removed(
     watcher: &mut dyn Watcher,
     root: &Path,
     known: BTreeMap<PathBuf, Known>,
+    whole: bool,
 ) {
     assert_eq!(
         watcher.poll(Duration::from_millis(300)).unwrap(),
-        quiet(root)
+        Poll {
+            whole,
+            ..quiet(root)
+        }
     );
 
     watcher.reset(Path::new("d"), known);
@@ -794,6 +809,7 @@ fn reset_entry_the_disk_lacks_is_removed(
                 modified("d/sub/y"),
                 modified("d/x")
             ],
+            whole,
             ..quiet(root)
         }
     );
@@ -809,7 +825,7 @@ fn reset_entry_the_disk_lacks_is_removed(
 fn native_watcher_reports_a_reset_entry_the_disk_lacks_as_removed() {
     let (_dir, root, known) = tree_that_lost_a_file();
     let mut watcher = NativeWatcher::start(&root, Snapshot::scan(&root).unwrap()).unwrap();
-    reset_entry_the_disk_lacks_is_removed(&mut watcher, &root, known);
+    reset_entry_the_disk_lacks_is_removed(&mut watcher, &root, known, false);
 }
 
 #[test]
@@ -821,7 +837,7 @@ fn rescan_watcher_reports_a_reset_entry_the_disk_lacks_as_removed() {
         Duration::from_millis(20),
     )
     .unwrap();
-    reset_entry_the_disk_lacks_is_removed(&mut watcher, &root, known);
+    reset_entry_the_disk_lacks_is_removed(&mut watcher, &root, known, true);
 }
 
 #[test]

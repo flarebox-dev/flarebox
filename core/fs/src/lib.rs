@@ -1782,6 +1782,9 @@ pub struct Poll {
     /// The folders whose rules the scans of this poll established and that no
     /// later scan of the poll found unreadable; see [`Rescan::read`].
     pub read: Vec<PathBuf>,
+    /// Whether the scan of `changes` covered the whole tree, so that an entry
+    /// it reports gone did not move to a path a later scan reports.
+    pub whole: bool,
 }
 
 /// A source of changes under one root.
@@ -2016,8 +2019,9 @@ impl NativeWatcher {
 impl NativeWatcher {
     /// What a poll returns once it has `changes` from a scan of `root`: the
     /// scopes still dirty, and the folders its scans could not read or read.
-    fn report(&mut self, changes: Vec<Change>, root: Option<FileId>) -> Poll {
+    fn report(&mut self, changes: Vec<Change>, root: Option<FileId>, whole: bool) -> Poll {
         Poll {
+            whole,
             changes,
             pending: self.dirty.iter().cloned().collect(),
             unreadable: std::mem::take(&mut self.unreadable).into_iter().collect(),
@@ -2149,7 +2153,7 @@ impl Watcher for NativeWatcher {
             if self.dirty.is_empty() && self.uncovered.is_none() {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if !self.receive(left)? {
-                    return Ok(self.report(Vec::new(), root));
+                    return Ok(self.report(Vec::new(), root, false));
                 }
             }
             let settle_until = Instant::now() + MAX_SETTLE;
@@ -2159,7 +2163,7 @@ impl Watcher for NativeWatcher {
                 // events can keep coming, so they must not hold the poll
                 // past its deadline.
                 if Instant::now() >= deadline {
-                    return Ok(self.report(Vec::new(), root));
+                    return Ok(self.report(Vec::new(), root, false));
                 }
                 continue;
             }
@@ -2175,6 +2179,7 @@ impl Watcher for NativeWatcher {
                 .chain(uncovered.iter().flatten())
                 .cloned()
                 .collect();
+            let whole = scopes.iter().any(|scope| scope.as_os_str().is_empty());
             let rescan = match self.snapshot.rescan_under(
                 &self.root,
                 scopes.iter().cloned(),
@@ -2185,7 +2190,7 @@ impl Watcher for NativeWatcher {
             ) {
                 Ok(rescan) => rescan,
                 Err(Error::Changed) if Instant::now() < deadline => continue,
-                Err(Error::Changed) => return Ok(self.report(Vec::new(), root)),
+                Err(Error::Changed) => return Ok(self.report(Vec::new(), root, false)),
                 Err(Error::RootReplaced) => {
                     self.uncovered = None;
                     return Err(Error::RootReplaced);
@@ -2203,7 +2208,7 @@ impl Watcher for NativeWatcher {
             #[cfg(target_os = "linux")]
             self.cover(&changes, readable, rescan.root);
             if !changes.is_empty() || !self.changed_rules.is_empty() || Instant::now() >= deadline {
-                return Ok(self.report(changes, root));
+                return Ok(self.report(changes, root, whole));
             }
         }
     }
@@ -2297,6 +2302,7 @@ impl Watcher for RescanWatcher {
                     root: Some(rescan.root),
                     rules: rescan.rules,
                     read: rescan.read,
+                    whole: true,
                 },
                 Err(Error::Changed) => Poll {
                     pending: vec![PathBuf::new()],

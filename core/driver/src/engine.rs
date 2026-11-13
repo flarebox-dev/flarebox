@@ -699,6 +699,20 @@ impl Engine {
     /// when its folder is in L or arrives in the batch, and keeps its entry otherwise ([`Trees::ignore_local`]); an
     /// entry L never held stays out.
     pub fn observe(&mut self, changes: &[Observed], now_ms: u64) -> BTreeSet<NodeId> {
+        self.observe_scans(changes, now_ms, true)
+    }
+
+    /// [`Engine::observe`] for a batch whose scans covered only part of the tree.
+    pub fn observe_part(&mut self, changes: &[Observed], now_ms: u64) -> BTreeSet<NodeId> {
+        self.observe_scans(changes, now_ms, false)
+    }
+
+    fn observe_scans(
+        &mut self,
+        changes: &[Observed],
+        now_ms: u64,
+        _whole: bool,
+    ) -> BTreeSet<NodeId> {
         let unscanned = self.unscanned.take();
         let mut before: Vec<Option<NodeId>> = changes
             .iter()
