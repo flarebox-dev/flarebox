@@ -3,9 +3,17 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { releaseVersion } from "./release-version.mjs";
+
+test("the committed standalone export matches the Cargo release version", () => {
+  const server = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const cargo = readFileSync(join(server, "../Cargo.toml"), "utf8");
+  const version = cargo.split("[workspace.package]")[1].match(/^version = "([^"]+)"/m)[1];
+  assert.equal(JSON.parse(readFileSync(join(server, "release.json"), "utf8")).version, version);
+});
 
 test("release version exports Cargo's workspace version and refreshes a stale standalone export", () => {
   const root = mkdtempSync(join(tmpdir(), "release-version-"));

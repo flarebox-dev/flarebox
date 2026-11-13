@@ -382,20 +382,19 @@ fn main() -> ExitCode {
             done = async move {
                 telemetry::start(&paths, switch, name, flow).await;
                 let outcome = run(paths, command_args, json).await;
+                telemetry::finish().await;
                 let pending = match reports_pending && (json || shows_banner) {
                     true => pending_questions(&pending_paths).await,
                     false => Vec::new(),
                 };
                 let succeeded = outcome.is_ok();
                 if json && daemon_run && succeeded {
-                    telemetry::finish().await;
                     return ExitCode::SUCCESS;
                 }
                 let exit = finish(command_name, json, outcome, pending);
                 if ask && succeeded {
                     telemetry::ask(&telemetry_paths).await;
                 }
-                telemetry::finish().await;
                 exit
             } => done,
             Ok(()) = interrupt => {

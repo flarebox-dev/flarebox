@@ -1243,6 +1243,7 @@ dependencies = [
  "reqwest",
  "rustix",
  "schemars",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

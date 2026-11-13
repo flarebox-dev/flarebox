@@ -1498,14 +1498,9 @@ fn free_name(base: &str, taken: &[String]) -> String {
         .expect("some name is free")
 }
 
-/// Whether version `a` is newer than `b`, comparing dotted numbers. Versions that are not dotted numbers compare
-/// as equal.
 fn newer(a: &str, b: &str) -> bool {
-    let parse = |version: &str| -> Option<Vec<u64>> {
-        version.split('.').map(|part| part.parse().ok()).collect()
-    };
-    match (parse(a), parse(b)) {
-        (Some(a), Some(b)) => a > b,
+    match (semver::Version::parse(a), semver::Version::parse(b)) {
+        (Ok(a), Ok(b)) => a.cmp_precedence(&b).is_gt(),
         _ => false,
     }
 }
@@ -2156,6 +2151,23 @@ mod tests {
         assert!(newer("0.10.0", "0.9.9"));
         assert!(!newer("0.3.0", "0.3.0"));
         assert!(!newer("0.2.9", "0.3.0"));
-        assert!(!newer("0.4.0-rc1", "0.3.0"));
+        assert!(newer("0.4.0-rc1", "0.3.0"));
+    }
+
+    #[test]
+    fn newer_obeys_semver_prerelease_precedence() {
+        for (server, cli) in [
+            ("0.1.0-alpha.2", "0.1.0-alpha.1"),
+            ("0.2.0-alpha.1", "0.1.0-alpha.1"),
+            ("0.1.0", "0.1.0-alpha.1"),
+            ("0.1.0-alpha.10", "0.1.0-alpha.2"),
+            ("0.1.0-rc.1", "0.1.0-alpha.10"),
+        ] {
+            assert!(newer(server, cli), "{server} must be newer than {cli}");
+            assert!(!newer(cli, server), "{cli} must not be newer than {server}");
+        }
+        assert!(!newer("0.1.0+build.2", "0.1.0+build.1"));
+        assert!(!newer("not-a-version", "0.1.0"));
+        assert!(!newer("0.1.0", "not-a-version"));
     }
 }

@@ -76,6 +76,59 @@ fn argv(next: &Value) -> Vec<&str> {
 }
 
 #[test]
+fn interrupt_during_telemetry_upload_prints_one_json_envelope() {
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let profile = Profile::new();
+    let mut child = profile
+        .command(&["join", "not-a-code", "--telemetry", "on", "--json"])
+        .env_remove("DO_NOT_TRACK")
+        .env_remove("KOIDRIVE_TELEMETRY")
+        .env("KOIDRIVE_TELEMETRY_TOKEN", "test-project-token")
+        .env(
+            "KOIDRIVE_TELEMETRY_URL",
+            format!("http://{}", listener.local_addr().unwrap()),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (_upload, _) = loop {
+        if let Ok(connection) = listener.accept() {
+            break connection;
+        }
+        if Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "no telemetry upload: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    rustix::process::kill_process(
+        rustix::process::Pid::from_child(&child),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(130));
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "not one JSON envelope ({error}): {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    schema::check(&envelope);
+    assert_eq!(envelope["error"]["code"], "interrupted");
+}
+
+#[test]
 fn status_reads_a_profile_that_is_not_set_up_and_check_exits_4() {
     let profile = Profile::new();
     let (code, envelope) = profile.json(&["status", "--json"]);

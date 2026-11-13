@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { execFileSync, spawn } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -18,7 +18,8 @@ const WHOLE_CHECK_MS = 9 * 60_000;
 
 const server = join(dirname(fileURLToPath(import.meta.url)), "..");
 const version = releaseVersion(server);
-const root = mkdtempSync(join(tmpdir(), "koidrive-deploy-"));
+const workspace = mkdtempSync(join(tmpdir(), "koidrive-deploy-"));
+const root = join(workspace, "server");
 const env = { ...process.env, WRANGLER_SEND_METRICS: "false", CI: "true" };
 let dev;
 let devOutput = "";
@@ -152,7 +153,7 @@ async function claimLocally() {
 
 function cleanUp() {
   stopDev();
-  rmSync(root, { recursive: true, force: true });
+  rmSync(workspace, { recursive: true, force: true });
 }
 
 const watchdog = setTimeout(() => {
@@ -166,7 +167,15 @@ try {
   copyTrackedFiles();
   run("pnpm", ["install", "--frozen-lockfile"], INSTALL_MS);
   await checkConfig();
-  run("pnpm", ["exec", "wrangler", "deploy", "--dry-run", "--outdir", join(root, ".dist")], DRY_RUN_MS);
+  writeFileSync(join(workspace, "Cargo.toml"), '[workspace.package]\nversion = ' + JSON.stringify(version) + '\n');
+  writeFileSync(join(root, "release.json"), JSON.stringify({ version: "0.0.0-stale" }) + '\n');
+  run("pnpm", ["run", "deploy", "--dry-run", "--outdir", join(root, ".dist")], DRY_RUN_MS);
+  const exported = JSON.parse(readFileSync(join(root, "release.json"), "utf8")).version;
+  if (exported !== version) fail("direct Wrangler deploy kept stale release version " + exported + " instead of " + version);
+  const worker = readFileSync(join(root, ".dist", "worker.js"), "utf8");
+  if (!worker.includes(JSON.stringify(version))) fail("direct Wrangler deploy did not embed the workspace release version");
+  console.log("Direct Wrangler deploy refreshed the stale export and embedded workspace version " + version);
+  rmSync(join(workspace, "Cargo.toml"));
   if (!existsSync(join(root, "web", "dist", "viewer", "index.html"))) fail("the dry run did not build the web package: web/dist/viewer/index.html is missing");
   console.log("The dry run built the web package through wrangler.jsonc's build.command");
   await claimLocally();
