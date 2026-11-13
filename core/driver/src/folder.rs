@@ -1516,6 +1516,7 @@ pub(crate) enum FromDisk {
 }
 
 pub(crate) struct FolderTask {
+    pub linked_started: Option<Time>,
     pub telemetry: koidrive_telemetry::Recorder,
     pub link: Link,
     pub store: PathBuf,
@@ -1772,6 +1773,7 @@ impl FolderTask {
             Ok(folder) => folder,
             Err(stop) => return stop.into(),
         };
+        folder.timing.linked(self.linked_started);
         folder.timing.enable(self.telemetry.clone());
         let mut from_disk = self.observe(lock.clone(), folder.sections(), folder.snapshot());
         let mut config = SessionConfig::new(

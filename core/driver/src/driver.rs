@@ -318,6 +318,7 @@ impl Drop for Inner {
 /// A linked folder. It stays in the driver's map until unlinking it has finished, so a stop, an unlink or a sign-out
 /// that starts later still finds its task and its cleanup, also after an earlier caller gave up waiting.
 struct Folder {
+    linked_started: Option<crate::timing::Time>,
     link: Link,
     status: Arc<crate::lifecycle::Lifecycle>,
     /// The folder's task, from its start until a stop has seen it end.
@@ -1178,6 +1179,7 @@ impl Driver {
             .map_err(io_error(&root))?,
         }
         claim::set_owner(&root, &owner).map_err(io_error(&root))?;
+        let linked_started = crate::timing::Time::now();
         let link = Link {
             space_id: space.space_id.clone(),
             space_name: space.name.clone(),
@@ -1185,7 +1187,7 @@ impl Driver {
             root,
             server_url: credential.server.clone(),
             device_id: credential.device_id.clone(),
-            linked_at_ms: now_ms(),
+            linked_at_ms: linked_started.unix_ms,
         };
         let store_path = self.inner.paths.store(&link.space_id)?;
         let store_dir = store_path.parent().expect("a store path has a parent");
@@ -1205,6 +1207,7 @@ impl Driver {
         );
         let linked = roots(&folders);
         let mut folder = Folder {
+            linked_started: Some(linked_started),
             link,
             status: status.clone(),
             run: None,
@@ -1720,6 +1723,7 @@ impl Driver {
             .store(&folder.link.space_id)
             .map_err(|error| error.to_string())?;
         Ok(FolderTask {
+            linked_started: folder.linked_started,
             telemetry: self.inner.telemetry.clone(),
             link: folder.link.clone(),
             store,
@@ -1925,6 +1929,7 @@ fn load_folders(paths: &Paths) -> Result<BTreeMap<String, Folder>, DriverError> 
             (
                 link.space_id.clone(),
                 Folder {
+                    linked_started: None,
                     status,
                     link,
                     run: None,

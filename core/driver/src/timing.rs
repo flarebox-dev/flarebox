@@ -18,12 +18,14 @@ use koidrive_proto::v1::{
 };
 use koidrive_telemetry::{
     Recorder,
-    schema::{FileCount, Measure},
+    schema::{Counter, FileCount, Measure},
 };
 
 use crate::status::FolderState;
 
 pub(crate) type Bytes = Option<Arc<AtomicU64>>;
+
+const MAX_DURATION_MS: u64 = 30 * 86_400_000;
 
 pub(crate) fn add_bytes(bytes: &Bytes, count: u64) {
     if let Some(bytes) = bytes {
@@ -33,7 +35,7 @@ pub(crate) fn add_bytes(bytes: &Bytes, count: u64) {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Time {
     pub mono: Instant,
     pub unix_ms: i64,
@@ -59,12 +61,18 @@ impl Time {
 pub(crate) struct Timing {
     recorder: Recorder,
     state: Option<Box<State>>,
-    first: Option<(PathBuf, i64)>,
+    first: Option<First>,
+}
+
+struct First {
+    path: PathBuf,
+    linked_ms: i64,
+    opened: Time,
 }
 
 #[derive(Default)]
 struct State {
-    syncing: Option<(Instant, Instant)>,
+    syncing: Option<(Instant, u32)>,
     download: Burst,
     upload: Burst,
     origins: BTreeMap<String, Origin>,
@@ -83,6 +91,7 @@ struct Origin {
     seq: u64,
     revision: Option<(u64, u64, bool)>,
     committed_ms: i64,
+    received: Time,
 }
 
 struct Planned {
@@ -109,6 +118,10 @@ impl Timing {
     }
 
     pub fn open(store: &Path, linked_ms: i64) -> Self {
+        Self::open_at(store, linked_ms, Time::now())
+    }
+
+    fn open_at(store: &Path, linked_ms: i64, opened: Time) -> Self {
         let path = store.with_file_name("first-sync");
         let eligible = fs::read_to_string(&path)
             .ok()
@@ -117,13 +130,26 @@ impl Timing {
         Self {
             recorder: Recorder::off(),
             state: None,
-            first: eligible.then_some((path, linked_ms)),
+            first: eligible.then_some(First {
+                path,
+                linked_ms,
+                opened,
+            }),
         }
     }
 
     pub fn enable(&mut self, recorder: Recorder) {
         self.state = recorder.is_on().then(Box::default);
         self.recorder = recorder;
+    }
+
+    pub fn linked(&mut self, started: Option<Time>) {
+        if let Some(started) = started
+            && let Some(first) = &mut self.first
+            && first.linked_ms == started.unix_ms
+        {
+            first.opened = started;
+        }
     }
 
     pub fn is_on(&self) -> bool {
@@ -139,45 +165,57 @@ impl Timing {
     }
 
     pub fn first_sync(&mut self, files: u64, at: Time) {
-        let Some((path, linked_ms)) = self.first.take() else {
+        let Some(first) = self.first.take() else {
             return;
         };
-        if fs::remove_file(&path).is_err() {
+        if fs::remove_file(&first.path).is_err() {
             return;
         }
-        if File::open(path.parent().unwrap())
+        if File::open(first.path.parent().unwrap())
             .and_then(|dir| dir.sync_all())
             .is_err()
         {
             return;
         }
-        if linked_ms > 0 && at.unix_ms >= linked_ms {
-            self.recorder.measure_on(
-                at.day(),
-                Measure::FirstSync(FileCount::bucket(files)),
-                (at.unix_ms - linked_ms) as u64,
-            );
+        let Some(before) = wall_duration(first.linked_ms, first.opened.unix_ms) else {
+            return;
+        };
+        if wall_duration(first.linked_ms, at.unix_ms).is_none() {
+            return;
         }
+        let Some(elapsed) = at.mono.checked_duration_since(first.opened.mono) else {
+            return;
+        };
+        let duration = before.saturating_add(millis(elapsed));
+        if duration > MAX_DURATION_MS {
+            return;
+        }
+        self.recorder.measure_on(
+            at.day(),
+            Measure::FirstSync(FileCount::bucket(files)),
+            duration,
+        );
     }
 
     pub fn status(&mut self, status: FolderState, at: Time) {
         let Some(state) = &mut self.state else { return };
         let syncing = matches!(status, FolderState::Bootstrapping | FolderState::CatchingUp);
-        if syncing {
-            let (start, sample) = state.syncing.get_or_insert((at.mono, at.mono));
-            if at.mono.saturating_duration_since(*sample) >= Duration::from_secs(60) {
-                self.recorder.measure_on(
-                    at.day(),
-                    Measure::ActiveSyncingMilliseconds,
-                    millis(at.mono.saturating_duration_since(*start)),
-                );
-                *sample = at.mono;
+        if let Some((_, day)) = &mut state.syncing
+            && *day < at.day()
+        {
+            for unfinished in (*day).max(at.day().saturating_sub(30))..at.day() {
+                self.recorder
+                    .count_on(unfinished, Counter::UnfinishedSyncing, 1);
             }
+            *day = at.day();
+        }
+        if syncing {
+            state.syncing.get_or_insert((at.mono, at.day()));
         } else if let Some((start, _)) = state.syncing.take() {
             self.recorder.measure_on(
                 at.day(),
                 Measure::SyncingMilliseconds,
-                millis(at.mono.saturating_duration_since(start)),
+                millis(at.mono.saturating_duration_since(start)).min(MAX_DURATION_MS),
             );
         }
     }
@@ -248,13 +286,14 @@ impl Timing {
                 _ => continue,
             };
             state.origins.remove(node);
-            if committed_ms > 0 && committed_ms <= at.unix_ms {
+            if wall_duration(committed_ms, at.unix_ms).is_some() {
                 state.origins.insert(
                     node.clone(),
                     Origin {
                         seq,
                         revision,
                         committed_ms,
+                        received: at,
                     },
                 );
             }
@@ -335,13 +374,14 @@ impl Timing {
         }
         if let Some(origin) = planned.origin
             && state.origins.get(&planned.node) == Some(&origin)
-            && at.unix_ms >= origin.committed_ms
+            && let Some(before) = wall_duration(origin.committed_ms, origin.received.unix_ms)
+            && let Some(elapsed) = at.mono.checked_duration_since(origin.received.mono)
         {
-            self.recorder.measure_on(
-                at.day(),
-                Measure::RemoteApplyMilliseconds,
-                (at.unix_ms - origin.committed_ms) as u64,
-            );
+            let duration = before.saturating_add(millis(elapsed));
+            if duration <= MAX_DURATION_MS {
+                self.recorder
+                    .measure_on(at.day(), Measure::RemoteApplyMilliseconds, duration);
+            }
             if planned.final_target {
                 state.origins.remove(&planned.node);
             }
@@ -366,6 +406,9 @@ impl Timing {
 
     pub fn uploaded(&mut self, commit: &Commit, result: &CommitResult) {
         let Some(state) = &mut self.state else { return };
+        if state.upload.start.is_none() {
+            return;
+        }
         for (index, (op, result)) in commit.ops.iter().zip(&result.results).enumerate() {
             if matches!(
                 op.op,
@@ -415,11 +458,19 @@ fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+fn wall_duration(start: i64, end: i64) -> Option<u64> {
+    if start <= 0 {
+        return None;
+    }
+    u64::try_from(end.checked_sub(start)?)
+        .ok()
+        .filter(|elapsed| *elapsed <= MAX_DURATION_MS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use koidrive_engine::tree::{Kind, Shape};
-    use koidrive_proto::v1::{Content, NodeState, NodeStatus, Op, OpResult};
+    use koidrive_proto::v1::{Content, NodeKind, NodeState, NodeStatus, Op, OpResult, VersionInfo};
     use serde_json::{Value, json};
 
     fn time() -> Time {
@@ -451,19 +502,22 @@ mod tests {
     }
 
     fn node(revision: u64) -> RemoteNode {
-        RemoteNode {
-            shape: Shape {
-                parent: "root".into(),
-                name: "secret-name".into(),
-                kind: Kind::File,
-                content: Some(Content::default()),
-            },
-            trashed: false,
+        RemoteNode::from_state(&NodeState {
+            parent_id: "root".into(),
+            name: "secret-name".into(),
+            kind: NodeKind::File as i32,
+            status: NodeStatus::Live as i32,
             content_rev: revision,
             meta_rev: 1,
-            trash_group: String::new(),
-            version_id: format!("version-{revision}"),
-        }
+            current: Some(VersionInfo {
+                version_id: format!("version-{revision}"),
+                content: Some(Content::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap()
+        .1
     }
 
     fn effect(id: &str) -> EffectRecord {
@@ -519,18 +573,18 @@ mod tests {
         let store = dir.path().join("store.sqlite");
         let recorder = Recorder::on();
         let at = time();
-        let mut legacy = Timing::open(&store, 1);
+        let mut legacy = Timing::open_at(&store, 1, at);
         legacy.enable(recorder.clone());
         legacy.first_sync(100_000, at);
         assert!(recorder.take().days.is_empty());
         Timing::initialize(&store, at.unix_ms - 5000);
-        drop(Timing::open(&store, at.unix_ms - 5000));
-        let mut timing = Timing::open(&store, at.unix_ms - 5000);
+        drop(Timing::open_at(&store, at.unix_ms - 5000, at));
+        let mut timing = Timing::open_at(&store, at.unix_ms - 5000, at);
         timing.enable(recorder.clone());
         timing.first_sync(100_000, at);
         timing.first_sync(400_000, at);
         drop(timing);
-        let mut reopened = Timing::open(&store, at.unix_ms - 5000);
+        let mut reopened = Timing::open_at(&store, at.unix_ms - 5000, at);
         reopened.enable(recorder.clone());
         reopened.first_sync(400_000, later(at, Duration::from_secs(100)));
         let value = reports(&recorder);
@@ -546,7 +600,7 @@ mod tests {
             1
         );
         Timing::initialize(&store, at.unix_ms);
-        let mut relinked = Timing::open(&store, at.unix_ms);
+        let mut relinked = Timing::open_at(&store, at.unix_ms, at);
         relinked.enable(recorder.clone());
         relinked.first_sync(400_000, later(at, Duration::from_secs(1)));
         assert_eq!(
@@ -562,8 +616,8 @@ mod tests {
         let at = time();
         let recorder = Recorder::on();
         Timing::initialize(&store, at.unix_ms);
-        assert!(!Timing::open(&store, at.unix_ms + 1).has_first());
-        let mut timing = Timing::open(&store, at.unix_ms);
+        assert!(!Timing::open_at(&store, at.unix_ms + 1, at).has_first());
+        let mut timing = Timing::open_at(&store, at.unix_ms, at);
         timing.enable(recorder.clone());
         fs::remove_file(store.with_file_name("first-sync")).unwrap();
         fs::create_dir(store.with_file_name("first-sync")).unwrap();
@@ -571,14 +625,14 @@ mod tests {
         assert!(recorder.take().days.is_empty());
         fs::remove_dir(store.with_file_name("first-sync")).unwrap();
         Timing::initialize(&store, at.unix_ms);
-        let mut off = Timing::open(&store, at.unix_ms);
+        let mut off = Timing::open_at(&store, at.unix_ms, at);
         off.first_sync(1, at);
-        assert!(!Timing::open(&store, at.unix_ms).has_first());
+        assert!(!Timing::open_at(&store, at.unix_ms, at).has_first());
         assert!(off.state.is_none());
     }
 
     #[test]
-    fn syncing_spans_sample_active_age_and_finish_on_real_transitions_across_days() {
+    fn syncing_spans_count_unfinished_days_and_finish_on_real_transitions() {
         let recorder = Recorder::on();
         let mut timing = tracker(&recorder);
         let at = time();
@@ -587,10 +641,8 @@ mod tests {
         timing.status(FolderState::CatchingUp, later(at, Duration::from_secs(10)));
         timing.status(FolderState::CatchingUp, later(at, Duration::from_secs(60)));
         let value = reports(&recorder);
-        assert_eq!(
-            value["2"]["histograms"]["syncing_ms"]["active_age"]["sum"],
-            60_000
-        );
+        assert_eq!(value["1"]["counters"]["sync"]["unfinished"], 1);
+        assert!(value["2"]["histograms"]["syncing_ms"]["active_age"].is_null());
         assert!(value["2"]["histograms"]["syncing_ms"]["completed"].is_null());
         timing.status(FolderState::Offline, later(at, Duration::from_secs(90)));
         timing.status(FolderState::Halted, later(at, Duration::from_secs(100)));
@@ -606,6 +658,108 @@ mod tests {
         timing.status(FolderState::UpToDate, later(at, Duration::from_secs(900)));
         assert!(timing.state.is_none());
         assert!(off.take().days.is_empty());
+    }
+
+    #[test]
+    fn unfinished_reports_cannot_reveal_the_start_minute_across_midnight() {
+        let mut unfinished = Vec::new();
+        for minute in [17, 47] {
+            let recorder = Recorder::on();
+            let mut timing = tracker(&recorder);
+            let at = Time {
+                mono: Instant::now(),
+                unix_ms: 20_000 * 86_400_000 + (22 * 3600 + minute * 60 + 23) * 1000,
+            };
+            let seconds = (20_001 * 86_400_000 + 30 * 60_000 - at.unix_ms) / 1000;
+            for elapsed in (0..=seconds).step_by(5) {
+                timing.status(
+                    FolderState::Bootstrapping,
+                    later(at, Duration::from_secs(elapsed as u64)),
+                );
+            }
+            let value = reports(&recorder);
+            assert!(!value.to_string().contains("active_age"));
+            assert!(value["20000"]["histograms"].is_null());
+            assert!(value["20001"].is_null());
+            unfinished.push(value["20000"]["counters"].clone());
+            timing.status(
+                FolderState::Stopped,
+                later(at, Duration::from_secs(seconds as u64)),
+            );
+        }
+        assert_eq!(unfinished[0], unfinished[1]);
+        assert_eq!(unfinished[0], json!({"sync": {"unfinished": 1}}));
+    }
+
+    #[test]
+    fn broken_clocks_cannot_turn_durations_into_timestamps() {
+        let now = Time::now();
+        for (linked_ms, opened, finished) in [
+            (
+                1,
+                Time { unix_ms: 1, ..now },
+                later(now, Duration::from_secs(1)),
+            ),
+            (1, now, later(now, Duration::from_secs(1))),
+            (
+                now.unix_ms,
+                now,
+                Time {
+                    unix_ms: now.unix_ms - 1,
+                    ..later(now, Duration::from_secs(1))
+                },
+            ),
+            (
+                now.unix_ms,
+                now,
+                later(now, Duration::from_millis(MAX_DURATION_MS + 1)),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = dir.path().join("store.sqlite");
+            Timing::initialize(&store, linked_ms);
+            let recorder = Recorder::on();
+            let mut timing = Timing::open_at(&store, linked_ms, opened);
+            timing.enable(recorder.clone());
+            timing.first_sync(1, finished);
+            assert!(recorder.take().days.is_empty());
+            assert!(!Timing::open_at(&store, linked_ms, finished).has_first());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store.sqlite");
+        Timing::initialize(&store, now.unix_ms);
+        let recorder = Recorder::on();
+        let jumped = Time {
+            unix_ms: now.unix_ms + 15 * 86_400_000,
+            ..later(now, Duration::from_secs(1))
+        };
+        let mut first = Timing::open_at(&store, now.unix_ms, jumped);
+        first.linked(Some(now));
+        first.enable(recorder.clone());
+        first.first_sync(1, jumped);
+        let value = reports(&recorder);
+        assert_eq!(
+            value[jumped.day().to_string()]["histograms"]["first_sync_ms"]["1"]["sum"],
+            1000
+        );
+        let recorder = Recorder::on();
+        let mut timing = tracker(&recorder);
+        timing.records(&[record(1, 1, 1)], 0, 1, "me", now);
+        let effect = effect("clock");
+        timing.planned(&effect, Some(&node(1)), now);
+        timing.applied(&effect.effect_id, true, later(now, Duration::from_secs(1)));
+        assert!(recorder.take().days.is_empty());
+        timing.records(&[record(2, now.unix_ms - 1000, 1)], 1, 2, "me", now);
+        timing.planned(&effect, Some(&node(1)), now);
+        let corrected = Time {
+            unix_ms: now.unix_ms + 15 * 86_400_000,
+            ..later(now, Duration::from_secs(1))
+        };
+        timing.applied(&effect.effect_id, true, corrected);
+        let value = reports(&recorder);
+        let histogram =
+            &value[corrected.day().to_string()]["histograms"]["remote_apply_ms"]["effect"];
+        assert_eq!(histogram["sum"], 2000);
     }
 
     #[test]
@@ -643,14 +797,16 @@ mod tests {
             later(at, Duration::from_millis(90)),
         );
         let mut upload = commit();
+        let mut update = koidrive_proto::v1::UpdateContent {
+            node_id: "deduplicated-file".into(),
+            ..Default::default()
+        };
+        update.content = Some(Content {
+            size: 4096,
+            ..Default::default()
+        });
         upload.ops.push(Op {
-            op: Some(op::Op::UpdateContent(koidrive_proto::v1::UpdateContent {
-                node_id: "deduplicated-file".into(),
-                content: Some(Content {
-                    size: 4096,
-                    ..Default::default()
-                }),
-            })),
+            op: Some(op::Op::UpdateContent(update)),
         });
         timing.uploading(&upload, at);
         let accepted = CommitResult {
@@ -706,6 +862,37 @@ mod tests {
         timing.status(FolderState::UpToDate, at);
         timing.drained(at);
         assert!(recorder.take().days.is_empty());
+    }
+
+    #[test]
+    fn accepting_a_resent_commit_without_an_upload_start_leaves_no_burst_files() {
+        let recorder = Recorder::on();
+        let mut timing = tracker(&recorder);
+        let at = time();
+        let mut upload = commit();
+        let accepted = CommitResult {
+            results: vec![OpResult {
+                code: op_result::Code::Applied as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        timing.uploaded(&upload, &accepted);
+        timing.drained(at);
+        assert!(recorder.take().days.is_empty());
+        upload.commit_id = "later-upload".into();
+        add_bytes(&timing.uploading(&upload, at), 1000);
+        timing.uploaded(&upload, &accepted);
+        timing.drained(later(at, Duration::from_secs(1)));
+        let value = reports(&recorder);
+        assert_eq!(
+            value["1"]["histograms"]["upload_per_second"]["files"]["sum"],
+            1
+        );
+        assert_eq!(
+            value["1"]["histograms"]["upload_per_second"]["bytes"]["sum"],
+            1000
+        );
     }
 
     #[test]

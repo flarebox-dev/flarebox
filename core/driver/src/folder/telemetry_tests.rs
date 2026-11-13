@@ -10,7 +10,7 @@ fn histograms(recorder: &Recorder) -> serde_json::Value {
 
 #[test]
 fn telemetry_folder_hooks_measure_first_sync_transfers_and_successful_apply() {
-    let mut remote = Remote::new();
+    let mut remote = Remote::new_at(Time::now().unix_ms - 10_000);
     let (site_a, mut a) = linked(&mut remote, "private-device-a");
     let uploaded = Recorder::on();
     a.folder.timing.enable(uploaded.clone());
@@ -117,7 +117,7 @@ fn telemetry_real_folder_release_measurement() {
         } else {
             [true, false]
         } {
-            let mut remote = Remote::new();
+            let mut remote = Remote::new_at(Time::now().unix_ms - 10_000);
             let (site_a, mut a) = linked(&mut remote, "a");
             fs::create_dir(site_a.root.join("files")).unwrap();
             for file in 0..16 {
@@ -174,7 +174,7 @@ fn telemetry_real_folder_release_measurement() {
 
 #[test]
 fn telemetry_folder_retries_preserve_apply_origin_without_success_on_failure() {
-    let mut remote = Remote::new();
+    let mut remote = Remote::new_at(Time::now().unix_ms - 10_000);
     let (site_a, mut a) = linked(&mut remote, "a");
     let (site_b, mut b) = linked(&mut remote, "b");
     let recorder = Recorder::on();
@@ -203,4 +203,52 @@ fn telemetry_folder_retries_preserve_apply_origin_without_success_on_failure() {
     let completed = histograms(&recorder);
     assert_eq!(completed["remote_apply_ms"]["effect"]["count"], 1);
     assert_eq!(completed["download_per_second"]["files"]["count"], 1);
+}
+
+#[test]
+fn resent_commits_without_a_burst_do_not_inflate_later_uploads() {
+    let mut remote = Remote::new_at(Time::now().unix_ms - 10_000);
+    let (site, mut a) = linked(&mut remote, "a");
+    for file in 0..20 {
+        fs::write(
+            site.root.join(format!("first-{file}")),
+            vec![file as u8; 1000],
+        )
+        .unwrap();
+    }
+    a.scan_until(|a| !a.work.is_empty());
+    let upload = a.work.pop_front().unwrap();
+    a.perform(upload, &mut remote).unwrap();
+    assert!(matches!(a.work.pop_front(), Some(Work::Send(_))));
+    drop(a);
+    let recorder = Recorder::on();
+    let mut a = site.start();
+    a.folder.timing.enable(recorder.clone());
+    a.connect(&remote);
+    assert!(matches!(a.work.front(), Some(Work::Send(_))));
+    a.scan_until(|a| a.folder.scanned);
+    a.rest(&mut remote);
+    assert_eq!(a.state(), FolderState::UpToDate);
+    assert_eq!(remote.names().len(), 20);
+    assert!(histograms(&recorder).get("upload_per_second").is_none());
+    for file in 0..20 {
+        fs::write(
+            site.root.join(format!("later-{file}")),
+            vec![100 + file as u8; 1000],
+        )
+        .unwrap();
+    }
+    a.scan_until(|a| !a.work.is_empty());
+    a.rest(&mut remote);
+    assert_eq!(a.state(), FolderState::UpToDate);
+    assert_eq!(remote.names().len(), 40);
+    let sent = histograms(&recorder);
+    let files = sent["upload_per_second"]["files"]["sum"].as_u64().unwrap() as f64;
+    let bytes = sent["upload_per_second"]["bytes"]["sum"].as_u64().unwrap() as f64;
+    assert!(files > 0.0);
+    let counted = 20_000.0 * files / bytes;
+    assert!(
+        (counted - 20.0).abs() < 2.0,
+        "counted {counted} files for a 20-file burst"
+    );
 }

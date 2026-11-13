@@ -18,10 +18,7 @@ fn preview_round_trips_every_timing_field_and_drops_private_fixture_fields() {
         recorder.measure(measure, 1234);
         if matches!(
             measure,
-            Measure::FirstSync(_)
-                | Measure::RemoteApplyMilliseconds
-                | Measure::SyncingMilliseconds
-                | Measure::ActiveSyncingMilliseconds
+            Measure::FirstSync(_) | Measure::RemoteApplyMilliseconds | Measure::SyncingMilliseconds
         ) {
             for millis in [60_000, 600_000, 5_280_000] {
                 recorder.measure(measure, millis);
@@ -29,6 +26,7 @@ fn preview_round_trips_every_timing_field_and_drops_private_fixture_fields() {
         }
     }
     recorder.count(Counter::CpuMilliseconds, 4567);
+    recorder.count(Counter::UnfinishedSyncing, 2);
     let pending = recorder.take();
     let expected = serde_json::to_value(&pending.days[&koidrive_telemetry::today()]).unwrap();
     let store = Store::new(&home.path().join("state/koidrive"));
@@ -49,16 +47,24 @@ fn preview_round_trips_every_timing_field_and_drops_private_fixture_fields() {
     day["counters"]["private-space-id"] = json!({ "private-name.txt": 1794527123456u64 });
     day["histograms"]["first_sync_ms"]["private-space-id"] =
         json!({"shift": 10, "buckets": vec![0;16], "count": 1, "sum": 1794527123456u64});
+    day["histograms"]["syncing_ms"]["active_age"] =
+        json!({"shift": 10, "buckets": vec![0;16], "count": 1, "sum": 1794527123456u64});
     std::fs::write(&queue, serde_json::to_vec(&value).unwrap()).unwrap();
     let preview = stdout(&koi(home.path(), &["telemetry", "preview"], &[]));
     let body: Value = serde_json::from_str(&preview).unwrap();
     let properties = &body["batch"][0]["properties"];
     assert_eq!(properties["c.process.cpu_ms"], 4567);
+    assert_eq!(properties["c.sync.unfinished"], 2);
+    assert!(
+        !properties
+            .as_object()
+            .unwrap()
+            .contains_key("h.syncing_ms.active_age")
+    );
     for metric in [
         "h.first_sync_ms.0",
         "h.remote_apply_ms.effect",
         "h.syncing_ms.completed",
-        "h.syncing_ms.active_age",
     ] {
         let histogram = &properties[metric];
         assert_eq!(histogram["shift"], 10);

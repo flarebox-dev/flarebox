@@ -245,6 +245,7 @@ pub enum Outcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Counter {
     CpuMilliseconds,
+    UnfinishedSyncing,
     /// A CLI command ran. Only its name; never its arguments.
     Command(Command),
     /// What the daemon synced, over all its linked folders.
@@ -259,12 +260,13 @@ impl Counter {
         (Command::ALL.into_iter().map(Counter::Command))
             .chain(Synced::ALL.map(Counter::Sync))
             .chain(Failure::all().map(Counter::Failure))
-            .chain([Counter::CpuMilliseconds])
+            .chain([Counter::CpuMilliseconds, Counter::UnfinishedSyncing])
     }
 
     pub(crate) fn key(self) -> (&'static str, &'static str) {
         match self {
             Counter::CpuMilliseconds => ("process", "cpu_ms"),
+            Counter::UnfinishedSyncing => ("sync", "unfinished"),
             Counter::Command(command) => ("command", command.name()),
             Counter::Sync(synced) => ("sync", synced.name()),
             Counter::Failure(failure) => failure.key(),
@@ -546,7 +548,6 @@ pub enum Measure {
     UploadBytesPerSecond,
     RemoteApplyMilliseconds,
     SyncingMilliseconds,
-    ActiveSyncingMilliseconds,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -596,7 +597,6 @@ impl Measure {
                 Measure::UploadBytesPerSecond,
                 Measure::RemoteApplyMilliseconds,
                 Measure::SyncingMilliseconds,
-                Measure::ActiveSyncingMilliseconds,
             ])
     }
 
@@ -605,12 +605,11 @@ impl Measure {
         match self {
             Measure::FirstSync(files) => ("first_sync_ms", files.name(), 10),
             Measure::DownloadFilesPerSecond => ("download_per_second", "files", 0),
-            Measure::DownloadBytesPerSecond => ("download_per_second", "bytes", 10),
+            Measure::DownloadBytesPerSecond => ("download_per_second", "bytes", 15),
             Measure::UploadFilesPerSecond => ("upload_per_second", "files", 0),
-            Measure::UploadBytesPerSecond => ("upload_per_second", "bytes", 10),
+            Measure::UploadBytesPerSecond => ("upload_per_second", "bytes", 15),
             Measure::RemoteApplyMilliseconds => ("remote_apply_ms", "effect", 10),
             Measure::SyncingMilliseconds => ("syncing_ms", "completed", 10),
-            Measure::ActiveSyncingMilliseconds => ("syncing_ms", "active_age", 10),
         }
     }
 }
@@ -1047,7 +1046,6 @@ mod tests {
                 Measure::FirstSync(_)
                     | Measure::RemoteApplyMilliseconds
                     | Measure::SyncingMilliseconds
-                    | Measure::ActiveSyncingMilliseconds
             )
         }) {
             let (metric, label, shift) = measure.key();
@@ -1081,6 +1079,51 @@ mod tests {
                     .unwrap();
             assert!(rejected.is_empty());
         }
+    }
+
+    #[test]
+    fn byte_rate_histograms_distinguish_one_ten_and_one_hundred_mebibytes_per_second() {
+        for measure in [
+            Measure::UploadBytesPerSecond,
+            Measure::DownloadBytesPerSecond,
+        ] {
+            let recorder = crate::Recorder::on();
+            for rate in [1 << 20, 10 << 20, 100 << 20] {
+                recorder.measure_on(1, measure, rate);
+            }
+            let report = recorder.take().days.remove(&1).unwrap();
+            let (metric, label, _) = measure.key();
+            let histogram = &report.histograms[metric][label];
+            for bucket in [6, 9, 12] {
+                assert_eq!(histogram.buckets[bucket], 1);
+            }
+            assert_eq!(histogram.buckets[15], 0);
+        }
+    }
+
+    #[test]
+    fn unfinished_syncing_round_trips_and_stored_active_ages_are_dropped() {
+        for shift in [0, 10] {
+            let report: DailyReport = serde_json::from_value(serde_json::json!({
+                "day": 1,
+                "counters": { "sync": { "unfinished": 2 } },
+                "histograms": { "syncing_ms": { "active_age": {
+                    "shift": shift,
+                    "buckets": vec![0; 16],
+                    "count": 1,
+                    "sum": 1794527123456u64,
+                } } },
+            }))
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(report).unwrap(),
+                serde_json::json!({
+                    "day": 1,
+                    "counters": { "sync": { "unfinished": 2 } },
+                })
+            );
+        }
+        assert_eq!(Counter::UnfinishedSyncing.key(), ("sync", "unfinished"));
     }
 
     #[test]
