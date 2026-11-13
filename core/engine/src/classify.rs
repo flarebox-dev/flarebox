@@ -1093,7 +1093,8 @@ impl Trees {
     /// `edited` lists the files whose content an edit of this device set before the bootstrap
     /// ([`Trees::edited_here`]), each with the seq of that edit's commit. A file of it that R now
     /// holds, live or in the trash, at the position S holds, with content of no revision above
-    /// `held_through`, lost the edit. S takes
+    /// `held_through` or at a version the log replaced for it before
+    /// ([`TreesState::replaced_versions`]), lost the edit. S takes
     /// R's shape for it, so the content L holds is sent again as an edit instead of being kept
     /// beside R's as a conflict copy. A delete R holds trashed the content from before the edit, so
     /// the edit beats it (R8): the server revives the file instead of this device moving the edit
@@ -1177,8 +1178,12 @@ impl Trees {
             self.set_synced(id, Some(shape));
         }
         for (id, _) in edited {
+            let replaced = self.replaced_versions.get(&id);
             let Some(remote) = (self.r.get(&id))
-                .filter(|remote| remote.content_rev <= held_through)
+                .filter(|remote| {
+                    remote.content_rev <= held_through
+                        || replaced.is_some_and(|versions| versions.contains(&remote.version_id))
+                })
                 .filter(|remote| (self.s.live(&id)).is_some_and(|s| s.same_position(&remote.shape)))
                 .map(|remote| remote.shape.clone())
             else {
