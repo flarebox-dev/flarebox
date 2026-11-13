@@ -222,7 +222,7 @@ def rust_fns(src):
 def changed_docs(old, new):
     added, removed = list(new), list(old)
     for same in (str.__eq__, lambda after, before: bool(before) and after.startswith(before)):
-        for docs in list(removed):
+        for docs in sorted(removed, key=len, reverse=True):
             match = next((fn for fn in added if same(fn[0], docs)), None)
             if match:
                 added.remove(match)

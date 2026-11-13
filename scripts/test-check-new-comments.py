@@ -390,6 +390,14 @@ class NewComments(unittest.TestCase):
             ("core/a/src/lib.rs", 5),
         )
 
+    def test_a_moved_doc_that_prefixes_an_extended_namesake_doc_fails(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": '#[cfg(unix)]\n/// Runs.\npub fn run() {}\n#[cfg(not(unix))]\n/// Runs.\n/// Fast.\npub fn run() {}\nfn helper() {}\n'},
+            {"core/a/src/lib.rs": '#[cfg(unix)]\npub fn run() {}\n#[cfg(not(unix))]\n/// Runs.\n/// Fast.\n/// More.\npub fn run() {}\n/// Runs.\nfn helper() {}\n'},
+            ("core/a/src/lib.rs", 2),
+            ("core/a/src/lib.rs", 9),
+        )
+
     def test_deleting_a_pub_fn_doc_comment_passes(self):
         self.assertFlags(
             {"core/a/src/lib.rs": "/// Acknowledges.\npub fn ack() {}\n"},
