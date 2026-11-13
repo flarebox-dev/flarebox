@@ -50,7 +50,10 @@ A new `rewind_id` is refused, with nothing recorded and nothing changed, in thes
 At admission, `restore_point_ms` (P) must meet all of these:
 - it is at least one minute and at most 29 days before the request;
 - it is not before the space was created;
+- PITR has a bookmark for it. PITR's history of a new Space DO begins some time after the object is created, and `getBookmarkForTime` refuses an earlier time with "Requested time is before this database existed." A point 30 s after creation was refused on Cloudflare (deploy-test run 43346942764); the documentation states no bound;
 - it is not inside the interval during which an earlier rewind of the space held the space closed (§3).
+
+The Account DO checks the last condition through the Space DO at admission, and refuses with `INVALID_ARGUMENT` like the others, since no retry can make PITR serve that point.
 
 The 29-day bound keeps P inside the 30-day PITR range, with a day for the rewind to finish. The window is checked once, at admission. A rewind already admitted is never refused later because time has passed.
 

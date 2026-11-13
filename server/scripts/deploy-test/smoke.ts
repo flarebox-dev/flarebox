@@ -20,6 +20,7 @@ const encoder = new TextEncoder();
 const SEGMENT_WAIT_MS = 9 * 60_000;
 const SNAPSHOT_WAIT_MS = 5 * 60_000;
 const REWIND_WAIT_MS = 5 * 60_000;
+const PITR_HISTORY_WAIT_MS = 90_000;
 
 afterAll(() => addStats(stats));
 
@@ -32,6 +33,7 @@ const run = {
   files: {} as Record<"notes" | "photo" | "plan" | "notesV2" | "later", FileData>,
   seqA: 0n,
   seqB: 0n,
+  spaceCreatedMs: 0,
   restorePointMs: 0,
   firstCommitMs: 0,
 };
@@ -73,6 +75,7 @@ describe("a server deployed to a real account", () => {
   });
 
   it("creates a space that both devices list", async () => {
+    run.spaceCreatedMs = Date.now();
     const space = await server.json("POST", "/v1/spaces", SpaceInfoSchema, { body: { name: "Deploy test" }, token: await owner.token(), status: 201 });
     run.spaceId = space.spaceId;
     const listed = await server.json("GET", "/v1/spaces", SpaceListSchema, { token: await run.second!.token() });
@@ -129,7 +132,7 @@ describe("a server deployed to a real account", () => {
   });
 
   it("commits a second set of changes twenty seconds after a restore point", async () => {
-    await sleep(20_000);
+    await sleep(Math.max(20_000, run.spaceCreatedMs + PITR_HISTORY_WAIT_MS - Date.now()));
     run.restorePointMs = Date.now();
     await sleep(20_000);
     run.files.notesV2 = await fileData([encoder.encode("Notes changed after the restore point\n")]);

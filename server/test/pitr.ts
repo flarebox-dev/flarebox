@@ -72,7 +72,7 @@ function simulated(state: DurableObjectState): Simulated {
 
 export const simulatedPitr = {
   dropArms: false,
-  bookmarkFor: undefined as ((timestampMs: number) => string) | undefined,
+  bookmarkFor: undefined as ((timestampMs: number) => string | undefined) | undefined,
 
   install(): void {
     pitrBackend.open = (state: DurableObjectState): Pitr => {
@@ -87,8 +87,7 @@ export const simulatedPitr = {
         bookmarkForTime: async (timestampMs) => {
           if (simulatedPitr.bookmarkFor) return simulatedPitr.bookmarkFor(timestampMs);
           const earlier = object.snapshots.filter((snapshot) => snapshot.atMs <= timestampMs);
-          if (earlier.length === 0) throw new Error("no state recorded at or before " + timestampMs);
-          return earlier.at(-1)!.bookmark;
+          return earlier.at(-1)?.bookmark;
         },
         restoreOnNextStart: async (bookmark) => {
           if (!object.snapshots.some((snapshot) => snapshot.bookmark === bookmark)) throw new Error("unknown bookmark " + bookmark);
