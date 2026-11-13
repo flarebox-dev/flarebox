@@ -595,7 +595,8 @@ impl Snapshot {
     /// so a removal another watcher held is not read as a replacement; a path
     /// below a folder the rescan cannot read is not counted as scanned. A held entry whose
     /// removal the scan cannot confirm, as below a folder it cannot read,
-    /// stays held.
+    /// stays held. One whose path the rules now leave out is left to the
+    /// search, whatever the disk holds at that path.
     ///
     /// On any error `rules` are unchanged too.
     pub fn rescan_with_rules(
@@ -824,7 +825,21 @@ impl Snapshot {
         )?;
         let stays = match &scan.rules {
             Some(rules) => {
-                let held = rules.held_in(&scan.replaced);
+                let held: BTreeMap<PathBuf, Entry> = (rules.held_in(&scan.replaced).into_iter())
+                    .filter(|(path, entry)| {
+                        (path
+                            .ancestors()
+                            .take_while(|above| !above.as_os_str().is_empty()))
+                        .all(|above| {
+                            let kind = if above == path {
+                                entry.kind
+                            } else {
+                                EntryKind::Dir
+                            };
+                            rules.status(above, kind) == Ignored::No
+                        })
+                    })
+                    .collect();
                 let mut there: BTreeMap<PathBuf, Entry> = (held.keys())
                     .filter_map(|path| Some((path.clone(), *scan.new.get(path)?)))
                     .collect();

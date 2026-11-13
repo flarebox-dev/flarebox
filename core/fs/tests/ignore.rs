@@ -2915,3 +2915,54 @@ fn a_reset_after_a_move_into_an_ignored_folder_finds_it_again() {
         ]
     );
 }
+
+#[test]
+fn a_held_removal_whose_path_the_rules_then_leave_out_is_decided() {
+    for rules_after in ["ig/\nd/\n", "ig/\n*.txt\n"] {
+        for (moved, restarted) in [(true, true), (true, false), (false, true), (false, false)] {
+            let case = format!("{rules_after:?} moved {moved} restarted {restarted}");
+            let dir = large_ignored_tree();
+            let root = dir.path();
+            write(root, "d/f.txt", "old");
+            let mut rules = rules().with_search_budget(100);
+            let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
+            let x = snapshot.entries[Path::new("d/f.txt")];
+            match moved {
+                true => fs::rename(root.join("d/f.txt"), root.join("ig/zz/deep/f.txt")).unwrap(),
+                false => fs::remove_file(root.join("d/f.txt")).unwrap(),
+            }
+            if restarted {
+                write(root, "d/f.txt", "new");
+                rules = self::rules().with_search_budget(100);
+            }
+            let first = snapshot
+                .rescan_with_rules(root, whole(), &mut rules)
+                .unwrap();
+            assert_eq!(first.changes, [], "{case}");
+            assert_eq!(first.unsettled, [PathBuf::from("d/f.txt")], "{case}");
+            if !restarted {
+                write(root, "d/f.txt", "new");
+            }
+            write(root, RULES_FILE, rules_after);
+            let decided = match moved {
+                true => Change::Ignored {
+                    from: "d/f.txt".into(),
+                    to: "ig/zz/deep/f.txt".into(),
+                    kind: File,
+                    id: x.id,
+                },
+                false => removed("d/f.txt", File),
+            };
+            assert_eq!(
+                settle(&mut snapshot, root, &mut rules),
+                [
+                    Change::Modified {
+                        path: RULES_FILE.into()
+                    },
+                    decided
+                ],
+                "{case}"
+            );
+        }
+    }
+}
