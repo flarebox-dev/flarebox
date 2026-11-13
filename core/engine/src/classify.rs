@@ -1443,8 +1443,8 @@ impl Trees {
 
     /// The changes of other devices that this device has not taken yet, for [`Trees::forget_lost`]
     /// once a bootstrap has replaced R: the nodes L holds as S does, with no local change below them,
-    /// while R holds them in the trash, and the files whose content L and S hold alike, with no waiting S update to other content,
-    /// while R holds other content live. Neither holds an unsent edit or content an edit of this
+    /// while R holds them in the trash, and the files whose content L and S hold alike, with no
+    /// waiting S update to other content, while R holds other content live. Neither holds an unsent edit or content an edit of this
     /// device set ([`Trees::edited_here`]). Each edit comes with whether a commit of this device
     /// that the server lost made R's record of the file's position: `lost_here` tells whether a seq
     /// is one of those commits.
