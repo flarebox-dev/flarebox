@@ -722,18 +722,37 @@ impl Trees {
     /// removed: the commit planner drops it from S, with every reclaimed folder above it, and
     /// sends them again.
     pub fn reclaimed(&self, id: &str) -> bool {
+        self.discard_state(id) == Some(Discard::Reclaimed)
+    }
+
+    fn discard_state(&self, id: &str) -> Option<Discard> {
         let (Some(local), Some(discarded)) = (self.l.get(id), self.discarded.get(id)) else {
-            return false;
+            return None;
         };
-        self.r.get(id).is_none()
-            && !self.excluded(id)
-            && (!local.shape.same(discarded)
-                || (self.local_children(id)).any(|child| {
-                    !self.excluded(child)
-                        && !self.held(child)
-                        && ((self.discarded.get(child)).is_none_or(|shape| shape.parent != id)
-                            || self.reclaimed(child))
-                }))
+        if self.r.get(id).is_some() {
+            return None;
+        }
+        let mut changed = !local.shape.same(discarded);
+        let mut holds_excluded = false;
+        for child in self.local_children(id) {
+            if changed {
+                break;
+            }
+            let state = self.discard_state(child);
+            let excluded = !self.parked(child)
+                && (state == Some(Discard::Kept) || self.ignored_in_place(child));
+            holds_excluded |= excluded;
+            changed = !excluded
+                && !self.held(child)
+                && ((self.discarded.get(child)).is_none_or(|shape| shape.parent != id)
+                    || state == Some(Discard::Reclaimed));
+        }
+        match (changed, holds_excluded) {
+            (true, _) if !self.parked(id) && self.ignored_in_place(id) => None,
+            (true, _) => Some(Discard::Reclaimed),
+            (false, true) => Some(Discard::Kept),
+            (false, false) => Some(Discard::Pending),
+        }
     }
 
     pub(crate) fn is_discarded(&self, id: &str) -> bool {
@@ -946,7 +965,7 @@ impl Trees {
 
     /// Whether the node is excluded on this device (section 5.10): its position in R, S or L
     /// matches the rules, or so does its place in L below its R parent, or a folder R holds it under is excluded, or its local copy, or a folder L holds it under, was moved into an
-    /// ignored folder. Nothing is planned for an excluded node, in either direction. Its S entry
+    /// ignored folder, or it is a discarded folder L still holds unchanged with an excluded entry in it. Nothing is planned for an excluded node, in either direction. Its S entry
     /// stays the merge base it was: S takes only what L and R both hold, and gives up a position
     /// neither holds any more, so that the entry never keeps another node out of S. A node that L holds at an included position
     /// different from S's is not excluded: the user moved it out, and the move is planned like
@@ -981,6 +1000,10 @@ impl Trees {
     /// it, also when the node is parked. The effects move a parked node that is ignored back to
     /// the position L keeps for it, and it is excluded from then on.
     pub fn ignored(&self, id: &str) -> bool {
+        self.discard_state(id) == Some(Discard::Kept) || self.ignored_in_place(id)
+    }
+
+    fn ignored_in_place(&self, id: &str) -> bool {
         if let Some(ignored) = self.ignored_by_paths(id) {
             return ignored;
         }
@@ -2210,4 +2233,11 @@ fn count_group(counts: &mut BTreeMap<String, u64>, group: Option<String>, add: b
             counts.remove(&group);
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Discard {
+    Reclaimed,
+    Kept,
+    Pending,
 }

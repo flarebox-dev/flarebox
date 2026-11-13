@@ -903,78 +903,6 @@ fn waits_on_excluded(trees: &Trees, id: &str, waiting: &BTreeSet<String>) -> boo
     false
 }
 
-type Discarded = BTreeMap<String, koidrive_engine::tree::Shape>;
-
-struct KnownUnsettled {
-    issue: &'static str,
-    applies: fn(&Trees, &str, &Discarded) -> bool,
-}
-
-const KNOWN_UNSETTLED: [KnownUnsettled; 2] = [
-    KnownUnsettled {
-        issue: "GUN-526",
-        applies: kept_for_an_excluded_entry,
-    },
-    KnownUnsettled {
-        issue: "GUN-526",
-        applies: blocked_by_a_folder_kept_for_an_excluded_entry,
-    },
-];
-
-fn kept_for_an_excluded_entry(trees: &Trees, id: &str, discarded: &Discarded) -> bool {
-    let local = trees.local();
-    let below = |node: &str, folder: &str| {
-        let mut at = node;
-        for _ in 0..=local.len() {
-            match local.get(at) {
-                Some(held) if held.shape.parent == folder => return true,
-                Some(held) => at = &held.shape.parent,
-                None => return false,
-            }
-        }
-        false
-    };
-    let mut at = id;
-    for _ in 0..=local.len() {
-        if discarded.contains_key(at)
-            && (local.iter()).any(|(other, _)| trees.excluded(other) && below(other, at))
-        {
-            return true;
-        }
-        match local.get(at) {
-            Some(held) => at = &held.shape.parent,
-            None => return false,
-        }
-    }
-    false
-}
-
-fn blocked_by_a_folder_kept_for_an_excluded_entry(
-    trees: &Trees,
-    id: &str,
-    discarded: &Discarded,
-) -> bool {
-    let blocked = |id: &str, node: &RemoteNode| {
-        let key = name_key(&node.shape.name);
-        (trees.local().iter()).any(|(other, held)| {
-            other != id
-                && held.shape.kind == Kind::Dir
-                && held.shape.parent == node.shape.parent
-                && name_key(&held.shape.name) == key
-                && kept_for_an_excluded_entry(trees, other, discarded)
-        })
-    };
-    let mut at = id;
-    for _ in 0..=trees.remote().len() {
-        match trees.remote().get(at) {
-            Some(node) if blocked(at, node) => return true,
-            Some(node) => at = &node.shape.parent,
-            None => return false,
-        }
-    }
-    false
-}
-
 /// Whether S cannot take `id` at its R position because the S entry of a node that waits still
 /// holds that name. The entry moves only once its node is placed, which the excluded node keeps
 /// from happening.
@@ -1438,19 +1366,13 @@ fn run_ignoring(
         .map(|(id, _)| id)
         .filter(|id| !outside(id))
         .collect();
-    let known = |id: &str| {
-        (KNOWN_UNSETTLED.iter())
-            .find(|known| (known.applies)(&device.trees, id, &discarded))
-            .map(|known| known.issue)
-    };
     let mut waiting: BTreeSet<String> = BTreeSet::new();
     loop {
         let more: Vec<String> = (unsettled.iter())
             .filter(|id| {
                 !waiting.contains(*id)
                     && (waits_on_excluded(&device.trees, id, &waiting)
-                        || waits_on_synced(&device.trees, id, &waiting)
-                        || known(id).is_some())
+                        || waits_on_synced(&device.trees, id, &waiting))
             })
             .cloned()
             .collect();
@@ -1462,15 +1384,7 @@ fn run_ignoring(
     let unsettled: Vec<&String> = (unsettled.iter())
         .filter(|id| !waiting.contains(*id))
         .collect();
-    let exempted: Vec<(&str, &String)> = (waiting.iter())
-        .filter_map(|id| Some((known(id)?, id)))
-        .collect();
-    prop_assert_eq!(
-        unsettled,
-        Vec::<&String>::new(),
-        "known unsettled: {:?}",
-        exempted
-    );
+    prop_assert_eq!(unsettled, Vec::<&String>::new());
     prop_assert!(commits.problems().is_empty(), "{:?}", commits.problems());
     prop_assert!(effects.blocked().is_empty(), "{:?}", effects.blocked());
     let reported = koidrive_engine::effects::stuck(&device.trees, &effects, commits.in_flight());
@@ -4420,60 +4334,4 @@ fn a_server_entry_below_a_folder_moved_out_of_what_the_rules_include_here_is_lef
         )
         .unwrap();
     }
-}
-
-#[test]
-fn the_gun_526_exemption_covers_only_a_server_node_another_kept_folder_blocks() {
-    use koidrive_engine::tree::Shape;
-    let dir = |name: &str| Shape {
-        parent: "root".into(),
-        name: name.into(),
-        kind: Kind::Dir,
-        content: None,
-    };
-    let file = |parent: &str, name: &str| Shape {
-        parent: parent.into(),
-        name: name.into(),
-        kind: Kind::File,
-        content: Some(content(1, 1)),
-    };
-    let remote = |shape| RemoteNode {
-        shape,
-        trashed: false,
-        meta_rev: 1,
-        content_rev: 1,
-        trash_group: String::new(),
-        version_id: String::new(),
-        edit_rev: 1,
-    };
-    let mut trees = Trees::new("root");
-    for (ino, (id, shape)) in [
-        ("kept", dir("ss")),
-        ("kept-tmp", file("kept", "keep.tmp")),
-        ("shared", dir("private")),
-        ("shared-tmp", file("shared", "keep.tmp")),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let node = LocalNode {
-            shape,
-            identity: identity(ino as u64 + 1),
-            parked: false,
-        };
-        trees.set_local(id.into(), node);
-    }
-    trees.set_remote("shared".into(), remote(dir("private")));
-    trees.set_remote("shared-new".into(), remote(file("shared", "target.txt")));
-    trees.set_remote("sharp-s".into(), remote(dir("\u{df}")));
-    trees.set_remote("sharp-s-c".into(), remote(file("sharp-s", "c.txt")));
-    trees.set_rules(&[] as &[&str], Some(RuleFile::parse(b"*.tmp\n")));
-    trees.settle();
-    let discarded = BTreeMap::from([
-        ("kept".into(), dir("ss")),
-        ("shared".into(), dir("private")),
-    ]);
-    let blocked = |id| blocked_by_a_folder_kept_for_an_excluded_entry(&trees, id, &discarded);
-    assert!(blocked("sharp-s") && blocked("sharp-s-c"));
-    assert!(!blocked("shared") && !blocked("shared-new"));
 }

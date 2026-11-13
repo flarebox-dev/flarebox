@@ -5,7 +5,7 @@
 
 use koidrive_engine::classify::Trees;
 use koidrive_engine::commit::{Commits, Failure, Reconnect};
-use koidrive_engine::effects::{Effect, Effects};
+use koidrive_engine::effects::{Effect, Effects, Stuck, stuck};
 use koidrive_engine::first_link::adopt;
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::ignore::RuleFile;
@@ -957,6 +957,114 @@ fn a_discarded_entry_the_rules_leave_out_for_a_while_goes_to_the_local_trash_onc
         (done.iter())
             .any(|(node, effect)| node == "l-b" && matches!(effect, Effect::RemoveFile { .. })),
         "{done:?}"
+    );
+}
+
+fn run_effects(
+    effects: &mut Effects,
+    commits: &mut Commits,
+    trees: &mut Trees,
+    ids: &mut IdGen,
+    first_ino: u128,
+) -> Vec<(String, Effect)> {
+    let mut done = Vec::new();
+    for ino in first_ino.. {
+        trees.settle();
+        assert_eq!(ops(commits, trees, ids), [], "{done:?}");
+        let Some(record) = effects.plan(trees, commits.in_flight(), ids, NOW).cloned() else {
+            break;
+        };
+        let identity = FileIdentity {
+            dev: 1,
+            ino,
+            birth_ns: Some(0),
+        };
+        effects
+            .done(
+                trees,
+                commits.in_flight(),
+                &record.effect_id,
+                Some(identity),
+            )
+            .unwrap();
+        done.push((record.node, record.effect));
+    }
+    done
+}
+
+#[test]
+fn a_discarded_folder_that_holds_an_entry_the_rules_leave_out_keeps_its_name_and_reports_the_server_folder_it_blocks()
+ {
+    let mut trees = trees(
+        &[("l-ss", dir(ROOT, "ss")), ("l-a", file("l-ss", "a", 1))],
+        &[
+            ("r-sharp-s", dir(ROOT, "ß")),
+            ("r-c", file("r-sharp-s", "c.txt", 2)),
+        ],
+    );
+    let mut commits = Commits::default();
+    let mut ids = IdGen::new(7);
+    commits.first_link(&mut trees, &mut ids, NOW);
+    trees.settle();
+    let asked = question(&commits);
+    assert!(commits.decide(&asked.id, Answer::Discard));
+    assert_eq!(ops(&mut commits, &mut trees, &mut ids), []);
+    let root: [&str; 0] = [];
+    trees.set_rules(&root, Some(RuleFile::parse(b"a\n")));
+    let mut effects = Effects::default();
+
+    let done = run_effects(&mut effects, &mut commits, &mut trees, &mut ids, 100);
+    assert!(done.is_empty(), "{done:?}");
+    let kept = trees.local().get("l-ss").unwrap();
+    assert!(!kept.parked && kept.shape.same_position(&dir(ROOT, "ss")));
+    assert!(trees.local().get("l-a").is_some());
+    assert_eq!(
+        stuck(&trees, &effects, commits.in_flight()),
+        [
+            ("r-c".to_owned(), Stuck::Behind("r-sharp-s".into())),
+            ("r-sharp-s".to_owned(), Stuck::HeldBy("l-ss".into())),
+        ]
+        .into()
+    );
+
+    trees.set_rules(&root, None);
+    let done = run_effects(&mut effects, &mut commits, &mut trees, &mut ids, 200);
+    trees.settle();
+    assert_eq!(
+        local(&trees),
+        [
+            ("r-c".into(), "r-sharp-s".into(), "c.txt".into()),
+            ("r-sharp-s".into(), ROOT.into(), "ß".into()),
+        ],
+        "{done:?}"
+    );
+    assert!(trees.work().is_empty(), "{:?}", trees.work());
+}
+
+#[test]
+fn a_deep_discarded_folder_goes_to_the_local_trash_folder_by_folder() {
+    let ids: Vec<String> = (0..24).map(|depth| format!("l-{depth}")).collect();
+    let mut entries = Vec::new();
+    let mut parent = ROOT;
+    for id in &ids {
+        entries.push((id.as_str(), dir(parent, "deeper")));
+        parent = id;
+    }
+    entries.push(("l-file", file(parent, "file", 1)));
+    let mut trees = trees(&entries, &[("r-notes", file(ROOT, "notes", 9))]);
+    let mut commits = Commits::default();
+    let mut ids_gen = IdGen::new(7);
+    commits.first_link(&mut trees, &mut ids_gen, NOW);
+    trees.settle();
+    let asked = question(&commits);
+    assert!(commits.decide(&asked.id, Answer::Discard));
+    assert_eq!(ops(&mut commits, &mut trees, &mut ids_gen), []);
+    let mut effects = Effects::default();
+    let done = run_effects(&mut effects, &mut commits, &mut trees, &mut ids_gen, 100);
+    assert_eq!(done.len(), ids.len() + 2, "{done:?}");
+    assert_eq!(
+        local(&trees),
+        [("r-notes".into(), ROOT.into(), "notes".into())]
     );
 }
 
