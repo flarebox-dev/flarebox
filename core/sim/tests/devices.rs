@@ -127,12 +127,10 @@ fn replaced_folder() -> impl Strategy<Value = (usize, Vec<Vec<(usize, Step)>>)> 
                 for (place, block) in places.into_iter().zip(race).rev() {
                     first.splice(place..place, block);
                 }
-                for _ in 0..ids_minted_before {
-                    phases.insert(0, vec![(1, delete(1))]);
-                    phases.insert(0, vec![(1, file("ss"))]);
-                }
-                phases.insert(0, vec![(0, folder("b"))]);
-                (devices, phases)
+                let mut all = vec![vec![(0, folder("b"))]];
+                all.extend(ids_minted_by_device_1(ids_minted_before, 1));
+                all.extend(phases);
+                (devices, all)
             },
         )
 }
@@ -3047,6 +3045,12 @@ fn a_write_on_a_third_device_reaches_the_server_around_an_owed_rename() {
     converge(3, &[vec![(0, file("a"))], steps]).unwrap();
 }
 
+fn ids_minted_by_device_1(count: usize, entries: usize) -> Vec<Vec<(usize, Step)>> {
+    (0..count)
+        .flat_map(|_| [vec![(1, file("ss"))], vec![(1, delete(entries))]])
+        .collect()
+}
+
 fn a_new_folder_merged_into_a_renamed_folder_its_commit_deletes(
     renamed: &str,
     made: &str,
@@ -3057,10 +3061,7 @@ fn a_new_folder_merged_into_a_renamed_folder_its_commit_deletes(
         let mut first = vec![(0, folder("b"))];
         first.extend(synced.iter().map(|step| (0, *step)));
         let mut phases = vec![first];
-        for _ in 0..ids_minted_before {
-            phases.push(vec![(1, file("ss"))]);
-            phases.push(vec![(1, delete(1 + synced.len()))]);
-        }
+        phases.extend(ids_minted_by_device_1(ids_minted_before, 1 + synced.len()));
         let mut racing = vec![(0, rename(0, 0, renamed))];
         racing.extend(commit(0));
         racing.extend([(1, delete(0)), (1, folder(made))]);
@@ -3112,4 +3113,100 @@ fn a_file_moved_into_a_new_folder_merged_into_a_folder_its_commit_deletes_stays_
         &[file("c.txt")],
         &[rename(0, 1, "c.txt")],
     );
+}
+
+#[test]
+fn a_file_made_in_a_new_folder_nested_in_a_merged_folder_reaches_the_server() {
+    for ids_minted_before in 0..=9 {
+        let mut phases = vec![vec![(0, folder("b")), (0, user(0, 0, 1, "b"))]];
+        phases.extend(ids_minted_by_device_1(ids_minted_before, 2));
+        let mut racing = vec![(0, rename(0, 0, "a")), (0, rename(1, 1, "ss"))];
+        racing.extend(commit(0));
+        racing.extend([
+            (1, delete(1)),
+            (1, folder("A")),
+            (1, user(0, 0, 2, "ß")),
+            (1, user(1, 0, 3, "c.txt")),
+            (1, SCAN),
+            (1, COMMIT),
+            (1, COMMIT),
+        ]);
+        phases.push(racing);
+        if let Err(failure) = converge(2, &phases) {
+            panic!("with {ids_minted_before} IDs minted before: {failure:?}");
+        }
+    }
+}
+
+#[test]
+fn a_file_made_in_a_new_folder_inside_a_new_folder_merged_into_a_renamed_folder_reaches_the_server()
+{
+    for ids_minted_before in 0..=4 {
+        let mut phases = vec![vec![(0, folder("b")), (0, user(0, 0, 1, "A"))]];
+        phases.extend(ids_minted_by_device_1(ids_minted_before, 2));
+        let mut racing = vec![(0, rename(0, 0, "a"))];
+        racing.extend(commit(0));
+        racing.extend([
+            (1, delete(1)),
+            (1, folder("a")),
+            (1, user(0, 0, 2, "A")),
+            (1, user(1, 0, 3, "c.txt")),
+            (1, SCAN),
+            (1, COMMIT),
+            (1, COMMIT),
+        ]);
+        phases.push(racing);
+        if let Err(failure) = converge(2, &phases) {
+            panic!("with {ids_minted_before} IDs minted before: {failure:?}");
+        }
+    }
+}
+
+#[test]
+fn a_folder_renamed_to_the_name_of_a_folder_deleted_beside_a_new_folder_keeps_its_name() {
+    let world = converge(
+        2,
+        &[
+            vec![(0, folder("b")), (0, folder("ss"))],
+            vec![
+                (0, delete(0)),
+                (0, rename(0, 0, "b")),
+                (0, folder("a")),
+                (0, SCAN),
+                (0, COMMIT),
+                (0, COMMIT),
+                (0, DELIVER),
+            ],
+        ],
+    )
+    .unwrap();
+    for (d, device) in world.devices.iter().enumerate() {
+        let mut names: Vec<String> = (device.disk.entries().values())
+            .map(|entry| entry.name.clone())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a", "b"], "device {d}");
+    }
+}
+
+#[test]
+fn a_file_moved_out_of_a_folder_into_a_new_folder_merged_into_it_stays_live() {
+    for ids_minted_before in 0..=4 {
+        let mut phases = vec![vec![(0, folder("b")), (0, user(1, 0, 1, "c.txt"))]];
+        phases.extend(ids_minted_by_device_1(ids_minted_before, 2));
+        let mut racing = vec![(0, rename(0, 0, "a"))];
+        racing.extend(commit(0));
+        racing.extend([
+            (1, folder("A")),
+            (1, rename(1, 2, "c.txt")),
+            (1, delete(0)),
+            (1, SCAN),
+            (1, COMMIT),
+            (1, COMMIT),
+        ]);
+        phases.push(racing);
+        if let Err(failure) = converge(2, &phases) {
+            panic!("with {ids_minted_before} IDs minted before: {failure:?}");
+        }
+    }
 }
