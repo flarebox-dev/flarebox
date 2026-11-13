@@ -1187,3 +1187,80 @@ fn two_trashed_folders_restored_into_each_other_are_both_sent() {
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert_eq!(ops(&commit), [restore_op(&into_b), restore_op(&into_a)]);
 }
+
+#[test]
+fn an_explicit_restore_of_a_file_its_user_removed_is_downloaded() {
+    let n = id(1);
+    let shape = file(&root(), "f", 1);
+    let mut trees = trees(&[(
+        n.clone(),
+        None,
+        Some(shape.clone()),
+        Some(trashed(shape.clone())),
+    )]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let intent = from_trash(&n);
+    assert!(commits.restore(id(100), intent.clone()));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [restore_op(&intent)]);
+
+    let restored = RemoteNode {
+        meta_rev: 2,
+        ..remote(shape)
+    };
+    trees.set_remote_made_here(n.clone(), restored);
+    let result = CommitResult {
+        seq: 2,
+        results: vec![outcome(op_result::Code::Applied)],
+        ..Default::default()
+    };
+    commits.received(result).unwrap();
+    assert!(commits.acknowledge(&mut trees, 2));
+    trees.settle();
+    assert_eq!(trees.class(&n), Class::Remote);
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+}
+
+#[test]
+fn a_restore_of_a_folder_its_user_removed_downloads_the_files_in_it() {
+    let (d, f) = (id(1), id(2));
+    let folder = dir(&root(), "d");
+    let inside = file(&d, "f", 1);
+    let mut trees = trees(&[
+        (
+            d.clone(),
+            None,
+            Some(folder.clone()),
+            Some(trashed(folder.clone())),
+        ),
+        (
+            f.clone(),
+            None,
+            Some(inside.clone()),
+            Some(trashed(inside.clone())),
+        ),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let intent = from_trash(&d);
+    assert!(commits.restore(id(100), intent.clone()));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [restore_op(&intent)]);
+
+    let at_2 = |shape: Shape| RemoteNode {
+        meta_rev: 2,
+        ..remote(shape)
+    };
+    trees.set_remote_made_here(d.clone(), at_2(folder));
+    trees.set_remote_made_here(f.clone(), at_2(inside));
+    let result = CommitResult {
+        seq: 2,
+        results: vec![outcome(op_result::Code::Applied)],
+        ..Default::default()
+    };
+    commits.received(result).unwrap();
+    assert!(commits.acknowledge(&mut trees, 2));
+    trees.settle();
+    assert_eq!(trees.class(&d), Class::Remote);
+    assert_eq!(trees.class(&f), Class::Remote);
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+}

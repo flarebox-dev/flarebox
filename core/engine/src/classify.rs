@@ -1424,6 +1424,34 @@ impl Trees {
         self.removed_here.contains_key(id)
     }
 
+    pub fn forget_removed(&mut self, id: &str) {
+        let group = (self.r.get(id))
+            .filter(|node| node.trashed)
+            .map(|node| node.trash_group.clone());
+        let below = |member: &str| {
+            let mut current = member;
+            for _ in 0..=self.r.len() {
+                if current == id {
+                    return true;
+                }
+                match self.r.get(current) {
+                    Some(node) if node.trashed && Some(&node.trash_group) == group.as_ref() => {
+                        current = &node.shape.parent
+                    }
+                    _ => return false,
+                }
+            }
+            false
+        };
+        let restored: Vec<NodeId> = (self.removed_here.keys())
+            .filter(|member| below(member))
+            .cloned()
+            .collect();
+        for member in restored {
+            self.removed_here.remove(&member);
+        }
+    }
+
     pub fn kept_original(&self, id: &str) -> Option<&NodeId> {
         (self.kept_originals.get(id)).filter(|kept| {
             self.l.get(kept).is_some()

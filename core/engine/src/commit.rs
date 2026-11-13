@@ -828,6 +828,11 @@ impl Commits {
         if ops.is_empty() {
             return None;
         }
+        for op in &ops {
+            if let Some(op::Op::Restore(restore)) = &op.op {
+                trees.forget_removed(&restore.node_id);
+            }
+        }
         trees.watch_content(ops.iter().filter_map(|op| match &op.op {
             Some(op::Op::CreateFile(create)) => Some(create.node_id.clone()),
             Some(op::Op::UpdateContent(update)) => Some(update.node_id.clone()),
@@ -2719,10 +2724,7 @@ fn plan(
                         let fit = scratch.fit_at(&op.node_id, parent, name);
                         if matches!(fit, Fit::Valid | Fit::NameTaken) {
                             scratch.place(&op.node_id, parent, name, node.shape.kind);
-                            let revived = scratch.revive_group(&op.node_id, &node.trash_group);
-                            scratch
-                                .owed
-                                .extend(revived.into_iter().filter(|id| removed(id)));
+                            scratch.revive_group(&op.node_id, &node.trash_group);
                         }
                     }
                     None => scratch.revive(&op.node_id),
