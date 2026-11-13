@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#[derive(Clone, Copy, Debug)]
+enum Served {
+    ResultFirst,
+    RecordOnly,
+    RecordOnlyThenRestart,
+}
+
 fn served_at_5_then_lost(
     rows: &[Row],
     change: impl FnOnce(&mut Trees),
     applied: RemoteNode,
     listed: &[(&str, RemoteNode)],
-    received: bool,
-    restart: bool,
+    served: Served,
 ) -> (Vec<Effect>, Vec<op::Op>) {
     let mut trees = trees(rows);
     let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
@@ -15,21 +21,20 @@ fn served_at_5_then_lost(
     change(&mut trees);
     trees.settle();
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    if let Served::ResultFirst = served {
+        let results = vec![outcome(op_result::Code::Applied); commit.ops.len()];
+        commits.received(result(5, results)).unwrap();
+    }
     assert!(commits.own_record(5, &commit.commit_id));
     if commits.edits_in_flight(&commit.commit_id, "n") {
         trees.set_remote_edited_here("n".into(), applied);
     } else {
         trees.set_remote_made_here("n".into(), applied);
     }
-    assert!(!commits.acknowledge(&mut trees, 5));
+    let acknowledged = commits.acknowledge(&mut trees, 5);
+    assert_eq!(acknowledged, matches!(served, Served::ResultFirst));
     trees.settle();
-    if received {
-        let results = vec![outcome(op_result::Code::Applied); commit.ops.len()];
-        commits.received(result(5, results)).unwrap();
-        assert!(commits.acknowledge(&mut trees, 5));
-        trees.settle();
-    }
-    if restart {
+    if let Served::RecordOnlyThenRestart = served {
         commits = Commits::from_state(commits.state()).unwrap();
         trees.restore(trees.state()).unwrap();
         trees.rules_scanned();
@@ -84,13 +89,12 @@ fn served_at_5_then_lost_with_or_without_its_result(
     applied: RemoteNode,
     listed: &[(&str, RemoteNode)],
 ) -> (Vec<Effect>, Vec<op::Op>) {
-    let run = |received, restart| {
-        served_at_5_then_lost(rows, &change, applied.clone(), listed, received, restart)
-    };
-    let received = run(true, false);
-    assert_eq!(run(false, false), received, "the dropped result changed the outcome");
-    assert_eq!(run(false, true), received, "the restart changed the outcome");
-    received
+    let run = |served| served_at_5_then_lost(rows, &change, applied.clone(), listed, served);
+    let reference = run(Served::ResultFirst);
+    for served in [Served::RecordOnly, Served::RecordOnlyThenRestart] {
+        assert_eq!(run(served), reference, "{served:?} changed the outcome");
+    }
+    reference
 }
 
 fn sent_for<'a>(sent: &'a [op::Op], node: &str) -> Vec<&'a op::Op> {

@@ -327,6 +327,118 @@ fn a_server_that_lost_a_commit_of_this_device_gets_it_back_after_others_committe
     assert_eq!(a.state(), FolderState::UpToDate);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Answered {
+    Received,
+    Dropped,
+    ResendRefused(Code),
+}
+
+fn created_in_a_folder_then_listed_and_lost(answered: Answered) -> (Vec<(String, String)>, Vec<String>) {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site.root.join("docs")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    let mut restored = backup(&remote, &a);
+    a.create(&mut remote, &site.root.join("one.txt"), b"one");
+    fs::write(site.root.join("docs/n.txt"), b"only on a").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    let upload = a.work.pop_front().unwrap();
+    a.perform(upload, &mut remote).unwrap();
+    let Some(Work::Send(commit)) = a.work.pop_front() else {
+        panic!("the commit is sent after its upload");
+    };
+    let result = remote.commit(&a.caller, &commit);
+    if answered == Answered::Received {
+        let step = a.folder.sent(result);
+        a.take(step).unwrap();
+    }
+    a.event(Event::ResyncRequired(ResyncRequired {
+        reason: Reason::LogTruncated as i32,
+        ..ResyncRequired::default()
+    }))
+    .unwrap();
+    a.run(&mut remote);
+    if let Answered::ResendRefused(code) = answered {
+        let welcome = remote.space.welcome(&a.caller);
+        assert_eq!(welcome.device_seq, a.folder.engine.commits.accepted() + 1);
+        a.event(Event::Connected(welcome)).unwrap();
+        a.run(&mut remote);
+        let refusal = ProtoError {
+            code: code as i32,
+            ..Default::default()
+        };
+        let step = a.folder.sent(Err(CallError::Server(ServerError(refusal))));
+        a.take(step).unwrap();
+        a.work.retain(|work| !matches!(work, Work::ResendAfter(_)));
+        a.run(&mut remote);
+    }
+    let (other, mut b) = linked(&mut restored, "b");
+    b.settle();
+    fs::remove_dir(other.root.join("docs")).unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    b.run(&mut restored);
+    let welcome = restored.space.welcome(&a.caller);
+    assert!(welcome.device_seq < a.folder.engine.commits.accepted());
+    a.event(Event::Connected(welcome)).unwrap();
+    a.run(&mut restored);
+    a.settle();
+    a.run(&mut restored);
+    (files(&site.root), restored.names())
+}
+
+#[test]
+fn a_create_whose_result_never_came_is_sent_again_after_a_listing_whose_pages_held_it() {
+    let received = created_in_a_folder_then_listed_and_lost(Answered::Received);
+    assert!(received.0.contains(&("docs/n.txt".into(), "only on a".into())), "{received:?}");
+    for answered in [
+        Answered::Dropped,
+        Answered::ResendRefused(Code::RetryLater),
+        Answered::ResendRefused(Code::Unauthenticated),
+    ] {
+        let lost = created_in_a_folder_then_listed_and_lost(answered);
+        assert_eq!(lost, received, "{answered:?} changed the outcome");
+    }
+}
+
+#[test]
+fn a_listing_that_waits_for_a_sent_commit_replaces_r_once_the_commit_is_abandoned() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::write(site.root.join("n.txt"), b"first").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    let upload = a.work.pop_front().unwrap();
+    a.perform(upload, &mut remote).unwrap();
+    let Some(Work::Send(_)) = a.work.pop_front() else {
+        panic!("the commit is sent after its upload");
+    };
+    a.event(Event::ResyncRequired(ResyncRequired {
+        reason: Reason::LogTruncated as i32,
+        ..ResyncRequired::default()
+    }))
+    .unwrap();
+    a.run(&mut remote);
+    assert!(matches!(a.folder.stream, Stream::Replaying(_)));
+    let missing = ProtoError {
+        code: Code::MissingChunks as i32,
+        ..Default::default()
+    };
+    let step = a.folder.sent(Err(CallError::Server(ServerError(missing))));
+    a.take(step).unwrap();
+    let Some(Work::Upload(_)) = a.work.pop_front() else {
+        panic!("the missing content is uploaded again");
+    };
+    fs::write(site.root.join("n.txt"), b"second").unwrap();
+    let step = a.folder.uploaded(Err(ChunkError::SourceChanged { hash: vec![0; 32] }));
+    a.take(step).unwrap();
+    assert!(a.folder.engine.commits.in_flight().is_none());
+    a.settle();
+    a.rest(&mut remote);
+    assert_eq!(remote.names(), ["n.txt"]);
+    assert_eq!(a.state(), FolderState::UpToDate);
+}
+
 /// The server's storage is restored from a backup taken before `a` deleted `one.txt` (GUN-359). `a` lists the tree
 /// again, which holds `one.txt` live as it was deleted, and sends the delete again instead of downloading the file.
 #[test]
