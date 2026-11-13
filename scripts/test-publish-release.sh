@@ -33,14 +33,26 @@ case "$1 $2" in
         [ -e "$db/release-$3" ] || exit 1
         if [ "$#" -gt 3 ]; then
             read -r draft prerelease < "$db/release-$3"
-            echo "draft=$draft prerelease=$prerelease"
+            case "$5" in
+                isDraft) echo "$draft" ;;
+                isDraft,isPrerelease) echo "draft=$draft prerelease=$prerelease" ;;
+                *) echo "stub gh: unexpected $*" >&2; exit 2 ;;
+            esac
         fi
         ;;
     "release create") echo "true false" > "$db/release-$3" ;;
     "release upload")
+        mkdir -p "$db/files-$3"
         for arg in "${@:4}"; do
-            [ "$arg" = --clobber ] || basename "$arg"
+            if [ "$arg" != --clobber ]; then
+                basename "$arg"
+                cp "$arg" "$db/files-$3/"
+            fi
         done >> "$db/assets-$3"
+        ;;
+    "release download")
+        [ "$4" = --dir ] || { echo "stub gh: unexpected $*" >&2; exit 2; }
+        cp "$db/files-$3/"* "$5/"
         ;;
     "release edit")
         tag=$3
@@ -149,6 +161,26 @@ publish v0.1.0-alpha.1
 expect_latest v0.1.0-alpha.1 'the first alpha becomes Latest'
 publish v0.1.0-alpha.1
 expect_latest v0.1.0-alpha.1 'a rerun of the highest tag keeps Latest'
+[ "$(wc -l < "$tmp/db/assets-v0.1.0-alpha.1" | tr -d ' ')" = 4 ] || { echo 'FAIL an identical rerun uploaded assets again' >&2; exit 1; }
+pass 'an identical rerun leaves published assets untouched'
+echo 'signed again with a different timestamp' > "$tmp/dist/koidrive-aarch64-apple-darwin.tar.gz"
+(cd "$tmp/dist" && sha256sum koidrive-*.tar.gz Koidrive-*.dmg > SHA256SUMS)
+if output=$(publish_staged v0.1.0-alpha.1 2>&1); then
+    echo 'FAIL a rerun replaced a published release with different bytes' >&2
+    exit 1
+fi
+grep -qF 'Published assets cannot be replaced; create a new version tag.' <<< "$output"
+[ "$(cat "$tmp/db/files-v0.1.0-alpha.1/koidrive-aarch64-apple-darwin.tar.gz")" = cli ] || { echo 'FAIL a refused rerun changed the published tarball' >&2; exit 1; }
+pass 'a rebuilt signed tarball is refused before any published asset changes'
+stage v0.1.0-alpha.1
+echo extra > "$tmp/db/files-v0.1.0-alpha.1/extra.txt"
+if output=$(publish_staged v0.1.0-alpha.1 2>&1); then
+    echo 'FAIL a rerun ignored an extra published asset' >&2
+    exit 1
+fi
+grep -qF 'has a published asset extra.txt that is absent from this build' <<< "$output"
+pass 'a rerun with an extra published asset is refused'
+rm "$tmp/db/files-v0.1.0-alpha.1/extra.txt"
 publish v0.1.0-alpha.2
 expect_latest v0.1.0-alpha.2 'a higher alpha moves Latest'
 publish v0.1.0-rc.1

@@ -68,10 +68,32 @@ else
     done <<< "$releases"
 fi
 
-if ! gh release view "$tag" >/dev/null 2>&1; then
+draft=$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null) || draft=missing
+if [ "$draft" = missing ]; then
     gh release create "$tag" --draft --verify-tag --title "$tag" --notes 'Koidrive CLI for Linux and macOS, and the Koidrive app for macOS. See docs/guide/install.md for installation.'
+    draft=true
 fi
-gh release upload "$tag" "$files"/* --clobber
+case "$draft" in
+    true) gh release upload "$tag" "$files"/* --clobber ;;
+    false)
+        published=$(mktemp -d)
+        trap 'rm -rf "$published"' EXIT
+        gh release download "$tag" --dir "$published"
+        for path in "$files"/*; do
+            name=${path##*/}
+            if ! cmp -s "$path" "$published/$name"; then
+                echo "::error::$tag is already published with different bytes for $name. Published assets cannot be replaced; create a new version tag."
+                exit 1
+            fi
+        done
+        for path in "$published"/*; do
+            name=${path##*/}
+            [ -f "$files/$name" ] || { echo "::error::$tag has a published asset $name that is absent from this build. Published assets cannot be replaced; create a new version tag."; exit 1; }
+        done
+        echo "$tag already has these assets; nothing was uploaded."
+        ;;
+    *) echo "::error::GitHub returned an invalid draft state for $tag: $draft"; exit 1 ;;
+esac
 gh release edit "$tag" --draft=false --prerelease="$prerelease" --latest="$latest"
 
 state=$(gh release view "$tag" --json isDraft,isPrerelease --jq '"draft=\(.isDraft) prerelease=\(.isPrerelease)"')

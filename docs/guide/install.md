@@ -20,6 +20,21 @@ curl -fsSL https://koidrive.com/install.sh | KOIDRIVE_VERSION=v0.1.0 KOIDRIVE_IN
 
 The release binary includes the server bundle, so deploying a server needs neither Node.js nor Rust. The SHA256 file comes from the same release as the tarball. It detects corruption, not a compromised release account. Tagged macOS builds use the existing Developer ID signing certificate when configured, but the CLI is not notarized. Without the certificate, the workflow reports an unsigned build.
 
+## Install with Homebrew
+
+On macOS or Linux with [Homebrew](https://brew.sh):
+
+```sh
+brew install koidrive/tap/koidrive
+koi setup
+```
+
+To upgrade:
+
+```sh
+brew update && brew upgrade koidrive
+```
+
 ## Build from source
 
 ### What you need
