@@ -202,7 +202,9 @@ impl Timing {
         let syncing = matches!(status, FolderState::Bootstrapping | FolderState::CatchingUp);
         if syncing {
             state.syncing.get_or_insert(at.mono);
-        } else if let Some(start) = state.syncing.take() {
+        } else if let Some(start) = state.syncing.take()
+            && status == FolderState::UpToDate
+        {
             self.recorder.measure_on(
                 at.day(),
                 Measure::SyncingMilliseconds,
@@ -632,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn syncing_spans_record_only_when_the_state_ends() {
+    fn syncing_spans_record_only_after_successful_completion() {
         let recorder = Recorder::on();
         let mut timing = tracker(&recorder);
         let at = time();
@@ -641,8 +643,8 @@ mod tests {
         timing.status(FolderState::CatchingUp, later(at, Duration::from_secs(10)));
         timing.status(FolderState::CatchingUp, later(at, Duration::from_secs(60)));
         assert!(recorder.take().days.is_empty());
-        timing.status(FolderState::Offline, later(at, Duration::from_secs(90)));
-        timing.status(FolderState::Halted, later(at, Duration::from_secs(100)));
+        timing.status(FolderState::UpToDate, later(at, Duration::from_secs(90)));
+        timing.status(FolderState::UpToDate, later(at, Duration::from_secs(100)));
         timing.status(FolderState::Stopped, later(at, Duration::from_secs(110)));
         assert_duration_bucket(
             &reports(&recorder)["2"]["histograms"]["syncing_ms"]["completed"],
@@ -655,6 +657,38 @@ mod tests {
         timing.status(FolderState::UpToDate, later(at, Duration::from_secs(900)));
         assert!(timing.state.is_none());
         assert!(off.take().days.is_empty());
+    }
+
+    #[test]
+    fn interrupted_sync_spans_do_not_record_completed_durations() {
+        for syncing in [FolderState::Bootstrapping, FolderState::CatchingUp] {
+            for interrupted in [
+                FolderState::Connecting,
+                FolderState::Offline,
+                FolderState::Halted,
+                FolderState::Stopped,
+            ] {
+                let recorder = Recorder::on();
+                let mut timing = tracker(&recorder);
+                let at = time();
+                timing.status(syncing, at);
+                timing.status(interrupted, later(at, Duration::from_secs(90)));
+                assert!(recorder.take().days.is_empty());
+                timing.status(FolderState::UpToDate, later(at, Duration::from_secs(120)));
+                assert!(recorder.take().days.is_empty());
+                timing.status(
+                    FolderState::Bootstrapping,
+                    later(at, Duration::from_secs(130)),
+                );
+                timing.status(FolderState::CatchingUp, later(at, Duration::from_secs(140)));
+                timing.status(FolderState::UpToDate, later(at, Duration::from_secs(150)));
+                timing.status(FolderState::UpToDate, later(at, Duration::from_secs(160)));
+                assert_duration_bucket(
+                    &reports(&recorder)["2"]["histograms"]["syncing_ms"]["completed"],
+                    5,
+                );
+            }
+        }
     }
 
     #[test]

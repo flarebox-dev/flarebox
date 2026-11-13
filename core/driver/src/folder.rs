@@ -1476,9 +1476,12 @@ impl Folder {
         if !self.timing.is_on() && !self.timing.has_first() {
             return;
         }
+        if state == FolderState::UpToDate && self.retry_at.is_some() {
+            return;
+        }
         let at = Time::now();
         self.timing.status(state, at);
-        if state == FolderState::UpToDate && self.retry_at.is_none() {
+        if state == FolderState::UpToDate {
             self.timing.drained(at);
             let files = if self.timing.first_pending() {
                 self.engine

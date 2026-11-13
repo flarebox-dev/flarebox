@@ -203,6 +203,7 @@ fn telemetry_folder_retries_preserve_apply_origin_without_success_on_failure() {
     let failed = histograms(&recorder);
     assert!(failed.get("remote_apply_ms").is_none());
     assert!(failed.get("download_per_second").is_none());
+    assert!(failed.get("syncing_ms").is_none());
     fs::remove_file(site_b.root.join("incoming")).unwrap();
     b.rest(&mut remote);
     assert_eq!(
@@ -212,6 +213,7 @@ fn telemetry_folder_retries_preserve_apply_origin_without_success_on_failure() {
     let completed = histograms(&recorder);
     assert_eq!(completed["remote_apply_ms"]["effect"]["count"], 1);
     assert_eq!(completed["download_per_second"]["files"]["count"], 1);
+    assert_eq!(completed["syncing_ms"]["completed"]["count"], 1);
 }
 
 #[test]
@@ -252,7 +254,9 @@ fn first_sync_waits_for_a_scheduled_disk_effect_retry() {
     assert_eq!(b.state(), FolderState::UpToDate);
     assert!(b.folder.timing.first_pending());
     assert!(site_b.db.with_file_name("first-sync").is_file());
-    assert!(histograms(&recorder).get("first_sync_ms").is_none());
+    let failed = histograms(&recorder);
+    assert!(failed.get("first_sync_ms").is_none());
+    assert!(failed.get("syncing_ms").is_none());
     fs::remove_file(site_b.root.join("incoming")).unwrap();
     b.rest(&mut remote);
     assert_eq!(
