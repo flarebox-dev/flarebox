@@ -1096,7 +1096,7 @@ impl Engine {
                     .map(|node| node.shape.parent.clone())
             })
             .flatten();
-        self.trees.set_local(
+        self.trees.set_local_changed(
             id.clone(),
             LocalNode {
                 shape,

@@ -221,6 +221,7 @@ pub struct Trees {
     unsent_edits: TrackedSet<NodeId>,
     replaced_versions: TrackedMap<NodeId, Vec<String>>,
     resends: TrackedSet<NodeId>,
+    local_changes: TrackedSet<NodeId>,
     kept_originals: TrackedMap<NodeId, NodeId>,
     ignore: Matcher,
     /// Nodes whose local copy the user moved into an ignored folder that is no node. L keeps the
@@ -296,6 +297,7 @@ impl Trees {
             unsent_edits: TrackedSet::default(),
             replaced_versions: TrackedMap::default(),
             resends: TrackedSet::default(),
+            local_changes: TrackedSet::default(),
             kept_originals: TrackedMap::default(),
             ignore: Matcher::new(LocalRules::default()),
             outside: TrackedSet::default(),
@@ -600,8 +602,9 @@ impl Trees {
         .take(self.l.len() + 1)
     }
 
-    fn changes(&self) -> impl Iterator<Item = &NodeId> {
-        (self.dirty.iter())
+    fn changes(&self) -> BTreeSet<&NodeId> {
+        (self.local_changes.iter())
+            .chain(self.unsent_edits.iter())
             .filter(|id| !self.resends.contains(*id) && !self.excluded(id))
             .filter(|id| {
                 matches!(
@@ -609,10 +612,11 @@ impl Trees {
                     Class::Local | Class::Concurrent
                 )
             })
+            .collect()
     }
 
     fn holding_changes(&self) -> BTreeSet<NodeId> {
-        (self.changes())
+        (self.changes().into_iter())
             .flat_map(|id| self.local_chain(id).skip(1))
             .map(str::to_owned)
             .collect()
@@ -639,7 +643,10 @@ impl Trees {
 
     pub(crate) fn resend_folders_of_changes(&mut self) {
         let lacking = |id: &NodeId| self.r.get(id).is_none() && self.acknowledged(id).is_some();
-        let changed: Vec<NodeId> = self.changes().filter(|id| lacking(id)).cloned().collect();
+        let changed: Vec<NodeId> = (self.changes().into_iter())
+            .filter(|id| lacking(id))
+            .cloned()
+            .collect();
         let mut folders: Vec<NodeId> = (self.holding_changes().into_iter())
             .filter(|id| lacking(id) && !changed.contains(id))
             .collect();
@@ -756,6 +763,16 @@ impl Trees {
         self.record_edit_in_trash(&id);
     }
 
+    /// Sets L as this device's user made it: from a scan of the disk, or as the copy that keeps a
+    /// change of the user. A shape other than the one L holds is recorded as a change of the user
+    /// ([`TreesState::local_changes`]).
+    pub fn set_local_changed(&mut self, id: NodeId, node: LocalNode) {
+        if !(self.l.get(&id)).is_some_and(|old| old.shape.same(&node.shape)) {
+            self.local_changes.insert(id.clone());
+        }
+        self.set_local(id, node);
+    }
+
     pub fn remove_local(&mut self, id: &str) {
         self.parked_as.remove(id);
         self.unknown_rules.remove(id);
@@ -764,6 +781,7 @@ impl Trees {
         self.count_held_trash(id, false);
         self.unsent_edits.remove(id);
         self.resends.remove(id);
+        self.local_changes.remove(id);
         if let Some(old) = self.l.remove(id) {
             if !old.parked {
                 self.l_names.remove(id, &old.shape);
@@ -1594,6 +1612,9 @@ impl Trees {
     /// content, ends its resend too: another device sent it first, and its position is a remote
     /// move. The device that made the change sends it again itself, as above.
     ///
+    /// A node of `moved` or `edited` whose commit has a seq above `held_through` holds a change of
+    /// this device's user that the server lost ([`TreesState::local_changes`]).
+    ///
     /// `accepted` is the count of this device's commits the server still holds (*w*, section
     /// 2.8). An S update that waits ([`Trees::waiting`]) from a commit above it came from a commit
     /// the server lost. The update is dropped, a removal as well as a shape, so S keeps what it held: L's change is
@@ -1659,6 +1680,12 @@ impl Trees {
                         || seen(id, remote)
                 })
         };
+        let lost_here = (moved.iter().map(|(id, moved)| (id, moved.seq)))
+            .chain(edited.iter().map(|(id, seq)| (id, *seq)))
+            .filter(|(id, seq)| *seq > held_through && self.l.get(id).is_some())
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        self.local_changes.extend(lost_here);
         let lost_moves: BTreeSet<NodeId> = (moved.into_iter())
             .filter(|(id, moved)| moved.seq > held_through && before(id, moved))
             .map(|(id, _)| id)
@@ -2451,6 +2478,7 @@ impl Trees {
             .is_some_and(|shape| (self.l.get(id)).is_some_and(|local| local.shape.same(shape)))
         {
             self.resends.remove(id);
+            self.local_changes.remove(id);
         }
         self.changed.insert(id.to_owned());
         let old = match shape {
@@ -2535,6 +2563,7 @@ impl Trees {
             unsent_edits: (*self.unsent_edits).clone(),
             replaced_versions: (*self.replaced_versions).clone(),
             resends: (*self.resends).clone(),
+            local_changes: (*self.local_changes).clone(),
             kept_originals: (*self.kept_originals).clone(),
         }
     }
@@ -2563,6 +2592,7 @@ impl Trees {
             unsent_edits,
             replaced_versions,
             resends,
+            local_changes,
             kept_originals,
             ignore: _,
             outside,
@@ -2599,6 +2629,7 @@ impl Trees {
             unsent_edits: unsent_edits.take_changes(),
             replaced_versions: replaced_versions.take_changes(),
             resends: resends.take_changes(),
+            local_changes: local_changes.take_changes(),
             kept_originals: kept_originals.take_changes(),
         }
     }
@@ -2681,6 +2712,9 @@ impl Trees {
         if let Some(id) = (state.resends.iter()).find(|id| self.l.get(id).is_none()) {
             return Err(StateError::NotResend(id.clone()));
         }
+        if let Some(id) = (state.local_changes.iter()).find(|id| self.l.get(id).is_none()) {
+            return Err(StateError::NotLocalChange(id.clone()));
+        }
         let TreesState {
             dirty,
             unsearched,
@@ -2700,6 +2734,7 @@ impl Trees {
             unsent_edits,
             replaced_versions,
             resends,
+            local_changes,
             kept_originals,
         } = state;
         self.unsettled = dirty.clone();
@@ -2723,6 +2758,7 @@ impl Trees {
         self.unsent_edits = unsent_edits.into();
         self.replaced_versions = replaced_versions.into();
         self.resends = resends.into();
+        self.local_changes = local_changes.into();
         self.kept_originals = kept_originals.into();
         self.rules_known = false;
         self.unknown_rules.clear();

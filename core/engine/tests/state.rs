@@ -123,6 +123,7 @@ fn trees_state() -> TreesState {
         .into(),
         unsent_edits: Default::default(),
         resends: Default::default(),
+        local_changes: ["b".into()].into(),
         replaced_versions: [("a".into(), vec!["v1".into()])].into(),
         kept_originals: [("t".into(), "a".into())].into(),
     }
@@ -196,6 +197,16 @@ fn a_resend_restores_only_while_l_holds_the_node() {
     let (mut trees, mut state) = unsent();
     state.resends.insert("g".into());
     assert_eq!(trees.restore(state), Err(StateError::NotResend("g".into())));
+}
+
+#[test]
+fn a_local_change_restores_only_while_l_holds_the_node() {
+    let (mut trees, mut state) = unsent();
+    state.local_changes.insert("g".into());
+    assert_eq!(
+        trees.restore(state),
+        Err(StateError::NotLocalChange("g".into()))
+    );
 }
 
 /// A restore of the trashed node `n`.

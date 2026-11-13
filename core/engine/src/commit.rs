@@ -1914,7 +1914,7 @@ pub(crate) fn rekey(trees: &mut Trees, from: &str, to: &str) {
     let parked = node.parked;
     trees.rekey_discarded(from, to);
     trees.remove_local(from);
-    trees.set_local(to.to_owned(), node);
+    trees.set_local_changed(to.to_owned(), node);
     if parked {
         trees.park_as(to.to_owned(), parked_name);
     }

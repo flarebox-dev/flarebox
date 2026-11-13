@@ -103,6 +103,10 @@ pub struct TreesState {
     /// or L changes the node. A folder S holds and R lacks that L holds such a change under is sent
     /// again as a resend.
     pub resends: BTreeSet<NodeId>,
+    /// The nodes L holds a change of this device's user in: a scan found L's shape changed, a
+    /// rekey made L's copy, or a commit of this device that the server lost made it. A node leaves
+    /// once S takes L's shape or L no longer holds it.
+    pub local_changes: BTreeSet<NodeId>,
 }
 
 /// A node this device sent under a pending name (docs/design/sync-engine.md section 2.6).
@@ -198,6 +202,7 @@ pub struct TreesChanges {
     pub unsent_edits: SetChanges<NodeId>,
     pub replaced_versions: MapChanges<NodeId, Vec<String>>,
     pub resends: SetChanges<NodeId>,
+    pub local_changes: SetChanges<NodeId>,
     pub kept_originals: MapChanges<NodeId, NodeId>,
 }
 
@@ -223,6 +228,7 @@ impl TreesChanges {
             unsent_edits,
             replaced_versions,
             resends,
+            local_changes,
             kept_originals,
         } = after;
         Self {
@@ -244,6 +250,7 @@ impl TreesChanges {
             unsent_edits: set_changes(&before.unsent_edits, unsent_edits),
             replaced_versions: map_changes(&before.replaced_versions, replaced_versions),
             resends: set_changes(&before.resends, resends),
+            local_changes: set_changes(&before.local_changes, local_changes),
             kept_originals: map_changes(&before.kept_originals, kept_originals),
         }
     }
@@ -418,6 +425,8 @@ pub enum StateError {
     NotRemote(NodeId),
     /// A node is recorded as sent again after a server loss, but L does not hold it.
     NotResend(NodeId),
+    /// A node is recorded as holding a change of this device's user, but L does not hold it.
+    NotLocalChange(NodeId),
     /// The commit in flight does not take the slot after the accepted counter.
     DeviceSeq {
         accepted: u64,
