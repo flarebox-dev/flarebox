@@ -14,6 +14,36 @@ fn a_download_the_server_lost_is_sent_again_over_the_version_it_replaced() {
 }
 
 #[test]
+fn a_download_the_server_lost_with_the_delete_after_it_is_sent_again_as_a_resend() {
+    let (mut commits, mut trees, mut ids) = downloaded_then_deleted();
+    list_after_a_loss(
+        &mut trees,
+        &commits,
+        version(remote(file(ROOT, "a", 1)), "v1"),
+    );
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [resend("a", 2)]);
+}
+
+#[test]
+fn a_download_the_server_lost_with_the_delete_after_it_yields_to_the_delete_sent_again() {
+    let (mut commits, mut trees, mut ids) = downloaded_then_deleted();
+    list_after_a_loss(
+        &mut trees,
+        &commits,
+        version(remote(file(ROOT, "a", 1)), "v1"),
+    );
+    let sent_again = RemoteNode {
+        meta_rev: 2,
+        ..version(trashed(file(ROOT, "a", 1)), "v1")
+    };
+    trees.set_remote("a".into(), sent_again);
+    trees.settle();
+    assert_eq!(trees.class("a"), Class::Remote);
+    assert!(build(&mut commits, &mut trees, &mut ids).is_none());
+}
+
+#[test]
 fn a_download_the_server_lost_is_not_sent_again_over_a_later_edit() {
     let (_, mut trees, _) = downloaded_at_5();
     let later = RemoteNode {

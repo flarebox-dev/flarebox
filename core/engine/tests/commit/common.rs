@@ -1027,6 +1027,22 @@ fn downloaded_at_5() -> (Commits, Trees, IdGen) {
     (Commits::default(), trees, IdGen::new(1))
 }
 
+fn downloaded_then_deleted() -> (Commits, Trees, IdGen) {
+    let (commits, mut trees, ids) = downloaded_at_5();
+    let deleted = RemoteNode {
+        trashed: true,
+        trash_group: "6:0".into(),
+        meta_rev: 6,
+        content_rev: 5,
+        edit_rev: 5,
+        ..version(remote(file(ROOT, "a", 2)), "v2")
+    };
+    trees.set_remote("a".into(), deleted);
+    trees.settle();
+    assert_eq!(trees.class("a"), Class::Remote);
+    (commits, trees, ids)
+}
+
 fn version(node: RemoteNode, version_id: &str) -> RemoteNode {
     RemoteNode {
         version_id: version_id.into(),
