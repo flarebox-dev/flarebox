@@ -897,6 +897,7 @@ fn a_discard_whose_s_update_waits_stays_after_a_server_loss() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -1220,6 +1221,7 @@ fn a_file_the_user_took_back_from_a_discard_is_sent_again_once_the_server_loses_
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         0,
         0,
     );

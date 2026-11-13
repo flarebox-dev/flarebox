@@ -644,6 +644,7 @@ fn forgetting_what_the_server_lost_keeps_the_rest_of_s() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         0,
         0,
     );
@@ -689,6 +690,7 @@ fn a_remote_delete_below_a_folder_the_server_lost_stays_a_remote_delete() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         0,
         0,
     );
@@ -714,6 +716,7 @@ fn forgotten_after_a_loss() -> Trees {
         vec!["a".into()],
         Vec::new(),
         Vec::new(),
+        Default::default(),
         0,
         0,
     );

@@ -160,6 +160,9 @@ impl ByName {
 pub struct Trashed {
     pub id: NodeId,
     pub shape: Shape,
+    pub content_rev: u64,
+    pub edit_rev: u64,
+    pub version_id: String,
     pub kept: Option<NodeId>,
 }
 
@@ -434,7 +437,10 @@ impl Trees {
                 .acknowledged(&id)
                 .and_then(|shape| shape.content.as_ref()))
             .zip(node.shape.content.as_ref())
-            .is_some_and(|(synced, remote)| same_content(synced, remote));
+            .is_some_and(|(synced, remote)| same_content(synced, remote))
+            && !(self.l.live(&id).and_then(|local| local.content.as_ref()))
+                .zip(node.shape.content.as_ref())
+                .is_some_and(|(local, remote)| same_content(local, remote));
         let local_gone = !made_here && self.l.get(&id).is_none();
         let resent_over_delete = local_gone
             && (self.r.get(&id)).is_some_and(|old| {
@@ -501,16 +507,18 @@ impl Trees {
     }
 
     fn place_remote(&mut self, id: NodeId, node: RemoteNode) {
-        let created_over_resend = !node.trashed
-            && self.r.get(&id).is_none()
+        let sent_by_another = !node.trashed
             && self.resends.contains(&id)
             && (self.l.live(&id)).is_some_and(|local| {
-                let at = Shape {
-                    parent: node.shape.parent.clone(),
-                    name: node.shape.name.clone(),
-                    ..local.clone()
+                let holds_local = |remote: &Shape| {
+                    let at = Shape {
+                        parent: remote.parent.clone(),
+                        name: remote.name.clone(),
+                        ..local.clone()
+                    };
+                    at.same(remote)
                 };
-                at.same(&node.shape)
+                holds_local(&node.shape) && !self.r.live(&id).is_some_and(holds_local)
             });
         self.mark(&id);
         let trashed = node.trashed;
@@ -565,7 +573,7 @@ impl Trees {
         if trashed {
             self.yield_resends();
         }
-        if created_over_resend {
+        if sent_by_another {
             self.take_local(id);
         }
     }
@@ -1400,7 +1408,7 @@ impl Trees {
     }
 
     /// The nodes whose content L and S hold as R holds it live, a folder's as any folder's, where no
-    /// commit of this device that the server lost made R's record and L holds no unsent edit
+    /// commit of this device that the server lost set R's content and L holds no unsent edit
     /// ([`Trees::unsent_edits`]): `lost_here` tells whether a seq is one of those commits. For
     /// [`Trees::forget_lost`] once a bootstrap has replaced R.
     pub fn taken_from_others(&self, lost_here: impl Fn(u64) -> bool) -> Vec<NodeId> {
@@ -1415,9 +1423,7 @@ impl Trees {
                 };
                 let remote = (self.r.get(id))
                     .filter(|remote| !remote.trashed)
-                    .filter(|remote| {
-                        !lost_here(remote.content_rev.max(remote.meta_rev).max(remote.edit_rev))
-                    });
+                    .filter(|remote| !lost_here(remote.content_rev.max(remote.edit_rev)));
                 holds(remote.map(|remote| &remote.shape)) && holds(self.l.live(id))
             })
             .map(|(id, _)| id.clone())
@@ -1449,6 +1455,14 @@ impl Trees {
             .collect()
     }
 
+    /// R's record of each node, live or in the trash, for [`Trees::forget_lost`] once a bootstrap
+    /// has replaced R.
+    pub fn remote_records(&self) -> BTreeMap<NodeId, RemoteNode> {
+        (self.r.iter())
+            .map(|(id, remote)| (id.clone(), remote.clone()))
+            .collect()
+    }
+
     /// The nodes a delete of this device trashed and R still holds trashed by it, for
     /// [`Trees::forget_lost`] once a bootstrap has replaced R.
     pub fn trashed_here(&self) -> Vec<Trashed> {
@@ -1458,6 +1472,9 @@ impl Trees {
                 Some(Trashed {
                     id: id.clone(),
                     shape: remote.shape.clone(),
+                    content_rev: remote.content_rev,
+                    edit_rev: remote.edit_rev,
+                    version_id: remote.version_id.clone(),
                     kept: self.kept_originals.get(id).cloned(),
                 })
             })
@@ -1476,6 +1493,12 @@ impl Trees {
     /// S then forgets each such ancestor only once the delete has taken what it held: the update
     /// waits ([`Trees::waiting`]) and is made as soon as it fits.
     ///
+    /// `records` holds R's record of each node before the bootstrap ([`Trees::remote_records`]).
+    /// S's content came from that record or an earlier one. A node keeps S whatever R's shape when
+    /// that record survived: R now holds it at the same version, or its content revision is at or
+    /// below `held_through`. The server then kept S's content, and what R holds otherwise is a
+    /// remote change this device has not taken yet.
+    ///
     /// A node R holds live as S does but at another position keeps S, so R's position is a remote
     /// move: a device that did not set S's position cannot tell whether a lost commit set it, and
     /// sending it again would undo a move another device made since. `moved` lists the
@@ -1484,15 +1507,21 @@ impl Trees {
     /// above `held_through`, and R holds the node as it was before the commit: at a revision at or
     /// below `held_through`, or with a record R held earlier, or when the store upgrade
     /// recorded the move without those records. So the position this device set is sent again,
-    /// unless another device moved the node after the loss.
+    /// unless another device moved the node after the loss. S takes R's position for these nodes
+    /// before `edited` and `synced` compare positions, so a file whose move and edit were both
+    /// lost is sent again as both. Where S cannot take that position yet, it waits, and `edited`
+    /// compares R's position with the one that waits, so the lost edit waits with it.
     ///
     /// `trashed` lists what deletes of this device had trashed before the bootstrap
     /// ([`Trees::trashed_here`]), and `held_through` the seq of the newest commit of this device the
     /// server still counts ([`Commits::held_through`]), at or below which every seq is from before
-    /// the loss. A node of `trashed` that R now holds live, as it was deleted and with no revision
-    /// above `held_through`, lost its delete: nothing changed it after the loss. S takes R's shape
-    /// for it, parents first, so the delete is sent again. Any other node of it is downloaded again,
-    /// since a restore or another change after the loss can take a seq the lost commits had.
+    /// the loss. A node of `trashed` that R now holds live as it was deleted, with no revision
+    /// above `held_through` or at a position this device saw with the revisions and version the
+    /// delete trashed, lost its delete: nothing changed it after the loss, since a server never
+    /// gives a version ID twice (RFC 0016).
+    /// S takes R's shape for it, parents first, so the delete is sent again. Any other node of it is
+    /// downloaded again, since a restore or another change after the loss can take a seq the lost
+    /// commits had.
     ///
     /// `edited` lists the files whose content an edit of this device set before the bootstrap
     /// ([`Trees::edited_here`]), each with the seq of that edit's commit. A file of it that R now
@@ -1517,7 +1546,8 @@ impl Trees {
     /// restores it from the trash with L's bytes would otherwise make L, S and R agree.
     ///
     /// `synced` lists the nodes whose content L and S held as R did before the bootstrap, where no
-    /// commit of this device that the server lost made R's record ([`Trees::taken_from_others`]).
+    /// commit of this device that the server lost set R's content ([`Trees::taken_from_others`]).
+    /// A lost move of this device leaves the content another device's, so the node is listed.
     /// A file of it that R now holds live at the position S holds, at a version the log replaced for it before
     /// ([`TreesState::replaced_versions`]), holds content from before the loss that S's
     /// content replaced: nothing changed it since. S takes R's shape, so the content L holds is sent
@@ -1535,9 +1565,9 @@ impl Trees {
     /// R lacks, also one found after the folder gave way, sends the folder again at the next build,
     /// and a node S holds and R lacks that L changes itself is created again at L's position.
     /// Resends give way parents first, so S takes each folder before what it holds.
-    /// R taking a node it lacked again, live with the content L holds, ends its resend too: another
-    /// device sent it first, and its position is a remote move. The device that made the change
-    /// sends it again itself, as above.
+    /// R taking the node live with the content L holds, where it lacked the node or held other
+    /// content, ends its resend too: another device sent it first, and its position is a remote
+    /// move. The device that made the change sends it again itself, as above.
     ///
     /// `accepted` is the count of this device's commits the server still holds (*w*, section
     /// 2.8). An S update that waits ([`Trees::waiting`]) from a commit above it came from a commit
@@ -1579,23 +1609,24 @@ impl Trees {
         synced: Vec<NodeId>,
         moved: Vec<(NodeId, MovedHere)>,
         untaken: Vec<(NodeId, bool)>,
+        records: BTreeMap<NodeId, RemoteNode>,
         held_through: u64,
         accepted: u64,
     ) {
+        let seen = |id: &NodeId, remote: &RemoteNode| {
+            (self.past_positions.get(id).into_iter().flatten()).any(|past| {
+                past.rev == remote.meta_rev
+                    && past.parent == remote.shape.parent
+                    && past.name == remote.shape.name
+            })
+        };
         let before = |id: &NodeId, moved: &MovedHere| {
-            let seen = |remote: &RemoteNode| {
-                (self.past_positions.get(id).into_iter().flatten()).any(|past| {
-                    past.rev == remote.meta_rev
-                        && past.parent == remote.shape.parent
-                        && past.name == remote.shape.name
-                })
-            };
             (self.r.get(id))
                 .filter(|remote| !remote.trashed)
                 .is_some_and(|remote| {
                     remote.meta_rev <= held_through
                         || (moved.upgraded && remote.meta_rev < moved.seq)
-                        || seen(remote)
+                        || seen(id, remote)
                 })
         };
         let lost_moves: BTreeSet<NodeId> = (moved.into_iter())
@@ -1619,7 +1650,13 @@ impl Trees {
             .filter_map(|deleted| {
                 let remote = (self.r.get(&deleted.id))
                     .filter(|remote| !remote.trashed && remote.shape.same(&deleted.shape))
-                    .filter(|remote| remote.content_rev.max(remote.meta_rev) <= held_through)?;
+                    .filter(|remote| {
+                        remote.content_rev.max(remote.meta_rev) <= held_through
+                            || (seen(&deleted.id, remote)
+                                && remote.content_rev == deleted.content_rev
+                                && remote.edit_rev == deleted.edit_rev
+                                && remote.version_id == deleted.version_id)
+                    })?;
                 Some((deleted.id, remote.shape.clone(), deleted.kept))
             })
             .collect();
@@ -1633,19 +1670,42 @@ impl Trees {
             }
             self.set_synced(id, Some(shape));
         }
+        let mut queued = BTreeSet::new();
+        for id in &lost_moves {
+            let (Some(remote), Some(synced)) = (self.r.live(id), self.s.live(id)) else {
+                continue;
+            };
+            let before = Shape {
+                parent: remote.parent.clone(),
+                name: remote.name.clone(),
+                ..synced.clone()
+            };
+            if !self.set_synced_if_valid(id.clone(), Some(before.clone())) {
+                queued.insert(id.clone());
+                self.wait(id.clone(), Some(before), Origin::Other);
+            }
+        }
         for (id, _) in edited {
             let replaced = self.replaced_versions.get(&id);
+            let waits_at = (self.waiting.get(&id))
+                .filter(|_| queued.contains(&id))
+                .and_then(|waiting| waiting.shape.as_ref());
             let Some(remote) = (self.r.get(&id))
                 .filter(|remote| {
                     remote.content_rev <= held_through
                         || replaced.is_some_and(|versions| versions.contains(&remote.version_id))
                 })
-                .filter(|remote| (self.s.live(&id)).is_some_and(|s| s.same_position(&remote.shape)))
+                .filter(|remote| {
+                    (waits_at.or(self.s.live(&id))).is_some_and(|s| s.same_position(&remote.shape))
+                })
                 .map(|remote| remote.shape.clone())
             else {
                 continue;
             };
-            self.set_synced_if_valid(id, Some(remote));
+            if !self.set_synced_if_valid(id.clone(), Some(remote.clone())) {
+                queued.insert(id.clone());
+                self.wait(id, Some(remote), Origin::Other);
+            }
         }
         let synced: BTreeSet<NodeId> = synced.into_iter().collect();
         for id in synced.iter().cloned() {
@@ -1680,19 +1740,6 @@ impl Trees {
             self.waiting.remove(&id);
             self.mark(&id);
         }
-        for id in &lost_moves {
-            let (Some(remote), Some(synced)) = (self.r.live(id), self.s.live(id)) else {
-                continue;
-            };
-            let before = Shape {
-                parent: remote.parent.clone(),
-                name: remote.name.clone(),
-                ..synced.clone()
-            };
-            if !self.set_synced_if_valid(id.clone(), Some(before.clone())) {
-                self.wait(id.clone(), Some(before), Origin::Other);
-            }
-        }
         let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for (id, shape) in self.s.iter() {
             children.entry(&shape.parent).or_default().push(id);
@@ -1714,6 +1761,10 @@ impl Trees {
             .collect();
         let mut lost: BTreeSet<&str> = (self.s.iter())
             .filter(|(id, synced)| {
+                let synced = (self.waiting.get(*id))
+                    .filter(|_| queued.contains(*id))
+                    .and_then(|waiting| waiting.shape.as_ref())
+                    .unwrap_or(*synced);
                 let moved = |remote: &Shape| {
                     let at = Shape {
                         parent: remote.parent.clone(),
@@ -1722,8 +1773,17 @@ impl Trees {
                     };
                     at.same(remote)
                 };
+                let survived =
+                    (records.get(*id))
+                        .zip(self.r.get(id))
+                        .is_some_and(|(old, remote)| {
+                            old.content_rev <= held_through
+                                || (!old.version_id.is_empty()
+                                    && old.version_id == remote.version_id)
+                        });
                 self.r.get(id).is_none()
                     || (!untaken.contains_key(*id)
+                        && !survived
                         && (self.r.live(id))
                             .is_some_and(|remote| !remote.same(synced) && !moved(remote)))
             })

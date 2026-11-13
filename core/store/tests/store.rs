@@ -2523,6 +2523,7 @@ fn an_own_move_acknowledged_before_the_upgrade_is_sent_again_after_a_later_loss(
         Vec::new(),
         moved,
         Vec::new(),
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -2836,6 +2837,7 @@ fn a_discarded_file_that_s_no_longer_holds_is_asked_about_again(edited: bool) {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         0,
         0,
     );

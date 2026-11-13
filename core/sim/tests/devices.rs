@@ -3893,3 +3893,260 @@ fn a_folder_delete_superseded_behind_a_name_that_differs_only_in_case_brings_the
         assert_eq!(paths, ["a", "a/a", "c.txt", "ß"]);
     }
 }
+
+#[test]
+fn a_folder_another_device_made_stays_deleted_when_a_restore_takes_its_delete() {
+    let synced = vec![(1, folder("b")), (1, user(1, 0, 1, "a"))];
+    let mut lost = vec![(0, BACKUP), (0, delete(0))];
+    lost.extend(commit(0));
+    lost.push((0, RESTORE));
+    let world = keep(2, &[synced, lost]).unwrap();
+    for device in &world.devices {
+        assert_eq!(device.disk.entries().len(), 0);
+    }
+}
+
+#[test]
+fn a_file_moved_and_edited_in_a_lost_commit_stays_one_file_when_another_file_takes_its_old_name() {
+    let mut world = world(2);
+    world.phase(0, &[(0, file("a")), (0, file("b"))]).unwrap();
+    let lost = [(0, BACKUP), (0, rename(0, 0, "c.txt")), (0, overwrite(0))];
+    world.phase(1, &lost).unwrap();
+    let disk = &world.devices[1].disk;
+    let b = (disk.visible().iter())
+        .position(|ino| disk.entries()[ino].name == "b")
+        .unwrap();
+    world.phase(2, &[(1, rename(b, 0, "a"))]).unwrap();
+    let mut steps = vec![(0, RESTORE), (0, Step::Connect)];
+    steps.extend([(0, DELIVER); 8]);
+    steps.extend(commit(0));
+    steps.extend([(0, DELIVER); 4]);
+    world.phase(3, &steps).unwrap();
+    for device in &world.devices {
+        assert_eq!(
+            device.disk.entries().len(),
+            2,
+            "{:?}",
+            device.disk.entries()
+        );
+    }
+}
+
+#[test]
+fn a_file_another_device_deletes_after_a_restore_stays_deleted_where_this_device_lost_its_move() {
+    use koidrive_sim::world::{Outcome::*, Reply::*, Step::*};
+    let u = |kind, target, parent, name, text| {
+        User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text,
+        })
+    };
+    let phases = vec![
+        vec![
+            (0, u(1, 0, 17106236007756318171, 5, 2)),
+            (0, Effect(Run)),
+            (2, u(2, 13154000409921659125, 11317697931782792700, 0, 0)),
+            (1, Work(10402927595796392272)),
+            (2, u(0, 8102071768465887985, 2491586679729720529, 3, 1)),
+            (1, Work(8147076248253367137)),
+            (0, Duplicate(17806711057161795297)),
+            (2, Work(9827515188722386526)),
+            (0, Work(10759842065693380470)),
+            (2, Connect),
+            (2, Commit(NoChunks)),
+            (2, u(2, 12304797714950920699, 8235545250517780698, 2, 2)),
+            (0, Effect(Run)),
+            (1, u(2, 18222769914265244999, 5113088640866526070, 3, 3)),
+            (0, u(3, 10796086952843793315, 17349774340083116548, 1, 0)),
+            (2, Deliver(12499940093593466751)),
+            (1, Work(4043467003170336494)),
+            (2, Work(4728614493924271296)),
+            (2, u(4, 9599447120861858895, 18007190340159385861, 5, 2)),
+            (0, Backup),
+        ],
+        vec![
+            (2, Backup),
+            (2, u(2, 9184836677058907065, 10433568392581601685, 0, 0)),
+            (2, Scan),
+            (2, Commit(Served)),
+            (2, Commit(Served)),
+            (2, Deliver(12927180940504033335)),
+            (2, Deliver(3825508426826136613)),
+            (2, u(2, 9184836677058907065, 3418892106507063918, 3, 3)),
+            (2, Scan),
+            (2, Commit(Served)),
+            (2, Commit(Served)),
+            (1, u(3, 6617529400670140390, 9272155802029785947, 4, 3)),
+            (2, Commit(Served)),
+            (2, u(2, 13905988022610025184, 3052641924150865604, 6, 2)),
+            (1, u(1, 7979644240074520884, 13471144562339818831, 4, 3)),
+            (1, Commit(Served)),
+            (2, Restore),
+            (2, Effect(Run)),
+            (2, u(1, 16549484964196156729, 15324450509200737979, 0, 2)),
+            (2, Effect(Run)),
+            (2, Duplicate(3438284062848940079)),
+            (2, Deliver(2861012374057950334)),
+        ],
+        vec![
+            (0, u(3, 11081397640828020932, 11362425464966793444, 6, 3)),
+            (0, Scan),
+            (0, Commit(Served)),
+            (0, Commit(Served)),
+            (0, Deliver(11797932787380850498)),
+            (0, u(3, 11081397640828020932, 6919568488104646115, 4, 0)),
+            (0, Scan),
+            (0, Commit(Served)),
+            (0, Commit(Served)),
+            (2, u(1, 1772315988544606582, 7017746951609423526, 0, 0)),
+            (2, Work(15679955762379804781)),
+            (1, u(1, 1277192366001788814, 1522225953410853276, 1, 1)),
+            (0, Work(16205367382564583885)),
+            (2, u(4, 13857229851831582670, 13975215875373442002, 2, 0)),
+            (0, Restore),
+            (2, u(3, 3702807200985915994, 14081670185505849278, 4, 3)),
+            (1, Connect),
+        ],
+        vec![
+            (0, Backup),
+            (0, u(3, 7527335667581534596, 10929708698728945290, 6, 0)),
+            (0, Scan),
+            (0, Commit(Served)),
+            (0, Commit(Served)),
+            (0, Deliver(10466699725936890930)),
+            (0, Deliver(6868596529788382619)),
+            (0, u(2, 7527335667581534596, 1287398878429798948, 5, 0)),
+            (1, Work(1465397633813081855)),
+            (0, Restore),
+            (2, u(1, 14282863983713927413, 10917475380281013382, 3, 2)),
+            (1, Work(6282625744961036041)),
+            (0, Deliver(5109877815414700445)),
+            (2, u(1, 11808259191354608109, 6804749932233161696, 5, 1)),
+            (2, u(1, 11096482189577154791, 2047070662338996294, 4, 3)),
+        ],
+    ];
+    converge(2, &phases).unwrap();
+}
+
+#[test]
+fn a_file_deleted_after_its_lost_edit_was_sent_again_stays_deleted_after_a_second_restore() {
+    use koidrive_sim::world::{Outcome::*, Reply::*, Step::*};
+    let u = |kind, target, parent, name, text| {
+        User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text,
+        })
+    };
+    let phases = vec![
+        vec![
+            (2, u(1, 0, 9903764825449132303, 3, 0)),
+            (2, u(1, 0, 11552117565777905621, 1, 0)),
+            (0, u(1, 0, 6547235099835790166, 2, 1)),
+            (2, Commit(Served)),
+            (1, Work(10851495513385420087)),
+            (0, Backup),
+        ],
+        vec![
+            (1, Backup),
+            (1, u(2, 13451676212994458387, 9565607454629926028, 5, 1)),
+            (1, Scan),
+            (1, Commit(Served)),
+            (1, Commit(Served)),
+            (1, Deliver(15439413583016071576)),
+            (1, u(2, 13451676212994458387, 1428915013577112214, 2, 0)),
+            (0, u(0, 14921052704295272185, 1631154572745136587, 3, 0)),
+            (0, Work(5760192452305054293)),
+            (1, Work(11147973249046154743)),
+            (1, Restore),
+            (2, Work(7569785021038804799)),
+            (1, Scan),
+            (1, u(2, 16917427084108916823, 3208504347092805974, 6, 2)),
+            (2, u(0, 13110796547459440586, 12873427126193245819, 1, 2)),
+            (2, Deliver(12181449998824957549)),
+            (2, Work(15345591448188332441)),
+        ],
+        vec![
+            (0, u(2, 5455820235707350558, 15481885657966313345, 2, 1)),
+            (0, Scan),
+            (0, Commit(Served)),
+            (0, Commit(Served)),
+            (0, Deliver(8823653801653775740)),
+            (0, Deliver(8476531716452877371)),
+            (0, u(3, 5455820235707350558, 17745467830829831845, 5, 2)),
+            (1, Deliver(2207532471932803233)),
+            (2, Work(5196016082092443997)),
+            (0, u(1, 10602450107474480572, 15713227814823447551, 6, 3)),
+            (2, Work(11845418407008084177)),
+            (0, Duplicate(17309292382555486343)),
+            (1, Deliver(14085540052365221270)),
+            (2, Deliver(11465396930300754326)),
+            (0, Restore),
+            (1, Work(4953386889912483399)),
+            (1, Effect(Run)),
+            (0, Work(10626274012016294836)),
+            (2, Scan),
+            (0, Connect),
+        ],
+        vec![
+            (1, u(2, 14029889503971787886, 17520627783615361546, 4, 1)),
+            (1, Scan),
+            (1, Commit(Served)),
+            (1, Commit(Served)),
+            (1, Deliver(10231594919977477748)),
+            (1, Deliver(8609908036244146517)),
+            (1, u(2, 14029889503971787886, 3245076338140175791, 3, 3)),
+            (1, Scan),
+            (1, Commit(Served)),
+            (1, Commit(Served)),
+            (2, u(1, 2450262582666582614, 2694992668587191784, 3, 0)),
+            (2, u(4, 16826249660264566776, 15981268369320786190, 4, 2)),
+            (1, Effect(Run)),
+            (1, Restore),
+            (1, u(2, 15018102010109100468, 13671348707082575255, 1, 1)),
+            (0, Work(8590167749790942484)),
+            (2, Work(777097490670644355)),
+        ],
+    ];
+    converge(2, &phases).unwrap();
+}
+
+#[test]
+fn a_lost_delete_is_not_sent_again_over_an_edit_another_device_made_after_the_restore() {
+    let mut world = converge(2, &[vec![(0, file("a"))]]).unwrap();
+    let mut steps = vec![(0, BACKUP), (0, delete(0))];
+    steps.extend(commit(0));
+    steps.extend([(0, RESTORE), (1, Step::Connect)]);
+    steps.extend([(1, DELIVER); 8]);
+    steps.push((1, overwrite(0)));
+    steps.extend(commit(1));
+    world.phase(1, &steps).unwrap();
+    for device in 0..2 {
+        assert_eq!(files_on(&world, device).len(), 1, "device {device}");
+    }
+}
+
+#[test]
+fn an_observers_rename_survives_when_a_restore_takes_it_with_the_edit_it_downloaded() {
+    let mut lost = vec![(0, BACKUP), (0, overwrite(0))];
+    lost.extend(commit(0));
+    lost.push((1, Step::Connect));
+    lost.extend([(1, Step::Work(0)); 16]);
+    lost.push((1, rename(0, 0, "b")));
+    lost.extend(commit(1));
+    lost.extend([(1, DELIVER); 4]);
+    lost.push((0, RESTORE));
+    reconnect(&mut lost, 1, true);
+    reconnect(&mut lost, 0, true);
+    let world = keep(3, &[vec![(0, file("a"))], lost]).unwrap();
+    for device in 0..3 {
+        let files = files_on(&world, device);
+        let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["b"], "device {device}: {files:?}");
+    }
+}

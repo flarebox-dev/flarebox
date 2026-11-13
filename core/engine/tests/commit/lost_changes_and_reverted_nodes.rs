@@ -16,6 +16,7 @@ fn a_delete_the_server_lost_is_sent_again() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -61,6 +62,7 @@ fn a_delete_the_server_lost_is_sent_again_only_for_what_it_saw() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -92,6 +94,7 @@ fn an_edit_the_server_lost_is_sent_again() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -119,6 +122,7 @@ fn an_edit_the_server_lost_is_not_sent_again_over_a_later_edit() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -143,6 +147,7 @@ fn an_edit_the_server_lost_is_sent_again_over_a_later_delete() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -550,6 +555,7 @@ fn a_reverted_file_the_server_lost_is_created_again_under_its_id() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         0,
         0,
     );
@@ -590,6 +596,7 @@ fn a_reverted_file_whose_s_update_waits_is_created_again_under_its_id_once_the_s
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         0,
         0,
     );
@@ -738,6 +745,7 @@ fn a_move_another_device_made_after_a_loss_is_taken() {
         Vec::new(),
         moved,
         Vec::new(),
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -997,6 +1005,7 @@ fn a_lost_move_of_a_folder_keeps_a_move_another_device_made_of_its_child_after_t
         Vec::new(),
         moved,
         Vec::new(),
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -1075,6 +1084,7 @@ fn a_lost_folder_move_keeps_its_childs_remote_move_when_its_old_name_is_held_in_
         Vec::new(),
         moved,
         Vec::new(),
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -1123,6 +1133,72 @@ fn a_lost_move_is_sent_again_when_the_loss_also_took_a_delete_made_after_it() {
 }
 
 #[test]
+fn a_delete_the_server_lost_is_sent_again_for_a_record_it_saw_above_the_bound() {
+    let seen = |shape: Shape| RemoteNode {
+        content_rev: 3,
+        edit_rev: 3,
+        meta_rev: 3,
+        version_id: "v3".into(),
+        ..remote(shape)
+    };
+    let row = |id: &'static str, r: RemoteNode| (id, Some(r.shape.clone()), Some(r.shape.clone()), Some(r));
+    let rows = [
+        row("dir", remote_at(dir(ROOT, "dir"), 3)),
+        row("same", seen(file(ROOT, "same", 1))),
+        row("restored", seen(file(ROOT, "restored", 1))),
+        row("marked", seen(file(ROOT, "marked", 1))),
+    ];
+    let (mut commits, mut trees, mut ids, _) = deleted_at_5_then_lost(&rows);
+    for id in ["same", "restored", "marked"] {
+        let deleted = RemoteNode {
+            meta_rev: 5,
+            trash_group: "5:0".into(),
+            trashed: true,
+            ..seen(file(ROOT, id, 1))
+        };
+        trees.set_remote(id.into(), deleted);
+    }
+    let trashed = trees.trashed_here();
+    assert_eq!(trashed.len(), 4);
+    trees.set_listed_remote("dir".into(), remote_at(dir(ROOT, "dir"), 3));
+    trees.set_listed_remote("same".into(), seen(file(ROOT, "same", 1)));
+    let restored = RemoteNode {
+        meta_rev: 7,
+        ..seen(file(ROOT, "restored", 1))
+    };
+    trees.set_listed_remote("restored".into(), restored);
+    let marked = RemoteNode {
+        edit_rev: 6,
+        ..seen(file(ROOT, "marked", 1))
+    };
+    trees.set_listed_remote("marked".into(), marked);
+    trees.forget_lost(
+        trashed,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Default::default(),
+        commits.held_through(),
+        commits.accepted(),
+    );
+    trees.settle();
+    let classes = ["dir", "same", "restored", "marked"].map(|id| (id, trees.class(id)));
+    assert_eq!(
+        classes,
+        [
+            ("dir", Class::Local),
+            ("same", Class::Local),
+            ("restored", Class::Remote),
+            ("marked", Class::Remote)
+        ]
+    );
+    let mut sent = ops(&build(&mut commits, &mut trees, &mut ids).unwrap());
+    sent.sort_by_key(|op| format!("{op:?}"));
+    assert_eq!(sent, [delete("dir"), delete("same")]);
+}
+
+#[test]
 fn a_file_this_device_made_follows_a_delete_after_another_device_edited_it_past_a_loss() {
     let made = RemoteNode {
         meta_rev: 2,
@@ -1151,6 +1227,7 @@ fn a_file_this_device_made_follows_a_delete_after_another_device_edited_it_past_
         synced,
         Vec::new(),
         Vec::new(),
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -1183,6 +1260,7 @@ fn a_file_another_device_edited_before_a_loss_follows_a_delete_made_after_it() {
         Vec::new(),
         Vec::new(),
         untaken,
+        Default::default(),
         0,
         0,
     );
@@ -1225,6 +1303,7 @@ fn an_untaken_edit_then(listed: RemoteNode) -> (Trees, Option<proto::Commit>) {
         Vec::new(),
         Vec::new(),
         untaken,
+        Default::default(),
         0,
         0,
     );
@@ -1291,6 +1370,7 @@ fn an_untaken_edit_below_a_lost_folder_follows_a_later_delete() {
         Vec::new(),
         Vec::new(),
         untaken,
+        Default::default(),
         0,
         0,
     );
@@ -1344,6 +1424,7 @@ fn an_untaken_edit_renamed_in_a_lost_commit_is_renamed_again() {
         Vec::new(),
         Vec::new(),
         untaken,
+        Default::default(),
         3,
         0,
     );
@@ -1380,6 +1461,7 @@ fn an_untaken_edit_another_device_moved_before_the_loss_stays_where_it_moved() {
         Vec::new(),
         Vec::new(),
         untaken,
+        Default::default(),
         3,
         0,
     );
@@ -1461,6 +1543,7 @@ fn content_l_went_back_to_while_an_acknowledged_edit_waits_is_sent_after_a_loss(
         synced,
         Vec::new(),
         untaken,
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -1507,6 +1590,7 @@ fn content_l_went_back_to_while_its_edit_was_in_flight_is_sent_after_a_loss() {
         synced,
         trees.moved_here(),
         untaken,
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -1550,6 +1634,7 @@ fn an_untaken_edit_another_device_moved_after_the_loss_stays_where_it_moved() {
         Vec::new(),
         Vec::new(),
         untaken,
+        Default::default(),
         3,
         0,
     );
@@ -1593,6 +1678,7 @@ fn content_l_went_back_to_while_its_equal_edit_was_in_flight_is_sent_after_a_los
         synced,
         trees.moved_here(),
         untaken,
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -1634,6 +1720,7 @@ fn content_this_devices_restore_set_is_not_kept_beside_it_after_a_loss() {
         synced,
         trees.moved_here(),
         untaken,
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -1648,4 +1735,70 @@ fn content_this_devices_restore_set_is_not_kept_beside_it_after_a_loss() {
         )
     });
     assert!(!kept, "{sent:?}");
+}
+
+#[test]
+fn a_lost_move_and_edit_are_sent_again_when_another_file_held_the_old_name() {
+    for occupied in [false, true] {
+        let mut trees = trees(&[
+            synced("n", file(ROOT, "x", 1)),
+            synced("q", file(ROOT, "z", 2)),
+        ]);
+        trees.set_remote("n".into(), version(remote(file(ROOT, "x", 1)), "v1"));
+        trees.set_remote("q".into(), version(remote(file(ROOT, "z", 2)), "vq"));
+        let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+        trees.set_local("n".into(), local(file(ROOT, "y", 3), 1));
+        trees.settle();
+        let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+        let changed = RemoteNode {
+            meta_rev: 2,
+            content_rev: 2,
+            edit_rev: 2,
+            version_id: "v2".into(),
+            ..remote(file(ROOT, "y", 3))
+        };
+        trees.set_remote("n".into(), changed);
+        let applied = commit.ops.iter().map(|_| outcome(op_result::Code::Applied));
+        commits.received(result(2, applied.collect())).unwrap();
+        assert!(commits.acknowledge(&mut trees, 2));
+        trees.settle();
+        if occupied {
+            let moved = version(remote_at(file(ROOT, "x", 2), 3), "vq");
+            trees.set_remote("q".into(), moved);
+            trees.set_local("q".into(), local(file(ROOT, "x", 2), 2));
+            trees.settle();
+        }
+        assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
+        let trashed = trees.trashed_here();
+        let edited = trees.edited_here();
+        let synced = trees.taken_from_others(|seq| commits.lost_here(seq));
+        let moved = trees.moved_here();
+        let untaken = trees.untaken_edits(|seq| commits.lost_here(seq));
+        let records = trees.remote_records();
+        trees.set_listed_remote("n".into(), version(remote(file(ROOT, "x", 1)), "v1"));
+        trees.set_listed_remote("q".into(), version(remote(file(ROOT, "z", 2)), "vq"));
+        trees.forget_lost(
+            trashed,
+            edited,
+            synced,
+            moved,
+            untaken,
+            records,
+            commits.held_through(),
+            commits.accepted(),
+        );
+        trees.settle();
+        let sent = build(&mut commits, &mut trees, &mut ids).map(|commit| ops(&commit));
+        let edits_n = |op: &op::Op| {
+            matches!(op, op::Op::UpdateContent(update) if update.node_id == "n" && update.content == Some(content(3)))
+        };
+        assert!(
+            sent.as_ref().is_some_and(|ops| ops.iter().any(edits_n)),
+            "occupied {occupied}: {sent:?}"
+        );
+        assert!(
+            sent.iter().flatten().all(|op| !matches!(op, op::Op::CreateFile(_))),
+            "occupied {occupied}: {sent:?}"
+        );
+    }
 }

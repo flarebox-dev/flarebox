@@ -439,6 +439,7 @@ pub struct World {
     writers: BTreeMap<i64, usize>,
     /// For each device, the writes its user overwrote or deleted on its disk.
     removed: Vec<BTreeSet<i64>>,
+    overwrote: BTreeMap<i64, i64>,
     /// For each device, the names its user gave to entries on its disk.
     named: Vec<BTreeSet<&'static str>>,
     /// The writes the server's live tree has held at some time.
@@ -516,6 +517,7 @@ impl World {
         Self {
             space,
             removed: vec![BTreeSet::new(); count],
+            overwrote: BTreeMap::new(),
             named: vec![BTreeSet::new(); devices.len()],
             restored_names: vec![BTreeMap::new(); devices.len()],
             placements: vec![BTreeSet::new(); devices.len()],
@@ -773,6 +775,7 @@ impl World {
                     && let Some(old) = disk.overwrite(ino, fresh)
                 {
                     self.removed[d].insert(old.mtime_ns);
+                    self.overwrote.insert(write, old.mtime_ns);
                     self.writes = write;
                     self.writers.insert(write, d);
                     touched = itself;
@@ -1380,6 +1383,7 @@ impl World {
                 let synced = trees.taken_from_others(|seq| commits.lost_here(seq));
                 let moved = trees.moved_here();
                 let untaken = trees.untaken_edits(|seq| commits.lost_here(seq));
+                let records = trees.remote_records();
                 let root = trees.remote().root.clone();
                 let mut listed = BTreeMap::new();
                 for state in nodes.iter().filter(|state| state.node_id != root) {
@@ -1408,6 +1412,7 @@ impl World {
                         synced,
                         moved,
                         untaken,
+                        records,
                         commits.held_through(),
                         commits.accepted(),
                     );
@@ -1793,9 +1798,17 @@ impl World {
                                 // write of the same bytes to that file.
                                 let held = self.held.get(node);
                                 let digest = held.and_then(|held| held.get(lost));
+                                let replaced = |write: &i64| {
+                                    std::iter::successors(self.overwrote.get(write), |write| {
+                                        self.overwrote.get(write)
+                                    })
+                                    .any(|write| write == lost)
+                                };
                                 let asked = |removed: &BTreeSet<i64>| {
                                     (removed.iter()).any(|write| {
                                         write == lost
+                                            || replaced(write)
+                                                && held.is_some_and(|held| held.contains_key(write))
                                             || digest.is_some()
                                                 && held.and_then(|held| held.get(write)) == digest
                                     })
@@ -2552,5 +2565,69 @@ mod tests {
             let accepted = resent_over_revert(&exposed, &rolled_back, &record, &applied);
             assert_eq!(accepted, file == "a", "write 2 exposed at {file}");
         }
+    }
+
+    fn send(world: &mut World, d: usize) -> Result<(), Failure> {
+        let mut steps = vec![
+            (d, Step::Scan),
+            (d, Step::Commit(Reply::Served)),
+            (d, Step::Commit(Reply::Served)),
+        ];
+        steps.extend([(d, Step::Deliver(0)); 8]);
+        world.run(0, &steps)
+    }
+
+    fn connect(world: &mut World, d: usize) {
+        let mut steps = vec![(d, Step::Connect)];
+        steps.extend([(d, Step::Deliver(0)); 8]);
+        world.run(0, &steps).unwrap();
+    }
+
+    #[test]
+    fn deleting_a_concurrent_later_write_does_not_excuse_removing_an_unseen_earlier_one() {
+        let user = |kind, text| {
+            Step::User(Action {
+                kind,
+                target: 0,
+                parent: 0,
+                name: 0,
+                text,
+            })
+        };
+        let mut world = World::new(2);
+        world.phase(0, &[(0, user(1, 0))]).unwrap();
+        (world.run(1, &[(0, Step::Backup), (0, user(2, 1)), (1, user(2, 2))])).unwrap();
+        send(&mut world, 1).unwrap();
+        assert_eq!(
+            live_writes(&world.space).into_keys().collect::<Vec<_>>(),
+            [3]
+        );
+        world.run(1, &[(1, user(4, 0))]).unwrap();
+        send(&mut world, 1).unwrap();
+        assert!(world.removed[1].contains(&3));
+        assert!(!world.removed[1].contains(&2));
+        world.run(2, &[(0, Step::Restore)]).unwrap();
+        connect(&mut world, 0);
+        send(&mut world, 0).unwrap();
+        assert_eq!(
+            live_writes(&world.space).into_keys().collect::<Vec<_>>(),
+            [2]
+        );
+        connect(&mut world, 1);
+        let trees = &mut world.devices[1].engine.trees;
+        let (id, shape) = (trees.remote().iter())
+            .find(|(_, node)| !node.trashed)
+            .map(|(id, node)| (id.clone(), node.shape.clone()))
+            .unwrap();
+        assert_eq!(shape.content.as_ref().unwrap().mtime_ns, 2);
+        assert!(trees.local().get(&id).is_none());
+        trees.set_synced(id, Some(shape));
+        trees.settle();
+        world.devices[1].persist().unwrap();
+        let removed = send(&mut world, 1);
+        assert!(
+            matches!(&removed, Err(Failure::Broken(why)) if why.contains("write 2")),
+            "{removed:?}"
+        );
     }
 }
