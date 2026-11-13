@@ -5,6 +5,7 @@ use std::future::Future;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::os::fd::{AsFd, OwnedFd};
 use std::process::{ExitCode, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use koidrive_ipc::Code;
 use rustix::termios::{LocalModes, OptionalActions, Termios, tcgetattr, tcsetattr};
@@ -13,9 +14,32 @@ use tokio::io::AsyncReadExt;
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::process::Child;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 
 use crate::error::CliError;
+
+const READY: &str = "\u{1b}]777;koi-prompt-ready\u{7}";
+
+#[derive(Default)]
+struct ReadyTheme(AtomicBool);
+
+struct DefaultTheme;
+
+impl cliclack::Theme for DefaultTheme {}
+
+impl cliclack::Theme for ReadyTheme {
+    fn format_footer_with_message(&self, state: &cliclack::ThemeState, message: &str) -> String {
+        let mut footer = <DefaultTheme as cliclack::Theme>::format_footer_with_message(
+            &DefaultTheme,
+            state,
+            message,
+        );
+        if !self.0.swap(true, Ordering::Relaxed) {
+            footer.push_str(READY);
+        }
+        footer
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Interaction {
@@ -87,7 +111,7 @@ struct InputBridge {
 }
 
 impl InputBridge {
-    fn new(input: &OwnedFd) -> io::Result<(Self, Stdio)> {
+    fn new(input: &OwnedFd, size: rustix::termios::Winsize) -> io::Result<(Self, std::fs::File)> {
         use rustix::fs::{Mode, OFlags, fcntl_getfl, fcntl_setfl, open};
         use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
 
@@ -109,32 +133,106 @@ impl InputBridge {
         let name = ptsname(&helper, Vec::new())?;
         let slave = open(
             name.as_c_str(),
-            OFlags::RDONLY | OFlags::NOCTTY | OFlags::CLOEXEC,
+            OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
         let mut raw = tcgetattr(&slave)?;
         raw.make_raw();
         tcsetattr(&slave, OptionalActions::Now, &raw)?;
+        rustix::termios::tcsetwinsize(&helper, size)?;
         Ok((
             Self {
                 terminal: register(terminal)?,
                 helper: register(helper)?,
             },
-            Stdio::from(std::fs::File::from(slave)),
+            std::fs::File::from(slave),
         ))
     }
 
-    async fn forward(&self) -> Result<(), PromptFailure> {
+    async fn relay(&self, ready: oneshot::Sender<()>, mut output: impl Write) -> io::Result<()> {
+        let mut ready = Some(ready);
+        let mut pending = Vec::new();
         let mut buffer = [0; 4096];
         loop {
             let count = self
-                .terminal
+                .helper
                 .async_io(Interest::READABLE, |fd| {
                     rustix::io::read(fd, &mut buffer).map_err(io::Error::from)
                 })
-                .await?;
+                .await;
+            let count = match count {
+                Ok(0) => return Ok(()),
+                Ok(count) => count,
+                Err(error) if error.raw_os_error() == Some(5) => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            pending.extend_from_slice(&buffer[..count]);
+            while let Some(index) = pending
+                .windows(READY.len())
+                .position(|bytes| bytes == READY.as_bytes())
+            {
+                if let Some(ready) = ready.take() {
+                    rustix::termios::tcflush(
+                        &self.terminal,
+                        rustix::termios::QueueSelector::IFlush,
+                    )?;
+                    output.write_all(&pending[..index])?;
+                    output.flush()?;
+                    let _ = ready.send(());
+                } else {
+                    output.write_all(&pending[..index])?;
+                    output.flush()?;
+                }
+                pending.drain(..index + READY.len());
+            }
+            if ready.is_some() {
+                if pending.len() > 64 * 1024 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "the terminal prompt frame is too long",
+                    ));
+                }
+                continue;
+            }
+            let keep = (1..READY.len())
+                .rev()
+                .find(|&length| pending.ends_with(&READY.as_bytes()[..length]))
+                .unwrap_or(0);
+            let written = pending.len() - keep;
+            output.write_all(&pending[..written])?;
+            output.flush()?;
+            pending.drain(..written);
+        }
+    }
+
+    async fn forward(&self, mut rendered: oneshot::Receiver<()>) -> Result<(), PromptFailure> {
+        let mut buffer = [0; 4096];
+        let mut accepting = false;
+        loop {
+            let count = tokio::select! {
+                biased;
+                ready = &mut rendered, if !accepting => {
+                    if ready.is_err() {
+                        return Ok(());
+                    }
+                    accepting = true;
+                    continue;
+                },
+                count = self.terminal.async_io(Interest::READABLE, |fd| {
+                    rustix::io::read(fd, &mut buffer).map_err(io::Error::from)
+                }) => count?,
+            };
             if count == 0 || buffer[..count].contains(&4) {
                 return Err(PromptFailure::Closed);
+            }
+            if !accepting {
+                if buffer[..count].contains(&3) {
+                    return Err(PromptFailure::Cancelled);
+                }
+                continue;
+            }
+            if let Ok(size) = rustix::termios::tcgetwinsize(io::stderr()) {
+                rustix::termios::tcsetwinsize(&self.helper, size).map_err(io::Error::from)?;
             }
             let mut bytes = &buffer[..count];
             while !bytes.is_empty() {
@@ -315,12 +413,8 @@ impl Terminal {
             hidden.local_modes.remove(LocalModes::ECHO);
         }
         tcsetattr(&saved.input, OptionalActions::Flush, &hidden).map_err(io::Error::from)?;
-        let (bridge, input) = if self.interaction == Interaction::Rich {
-            let (bridge, input) = InputBridge::new(&saved.input)?;
-            (Some(bridge), input)
-        } else {
-            (None, Stdio::inherit())
-        };
+        let size = rustix::termios::tcgetwinsize(io::stderr()).map_err(io::Error::from)?;
+        let (bridge, input) = InputBridge::new(&saved.input, size)?;
         let child = tokio::process::Command::new(std::env::current_exe()?)
             .arg("_prompt")
             .arg(if self.interaction == Interaction::Rich {
@@ -329,8 +423,8 @@ impl Terminal {
                 "plain"
             })
             .arg(serde_json::to_string(&request).expect("prompt requests serialize"))
-            .stdin(input)
-            .stderr(Stdio::inherit())
+            .stdin(Stdio::from(input.try_clone()?))
+            .stderr(Stdio::from(input))
             .stdout(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
@@ -361,17 +455,25 @@ impl Terminal {
                     PromptFailure::Io("the terminal helper returned an invalid answer".into())
                 })?
             };
-            tokio::pin!(answer);
-            match bridge.as_ref() {
-                Some(bridge) => tokio::select! {
-                    biased;
-                    result = &mut answer => result,
-                    result = bridge.forward() => match result {
-                        Ok(()) => answer.await,
-                        Err(error) => Err(error),
-                    },
+            let (ready, rendered) = oneshot::channel();
+            let completion = async {
+                tokio::try_join!(answer, async {
+                    bridge
+                        .relay(ready, io::stderr())
+                        .await
+                        .map_err(PromptFailure::from)
+                })
+                .map(|(answer, ())| answer)
+            };
+            tokio::pin!(completion);
+            let input = bridge.forward(rendered);
+            tokio::select! {
+                biased;
+                result = &mut completion => result,
+                result = input => match result {
+                    Ok(()) => completion.await,
+                    Err(error) => Err(error),
                 },
-                None => answer.await,
             }
         };
         self.cleanup(&mut active).await;
@@ -450,6 +552,7 @@ fn line(question: &str, secret: bool) -> Result<String, PromptFailure> {
     }
     let result = (|| {
         io::stderr().write_all(question.as_bytes())?;
+        io::stderr().write_all(READY.as_bytes())?;
         io::stderr().flush()?;
         read_line(input.lock())
     })();
@@ -541,6 +644,9 @@ pub fn helper(args: &[OsString]) -> Option<ExitCode> {
     };
     let rich = args.get(2).is_some_and(|value| value == "rich");
     colors(!rich);
+    if rich {
+        cliclack::set_theme(ReadyTheme::default());
+    }
     let result = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -565,6 +671,96 @@ pub fn helper(args: &[OsString]) -> Option<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn input_waits_for_the_complete_rendered_frame_and_discards_startup_keys() {
+        use rustix::fs::{Mode, OFlags, fcntl_getfl, fcntl_setfl, open};
+        use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+
+        let terminal = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
+        grantpt(&terminal).unwrap();
+        unlockpt(&terminal).unwrap();
+        let name = ptsname(&terminal, Vec::new()).unwrap();
+        let slave = open(
+            name.as_c_str(),
+            OFlags::RDWR | OFlags::NOCTTY,
+            Mode::empty(),
+        )
+        .unwrap();
+        let mut raw = tcgetattr(&slave).unwrap();
+        raw.make_raw();
+        tcsetattr(&slave, OptionalActions::Now, &raw).unwrap();
+        let size = rustix::termios::Winsize {
+            ws_row: 30,
+            ws_col: 100,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let (bridge, mut helper) = InputBridge::new(&slave, size).unwrap();
+        fcntl_setfl(&helper, fcntl_getfl(&helper).unwrap() | OFlags::NONBLOCK).unwrap();
+        rustix::io::write(&terminal, b"\r").unwrap();
+        let (ready, rendered) = oneshot::channel();
+        let (started, accepting) = oneshot::channel();
+        let mut output = Vec::new();
+        let received = {
+            let display = bridge.relay(ready, &mut output);
+            let input = async {
+                rendered.await.unwrap();
+                started.send(()).unwrap();
+                let (ready, rendered) = oneshot::channel();
+                ready.send(()).unwrap();
+                bridge.forward(rendered).await
+            };
+            let dialog = async {
+                helper.write_all(b"Send reports? [Y/n] ").unwrap();
+                helper.write_all(&READY.as_bytes()[..3]).unwrap();
+                tokio::task::yield_now().await;
+                let mut buffer = [0; 32];
+                assert_eq!(
+                    rustix::io::read(&helper, &mut buffer),
+                    Err(rustix::io::Errno::AGAIN)
+                );
+                helper.write_all(&READY.as_bytes()[3..]).unwrap();
+                accepting.await.unwrap();
+                rustix::io::write(&terminal, b"n\n").unwrap();
+                let mut received = Vec::new();
+                loop {
+                    match rustix::io::read(&helper, &mut buffer) {
+                        Ok(count) => received.extend_from_slice(&buffer[..count]),
+                        Err(rustix::io::Errno::AGAIN) => tokio::task::yield_now().await,
+                        other => panic!("unexpected helper input: {other:?}"),
+                    }
+                    if received.ends_with(b"\n") {
+                        break received;
+                    }
+                }
+            };
+            tokio::pin!(display, input, dialog);
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                tokio::select! {
+                    received = &mut dialog => received,
+                    result = &mut display => panic!("the display stopped early: {result:?}"),
+                    result = &mut input => panic!("input stopped early: {result:?}"),
+                }
+            })
+            .await
+            .unwrap()
+        };
+        assert_eq!(received, b"n\n");
+        assert_eq!(output, b"Send reports? [Y/n] ");
+        for key in [3_u8, 4] {
+            let (_sender, rendered) = oneshot::channel();
+            rustix::io::write(&terminal, &[key]).unwrap();
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(2), bridge.forward(rendered))
+                    .await
+                    .unwrap();
+            assert!(matches!(
+                (key, result),
+                (3, Err(PromptFailure::Cancelled)) | (4, Err(PromptFailure::Closed))
+            ));
+        }
+    }
 
     #[test]
     fn interaction_policy_keeps_direct_and_plain_modes_separate() {
