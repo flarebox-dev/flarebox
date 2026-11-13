@@ -368,7 +368,11 @@ fn main() -> ExitCode {
         .then(|| service::this_service(&paths).ok())
         .flatten()
         .and_then(|service| logfile::CappedLog::of_stderr(service.log_file()));
-    init_logging(log_format, json || terminal.plain_output(), agent_log);
+    init_logging(
+        log_format,
+        json || !console::colors_enabled_stderr(),
+        agent_log,
+    );
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

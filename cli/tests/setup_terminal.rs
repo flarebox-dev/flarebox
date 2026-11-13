@@ -420,6 +420,31 @@ fn rich_questions_use_the_terminal_color_policy_with_a_private_answer_pipe() {
 }
 
 #[test]
+fn no_color_applies_to_warnings_after_a_cancelled_question() {
+    let (home, _) = setup("2\nCODE@files.example.com\n\u{4}", &[], &[], true);
+    fs::write(
+        home.path().join("state/koidrive/telemetry/prompt.json"),
+        "invalid",
+    )
+    .unwrap();
+    let output = terminal_run(
+        home.path(),
+        "",
+        &["status"],
+        &[("NO_COLOR", "1"), ("CLICOLOR_FORCE", "1")],
+        true,
+        None,
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success(), "{text}");
+    assert!(
+        text.contains("the unanswered telemetry question cannot be read"),
+        "{text}"
+    );
+    assert!(!text.contains('\u{1b}'), "{text}");
+}
+
+#[test]
 fn telemetry_is_asked_after_pairing_succeeds() {
     let (home, output) = setup("2\nCODE@files.example.com\nn\n", &[], &[], true);
     let text = String::from_utf8(output.stdout).unwrap();

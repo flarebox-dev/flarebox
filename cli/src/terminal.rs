@@ -6,13 +6,14 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::os::fd::OwnedFd;
 use std::process::{ExitCode, Stdio};
 
+use koidrive_ipc::Code;
 use rustix::termios::{LocalModes, OptionalActions, Termios, tcgetattr, tcsetattr};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tokio::process::Child;
 use tokio::sync::Mutex;
 
-use crate::error::{CliError, Code};
+use crate::error::CliError;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Interaction {
@@ -150,10 +151,6 @@ impl Terminal {
 
     pub fn guided(&self) -> bool {
         self.interaction != Interaction::Direct
-    }
-
-    pub fn plain_output(&self) -> bool {
-        self.interaction != Interaction::Rich
     }
 
     pub fn message(&self, message: &str) {
