@@ -267,6 +267,50 @@ class NewComments(unittest.TestCase):
             ("core/a/src/lib.rs", 5),
         )
 
+    def test_a_helper_between_a_doc_comment_and_its_multiline_attribute_fails(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "/// Acknowledges.\n#[allow(\n    dead_code,\n)]\npub fn ack() {}\n"},
+            {"core/a/src/lib.rs": "/// Acknowledges.\n#[allow(\n    dead_code,\n)]\nfn helper() {}\n\npub fn ack() {}\n"},
+            ("core/a/src/lib.rs", 5),
+            ("core/a/src/lib.rs", 7),
+        )
+
+    def test_a_helper_after_a_blank_line_below_a_doc_comment_fails(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "/// Acknowledges.\n\npub fn ack() {}\n"},
+            {"core/a/src/lib.rs": "/// Acknowledges.\n\nfn helper() {}\n\npub fn ack() {}\n"},
+            ("core/a/src/lib.rs", 3),
+            ("core/a/src/lib.rs", 5),
+        )
+
+    def test_deleting_one_of_two_equal_doc_comments_passes(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "/// Runs.\npub fn a() {}\n/// Runs.\npub fn b() {}\n"},
+            {"core/a/src/lib.rs": "pub fn a() { let _x = 1; }\n/// Runs.\npub fn b() {}\n"},
+        )
+
+    def test_renaming_a_private_fn_whose_doc_a_pub_fn_shares_passes(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "/// Runs.\npub fn a() {}\n/// Runs.\nfn b() {}\n"},
+            {"core/a/src/lib.rs": "/// Runs.\npub fn a() {}\n/// Runs.\nfn c() {}\n"},
+        )
+
+    def test_deleting_a_pub_fn_and_leaving_its_doc_on_a_helper_fails(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "/// Acknowledges.\npub fn ack() {}\nfn helper() {}\n"},
+            {"core/a/src/lib.rs": "/// Acknowledges.\nfn helper() {}\n"},
+            ("core/a/src/lib.rs", 2),
+        )
+
+    def test_a_helper_under_a_pub_fn_doc_in_a_file_with_clap_help_fails(self):
+        prefix = "#[derive(Parser)]\nstruct Args;\n"
+        self.assertFlags(
+            {"core/a/src/lib.rs": prefix + "/// Acknowledges.\npub fn ack() {}\n"},
+            {"core/a/src/lib.rs": prefix + "/// Acknowledges.\nfn helper() {}\n\npub fn ack() {}\n"},
+            ("core/a/src/lib.rs", 4),
+            ("core/a/src/lib.rs", 6),
+        )
+
     def test_deleting_a_pub_fn_doc_comment_passes(self):
         self.assertFlags(
             {"core/a/src/lib.rs": "/// Acknowledges.\npub fn ack() {}\n"},

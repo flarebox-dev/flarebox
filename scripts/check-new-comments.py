@@ -190,35 +190,45 @@ def rust_fns(src):
     lines = src.split("\n")
     comments = comment_lines(src, "rust")
     fns, seen = {}, {}
+    docs, top, depth = [], None, 0
     for number, text in enumerate(lines, 1):
-        m = RUST_FN.match(text)
-        if not m or number in comments and text.lstrip().startswith(("//", "/*", "*")):
+        stripped = text.strip()
+        if depth:
+            depth += stripped.count("[") - stripped.count("]")
             continue
-        docs, above = [], number - 1
-        while above >= 1:
-            stripped = lines[above - 1].strip()
-            if any(doc for doc, _ in comments.get(above, [])) and not stripped.startswith("#"):
-                docs.insert(0, stripped)
-            elif not stripped.startswith("#["):
-                break
-            above -= 1
-        name = m.group(2)
-        seen[name] = seen.get(name, 0) + 1
-        fns[(name, seen[name])] = ((m.group(1) or "").strip() == "pub", "\n".join(docs), number, text, above + 1)
+        if not stripped:
+            continue
+        if stripped.startswith(("//", "/*", "*")) and number in comments:
+            if any(doc for doc, _ in comments[number]) and not stripped.startswith(("//!", "/*!")):
+                docs.append(stripped)
+                top = top or number
+            continue
+        if stripped.startswith("#["):
+            depth = stripped.count("[") - stripped.count("]")
+            continue
+        m = RUST_FN.match(text)
+        if m:
+            name = m.group(2)
+            seen[name] = seen.get(name, 0) + 1
+            fns[(name, seen[name])] = ((m.group(1) or "").strip() == "pub", "\n".join(docs), number, text, top or number)
+        docs, top = [], None
     return fns
 
 
 def moved_docs(path, old_src, new_src):
     old = rust_fns(old_src) if old_src is not None else {}
     new = rust_fns(new_src)
-    public_docs = {docs for public, docs, *_ in old.values() if docs and public}
-    new_docs = {docs for _, docs, *_ in new.values() if docs}
+
+    def has(fns, key, docs):
+        return key in fns and fns[key][1].startswith(docs)
+
+    lost = {docs for key, (public, docs, *_) in old.items() if public and docs and not has(new, key, docs)}
+    gained = {docs for docs in lost if any(has(new, key, docs) and not has(old, key, docs) for key in new)}
     problems = []
     for key, (public, docs, number, text, top) in new.items():
-        before = old.get(key)
-        if not public and any(docs.startswith(moved) for moved in public_docs) and not (before and before[1] == docs):
+        if not public and any(docs.startswith(moved) and not has(old, key, moved) for moved in gained):
             problems.append((path, number, "private-doc", text, top))
-        if public and not docs and before and before[0] and before[1] and any(d.startswith(before[1]) for d in new_docs):
+        if public and key in old and old[key][0] and old[key][1] in gained and not has(new, key, old[key][1]):
             problems.append((path, number, "lost-doc", text, number))
     return problems
 
@@ -312,14 +322,16 @@ def check(base, head):
     problems, moved = [], []
     for f in files:
         path = f.get("new")
-        if not path or not f["added"] or "/gen/" in path:
+        if not path or "/gen/" in path:
             continue
         lang = LANGUAGES["." + path.rsplit(".", 1)[-1]]
         new_src = git("show", f"{head}:{path}")
+        if lang == "rust":
+            moved.extend(moved_docs(path, git("show", f"{base}:{f['old']}") if f["old"] else None, new_src))
+        if not f["added"]:
+            continue
         new_lines = comment_lines(new_src, lang)
         help_text = macro_docs(new_src, lang)
-        if lang == "rust" and not help_text:
-            moved.extend(moved_docs(path, git("show", f"{base}:{f['old']}") if f["old"] else None, new_src))
         for number in f["added"]:
             for doc, piece in new_lines.get(number, []):
                 words = [w.lower() for w in WORD.findall(piece)]
