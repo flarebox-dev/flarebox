@@ -1753,6 +1753,12 @@ impl World {
                                 if asked(&self.removed[d])
                                     || resent && self.removed.iter().any(asked)
                                     || resends.contains(node)
+                                        && (nodes.iter()).any(|trashed| {
+                                            trashed.node_id == *node
+                                                && trashed.status != NodeStatus::Live as i32
+                                        })
+                                        && (chain(&parents, node).iter())
+                                            .any(|id| folders.contains(id))
                                         && (self.removed[d].iter()).any(|write| {
                                             held.is_some_and(|held| held.contains_key(write))
                                         })

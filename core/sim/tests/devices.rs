@@ -2595,8 +2595,7 @@ fn the_authors_edit_survives_a_second_loss_and_a_delete() {
     ));
 }
 
-#[test]
-fn an_idle_device_sends_nothing_over_a_resend_it_pulled() {
+fn an_idle_device_over_a_resend_it_pulled(deleted_before: bool) {
     let user = |kind| {
         Step::User(Action {
             kind,
@@ -2608,6 +2607,10 @@ fn an_idle_device_sends_nothing_over_a_resend_it_pulled() {
     };
     let mut world = World::new(3);
     world.phase(0, &[(0, user(1))]).unwrap();
+    if deleted_before {
+        world.phase(10, &[(1, user(2))]).unwrap();
+        world.phase(11, &[(0, user(2))]).unwrap();
+    }
     let steps = [
         (2, user(2)),
         (0, user(0)),
@@ -2621,4 +2624,14 @@ fn an_idle_device_sends_nothing_over_a_resend_it_pulled() {
         (0, RESTORE),
     ];
     world.phase(1, &steps).unwrap();
+}
+
+#[test]
+fn an_idle_device_sends_nothing_over_a_resend_it_pulled() {
+    an_idle_device_over_a_resend_it_pulled(false);
+}
+
+#[test]
+fn an_idle_device_whose_user_once_deleted_an_older_write_sends_nothing_over_a_resend() {
+    an_idle_device_over_a_resend_it_pulled(true);
 }
