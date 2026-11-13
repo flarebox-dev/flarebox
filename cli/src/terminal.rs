@@ -150,6 +150,25 @@ impl InputBridge {
     }
 
     fn discard_startup_input(&self) -> io::Result<Option<PromptFailure>> {
+        if let Some(control) = self.drain()? {
+            return Ok(Some(control));
+        }
+        let terminal = self.terminal.get_ref();
+        let line = tcgetattr(terminal)?;
+        if !line.local_modes.contains(LocalModes::ICANON) {
+            return Ok(None);
+        }
+        let mut partial = line.clone();
+        partial.local_modes.remove(LocalModes::ICANON);
+        partial.special_codes[rustix::termios::SpecialCodeIndex::VMIN] = 1;
+        partial.special_codes[rustix::termios::SpecialCodeIndex::VTIME] = 0;
+        tcsetattr(terminal, OptionalActions::Now, &partial)?;
+        let control = self.drain();
+        tcsetattr(terminal, OptionalActions::Now, &line)?;
+        control
+    }
+
+    fn drain(&self) -> io::Result<Option<PromptFailure>> {
         let mut buffer = [0; 4096];
         loop {
             match rustix::io::read(self.terminal.get_ref(), &mut buffer) {
@@ -695,7 +714,7 @@ pub fn helper(args: &[OsString]) -> Option<ExitCode> {
 mod tests {
     use super::*;
 
-    fn open_bridge() -> (OwnedFd, OwnedFd, InputBridge, std::fs::File) {
+    fn open_bridge(raw: bool) -> (OwnedFd, OwnedFd, InputBridge, std::fs::File) {
         use rustix::fs::{Mode, OFlags, fcntl_getfl, fcntl_setfl, open};
         use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
 
@@ -709,9 +728,11 @@ mod tests {
             Mode::empty(),
         )
         .unwrap();
-        let mut raw = tcgetattr(&slave).unwrap();
-        raw.make_raw();
-        tcsetattr(&slave, OptionalActions::Now, &raw).unwrap();
+        if raw {
+            let mut modes = tcgetattr(&slave).unwrap();
+            modes.make_raw();
+            tcsetattr(&slave, OptionalActions::Now, &modes).unwrap();
+        }
         let size = rustix::termios::Winsize {
             ws_row: 30,
             ws_col: 100,
@@ -725,7 +746,7 @@ mod tests {
 
     #[tokio::test]
     async fn input_waits_for_the_complete_rendered_frame_and_discards_startup_keys() {
-        let (terminal, _slave, bridge, mut helper) = open_bridge();
+        let (terminal, _slave, bridge, mut helper) = open_bridge(true);
         rustix::io::write(&terminal, b"\r").unwrap();
         let (ready, rendered) = oneshot::channel();
         let (started, accepting) = oneshot::channel();
@@ -793,7 +814,7 @@ mod tests {
     #[tokio::test]
     async fn control_keys_queued_before_the_frame_is_ready_still_end_the_prompt() {
         for key in [3_u8, 4] {
-            let (terminal, _slave, bridge, mut helper) = open_bridge();
+            let (terminal, _slave, bridge, mut helper) = open_bridge(true);
             rustix::io::write(&terminal, &[b'y', key]).unwrap();
             helper.write_all(b"Send reports? [Y/n] ").unwrap();
             helper.write_all(READY.as_bytes()).unwrap();
@@ -827,6 +848,59 @@ mod tests {
                 rustix::io::read(&helper, &mut buffer),
                 Err(rustix::io::Errno::AGAIN)
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_key_typed_before_the_frame_is_ready_never_reaches_the_answer() {
+        for raw in [false, true] {
+            let (terminal, slave, bridge, mut helper) = open_bridge(raw);
+            rustix::io::write(&terminal, b"y").unwrap();
+            helper.write_all(b"Use the existing files? [y/N] ").unwrap();
+            helper.write_all(READY.as_bytes()).unwrap();
+            let (ready, rendered) = oneshot::channel();
+            let (started, accepting) = oneshot::channel();
+            let mut output = Vec::new();
+            let received = {
+                let display = bridge.relay(ready, &mut output);
+                let input = async {
+                    let control = rendered.await.unwrap();
+                    started.send(()).unwrap();
+                    let (ready, rendered) = oneshot::channel();
+                    ready.send(control).unwrap();
+                    bridge.forward(rendered).await
+                };
+                let dialog = async {
+                    accepting.await.unwrap();
+                    rustix::io::write(&terminal, b"\n").unwrap();
+                    let mut buffer = [0; 32];
+                    let mut received = Vec::new();
+                    loop {
+                        match rustix::io::read(&helper, &mut buffer) {
+                            Ok(count) => received.extend_from_slice(&buffer[..count]),
+                            Err(rustix::io::Errno::AGAIN) => tokio::task::yield_now().await,
+                            other => panic!("unexpected helper input: {other:?}"),
+                        }
+                        if received.ends_with(b"\n") {
+                            break received;
+                        }
+                    }
+                };
+                tokio::pin!(display, input, dialog);
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    tokio::select! {
+                        received = &mut dialog => received,
+                        result = &mut display => panic!("the display stopped early: {result:?}"),
+                        result = &mut input => panic!("input stopped early: {result:?}"),
+                    }
+                })
+                .await
+                .unwrap()
+            };
+            assert_eq!(received, b"\n", "raw: {raw}");
+            assert_eq!(output, b"Use the existing files? [y/N] ");
+            let modes = tcgetattr(&slave).unwrap().local_modes;
+            assert_eq!(modes.contains(LocalModes::ICANON), !raw);
         }
     }
 
