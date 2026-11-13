@@ -4,7 +4,7 @@
 
 Scenario files use `include!` in the original module. This preserves the fully qualified test names and private helper access. `common.rs` holds shared helpers once. The simulation's `proptest!` blocks stay in the original file so their regression-file lookup keeps the same source path.
 
-The parser uses `syn` spans to copy source bytes, not pretty-printed syntax. `verify` compares every original item with its destination, including attributes, signatures, and bodies. It also checks the include list and rejects missing or duplicated items. `compare-lists` compares the full Cargo test-name multiset, not only a count.
+The parser uses `syn` spans to copy source bytes, not pretty-printed syntax. `verify` compares every original item with its destination, including attributes, signatures, and bodies. It reads include statements from the Rust syntax tree, rejects attributed includes, and ignores include text in comments or strings. It checks the module header and rejects missing or duplicated items. `compare-lists` compares the full Cargo test-name multiset, not only a count.
 
 ## Regenerate and verify
 

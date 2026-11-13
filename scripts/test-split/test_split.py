@@ -38,7 +38,7 @@ class SplitTests(unittest.TestCase):
         self.path.write_bytes(self.source)
 
     def generate(self):
-        split.write(split.render(self.executable, self.mapping, {"tests.rs": self.source}))
+        split.write(self.executable, split.render(self.executable, self.mapping, {"tests.rs": self.source}))
 
     def test_unicode_offsets_are_byte_offsets(self):
         found = split.items(self.executable, self.source)
@@ -48,11 +48,13 @@ class SplitTests(unittest.TestCase):
     def test_split_is_byte_identical_and_repeatable(self):
         self.generate()
         first = {path: path.read_bytes() for path in self.root.rglob("*.rs")}
+        mtimes = {path: path.stat().st_mtime_ns for path in first}
         with patch.object(split, "git_source", return_value=self.source):
             split.verify(self.executable, self.mapping, "base")
             split.split(self.executable, self.mapping, "base")
         split.split(self.executable, self.mapping, None)
         self.assertEqual(first, {path: path.read_bytes() for path in self.root.rglob("*.rs")})
+        self.assertEqual(mtimes, {path: path.stat().st_mtime_ns for path in first})
 
     def test_unmapped_items_do_not_write(self):
         del self.mapping["tests.rs"]["fn:one"]
@@ -73,6 +75,34 @@ class SplitTests(unittest.TestCase):
         self.path.write_bytes(self.path.read_bytes().replace(b'include!("tests/scenario.rs");', b""))
         with patch.object(split, "git_source", return_value=self.source):
             with self.assertRaisesRegex(ValueError, "include list"):
+                split.verify(self.executable, self.mapping, "base")
+
+    def test_commented_include_fails_identity(self):
+        self.generate()
+        self.path.write_bytes(self.path.read_bytes().replace(
+            b'include!("tests/scenario.rs");', b'// include!("tests/scenario.rs");'))
+        with patch.object(split, "git_source", return_value=self.source):
+            with self.assertRaisesRegex(ValueError, "include list"):
+                split.verify(self.executable, self.mapping, "base")
+
+    def test_conditional_include_is_rejected(self):
+        self.generate()
+        self.path.write_bytes(self.path.read_bytes().replace(
+            b'include!("tests/scenario.rs");', b'#[cfg(any())]\ninclude!("tests/scenario.rs");'))
+        with patch.object(split, "git_source", return_value=self.source):
+            with self.assertRaisesRegex(ValueError, "must be unconditional"):
+                split.verify(self.executable, self.mapping, "base")
+
+    def test_include_text_in_a_string_is_not_expanded(self):
+        source = b'const TEXT: &str = r#"include!("tests/missing.rs");"#;\n'
+        self.path.write_bytes(source)
+        self.assertEqual(split.load_source(self.executable, "tests.rs"), source)
+
+    def test_module_cfg_cannot_disable_the_suite(self):
+        self.generate()
+        self.path.write_bytes(b'#![cfg(any())]\n' + self.path.read_bytes())
+        with patch.object(split, "git_source", return_value=self.source):
+            with self.assertRaisesRegex(ValueError, "module header"):
                 split.verify(self.executable, self.mapping, "base")
 
     def test_test_lists_keep_duplicates(self):

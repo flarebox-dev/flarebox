@@ -62,7 +62,15 @@ fn main() {
                 assert!(!names.is_empty(), "proptest must contain named functions");
                 (format!("proptest:{}", names.join(",")), "property")
             }
-            syn::Item::Macro(m) if m.mac.path.is_ident("include") => continue,
+            syn::Item::Macro(m) if m.mac.path.is_ident("include") => {
+                assert!(
+                    m.attrs.is_empty(),
+                    "include statements must be unconditional and unadorned"
+                );
+                let path: syn::LitStr = syn::parse2(m.mac.tokens.clone())
+                    .expect("include path must be a string literal");
+                (format!("include:{}", path.value()), "include")
+            }
             other => panic!("unsupported item: {}", other.to_token_stream()),
         };
         let span = item.span();

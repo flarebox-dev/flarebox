@@ -19,17 +19,25 @@ def git_source(revision, path):
     return subprocess.check_output(["git", "show", f"{revision}:{path}"], cwd=ROOT)
 
 
-def load_source(path, revision=None):
+def include_path(path, name):
+    path = Path(path)
+    included = path.parent / name
+    if included.parent != path.parent / path.stem:
+        raise ValueError(f"unexpected include path: {included}")
+    return included
+
+
+def load_source(executable, path, revision=None):
     def read(name):
         return git_source(revision, name) if revision else (ROOT / name).read_bytes()
 
     source = read(path)
 
-    def expand(match):
-        included = Path(path).parent / match[1].decode()
-        return read(str(included)).removeprefix(LICENSE).rstrip()
-
-    return re.sub(rb'include!\("([^"]+)"\);', expand, source)
+    for item in reversed(includes(executable, source)):
+        included = include_path(path, item["name"].removeprefix("include:"))
+        text = read(str(included)).removeprefix(LICENSE).rstrip()
+        source = source[:item["start"]] + text + source[item["end"]:]
+    return source
 
 
 def parser():
@@ -46,12 +54,23 @@ def parser():
     return Path(metadata["target_directory"]) / "debug/test-split"
 
 
-def items(executable, source):
-    found = json.loads(subprocess.check_output([str(executable)], input=source))
+def parsed(executable, source):
+    result = subprocess.run([str(executable)], input=source, capture_output=True)
+    if result.returncode:
+        raise ValueError(result.stderr.decode().strip())
+    found = json.loads(result.stdout)
     names = [item["name"] for item in found]
     if len(names) != len(set(names)):
         raise ValueError(f"duplicate item names: {names}")
     return found
+
+
+def items(executable, source):
+    return [item for item in parsed(executable, source) if item["kind"] != "include"]
+
+
+def includes(executable, source):
+    return [item for item in parsed(executable, source) if item["kind"] == "include"]
 
 
 def output_path(source, scenario):
@@ -63,7 +82,7 @@ def render(executable, mapping, sources):
     planned = {}
     for path, assignments in mapping.items():
         source = sources[path]
-        if b'include!("' in source:
+        if includes(executable, source):
             raise ValueError(f"{path} is already split; use --source-ref with an unsplit revision")
         found = items(executable, source)
         unknown = [item["name"] for item in found if item["name"] not in assignments]
@@ -96,28 +115,27 @@ def render(executable, mapping, sources):
     return planned
 
 
-def write(planned):
+def write(executable, planned):
     obsolete = set()
     for path in planned:
         if path.exists():
-            for included in re.findall(rb'include!\("([^"]+)"\);', path.read_bytes()):
-                old = path.parent / included.decode()
-                if old.parent != path.parent / path.stem:
-                    raise ValueError(f"unexpected include path: {old}")
+            for included in includes(executable, path.read_bytes()):
+                old = include_path(path, included["name"].removeprefix("include:"))
                 if old not in planned:
                     if not old.read_bytes().startswith(LICENSE):
                         raise ValueError(f"not a generated scenario file: {old}")
                     obsolete.add(old)
     for path, source in planned.items():
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(source)
+        if not path.exists() or path.read_bytes() != source:
+            path.write_bytes(source)
     for path in obsolete:
         path.unlink()
 
 
 def split(executable, mapping, revision):
-    sources = {path: load_source(path, revision) for path in mapping}
-    write(render(executable, mapping, sources))
+    sources = {path: load_source(executable, path, revision) for path in mapping}
+    write(executable, render(executable, mapping, sources))
 
 
 def records(executable, source):
@@ -152,9 +170,9 @@ def merge(base, branch, current, name):
 def port(executable, mapping, base_ref, branch_ref):
     sources = {}
     for path in mapping:
-        base_header, base = records(executable, load_source(path, base_ref))
-        branch_header, branch = records(executable, load_source(path, branch_ref))
-        current_header, current = records(executable, load_source(path))
+        base_header, base = records(executable, load_source(executable, path, base_ref))
+        branch_header, branch = records(executable, load_source(executable, path, branch_ref))
+        current_header, current = records(executable, load_source(executable, path))
         order = list(current) + [name for name in branch if name not in current]
         merged = []
         for name in order:
@@ -163,21 +181,28 @@ def port(executable, mapping, base_ref, branch_ref):
                 merged.append(text)
         header = merge(base_header, branch_header, current_header, f"{path} header")
         sources[path] = header.rstrip() + b"\n\n" + b"\n\n".join(merged) + b"\n"
-    write(render(executable, mapping, sources))
+    write(executable, render(executable, mapping, sources))
 
 
 def verify(executable, mapping, revision):
     total = 0
     for path, assignments in mapping.items():
-        original = load_source(path, revision)
+        original = load_source(executable, path, revision)
+        root = (ROOT / path).read_bytes()
+        root_items = parsed(executable, root)
         expected_includes = Counter(f'{Path(path).stem}/{scenario}.rs'
                                     for scenario in set(assignments.values()) - {"root"}
                                     if output_path(path, scenario).exists())
-        actual_includes = Counter(re.findall(r'include!\("([^"]+)"\);', (ROOT / path).read_text()))
+        actual_includes = Counter(item["name"].removeprefix("include:")
+                                  for item in root_items if item["kind"] == "include")
         if actual_includes != expected_includes:
             raise ValueError(f"{path}: include list differs from the mapping")
+        original_items = items(executable, original)
+        header = original[:original_items[0]["start"]].rstrip() + b"\n\n"
+        if not root_items or root[:root_items[0]["start"]] != header:
+            raise ValueError(f"{path}: module header changed")
         before = {item["name"]: original[item["start"]:item["end"]]
-                  for item in items(executable, original)}
+                  for item in original_items}
         after = {}
         paths = [ROOT / path] + sorted(output_path(path, "common").parent.glob("*.rs"))
         for moved in paths:
