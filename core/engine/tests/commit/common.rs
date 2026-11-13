@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use koidrive_engine::classify::{
-    Class, Origin, PAST_POSITIONS_KEPT, REPLACED_VERSIONS_KEPT, Trees, Waiting,
+    Class, Origin, PAST_POSITIONS_KEPT, REPLACED_VERSIONS_KEPT, Trees, Untaken, Waiting,
 };
 
 use koidrive_engine::commit::{

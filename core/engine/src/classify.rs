@@ -166,6 +166,17 @@ pub struct Trashed {
     pub kept: Option<NodeId>,
 }
 
+/// A change of another device that R held of a node before a bootstrap replaced it, and that this
+/// device had not taken, since L and S held the node alike ([`Trees::untaken_changes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Untaken {
+    /// R held other content live, with whether a commit of this device that the server lost made
+    /// R's record of the file's position.
+    Edit { moved_in_lost_commit: bool },
+    /// R held the node in the trash.
+    Delete,
+}
+
 /// R, L and S of one space, and the nodes whose entries changed since they were last found in sync.
 /// Every mutation goes through these methods, so a change in any tree marks its node dirty, and
 /// [`Trees::settle`] and the planner look only at what changed.
@@ -1429,19 +1440,26 @@ impl Trees {
             .collect()
     }
 
-    /// The files whose content L and S hold alike, with no waiting S update to other content, while R
-    /// holds other content live that no edit of this device set ([`Trees::edited_here`]): edits of
-    /// other devices that this device has not taken yet, each
-    /// with whether a commit of this device that the server lost made R's record of the file's
-    /// position: `lost_here` tells whether a seq is one of those commits. For
-    /// [`Trees::forget_lost`] once a bootstrap has replaced R.
-    pub fn untaken_edits(&self, lost_here: impl Fn(u64) -> bool) -> Vec<(NodeId, bool)> {
+    /// The changes of other devices that this device has not taken yet, for [`Trees::forget_lost`]
+    /// once a bootstrap has replaced R: the nodes L holds as S does, with no local change below them,
+    /// while R holds them in the trash, and the files whose content L and S hold alike, with no
+    /// waiting S update to other content, while R holds other content live. Neither holds an unsent edit or content an edit of this
+    /// device set ([`Trees::edited_here`]). Each edit comes with whether a commit of this device
+    /// that the server lost made R's record of the file's position: `lost_here` tells whether a seq
+    /// is one of those commits.
+    pub fn untaken_changes(&self, lost_here: impl Fn(u64) -> bool) -> Vec<(NodeId, Untaken)> {
+        let holding_changes = self.holding_changes();
         (self.s.iter())
             .filter(|(id, _)| {
                 !self.unsent_edits.contains(*id) && !self.edited_here.contains_key(*id)
             })
             .filter_map(|(id, synced)| {
-                let remote = self.r.get(id).filter(|remote| !remote.trashed)?;
+                let remote = self.r.get(id)?;
+                if remote.trashed {
+                    let unchanged = self.l.live(id).is_some_and(|local| local.same(synced))
+                        && !holding_changes.contains(id);
+                    return unchanged.then(|| (id.clone(), Untaken::Delete));
+                }
                 let held = synced.content.as_ref()?;
                 let acknowledged = self.acknowledged(id)?.content.as_ref()?;
                 let local = self.l.live(id)?.content.as_ref()?;
@@ -1449,7 +1467,15 @@ impl Trees {
                 (same_content(local, held)
                     && same_content(acknowledged, held)
                     && !same_content(theirs, held))
-                .then(|| (id.clone(), lost_here(remote.meta_rev)))
+                .then(|| {
+                    let moved_in_lost_commit = lost_here(remote.meta_rev);
+                    (
+                        id.clone(),
+                        Untaken::Edit {
+                            moved_in_lost_commit,
+                        },
+                    )
+                })
             })
             .collect()
     }
@@ -1585,9 +1611,14 @@ impl Trees {
     /// record may be lost, and a later record can take its seq, so a revision comparison cannot
     /// tell it survived (GUN-457). The agreement is then taken again from L and the new R.
     ///
-    /// `untaken` lists the files whose content L and S held alike while R held other content live
-    /// before the bootstrap, each with whether a lost commit of this device set R's position of it
-    /// ([`Trees::untaken_edits`]).
+    /// `untaken` lists the changes of other devices that this device had not taken before the
+    /// bootstrap ([`Trees::untaken_changes`]). A node L held as S did while R held it in the trash
+    /// was deleted by another device, so L holds nothing the server lacks. It keeps S whatever the
+    /// new R holds, so the trash, R lacking the node, or the content a restore brought back is a
+    /// remote change, and the delete is not undone.
+    ///
+    /// The other changes are files whose content L and S held alike while R held other content
+    /// live, each with whether a lost commit of this device set R's position of it.
     /// R's content was newer than S's, so L holds nothing the server lacks. Each such file that the
     /// new R holds, live or in the trash, keeps S's content and is never recorded as holding an
     /// unsent edit, so whatever content R holds now is taken as a remote change, and a delete made
@@ -1607,7 +1638,7 @@ impl Trees {
         edited: Vec<(NodeId, u64)>,
         synced: Vec<NodeId>,
         moved: Vec<(NodeId, MovedHere)>,
-        untaken: Vec<(NodeId, bool)>,
+        untaken: Vec<(NodeId, Untaken)>,
         records: BTreeMap<NodeId, RemoteNode>,
         held_through: u64,
         accepted: u64,
@@ -1743,12 +1774,63 @@ impl Trees {
         for (id, shape) in self.s.iter() {
             children.entry(&shape.parent).or_default().push(id);
         }
+        let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for (id, shape) in self.s.iter() {
+            children.entry(&shape.parent).or_default().push(id);
+        }
+        let holds_live_below = |id: &str| {
+            let mut below = vec![id];
+            while let Some(id) = below.pop() {
+                for &child in children.get(id).into_iter().flatten() {
+                    if self.r.live(child).is_some() {
+                        return true;
+                    }
+                    below.push(child);
+                }
+            }
+            false
+        };
+        let candidates: BTreeSet<&str> = (untaken.iter())
+            .filter(|(id, change)| *change == Untaken::Delete && !holds_live_below(id))
+            .map(|(id, _)| id.as_str())
+            .collect();
+        let in_place = |id: &str| {
+            let mut parent = self.s.get(id).map(|synced| synced.parent.as_str());
+            while let Some(id) = parent {
+                if self.r.get(id).is_some() {
+                    return true;
+                }
+                let Some(synced) = self.s.get(id) else {
+                    return true;
+                };
+                if !candidates.contains(id) {
+                    return false;
+                }
+                parent = Some(synced.parent.as_str());
+            }
+            true
+        };
+        let deleted: BTreeSet<NodeId> = (candidates.iter())
+            .filter(|id| in_place(id))
+            .map(|id| (*id).to_owned())
+            .collect();
         let taken_late: BTreeSet<NodeId> = (untaken.iter())
-            .filter(|(_, moved_in_lost_commit)| !moved_in_lost_commit)
+            .filter(|(_, change)| {
+                *change
+                    == Untaken::Edit {
+                        moved_in_lost_commit: false,
+                    }
+            })
             .map(|(id, _)| id.clone())
             .collect();
         let untaken: BTreeMap<NodeId, Shape> = (untaken.into_iter())
-            .filter_map(|(id, moved_in_lost_commit)| {
+            .filter_map(|(id, change)| {
+                let Untaken::Edit {
+                    moved_in_lost_commit,
+                } = change
+                else {
+                    return None;
+                };
                 let remote = self.r.get(&id)?;
                 let mut kept = self.s.get(&id)?.clone();
                 if moved_in_lost_commit && !remote.trashed && remote.meta_rev <= held_through {
@@ -1759,6 +1841,7 @@ impl Trees {
             })
             .collect();
         let mut lost: BTreeSet<&str> = (self.s.iter())
+            .filter(|(id, _)| !deleted.contains(*id))
             .filter(|(id, synced)| {
                 let synced = (self.waiting.get(*id))
                     .filter(|_| queued.contains(*id))
@@ -1792,9 +1875,10 @@ impl Trees {
         while let Some(id) = below.pop() {
             for &child in children.get(id).into_iter().flatten() {
                 let trashed = self.r.get(child).is_some_and(|remote| remote.trashed);
-                if !trashed && lost.insert(child) {
-                    below.push(child);
+                if trashed || deleted.contains(child) || !lost.insert(child) {
+                    continue;
                 }
+                below.push(child);
             }
         }
         let mut waits = BTreeSet::new();

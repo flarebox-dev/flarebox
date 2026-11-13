@@ -390,7 +390,7 @@ fn an_edit_and_a_restore_of_one_file_in_one_commit_leave_the_restored_content_re
     let edited = trees.edited_here();
     let synced = trees.taken_from_others(|seq| commits.lost_here(seq));
     let moved = trees.moved_here();
-    let untaken = trees.untaken_edits(|seq| commits.lost_here(seq));
+    let untaken = trees.untaken_changes(|seq| commits.lost_here(seq));
     trees.set_listed_remote(n.clone(), restored);
     trees.forget_lost(
         trashed,
