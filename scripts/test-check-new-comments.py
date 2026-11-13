@@ -377,6 +377,19 @@ class NewComments(unittest.TestCase):
         other = '#[cfg_attr(all(), cfg(not(target_os = "macos")))]\n/// Runs elsewhere.\npub fn run() {}\n'
         self.assertFlags({"core/a/src/lib.rs": mac + other}, {"core/a/src/lib.rs": other + mac})
 
+    def test_renaming_one_cfg_alternative_with_its_doc_passes(self):
+        mac = '#[cfg(target_os = "macos")]\n/// Runs on macOS.\npub fn {}() {{}}\n'
+        other = '#[cfg(not(target_os = "macos"))]\n/// Runs elsewhere.\npub fn run() {}\n'
+        self.assertFlags({"core/a/src/lib.rs": mac.format("run") + other}, {"core/a/src/lib.rs": mac.format("moved") + other})
+
+    def test_a_doc_moved_from_a_pub_fn_to_a_private_namesake_fails(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": '#[cfg(target_os = "macos")]\n/// Runs.\npub fn run() {}\n#[cfg(not(target_os = "macos"))]\nfn run() {}\n'},
+            {"core/a/src/lib.rs": '#[cfg(target_os = "macos")]\npub fn run() {}\n#[cfg(not(target_os = "macos"))]\n/// Runs.\nfn run() {}\n'},
+            ("core/a/src/lib.rs", 2),
+            ("core/a/src/lib.rs", 5),
+        )
+
     def test_deleting_a_pub_fn_doc_comment_passes(self):
         self.assertFlags(
             {"core/a/src/lib.rs": "/// Acknowledges.\npub fn ack() {}\n"},

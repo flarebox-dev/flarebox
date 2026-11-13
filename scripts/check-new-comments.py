@@ -215,8 +215,19 @@ def rust_fns(src):
     fns = {}
     for record in run.stdout.decode().splitlines():
         scope, name, public, number, top, docs = record.split("\t")
-        fns.setdefault((scope, name), []).append((public == "true", docs, int(number), lines[int(number) - 1], int(top)))
+        fns.setdefault((scope, name, public == "true"), []).append((docs, int(number), lines[int(number) - 1], int(top)))
     return fns
+
+
+def changed_docs(old, new):
+    added, removed = list(new), list(old)
+    for same in (str.__eq__, lambda after, before: bool(before) and after.startswith(before)):
+        for docs in list(removed):
+            match = next((fn for fn in added if same(fn[0], docs)), None)
+            if match:
+                added.remove(match)
+                removed.remove(docs)
+    return removed, added
 
 
 def moved_docs(path, old_src, new_src):
@@ -224,21 +235,16 @@ def moved_docs(path, old_src, new_src):
     new = rust_fns(new_src)
     if old is None or new is None:
         return []
-
-    def count(fns, key, docs):
-        return sum(fn[1].startswith(docs) for fn in fns.get(key, []))
-
-    lost = {
-        key: {docs for public, docs, *_ in group if public and docs and count(new, key, docs) < count(old, key, docs)}
-        for key, group in old.items()
-    }
-    gained = {docs for docs in set().union(*lost.values()) if any(count(new, key, docs) > count(old, key, docs) for key in new)}
+    changes = {key: changed_docs([fn[0] for fn in old.get(key, [])], new.get(key, [])) for key in old.keys() | new.keys()}
+    lost = {key: {docs for docs in removed if docs} for key, (removed, _) in changes.items() if key[2]}
+    gained = [fn for _, added in changes.values() for fn in added]
+    moved = {docs for docs in set().union(*lost.values()) if any(fn[0].startswith(docs) for fn in gained)}
     problems = []
-    for key, group in new.items():
-        for public, docs, number, text, top in group:
-            if not public and any(docs.startswith(moved) and count(new, key, moved) > count(old, key, moved) for moved in gained):
+    for key, (_, added) in changes.items():
+        for docs, number, text, top in added:
+            if not key[2] and any(docs.startswith(m) for m in moved):
                 problems.append((path, number, "private-doc", text, top))
-            if public and any(not docs.startswith(moved) for moved in lost.get(key, set()) & gained):
+            if key[2] and any(not docs.startswith(m) for m in lost[key] & moved):
                 problems.append((path, number, "lost-doc", text, number))
     return problems
 
@@ -360,7 +366,7 @@ def check(base, head):
                 elif INTERNAL.search(path):
                     problems.append((path, number, "doc", piece))
     flagged = {(path, number) for path, number, _, _ in problems}
-    for path, number, kind, text, top in moved:
+    for path, number, kind, text, top in sorted(moved):
         if not any((path, line) in flagged for line in range(top, number)):
             problems.append((path, number, kind, text))
     return problems
