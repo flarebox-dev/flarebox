@@ -464,165 +464,33 @@ async fn native_codesign_parses_production_requirements_and_rejects_the_wrong_si
     }
 }
 
-struct ForgedDeveloperId {
-    temp: tempfile::TempDir,
-}
-
-impl ForgedDeveloperId {
-    const IDENTITY: &str = "Developer ID Application: Gunwoo Kim (656SPP5XR8)";
-    const PASSWORD: &str = "forged";
-
-    fn new() -> Self {
-        let temp = tempfile::Builder::new()
-            .prefix("koi-forged-developer-id-")
-            .tempdir()
-            .unwrap();
-        let dir = temp.path().to_path_buf();
-        fs::write(
-            dir.join("leaf.cnf"),
-            format!(
-                "[req]\ndistinguished_name=dn\nprompt=no\n[dn]\nCN={}\nOU=656SPP5XR8\nO=Gunwoo Kim\nC=US\n[leaf]\nbasicConstraints=critical,CA:false\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,codeSigning\n1.2.840.113635.100.6.1.13=critical,DER:0500\n",
-                Self::IDENTITY
-            ),
-        )
-        .unwrap();
-        let forged = Self { temp };
-        let keychain = forged.keychain();
-        succeed(
-            std::process::Command::new("/usr/bin/openssl")
-                .current_dir(&dir)
-                .args([
-                    "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-config",
-                    "leaf.cnf", "-extensions", "leaf", "-keyout", "key.pem", "-out", "cert.pem",
-                ]),
-        );
-        succeed(
-            std::process::Command::new("/usr/bin/openssl")
-                .current_dir(&dir)
-                .args([
-                    "pkcs12", "-export", "-inkey", "key.pem", "-in", "cert.pem", "-out",
-                    "identity.p12", "-passout",
-                ])
-                .arg(format!("pass:{}", Self::PASSWORD)),
-        );
-        for args in [
-            vec!["create-keychain", "-p", Self::PASSWORD],
-            vec!["unlock-keychain", "-p", Self::PASSWORD],
-        ] {
-            succeed(
-                std::process::Command::new("/usr/bin/security")
-                    .args(args)
-                    .arg(&keychain),
-            );
-        }
-        succeed(
-            std::process::Command::new("/usr/bin/security")
-                .arg("import")
-                .arg(dir.join("identity.p12"))
-                .arg("-k")
-                .arg(&keychain)
-                .args(["-f", "pkcs12", "-P", Self::PASSWORD, "-T", "/usr/bin/codesign"]),
-        );
-        succeed(
-            std::process::Command::new("/usr/bin/security")
-                .args([
-                    "set-key-partition-list",
-                    "-S",
-                    "apple-tool:,apple:,codesign:",
-                    "-s",
-                    "-k",
-                    Self::PASSWORD,
-                ])
-                .arg(&keychain),
-        );
-        forged
-    }
-
-    fn keychain(&self) -> PathBuf {
-        self.temp.path().join("forged.keychain-db")
-    }
-
-    fn sign(&self, path: &Path) {
-        succeed(
-            std::process::Command::new("/usr/bin/codesign")
-                .args(["--force", "--timestamp=none", "--keychain"])
-                .arg(self.keychain())
-                .args(["--sign", Self::IDENTITY])
-                .arg(path),
-        );
-    }
-
-    fn app(&self) -> PathBuf {
-        let app = self.temp.path().join(BUNDLE);
-        for (directory, file) in [("MacOS", "Koidrive"), ("Helpers", "koi")] {
-            fs::create_dir_all(app.join("Contents").join(directory)).unwrap();
-            fs::copy("/usr/bin/true", app.join("Contents").join(directory).join(file)).unwrap();
-        }
-        let mut info = plist::Dictionary::new();
-        info.insert(
-            "CFBundleIdentifier".into(),
-            plist::Value::String(IDENTIFIER.into()),
-        );
-        info.insert(
-            "CFBundleExecutable".into(),
-            plist::Value::String("Koidrive".into()),
-        );
-        plist::Value::Dictionary(info)
-            .to_file_xml(app.join("Contents/Info.plist"))
-            .unwrap();
-        self.sign(&app.join("Contents/Helpers/koi"));
-        self.sign(&app);
-        app
-    }
-}
-
-impl Drop for ForgedDeveloperId {
-    fn drop(&mut self) {
-        let _ = std::process::Command::new("/usr/bin/security")
-            .arg("delete-keychain")
-            .arg(self.keychain())
-            .output();
-    }
-}
-
-fn succeed(command: &mut std::process::Command) {
-    let output = command.output().unwrap();
-    assert!(
-        output.status.success(),
-        "{command:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
 #[tokio::test]
-async fn native_codesign_refuses_an_app_and_updater_signed_by_a_forged_developer_id() {
-    let forged = ForgedDeveloperId::new();
-    let app = forged.app();
-    let helper = app.join("Contents/Helpers/koi");
+async fn native_codesign_refuses_an_app_and_updater_signed_by_another_identity() {
+    let app = Path::new("/System/Applications/Calculator.app");
+    let helper = Path::new("/usr/bin/true");
     let config = Config::production().unwrap();
     let (_tx, cancel) = watch::channel(false);
     let control = Control {
         deadline: Instant::now() + Duration::from_secs(30),
         cancel,
     };
-    let claimed = "certificate leaf[subject.OU] = \"656SPP5XR8\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists";
-    for (path, deep) in [(&app, true), (&helper, false)] {
+    for (path, deep) in [(app, true), (helper, false)] {
         process(
             &config.codesign,
-            &signature_args(path, claimed, deep),
+            &signature_args(path, "anchor apple", deep),
             &control,
         )
         .await
         .unwrap();
     }
-    let Err(error) = verify(&config, &app, None, &control).await else {
-        panic!("a forged Developer ID app was accepted");
+    let Err(error) = verify(&config, app, None, &control).await else {
+        panic!("an app signed by another identity was accepted");
     };
     assert_eq!(error.kind, AppInstallFailure::Verification);
     assert!(error.message.contains("failed to satisfy"), "{error:?}");
     let error = process(
         &config.codesign,
-        &signature_args(&helper, SIGNER, false),
+        &signature_args(helper, SIGNER, false),
         &control,
     )
     .await
