@@ -7895,3 +7895,62 @@ fn a_move_recorded_by_the_store_upgrade_is_not_sent_over_a_move_made_after_its_c
     assert!(sent.is_empty());
     assert_eq!(trees.class("n"), Class::Remote);
 }
+
+#[test]
+fn a_lost_folder_move_keeps_its_childs_remote_move_when_its_old_name_is_held_in_s() {
+    let mut trees = trees(&[
+        (
+            "p",
+            Some(dir(ROOT, "x")),
+            Some(dir(ROOT, "x")),
+            Some(remote(dir(ROOT, "x"))),
+        ),
+        (
+            "q",
+            Some(dir(ROOT, "z")),
+            Some(dir(ROOT, "z")),
+            Some(remote(dir(ROOT, "z"))),
+        ),
+        (
+            "n",
+            Some(file("p", "n", 1)),
+            Some(file("p", "n", 1)),
+            Some(remote(file("p", "n", 1))),
+        ),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    trees.set_local("p".into(), local(dir(ROOT, "y"), 1));
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("p", ROOT, "y")]);
+    trees.set_remote("p".into(), remote_at(dir(ROOT, "y"), 2));
+    commits
+        .received(result(2, vec![outcome(op_result::Code::Applied)]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 2));
+    trees.set_remote("q".into(), remote_at(dir(ROOT, "x"), 3));
+    trees.set_local("q".into(), local(dir(ROOT, "x"), 2));
+    trees.settle();
+    assert_eq!(trees.synced().live("q").unwrap().name, "x");
+    assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
+    let (trashed, edited, moved) = (
+        trees.trashed_here(),
+        trees.edited_here(),
+        trees.moved_here(),
+    );
+    trees.set_remote("p".into(), remote(dir(ROOT, "x")));
+    trees.set_remote("q".into(), remote(dir(ROOT, "z")));
+    trees.set_remote("n".into(), remote_at(file(ROOT, "w", 1), 4));
+    trees.forget_lost(
+        trashed,
+        edited,
+        Vec::new(),
+        moved,
+        commits.held_through(),
+        commits.accepted(),
+    );
+    trees.settle();
+    let sent = build(&mut commits, &mut trees, &mut ids).map(|commit| ops(&commit));
+    assert_eq!(sent, Some(vec![mv("p", ROOT, "y")]));
+    assert_eq!(trees.class("n"), Class::Remote);
+}

@@ -1518,7 +1518,9 @@ impl Trees {
                 name: remote.name.clone(),
                 ..synced.clone()
             };
-            self.set_synced_if_valid(id.clone(), Some(before));
+            if !self.set_synced_if_valid(id.clone(), Some(before.clone())) {
+                self.wait(id.clone(), Some(before), Origin::Other);
+            }
         }
         let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for (id, shape) in self.s.iter() {
@@ -1532,7 +1534,7 @@ impl Trees {
                         name: remote.name.clone(),
                         ..(*synced).clone()
                     };
-                    at.same(remote) && !lost_moves.contains(*id)
+                    at.same(remote)
                 };
                 self.r.get(id).is_none()
                     || (self.r.live(id))
