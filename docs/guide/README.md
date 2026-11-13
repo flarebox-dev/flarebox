@@ -2,12 +2,7 @@
 
 Koidrive keeps folders in sync between your computers through a server that you deploy to your own Cloudflare account. File contents are stored as chunks in an R2 bucket in that account. A Durable Object for each space keeps its file tree, its trash and the old versions of its files.
 
-This guide covers the `koi` command on macOS and Linux, version 0.1.0.
-
-> [!IMPORTANT]
-> Koidrive is in alpha, and the protocol and storage format may change before 0.1.0. [Install](install.md) the command with the install script, and the macOS app from the disk image on [GitHub releases](https://github.com/koidrive/koidrive/releases).
->
-> The Cloudflare login that `koi setup` uses needs Koidrive's public OAuth client, which doesn't exist yet. Until it does, only members of the project's own test account can log in. Everyone else deploys the server with the deploy button and claims it with `koi server claim`, as [Set up](setup.md#without-the-cloudflare-login) describes.
+This guide covers the `koi` command on Macs with Apple silicon and on Linux, version 0.1.0. To start, [install](install.md) the command and [set up](setup.md) a server.
 
 ## Words this guide uses
 
@@ -16,18 +11,26 @@ This guide covers the `koi` command on macOS and Linux, version 0.1.0.
 - **Space.** A synced file tree on the server. A space has its own trash and keeps old versions of its files.
 - **Linked folder.** A folder on a device that syncs one space. A device links each space to at most one folder.
 
-## Pages
+## Do a task
 
-1. [Install](install.md): install and update the command, and how it syncs in the background.
-2. [Set up](setup.md): deploy a server, add devices, create spaces and upgrade the server.
-3. [Folders](folders.md): link a folder, choose what syncs with `.koiignore`, and what Koidrive doesn't sync.
-4. [Conflicts](conflicts.md): what happens when two devices change the same file.
-5. [Trash, versions and restore](history.md): get back a deleted file or an earlier version.
-6. [Share links](sharing.md): let anyone with a link open a file or folder, with an expiry and a password.
-7. [Status and problems](status.md): read `koi status`, pause sync, wait out a quota, restart a folder, send refused changes again and write a file for a problem report.
-8. [Devices](devices.md): list and revoke devices, and get back in after losing every device.
-9. [Limits](limits.md): what the Workers Free plan allows, and Koidrive's own limits.
-10. [Back up the server](backup.md): copy the R2 bucket outside Cloudflare, and what the copy can restore.
-11. [Uninstall](uninstall.md): remove a device, or remove everything.
-12. [Agents and scripts](agents.md): the JSON envelope, the exit codes and `koi status --check`.
-13. [Usage reports](telemetry.md): what the anonymous usage reports hold, and how to turn them off.
+1. [Install](install.md): install or update the command, or build it from source.
+2. [Set up](setup.md): deploy a server and claim it, add devices, create spaces and upgrade the server.
+3. [Folders](folders.md): link a folder, and choose what syncs with `.koiignore` and `config.toml`.
+4. [Trash, versions and restore](history.md): get back a deleted file or an earlier version.
+5. [Share links](sharing.md): let anyone with a link open a file or folder, with an expiry and a password.
+6. [Status and problems](status.md): read `koi status`, pause sync, answer a decision, restart a folder, send refused changes again and write a file for a problem report.
+7. [Devices](devices.md): list and revoke devices, and get back in after losing every device.
+8. [Back up the server](backup.md): copy the R2 bucket outside Cloudflare, and what the copy can restore.
+9. [Uninstall](uninstall.md): remove a device, or remove everything.
+10. [Agents and scripts](agents.md): read JSON, check health and retry safely from a script.
+
+## Look something up
+
+- [Conflicts](conflicts.md): what happens when two devices change the same file.
+- [What syncs](sync-rules.md): what Koidrive syncs, the first link, `.koiignore` rules, the local trash and uploads.
+- [Status reference](status-reference.md): folder states, waits and decisions.
+- [koi setup](koi-setup.md): the guided setup's questions and options, and scripted setup.
+- [Background service and files](service.md): the service on Linux and macOS, running the daemon yourself, `koi update` and the update check, and the files on this machine.
+- [JSON output](json-output.md): the envelope, decisions, retries and exit statuses.
+- [Limits](limits.md): what the Workers Free plan allows, and Koidrive's own limits.
+- [Usage reports](telemetry.md): what the anonymous usage reports hold, and how to turn them off.

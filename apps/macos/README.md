@@ -1,11 +1,13 @@
 # Koidrive for macOS
 
-A menu bar app over the `koi` command. It has a menu bar menu (status, notices, pause and resume, open folder), a first-run setup window (server, sign-in, folder), a questions window, and settings (linked folders, account, storage used by each space, problems, open at login). The app carries `koi` in `Contents/Helpers/koi` and shows the same device, folders and background service as `koi status`. Through `core/ffi` and [UniFFI](https://mozilla.github.io/uniffi-rs/), it runs each change as a `koi --json` command and follows the state of the sync daemon over its socket. While no daemon runs, it reads the state with `koi status`. There is no File Provider extension.
+A menu bar app over the `koi` command, for macOS 26 or later on Apple silicon. The app carries `koi` in `Contents/Helpers/koi` and shows the same device, folders and background service as `koi status`. Through `core/ffi` and [UniFFI](https://mozilla.github.io/uniffi-rs/), it runs each change as a `koi --json` command and follows the state of the sync daemon over its socket. While no daemon runs, it reads the state with `koi status`.
+
+The app has a menu bar menu (status, notices, pause and resume, open folder), a first-run setup window (server, sign-in, folder), a **Needs You** window for questions, and settings with **Folders**, **Account**, **Storage**, **Problems** and **General** tabs. The menu bar shows no transfer progress or recent changes, because the session reports neither. There is no File Provider extension, so every synced file is on disk.
 
 ## Requirements
 
 - macOS 26 or later on Apple silicon.
-- Xcode 16 or later, with its command-line tools selected (`xcode-select -p`).
+- Xcode 26 or later, for the macOS 26 SDK, with its command-line tools selected (`xcode-select -p`).
 - Rust through [rustup](https://rustup.rs/). The toolchain version comes from `rust-toolchain.toml` at the repository root and is installed on first use.
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen) 2.46.0. You don't install it yourself: the first run of `scripts/generate-project.sh` downloads the release into `build/tools` and checks its SHA-256.
 
@@ -40,7 +42,7 @@ HOME="$profile" XDG_CONFIG_HOME="$profile/config" XDG_STATE_HOME="$profile/state
 
 Then start the Worker in `server/` with `pnpm exec wrangler dev` (after `pnpm install`), enter `http://127.0.0.1:8787` in the setup window, open `http://127.0.0.1:8787/setup` in a browser, and claim the server with the code that `wrangler dev` prints. Plain `http` is accepted only on a loopback address.
 
-To show a state the driver cannot reach yet, start a Debug build on the fake core in `core/ffi` with a scripted scenario. Release builds ignore the `FakeScenario` setting. The fake keeps its state in memory only:
+To show a given state, such as a question or a problem, start a Debug build on the fake core in `core/ffi` with a scripted scenario. Release builds ignore the `FakeScenario` setting. The fake keeps its state in memory only:
 
 ```sh
 xcodebuild -project Koidrive.xcodeproj -scheme Koidrive -configuration Debug \
@@ -51,9 +53,9 @@ open build/DerivedData/Build/Products/Debug/Koidrive.app --args -FakeScenario ma
 
 The scenarios are `firstRun`, `upToDate`, `syncing`, `paused`, `offline`, `massDelete`, `ambiguousDisappearance`, `recovery`, `recoveredWithoutQuestions`, `remoteMassDelete`, `manyQuestions` and `problems`.
 
-You can also open `Koidrive.xcodeproj` in Xcode after step 3 and run the Koidrive scheme; the views have SwiftUI previews for these scenarios. Local builds are signed ad hoc, so no Apple developer account is needed.
+You can also open `Koidrive.xcodeproj` in Xcode after step 3 and run the Koidrive scheme. The views have SwiftUI previews for these scenarios. Local builds are signed ad hoc, so no Apple developer account is needed.
 
-`core/ffi/scripts/integration-test.sh`, run from anywhere in the repository, tests the session against the Worker under `wrangler dev` with a debug `koi` and its daemon: claiming, pairing, linking, status events, the pause, questions, problems and signing out.
+`core/ffi/scripts/integration-test.sh`, run from anywhere in the repository, tests the session against the Worker under `wrangler dev` with a debug `koi` and its daemon: claiming, pairing, linking, status events, the pause, questions, problems and signing out. It needs `pnpm install` in `server/` first.
 
 Run `scripts/build-ffi.sh` again after every change to `core/ffi` or `cli`. It rebuilds the Rust library and regenerates the Swift API together. UniFFI checksums stop the app at launch when the library and the bindings disagree on the API, but they do not detect a build that is merely out of date: an old library with its matching bindings still launches.
 

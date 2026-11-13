@@ -18,31 +18,19 @@
 </p>
 
 > [!WARNING]
-> **Koidrive is in alpha.** Install the `koi` command as [Get started](#get-started) shows, and the macOS app from the disk image on [GitHub releases](https://github.com/koidrive/koidrive/releases). The protocol and storage format may change before 0.1.0. Keep another copy of anything you sync.
+> **Koidrive is in alpha.** Install the `koi` command as [Get started](#get-started) shows. The protocol and storage format may change before 0.1.0. Keep another copy of anything you sync.
 
 ## Why Koidrive
 
-**Pay for storage, not for seats.** Koidrive is free and open source. It runs on your Cloudflare account, so Cloudflare bills you for the storage you use, plus requests past R2's free monthly allowance, with no egress fee. R2 gives you 10 GB a month free and charges $0.015 per GB-month after that. Dropbox sells storage in fixed tiers, and its team plans charge for every person.
+**You pay for storage, not for seats.** Koidrive is free and open source. Cloudflare bills your account for the storage and requests you use, with no egress fee, as [What it costs](#what-it-costs) shows. Dropbox sells storage in fixed tiers, and its team plans charge for every person.
 
-**Your files, in your account.** Koidrive stores your files as chunks in an R2 bucket you own. A Durable Object in the same account keeps each space's history. Cloudflare hosts both, in your account, and no other company stores your files. The code is yours to read, change and run. If you stop using Koidrive, every linked folder still holds ordinary files.
+**Your files stay in your account.** Koidrive stores your files as chunks in an R2 bucket you own. A Durable Object in the same account keeps each space's history. No other company stores your files. If you stop using Koidrive, every linked folder still holds ordinary files.
 
-**Built not to lose your files.** When two machines edit the same file, Koidrive keeps both versions. When one machine deletes a file that another just edited, the edit stays. A large delete waits for your answer before it reaches your other machines. Deleted files and old versions stay in the trash for 30 days. Every pull request runs a simulation that loses, repeats and reorders messages and crashes devices. It fails if any device loses a write.
+**The same files on every machine.** An edit on your Mac reaches your Linux machine as soon as both are online, and the other way round. New files, edits, renames, moves and deletes all sync.
 
-**Agents work in the same folder.** A linked folder holds plain files. An agent that edits files can work in it, and Koidrive syncs its changes like yours. The `koi` command prints JSON for status, decisions, trash, versions, restores, usage, devices and spaces, and an agent can answer a held delete with `koi resolve`. See [Coming next](#coming-next) for what we're adding.
+**Mistakes you can undo.** When two machines edit the same file, Koidrive keeps both versions. When one machine deletes a file that another just edited, the edit stays. A large delete waits for your answer before it reaches your other machines. Deleted files and old versions stay in the trash for 30 days, and one command brings them back. Every pull request runs a simulation that loses, repeats and reorders messages and crashes devices, and it fails if any device loses a write.
 
-## What you get
-
-**Set it up once.** One command deploys the server to your Cloudflare account and signs in your first machine. Each new machine joins with a one-time code. Then you link a folder.
-
-**The same files on every machine.** An edit on your Mac reaches your Linux machine as soon as both are online, and the same goes the other way. New files, edits, renames, moves and deletes all sync.
-
-**Mistakes you can undo.** If you delete a file or save over the wrong one, the deleted file or the earlier version stays for 30 days. One command brings it back.
-
-**Big deletes wait for you.** If one machine deletes a large part of a folder at once, Koidrive holds the deletion on that machine and asks you before it reaches the others. When two machines change the same file at the same time, you keep both versions.
-
-**Agents can use it too.** An agent can edit files in a synced folder, and the `koi` command answers in JSON for scripts and agents.
-
-The [user guide](docs/guide/README.md) explains how each of these works.
+**Agents work in the same folder.** A linked folder holds plain files, so an agent that edits files can work in it, and Koidrive syncs its changes like yours. Every `koi` command prints JSON with `--json`, `koi status --check` reports problems through its exit status, and an agent can answer a held delete with `koi resolve`. See [Agents and scripts](docs/guide/agents.md).
 
 ## Koidrive and Dropbox, side by side
 
@@ -65,7 +53,7 @@ Dropbox does much more, and charges per person for it. Koidrive does the core of
 | **Both copies kept on a conflict** | Yes | Yes |
 | **Trash and version history** | 30 days | 30 days to 1 year |
 | **Share links** | Yes | Yes |
-| **macOS on Apple silicon** | Menu bar app and command line | Yes |
+| **macOS on Apple silicon** | Command line, and a menu bar app for macOS 26 or later that you build from source | Yes |
 | **Linux** | Command line and daemon | Yes |
 
 ### Where Dropbox does more
@@ -73,7 +61,7 @@ Dropbox does much more, and charges per person for it. Koidrive does the core of
 | | Koidrive | Dropbox |
 |---|---|---|
 | **Sharing with other people and teams** | No | Shared folders, team folders, groups and roles |
-| **Files on demand** | Planned after 0.1 | Online-only files |
+| **Files on demand** | No. Every synced file is on disk | Online-only files |
 | **Windows, iPhone and Android** | No | Yes |
 | **Web interface** | No | Yes |
 | **Admin tools** | No | Device approvals, remote wipe and account transfer |
@@ -96,7 +84,7 @@ Files in the trash and old versions count as storage for the 30 days Koidrive ke
 
 ## Get started
 
-You need a Cloudflare account with R2 turned on, and a Mac or a Linux machine.
+You need a Cloudflare account with R2 turned on, and a Mac with Apple silicon or a Linux machine.
 
 1. **Install the `koi` command.**
 
@@ -104,15 +92,15 @@ You need a Cloudflare account with R2 turned on, and a Mac or a Linux machine.
    curl -fsSL https://koidrive.com/install.sh | sh
    ```
 
-   The script installs the latest release from GitHub. You can also [build from source](docs/guide/install.md#build-from-source).
+   Then `koi --version` prints the version. [Install](docs/guide/install.md) covers `PATH` warnings and building from source.
 
-2. **Set up your server and this machine.**
+2. **Deploy your server and sign in this machine.** Deploy the server with the deploy button, open `<your server>/setup` to get a claim code, and claim the server:
 
    ```sh
-   koi setup
+   koi server claim koidrive.alice.workers.dev ABCD-EFGH-JKLM --user "Alice Park"
    ```
 
-   This deploys the server to your Cloudflare account and signs in this machine as your first device. Koidrive's public Cloudflare login doesn't exist yet, so for now follow [Without the Cloudflare login](docs/guide/setup.md#without-the-cloudflare-login).
+   [Set up](docs/guide/setup.md#deploy-a-server-and-claim-it) walks through each step.
 
 3. **Link a folder.**
 
@@ -122,7 +110,7 @@ You need a Cloudflare account with R2 turned on, and a Mac or a Linux machine.
    koi folder link ~/Koidrive --space Koidrive
    ```
 
-   The folder syncs in the background, including after a restart (on macOS, while you're logged in). See [Background sync](docs/guide/install.md#background-sync).
+   The folder syncs in the background, including after a restart (on macOS, while you're logged in). `koi status` shows it as `UpToDate` once it has the server's files.
 
 4. **Add your other machines.** On a machine that is signed in, run `koi device invite`. It prints a command with a pairing code. Run that command on the new machine, then link a folder there too.
 
@@ -130,17 +118,9 @@ The [user guide](docs/guide/README.md) covers conflicts, the trash, devices, lim
 
 ## The macOS app
 
-Koidrive for macOS is a menu bar app. It shows each folder's sync status, asks before a large delete reaches your other machines, links folders, adds devices and pauses sync. It needs macOS 14 or later.
-
-Download `Koidrive-<version>-arm64.dmg` from [GitHub releases](https://github.com/koidrive/koidrive/releases), open it and drag Koidrive to Applications.
+Koidrive for macOS is a menu bar app for macOS 26 or later on Apple silicon. It shows each folder's sync status, asks before a large delete reaches your other machines, links folders, adds devices and pauses sync. Build it from source as [apps/macos/README.md](apps/macos/README.md) describes.
 
 The app runs the `koi` command it carries inside it, so the app and `koi` are one device. They share one profile and one background sync service, and a folder you link in either one shows up in both.
-
-## Coming next
-
-- For agents, `koi status --check` with exit codes for scripts, conflict decisions that an agent can answer, a machine-readable list of every command, and a skill that teaches an agent to use Koidrive.
-- Files on demand on macOS.
-- The packaged 0.1.0 release.
 
 ## Repository layout
 
@@ -156,6 +136,6 @@ The app runs the `koi` command it carries inside it, so the app and `koi` are on
 
 The server in [server/](server/) uses the GNU AGPL v3.0 or later, and everything else uses the Apache License 2.0. [LICENSE](LICENSE) explains the split.
 
-Anyone can open an issue. Until 1.0, only the project owner and invited maintainers open pull requests. See [CONTRIBUTING.md](CONTRIBUTING.md). Report vulnerabilities privately, as [SECURITY.md](SECURITY.md) describes.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before you open an issue or a pull request. Report vulnerabilities privately, as [SECURITY.md](SECURITY.md) describes.
 
-Cloudflare, Cloudflare Workers, Durable Objects and R2 are trademarks of Cloudflare, Inc. Dropbox is a trademark of Dropbox, Inc. Koidrive is an independent project, not affiliated with or endorsed by either company.
+Cloudflare, Cloudflare Workers, Durable Objects and R2 are trademarks of Cloudflare, Inc. Dropbox is a trademark of Dropbox, Inc.

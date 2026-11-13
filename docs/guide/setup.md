@@ -1,90 +1,21 @@
 # Set up
 
-You need one server, in a Cloudflare account you own, and at least one device signed in to it. The first device claims the server and becomes its owner's device. Every other device joins later.
+You need one server, in a Cloudflare account you own, and at least one device signed in to it. The first device claims the server and becomes its owner's device. Every other device joins with a pairing code.
 
-## What you need
+## Deploy a server and claim it
 
-- A Cloudflare account with R2 enabled. R2 includes free monthly usage and bills usage beyond it ([R2 pricing](https://developers.cloudflare.com/r2/pricing/)). If R2 isn't enabled, `koi setup` opens the R2 page of the dashboard and waits up to 30 minutes while you complete its checkout.
-- The `koi` command, [built with the server inside it](install.md#build).
+You need a Cloudflare account with R2 turned on ([R2 pricing](https://developers.cloudflare.com/r2/pricing/)) and the [`koi` command](install.md).
 
-## With koi setup
-
-> [!WARNING]
-> The Cloudflare login needs Koidrive's public OAuth client, which doesn't exist yet. Until it does, only members of the project's test account can log in. Use the steps under [Without the Cloudflare login](#without-the-cloudflare-login) instead.
-
-```sh
-koi setup
-```
-
-On a terminal, `koi setup` asks how to set up this machine:
-
-Use the arrow keys and Enter to choose. Pairing codes and pasted login callback addresses are hidden while you type. For numbered, line-oriented questions without color or animation, run `koi setup --plain` or set `KOI_PLAIN=1`. Narrow terminals and `TERM=dumb` use that mode too. A nonempty `NO_COLOR` disables color without changing the questions.
-
-1. Log in with Cloudflare. Your browser opens Cloudflare's login page. Pick the account and select Authorize. Then Koidrive looks for its servers in that account:
-   - With no server, it deploys one. It creates an R2 bucket, uploads the server as a Worker, turns on its `workers.dev` address, and claims the server with this device.
-   - With one server, it adds this device to it.
-   - With several, it asks which one.
-2. Enter a pairing code from another device, written as `<code>@<host>`. For a code without the host, run `koi join <code> --server <address>` instead. See [Add another device](#add-another-device).
-
-Once this machine is connected, setup asks which folder to sync:
-
-- The shared folder: a space whose files are the same on each of your devices. When the server has none, setup proposes one named `Koidrive`. Otherwise it lists them, adds the end of the ID when two have the same name, and offers to create a new one.
-- Where its files go on this machine. The default is `~/Koidrive`, shown as a full path. Press Enter to use it, or type another path. `~`, spaces and other characters work. Setup asks before it creates a missing folder or a new shared folder. A folder that already holds files is linked only after you agree: its files upload, and the shared folder's files download into it. A file is refused, and setup asks again.
-
-Setup then links the folder, as `koi folder link` does, and starts background sync. It ends with the folder to add files to and `koi status`, which shows how sync is going. If you cancel a folder question, this machine stays connected and no folder is linked.
-
-The daemon checks the approved directory and existing-files choice after its server lookup. If the directory is replaced or unapproved files arrive while setup is waiting, it refuses the link; run `koi setup` again to review the folder. A shared-folder name that matches several spaces is refused with their IDs, including when recovering a lost create response. Select the intended shared folder from the list, or use its ID in a script. Dangling paths and folders without write access are refused before a pairing code is redeemed.
-
-After setup succeeds, it asks whether to send anonymous usage reports, unless you already chose or an environment variable decides it. Press Enter for yes. The choice applies to future commands, not the setup that just finished. [Usage reports](telemetry.md) lists what they hold and how to turn them off.
-
-The login asks for four permissions: reading the account's settings, managing its Workers, writing to its R2 buckets, and keeping access while the command runs (`account-settings.read`, `workers-scripts.admin`, `workers-r2.write` and `offline_access`). Koidrive revokes the login when the command ends. If it can't, it says so, and you can revoke it under Manage OAuth authorizations in the Cloudflare dashboard.
-
-The device takes this machine's host name. Give it another with `--name`.
-
-If a setup stops halfway, for example because the network dropped, run `koi setup` again. It finishes from where it stopped. On a machine that is already connected, it doesn't log in or pair again: with a linked folder, it lists the linked folders and changes nothing, and without one, it goes on to the folder questions.
-
-Without a terminal on stdin and stderr, with `--json`, or with the `CI` environment variable set, `koi setup` asks nothing. Unless `--folder` asks for a [scripted setup](#scripted-setup), it lists the commands below and exits. `koi setup --interactive` asks for the guided setup explicitly, and fails when no terminal is attached.
-
-**On a machine without a browser**, add `--interactive --no-browser`. Koidrive prints the login page's address. Open it on any device, log in, and select Authorize. The browser then fails to load a page on `127.0.0.1`. Copy that page's address and paste it into the terminal. To forward the login over SSH instead, pick the callback port with `--port`.
-
-**In a script**, use the commands that never ask questions:
-
-| Command | What it does |
-|---|---|
-| `koi server claim <server-url> <code> --user <name>` | Claims a server deployed with the deploy button |
-| `koi join <code>` | Joins with a pairing code |
-
-`koi server deploy` and `koi server add-device [--worker <name>]` log in with Cloudflare in a browser, so a person runs them on a terminal with `--interactive`. Without it, with or without `--json`, they open no browser: they stop with `auth_required` and name the same command with `--interactive`. `deploy` deploys a new server and claims it, and stops if the account already has one. `add-device` adds this device to the server in the account without a pairing code, and `--worker` names the Worker when there are several. See [Agents and scripts](agents.md).
-
-### Scripted setup
-
-To pair and link a folder in one command, give the pairing code on stdin:
-
-```sh
-printf '%s\n' "$KOI_PAIRING_CODE" | koi setup --pairing-code-stdin \
-  --folder "$HOME/Koidrive" --space "$KOI_SPACE" --telemetry off --json
-```
-
-With `--folder`, setup asks nothing, with or without a terminal. `--space` takes a space's ID or name, as `koi space list` shows it, and must name a space that exists. Setup creates a missing folder. A folder that already holds files needs `--accept-existing-files`: its files upload, and the space's files download into it. Setup checks the arguments, the folder and the code before it uses the code, which works once.
-
-On a machine that is already connected, `--pairing-code-stdin` is optional, and setup links the folder without pairing again. A code for another server is refused. A machine that isn't connected needs the code, or setup stops with `auth_required` (exit 4). Running the same command again changes nothing and reports `unchanged`.
-
-With `--json`, `data` holds `account` (the device this machine is connected as), `folder` (the linked folder, with its `space_id`, `space_name` and `state`) and `service` (the background service). [docs/json-schema/v1/koi-setup.json](../json-schema/v1/koi-setup.json) is the schema.
-
-## Without the Cloudflare login
-
-Until the public client exists, deploy the server and claim it without `koi setup`:
-
-1. Deploy the server with the deploy button or with `pnpm run deploy` in `server/`, as [Deploying and upgrading a Koidrive server](../deploy.md#deploy) describes.
-2. Open `<your server>/setup` in a browser. The server writes a one-time claim code, valid for one hour, to the Worker's log. In the Cloudflare dashboard, open your Worker, then Observability, and search for `Koidrive claim code`.
-3. Claim the server with this device, which becomes your first device:
+1. Deploy the server with the deploy button, or with `pnpm run deploy` in `server/`, as [Deploying and upgrading a Koidrive server](../deploy.md#deploy) describes.
+2. Open `<your server>/setup` in a browser. The server writes a one-time claim code, valid for one hour, to the Worker's log. In the Cloudflare dashboard, open your Worker, then **Observability**, and search for `Koidrive claim code`.
+3. Claim the server with this device. Give the server's address, the claim code and your name:
 
    ```sh
    koi server claim koidrive.alice.workers.dev ABCD-EFGH-JKLM --user "Alice Park"
    ```
 
-   Give the server's address, the claim code and your name. The device takes this machine's host name; give it another with `--name`. A server that already has an owner refuses the claim code.
-4. Add your other machines with a pairing code, as the next section describes.
+   It prints `Paired as laptop (019a...) with https://koidrive.alice.workers.dev.` The device takes this machine's host name. Give it another with `--name`. A server that already has an owner refuses the claim code.
+4. [Create a space](#create-a-space) and [link a folder](folders.md#link-a-folder) to it.
 
 ## Add another device
 
@@ -105,11 +36,7 @@ The code works once, for about 10 minutes.
 
 Only the code goes to stdout, so `code=$(koi device invite)` captures it. The rest goes to stderr.
 
-In the macOS app, Settings, Account, Add a Device shows a pairing code without the server's address. To use it on a device with the `koi` command, run `koi join <code> --server <address>`.
-
-A code written as `<code>@<host>` carries the server's address. For a code without it, add the address with `--server https://koidrive.alice.workers.dev`.
-
-With the Cloudflare login, `koi server add-device` adds a device without a code.
+The macOS app shows a pairing code without the server's address, under **Settings**, **Account**, **Add a Device**. To use that code with the `koi` command, add the address: `koi join K7QM-2XPD --server https://koidrive.alice.workers.dev`.
 
 ## Create a space
 
@@ -117,15 +44,21 @@ With the Cloudflare login, `koi server add-device` adds a device without a code.
 koi space create Photos
 ```
 
-This prints the new space's ID. Each of your spaces needs its own name, because `koi folder link --space` finds a space by its name: the server refuses a name you already use. Names are compared exactly after leading and trailing whitespace is removed, so `Photos` and `photos` are two names. `koi space list` lists your spaces with their IDs, and `--json` returns them as data. Then [link a folder](folders.md#link-a-folder) to a space.
+This prints the new space's ID. `koi folder link --space` finds a space by its name, so the server refuses a name you already use. Names are compared exactly after leading and trailing whitespace is removed, so `Photos` and `photos` are two names. `koi space list` lists your spaces with their IDs. Then [link a folder](folders.md#link-a-folder) to the space.
+
+## Set up with the Cloudflare login
+
+`koi setup` can do all of this in one guided run on a terminal. It logs in with Cloudflare, deploys a server or finds yours, signs in this machine, and links a folder. The login needs Koidrive's public OAuth client, which isn't available: only members of the project's test account can log in. Everyone else deploys and claims the server as described above. The same login is behind `koi server deploy`, `add-device`, `upgrade` and `delete`. [koi setup](koi-setup.md) describes each question and option.
 
 ## Upgrade the server
 
+With the Cloudflare login, run this on a terminal:
+
 ```sh
-koi server upgrade
+koi server upgrade --interactive
 ```
 
-This logs in with Cloudflare and uploads the server version built into your `koi`. Without the Cloudflare login, upgrade as [Deploying and upgrading a Koidrive server](../deploy.md#upgrade) describes. Your files, devices and settings stay. Open sync sessions move to the new version within 5 minutes. The command stops if the server runs a newer version than your `koi`.
+It uploads the server version built into your `koi`. Without the login, upgrade as [Deploying and upgrading a Koidrive server](../deploy.md#upgrade) describes. Your files, devices and settings stay. Open sync sessions move to the new version within 5 minutes. The command stops if the server runs a newer version than your `koi`.
 
 A server deployed with the deploy button deploys again whenever its repository changes, and that would replace the upgrade. The command warns you and asks first. Update that repository too, or answer no. `--yes` goes on without asking.
 

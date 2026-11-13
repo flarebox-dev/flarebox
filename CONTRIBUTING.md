@@ -1,26 +1,24 @@
 # Contributing to Koidrive
 
-Koidrive is pre-alpha. Issues are open to everyone. Until 1.0, only the project owner and invited maintainers open pull requests.
+Anyone can open an issue. The sections below say how to report a problem, how to propose a change, and what every commit needs.
 
-## Issues
+## Report a bug or ask for a change in an issue
 
 Open an issue for a bug report, a reproduction, feedback on a deployment, or a feature request. Search the existing issues first, and add to a matching one instead of opening another. Remove credentials, such as API tokens, and personal data from logs, screenshots and files before you post them.
 
 Do not report security vulnerabilities in issues. [SECURITY.md](SECURITY.md) explains how to report them privately.
 
-## Pull requests
+## Only maintainers open pull requests until 1.0
 
-Each merged change needs review now and maintenance for as long as its code stays in Koidrive. To keep that work within what the maintainers can do, only the project owner and invited maintainers open pull requests until 1.0.
+Until 1.0, only the project owner and invited maintainers open pull requests. Each merged change needs review now and maintenance for as long as its code stays in Koidrive, and the maintainers can take on only so much of that work.
 
 To propose a change, open an issue that describes the problem and the change you have in mind. Changes to the protocol in [spec/](spec/) affect both the server and the clients, so they need an issue too. An accepted issue is not an invitation to open a pull request.
 
 Forks and experiments are welcome under the licenses below. You can link a fork or an experiment in an issue, but a link does not mean a maintainer will review or merge it.
 
-We will revisit this policy after launch.
-
 ## Store migrations
 
-Each change to the local store's schema is one SQL file in `core/store/migrations/`, named after what it adds, such as `kept_originals.sql`. A store applies the files it lacks in name order and records each name it applied, so migrations from different pull requests merge in any order. When a migration reads or changes a table or column that another named migration creates, its first line names that migration: `-- requires: other_name`. A merged migration file never changes; a later migration corrects it. `cargo test -p koidrive-store` checks that the named migrations give the same store in every order they can run in.
+Each change to the local store's schema is one SQL file in `core/store/migrations/`, named after what it adds, such as `kept_originals.sql`. A store applies the files it lacks in name order and records each name it applied, so migrations from different pull requests merge in any order. When a migration reads or changes a table or column that another named migration creates, its first line names that migration: `-- requires: other_name`. A merged migration file never changes. A later migration corrects it. `cargo test -p koidrive-store` checks that the named migrations give the same store in every order they can run in.
 
 ## AI assistance
 

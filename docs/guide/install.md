@@ -1,37 +1,18 @@
 # Install
 
-Install the `koi` command on Linux x86_64 or arm64, or macOS on Apple silicon:
+Install the `koi` command on Linux (x86_64 or arm64) or on a Mac with Apple silicon:
 
 ```sh
 curl -fsSL https://koidrive.com/install.sh | sh
 ```
 
-The installer downloads the latest GitHub Release for x86_64 or arm64, checks its SHA256 checksum, and installs it in `~/.local/bin`. It needs `curl`, `tar`, `awk`, `grep`, `sed`, `mktemp`, and either `sha256sum` or `shasum`. It never needs root. Add `~/.local/bin` to your shell's `PATH` if the installer warns that it is missing, then run `koi --version`. The installer also warns when another program named `koi` comes first on `PATH`, such as the Koi theme switcher for KDE; put `~/.local/bin` before it. It refuses to replace a `koi` in the install directory that is another program.
+The installer prints `Installed koi to /home/alice/.local/bin/koi`. Check it with `koi --version`, which prints the version, such as `koi 0.1.0-alpha.1`.
 
-Run the same command again, or [`koi update`](#update-koidrive), to upgrade. The installer restarts the [background service](#background-sync) of every profile that runs one, so each runs the new `koi`. To choose a version or another directory, set `KOIDRIVE_VERSION` or `KOIDRIVE_INSTALL_DIR` on the `sh` command:
+The installer downloads the latest [GitHub release](https://github.com/koidrive/koidrive/releases) for your system, checks it against the release's `SHA256SUMS` file and installs `koi` in `~/.local/bin`. It never needs root. The release includes the server, so you can deploy a server without Node.js or Rust. On macOS, the release's `koi` is signed with a Developer ID and notarized.
 
-```sh
-curl -fsSL https://koidrive.com/install.sh | KOIDRIVE_VERSION=v0.1.0 KOIDRIVE_INSTALL_DIR="$HOME/bin" sh
-```
+## Fix a PATH warning
 
-`KOIDRIVE_RELEASE_BASE_URL` replaces `https://github.com/koidrive/koidrive/releases` for a trusted mirror or local tests. The base must serve tarballs and `SHA256SUMS` under `latest/download/` and `download/v<version>/`. This changes the source of both the binary and its checksum, so use only a source you trust.
-
-The release binary includes the server bundle, so deploying a server needs neither Node.js nor Rust. The SHA256 file comes from the same release as the tarball. It detects corruption, not a compromised release account. Tagged macOS builds use the existing Developer ID signing certificate when configured, but the CLI is not notarized. Without the certificate, the workflow reports an unsigned build.
-
-## Install with Homebrew
-
-On macOS or Linux with [Homebrew](https://brew.sh):
-
-```sh
-brew install koidrive/tap/koidrive
-koi setup
-```
-
-To upgrade:
-
-```sh
-brew update && brew upgrade koidrive
-```
+If the installer warns that `~/.local/bin` is not on `PATH`, add it to your shell profile. If it warns that `koi` on `PATH` runs another program, such as the Koi theme switcher for KDE, put `~/.local/bin` before it. The installer never replaces a `koi` in the install directory that is another program.
 
 ## Update Koidrive
 
@@ -39,40 +20,21 @@ brew update && brew upgrade koidrive
 koi update
 ```
 
-`koi update` asks GitHub for the newest release and upgrades the `koi` on this computer. With the Homebrew formula installed, it runs `brew update` and `brew upgrade koidrive/tap/koidrive`. Otherwise it runs the installer above for the folder that holds `koi`. When only the macOS app is installed, it names the release to download. Then the new `koi` takes over the [background service](#background-sync). When this computer runs the newest release, it changes nothing. It runs as your own user and refuses to run as root. Each run writes what it ran and printed to `update.log`, in `~/Library/Logs/Koidrive/` on macOS and in the state folder on Linux.
+`koi update` asks GitHub for the newest release and upgrades the `koi` on this computer. For a `koi` from the installer, it runs the installer again for the folder that holds `koi`. The new `koi` then takes over the [background service](#background-sync). When this computer already runs the newest release, it prints `Koidrive 0.1.0-alpha.1 is the newest release.` and changes nothing. Running the install command again also upgrades `koi`, and restarts the background service of every profile that runs one.
 
-The background service also looks every hour for a newer `koi` from Homebrew, the installer or the app, and hands itself to the newest one. After `brew upgrade koidrive`, sync runs the new release within the hour.
+`koi status` shows an `Update:` line when a newer release is out. [Updates](service.md#updates) covers which install `koi update` upgrades, the daily update check and how to turn it off.
 
-### Update check
+To install a given version or into another directory, set `KOIDRIVE_VERSION` or `KOIDRIVE_INSTALL_DIR` for `sh`:
 
-The daemon asks GitHub once a day whether a newer release is out, and `koi status` shows it after the background service:
-
-```
-Update: Koidrive 0.1.2 is out (this device runs 0.1.0). Run: koi update
+```sh
+curl -fsSL https://koidrive.com/install.sh | KOIDRIVE_VERSION=v0.1.0-alpha.1 KOIDRIVE_INSTALL_DIR="$HOME/bin" sh
 ```
 
-Each daily check reads Koidrive's public list of releases, `https://api.github.com/repos/koidrive/koidrive/releases`, following its pages with ordinary GitHub requests. It sends the user agent `koidrive` and, for a cached single-page list, the list's ETag, a hash that is the same for everyone. It sends no version, device, account or server address. GitHub sees your IP address, as it does for any download. The check isn't a [usage report](telemetry.md): nothing goes to Koidrive, and turning reports off leaves the check on.
-
-Until a stable release exists, the notice follows prereleases. After that it follows stable releases only, so a computer on a prerelease hears nothing until a newer stable release is out.
-
-To turn the check off, set this in `config.toml` and restart the daemon, or set `KOIDRIVE_UPDATE_CHECK=0`, which wins over the file:
-
-```toml
-[updates]
-check = false
-```
-
-With the check off, the daemon sends nothing and deletes the answer it kept. `koi update` still asks GitHub when you run it.
+The installer needs `curl`, `tar`, `awk`, `grep`, `sed`, `mktemp`, and `sha256sum` or `shasum`. `KOIDRIVE_RELEASE_BASE_URL` replaces `https://github.com/koidrive/koidrive/releases` with a mirror that serves the same files. The checksum comes from the same place as the binary, so use only a mirror you trust.
 
 ## Build from source
 
-### What you need
-
-- Git.
-- Rust, installed with [rustup](https://rustup.rs/). The repository pins the toolchain in `rust-toolchain.toml`, and rustup installs that version the first time you build.
-- Node.js 24 and pnpm, to pack the server. `server/package.json` names the pnpm version. Only `koi server deploy` and `koi server upgrade` use the packed server, but `koi setup` deploys through the same code, so pack it unless you only join existing servers.
-
-### Build
+You need Git, Rust installed with [rustup](https://rustup.rs/), Node.js 24 and pnpm. rustup installs the toolchain that `rust-toolchain.toml` pins the first time you build, and `server/package.json` names the pnpm version.
 
 ```sh
 git clone https://github.com/koidrive/koidrive.git
@@ -83,67 +45,12 @@ cd ..
 KOIDRIVE_SERVER_BUNDLE="$PWD/target/server-bundle" cargo install --locked --path cli
 ```
 
-`pack-bundle.mjs` writes the server's Worker code, its static files and a manifest into `target/server-bundle`. It needs no Cloudflare account. `cargo install` builds the command with that server inside it and puts `koi` in `~/.cargo/bin`. Check it with `koi --version`.
+`pack-bundle.mjs` packs the server into `target/server-bundle`, without a Cloudflare account. `cargo install` builds `koi` with that server inside it and puts it in `~/.cargo/bin`. Check it with `koi --version`.
 
-A build without `KOIDRIVE_SERVER_BUNDLE` can't find or deploy a server in your Cloudflare account. `koi setup` with the Cloudflare login, `server deploy`, `server add-device`, `server upgrade` and `server delete` without `--bucket` stop with "this koi was built without a server bundle". Everything else works.
+A build without `KOIDRIVE_SERVER_BUNDLE` can't find or deploy a server in your Cloudflare account. `koi setup` with the Cloudflare login, `koi server deploy`, `add-device` and `upgrade`, and `koi server delete` without `--bucket` stop with "this koi was built without a server bundle". Everything else works, including `koi server claim` and `koi join`.
 
 ## Background sync
 
-Linking the first folder installs a service that runs the sync daemon, starts it, and waits until the daemon answers. If the service can't start, the folder stays linked and the command says why. Unlinking the last folder stops the service and removes it. `koi setup`, `koi join`, `koi folder link` and `koi folder unlink` bring the service in line with the linked folders. To repair a stopped or missing service, run `koi service start`.
+Linking the first folder installs a background service that runs the sync daemon and starts it. Unlinking the last folder stops the service and removes it. If the service stopped or is missing, run `koi service start`. The `Background service` line of `koi status` shows its state.
 
-When more than one `koi` is installed, for example one in `~/.local/bin` and one inside the macOS app, the newest runs the service. A command that brings the service in line keeps the binary the service runs when that binary reports a version at least as new as its own, and otherwise points the service at itself. An older `koi` hands `koi service start` to the newer binary, so it never opens a profile that a newer version upgraded. When the daemon that runs is older than the binary the service then runs, the command restarts it on that binary.
-
-`koi status` shows the service on its `Background service` line. With `--json`, `status` and the commands above add it as `service`, with `state` set to `running`, `stopped`, `switched_off`, `not_installed`, `unavailable` or `off`, and `problem`, when koi knows the cause, saying why it isn't running.
-
-Give each profile its own `XDG_STATE_HOME`. The service and the daemon's socket are named with a hash of the state folder, so profiles that share `XDG_RUNTIME_DIR` sync side by side. Two profiles that share a state folder can't.
-
-**Linux.** Koidrive uses a systemd user service, `koidrive.service`. It writes the unit, based on [cli/systemd/koidrive.service](../../cli/systemd/koidrive.service), to `~/.local/state/koidrive/systemd/` and enables it with `systemctl --user enable`. Read its log with `journalctl --user -u koidrive`, or with the unit name that `koi status` shows for another profile.
-
-A user service stops when you log out and starts at your next login, unless lingering is on for your user. With lingering, it starts when the machine boots and keeps running after you log out ([systemd/User](https://wiki.archlinux.org/title/Systemd/User)). Sync needs that on a server, so Koidrive turns lingering on with `loginctl enable-linger` when the system allows it without a password. When it doesn't, for example over SSH, the link says so. Then run:
-
-```sh
-sudo loginctl enable-linger "$USER"
-```
-
-Koidrive never turns lingering off, since other services of yours may need it. Run `loginctl disable-linger` yourself to turn it off.
-
-Containers, WSL without systemd, and shells started with `su` or `sudo -u` have no systemd user session. There the link still succeeds and says that Koidrive can't sync in the background. Log in as the user directly, or turn lingering on and log in again, then run `koi service start`. On a system without systemd, run `koi _daemon` with your own service manager.
-
-**macOS.** Koidrive installs the launch agent `~/Library/LaunchAgents/dev.koidrive.koi.plist` and loads it with `launchctl bootstrap gui/$UID`. It runs while you are logged in and starts again at each login. Its log is in `~/Library/Logs/Koidrive/`. The daemon keeps the log under 10 MiB and moves the previous one to a file ending in `.log.1`. The first time, macOS shows a "Background Items Added" notification. Leave koi switched on in System Settings > General > Login Items > Allow in the Background. If you switch it off, macOS stops the agent, Koidrive leaves it off, and `koi status` shows `switched off in Login Items`. To turn it back on, switch koi on and run `koi service start`. Over SSH, with nobody logged in to the desktop, launchd has no session for the agent, so log in to the Mac once and run `koi service start`.
-
-macOS privacy settings treat the launch agent as a program of its own, so the access you gave Terminal doesn't carry over. When you link a folder in Documents, Desktop, Downloads or iCloud Drive, or on an external or network volume, macOS asks whether koi may access it. Click Allow. If you clicked Don't Allow, `koi status` names the folder. Open System Settings > Privacy & Security > Files & Folders and switch the folder on under koi, or add koi under Full Disk Access. Then run `koi folder restart <folder>`. macOS keeps these permissions across upgrades for a koi signed with a Developer ID. For an unsigned build it asks again after each upgrade.
-
-The macOS app runs the `koi` inside it, so it shows the same device, folders and service as the command. Opening the app brings the service in line, as the commands above do, and never starts a service you switched off.
-
-## Run the daemon yourself
-
-For scripts and machines where something else runs the daemon, turn the service off in `config.toml`:
-
-```toml
-[service]
-background = false
-```
-
-Koidrive then never installs, starts or removes the service, so unlink every folder before you turn it off, and link them again after. Folders then sync only while this runs:
-
-```sh
-koi _daemon
-```
-
-`_daemon` is the service's entry point, so `koi --help` doesn't list it. It runs in the foreground until you press Ctrl-C or send it SIGTERM. Commands that change this device's folders, such as `folder link`, `folder restart`, `folder retry` and `device leave`, talk to the daemon through a socket when it runs, and open the profile themselves when it doesn't. The other `device` commands and the `space` commands talk to the server directly. `history trash` and `history versions` read from the server too, but first ask the daemon, when it runs, which space the folder syncs.
-
-The daemon logs at the `info` level. Set `KOIDRIVE_LOG` to change it, for example `KOIDRIVE_LOG=debug`. `--log-format json` writes one JSON object per line.
-
-## Files on this machine
-
-| Path | What it holds |
-|---|---|
-| `~/.config/koidrive/config.toml` | Your settings: [selective sync](folders.md#sync-only-part-of-a-space-on-this-device), the [local trash](folders.md#the-local-trash) size, how many [uploads run at once](folders.md#uploads-at-once), whether the [background service](#background-sync) is on, and whether the daemon runs the [update check](#update-check). You edit it. Koidrive never writes it |
-| `~/.local/state/koidrive/update-check.json` | GitHub's last answer to the [update check](#update-check) |
-| `~/.local/state/koidrive/credential.json` | This device's credential. On macOS, Koidrive keeps it out of Time Machine backups |
-| `~/.local/state/koidrive/spaces/` | The sync state of each linked folder |
-| `~/.local/state/koidrive/systemd/koidrive.service` | On Linux, the background service's unit |
-| `~/Library/LaunchAgents/dev.koidrive.koi.plist` | On macOS, the background service's launch agent. Its log is in `~/Library/Logs/Koidrive/` |
-| `.koidrive/` in each linked folder | The folder's marker, the record of the device that linked it, and the local trash |
-
-`XDG_CONFIG_HOME` and `XDG_STATE_HOME` replace `~/.config` and `~/.local/state` when they are set to absolute paths, on macOS too. Koidrive ignores a relative value. The daemon's socket is `$XDG_RUNTIME_DIR/koidrive/daemon-<hash>.sock`, named with a hash of the state folder, or `daemon.sock` in the state folder when `XDG_RUNTIME_DIR` isn't set to an absolute path.
+[Background service and files](service.md) describes the service on Linux and macOS, its logs, how to run the daemon yourself and the files Koidrive keeps on this machine.
