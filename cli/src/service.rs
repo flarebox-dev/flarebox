@@ -407,7 +407,7 @@ impl Report {
     }
 
     pub fn failure_message(&self) -> String {
-        if self.state == State::SwitchedOff {
+        if self.state == State::SwitchedOff && self.problem.is_none() {
             return SWITCHED_OFF.trim_end().to_owned();
         }
         self.problem
@@ -1182,12 +1182,16 @@ mod tests {
     #[test]
     fn a_failed_start_of_a_disabled_agent_has_one_login_items_message() {
         let mut report = Report::new(&Fake::default(), "koi".into(), State::SwitchedOff);
+        assert_eq!(report.failure_message(), SWITCHED_OFF.trim_end());
         report.problem = Some(format!("bootstrap failed. {SWITCHED_OFF}"));
         report.folders = Some(1);
         let message = report.failure_message();
-        assert_eq!(message, SWITCHED_OFF.trim_end());
+        assert_eq!(
+            message,
+            format!("bootstrap failed. {}", SWITCHED_OFF.trim_end())
+        );
         assert!(!message.contains('\n'));
-        assert!(!message.contains("bootstrap"));
+        assert!(message.contains("bootstrap"));
         assert!(!crate::printable(&message).contains("\\u{a}"));
     }
 
@@ -1415,6 +1419,7 @@ mod tests {
         spawning: Cell<u32>,
         /// The person switched it off, as Login Items does: installed and disabled.
         switched_off: Cell<bool>,
+        remove_problem: Option<&'static str>,
         service_lock: Option<PathBuf>,
         locked_at_start: Cell<Option<bool>>,
     }
@@ -1467,6 +1472,9 @@ mod tests {
         }
 
         fn remove(&self, _: &Service) -> Result<(), String> {
+            if let Some(problem) = self.remove_problem {
+                return Err(problem.into());
+            }
             *self.unit.borrow_mut() = None;
             self.running.set(false);
             Ok(())
@@ -1559,6 +1567,24 @@ mod tests {
         let asked = converge(&fake, &service, 2, false, true, &Daemon::Absent);
         assert_eq!((asked.state, asked.started), (State::Running, true));
         assert!(!asked.failed());
+    }
+
+    #[test]
+    fn removing_a_disabled_agent_preserves_the_removal_failure() {
+        let service = service(&[]);
+        let fake = Fake {
+            unit: RefCell::new(Some(service.unit())),
+            switched_off: Cell::new(true),
+            remove_problem: Some("removal refused"),
+            ..Fake::default()
+        };
+        let report = converge(&fake, &service, 0, false, false, &Daemon::Absent);
+        assert_eq!(report.state, State::SwitchedOff);
+        assert!(report.failed());
+        assert_eq!(report.problem.as_deref(), Some("removal refused"));
+        assert_eq!(report.failure_message(), "removal refused");
+        assert!(!report.removed);
+        assert_eq!(*fake.unit.borrow(), Some(service.unit()));
     }
 
     #[test]

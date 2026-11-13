@@ -368,6 +368,49 @@ fn reconcile_leaves_a_login_items_disabled_service_off_and_succeeds() {
     assert!(!attempted.exists());
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn reconcile_reports_a_disabled_agents_removal_failure_without_linked_folders() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let profile = Profile::new("");
+    let bin = profile.home.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let launchctl = bin.join("launchctl");
+    std::fs::write(&launchctl, "#!/bin/sh\ncase \"$1:$2\" in\nprint:gui/*/*) exit 1;;\nprint:gui/*) exit 0;;\nprint-disabled:*) echo '{}';;\n*) exit 1;;\nesac\n").unwrap();
+    std::fs::set_permissions(&launchctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = profile
+        .command(&["status", "--json"])
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(envelope["data"]["folders"].as_array().unwrap().is_empty());
+    let label = envelope["data"]["service"]["name"].as_str().unwrap();
+    let agent = profile
+        .home
+        .path()
+        .join("Library/LaunchAgents")
+        .join(format!("{label}.plist"));
+    std::fs::create_dir_all(&agent).unwrap();
+    std::fs::write(&launchctl, format!("#!/bin/sh\ncase \"$1:$2\" in\nprint:gui/*/*) exit 1;;\nprint:gui/*) exit 0;;\nprint-disabled:*) echo '\"{label}\" => true';;\n*) exit 1;;\nesac\n")).unwrap();
+    let output = profile
+        .command(&["_reconcile", "--json"])
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    schema::check(&envelope);
+    assert_eq!(output.status.code(), Some(1), "{envelope:#}");
+    assert_eq!(envelope["outcome"], "error");
+    assert_eq!(envelope["data"]["service"]["state"], "switched_off");
+    let problem = envelope["data"]["service"]["problem"].as_str().unwrap();
+    assert!(problem.contains("cannot remove"), "{problem}");
+    assert_eq!(envelope["error"]["code"], "failed");
+    assert_eq!(envelope["error"]["message"], problem);
+    assert!(agent.is_dir());
+}
+
 struct Daemon {
     stopped: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,

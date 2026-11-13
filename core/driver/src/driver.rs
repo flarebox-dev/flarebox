@@ -2127,8 +2127,8 @@ async fn revoke(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
     use crate::failures::{self, Failure};
+    use std::sync::atomic::AtomicUsize;
     use std::time::{Duration, Instant};
 
     use crate::leave::Intent;
@@ -4059,6 +4059,7 @@ mod tests {
                 if checking {
                     driver.check_for_updates();
                 }
+                let before = driver.status().folders;
                 {
                     let leave = driver.sign_out(false);
                     tokio::pin!(leave);
@@ -4110,12 +4111,16 @@ mod tests {
                 assert_eq!(status.paused, paused);
                 if paused {
                     assert_eq!(fs::read(paths.paused()).unwrap(), b"pause stays\n");
-                    assert!(
-                        status
-                            .folders
-                            .iter()
-                            .all(|folder| folder.state == FolderState::Stopped)
-                    );
+                    assert_eq!(status.folders.len(), before.len());
+                    for (folder, before) in status.folders.iter().zip(&before) {
+                        assert_eq!(folder.space_id, before.space_id);
+                        if before.state == FolderState::Halted {
+                            assert_eq!(folder.state, FolderState::Halted);
+                            assert_eq!(folder.problem, before.problem);
+                        } else {
+                            assert_eq!(folder.state, FolderState::Stopped);
+                        }
+                    }
                 } else {
                     assert!(!paths.paused().exists());
                 }

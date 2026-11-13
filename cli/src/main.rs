@@ -562,7 +562,7 @@ async fn run(
         };
         let failed = shows_state
             && report.failed()
-            && (asked || report.state != service::State::SwitchedOff);
+            && (asked || report.state != service::State::SwitchedOff || report.problem.is_some());
         let failure = failed.then(|| report.failure_message());
         let data = match done.data.take() {
             Value::Null => Value::Object(serde_json::Map::new()),
