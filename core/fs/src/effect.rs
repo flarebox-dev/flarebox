@@ -367,6 +367,9 @@ impl Space {
             }
             None => Outcome::Done { identity: None },
         };
+        if !matches!(outcome, Outcome::Done { .. }) {
+            self.drop_staged(&effect.id)?;
+        }
         if displaced.entry.kind == EntryKind::Dir {
             clear_platform_files(quarantine.fd(), id)?;
         }

@@ -779,3 +779,25 @@ fn recovery_of_a_replacement_whose_target_the_user_changed_is_overtaken() {
         assert_settled(root);
     }
 }
+
+#[test]
+fn recovery_of_a_replacement_whose_name_was_taken_before_a_crash_after_the_trash_is_overtaken() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let effect = replace(root);
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        apply(root, &effect, |step| match step {
+            Step::Compared => fs::write(root.join("docs/report.txt"), EDITED).unwrap(),
+            Step::Trashed => panic!("crash"),
+            _ => {}
+        })
+    }));
+    assert!(crashed.is_err());
+    let outcome = bind(root)
+        .recover(&marker(), &effect, &mut Bytes, now(), &mut |_| {})
+        .unwrap();
+    assert_eq!(outcome, failed(Reason::Overtaken));
+    assert_eq!(fs::read(root.join("docs/report.txt")).unwrap(), EDITED);
+    assert_eq!(trashed(root), [SYNCED]);
+    assert_settled(root);
+}
