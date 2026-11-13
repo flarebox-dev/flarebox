@@ -18,7 +18,4 @@
     SELECT remote_nodes.node_id, remote_nodes.meta_rev, 1
       FROM remote_nodes
       JOIN commit_slots ON commit_slots.seq = remote_nodes.meta_rev
-      JOIN synced_nodes ON synced_nodes.node_id = remote_nodes.node_id
-     WHERE remote_nodes.status = 1
-       AND synced_nodes.parent_id IS remote_nodes.parent_id
-       AND synced_nodes.name = remote_nodes.name;
+     WHERE remote_nodes.status = 1;

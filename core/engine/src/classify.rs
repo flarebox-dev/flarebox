@@ -1216,9 +1216,17 @@ impl Trees {
     }
 
     /// Records that a create or a move of this device, in the commit at `seq`, set the position of
-    /// `id`, if R holds the position of that commit.
+    /// `id`, if R holds the position of that commit, or held it and holds the same position again.
     pub fn record_moved(&mut self, id: &str, seq: u64) {
-        if (self.r.get(id)).is_some_and(|remote| !remote.trashed && remote.meta_rev == seq) {
+        let held = |remote: &RemoteNode| {
+            remote.meta_rev == seq
+                || (self.past_positions.get(id).into_iter().flatten()).any(|past| {
+                    past.rev == seq
+                        && past.parent == remote.shape.parent
+                        && past.name == remote.shape.name
+                })
+        };
+        if (self.r.get(id)).is_some_and(|remote| !remote.trashed && held(remote)) {
             let moved = MovedHere {
                 seq,
                 upgraded: false,
@@ -1228,10 +1236,14 @@ impl Trees {
     }
 
     /// Forgets the earlier records of R below `rev`, the seq of the oldest commit of this device
-    /// that [`Commits::held_through`] can still name.
+    /// that [`Commits::held_through`] can still name, except the newest of them, which a commit at
+    /// `rev` or later may have replaced.
     pub fn forget_past_positions_below(&mut self, rev: u64) {
         self.past_positions.retain(|_, past| {
-            past.retain(|position| position.rev >= rev);
+            let newest_below = (past.iter().map(|position| position.rev))
+                .filter(|&past_rev| past_rev < rev)
+                .max();
+            past.retain(|position| position.rev >= rev || Some(position.rev) == newest_below);
             !past.is_empty()
         });
     }
@@ -1410,7 +1422,9 @@ impl Trees {
             (self.r.get(id))
                 .filter(|remote| !remote.trashed)
                 .is_some_and(|remote| {
-                    remote.meta_rev <= held_through || moved.upgraded || seen(remote)
+                    remote.meta_rev <= held_through
+                        || (moved.upgraded && remote.meta_rev < moved.seq)
+                        || seen(remote)
                 })
         };
         let lost_moves: BTreeSet<NodeId> = (moved.into_iter())
@@ -1494,6 +1508,17 @@ impl Trees {
             }
             self.waiting.remove(&id);
             self.mark(&id);
+        }
+        for id in &lost_moves {
+            let (Some(remote), Some(synced)) = (self.r.live(id), self.s.live(id)) else {
+                continue;
+            };
+            let before = Shape {
+                parent: remote.parent.clone(),
+                name: remote.name.clone(),
+                ..synced.clone()
+            };
+            self.set_synced_if_valid(id.clone(), Some(before));
         }
         let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for (id, shape) in self.s.iter() {

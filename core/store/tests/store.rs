@@ -2370,11 +2370,13 @@ fn a_store_from_before_moves_were_recorded_records_the_positions_its_commits_set
         node("other", "other.txt", 8, NodeStatus::Live),
         node("moved", "moved.txt", 9, NodeStatus::Live),
         node("gone", "gone.txt", 9, NodeStatus::Trashed),
+        node("nfd", "\u{d55c}.txt", 7, NodeStatus::Live),
     ];
     let synced = [
         ("own", "own.txt"),
         ("other", "other.txt"),
         ("moved", "since.txt"),
+        ("nfd", "\u{1112}\u{1161}\u{11ab}.txt"),
         ("gone", "gone.txt"),
     ]
     .map(|(id, name)| SyncedNode {
@@ -2398,11 +2400,15 @@ fn a_store_from_before_moves_were_recorded_records_the_positions_its_commits_set
 
     let mut store = Store::open(&path).unwrap();
     let after = before.clone();
-    let own = MovedHere {
-        seq: 7,
+    let upgraded = |seq| MovedHere {
+        seq,
         upgraded: true,
     };
-    before.trees.moved_here = BTreeMap::from([("own".into(), own)]);
+    before.trees.moved_here = BTreeMap::from([
+        ("own".into(), upgraded(7)),
+        ("moved".into(), upgraded(9)),
+        ("nfd".into(), upgraded(7)),
+    ]);
     before.trees.past_positions.clear();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
     store

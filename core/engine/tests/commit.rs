@@ -14,7 +14,7 @@ use koidrive_engine::ids::IdGen;
 use koidrive_engine::ignore::RuleFile;
 use koidrive_engine::names::{MAX_NAME_BYTES, nfc, normalize_name};
 use koidrive_engine::question::Answer;
-use koidrive_engine::state::{CommitsState, Pending, TreesState};
+use koidrive_engine::state::{CommitsState, MovedHere, Pending, TreesState};
 use koidrive_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
 use koidrive_proto::v1::{self as proto, CommitResult, OpResult, Welcome, error, op, op_result};
 use prost::Message;
@@ -3426,7 +3426,7 @@ fn a_full_set_of_slots_forgets_only_the_positions_below_its_oldest_seq() {
     .unwrap();
     assert_eq!(past_revisions_of_n(&trees), [1, 5, 1500]);
     move_n_to_y_at(2000, &mut trees, &mut commits, &mut ids);
-    assert_eq!(past_revisions_of_n(&trees), [1500, 1600]);
+    assert_eq!(past_revisions_of_n(&trees), [5, 1500, 1600]);
 }
 
 #[test]
@@ -7776,4 +7776,122 @@ fn a_resent_answer_delete_drops_its_precondition_once_a_delete_of_this_device_tr
     );
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert_eq!(ops(&commit), [delete("a")]);
+}
+
+#[test]
+fn a_lost_move_in_the_oldest_kept_commit_is_sent_again_over_the_position_it_replaced() {
+    let (mut trees, mut commits, mut ids) = n_at_x();
+    move_n_to_y_at(2, &mut trees, &mut commits, &mut ids);
+    let mut commits = Commits::from_state(CommitsState {
+        accepted: 999,
+        slots: std::iter::once((1, 2))
+            .chain((2..=999).map(|slot| (slot, slot + 1000)))
+            .collect(),
+        ..Default::default()
+    })
+    .unwrap();
+    trees.set_local("pad".into(), local(file(ROOT, "pad", 7), 99));
+    trees.settle();
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    trees.set_remote("pad".into(), remote_at(file(ROOT, "pad", 7), 3000));
+    commits
+        .received(result(3000, vec![outcome(op_result::Code::Applied)]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 3000));
+    trees.settle();
+    let n = remote(file(ROOT, "x", 1));
+    let sent = lose_with_n_at(n, 0, &mut trees, &mut commits, &mut ids);
+    assert_eq!(sent, [mv("n", ROOT, "y")]);
+}
+
+#[test]
+fn a_lost_move_is_sent_again_after_another_device_trashed_and_restored_the_node_before_its_result()
+{
+    let (mut trees, mut commits, mut ids) = n_at_x();
+    trees.set_local("n".into(), local(file(ROOT, "y", 1), 1));
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "y")]);
+    trees.set_remote("n".into(), remote_at(file(ROOT, "y", 1), 2));
+    let trashed_at_3 = RemoteNode {
+        meta_rev: 3,
+        ..trashed(file(ROOT, "y", 1))
+    };
+    trees.set_remote("n".into(), trashed_at_3);
+    trees.set_remote("n".into(), remote_at(file(ROOT, "y", 1), 4));
+    commits
+        .received(result(2, vec![outcome(op_result::Code::Applied)]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 2));
+    trees.settle();
+    let n = remote(file(ROOT, "x", 1));
+    let sent = lose_with_n_at(n, 0, &mut trees, &mut commits, &mut ids);
+    assert_eq!(sent, [mv("n", ROOT, "y")]);
+}
+
+#[test]
+fn a_lost_move_of_a_folder_keeps_a_move_another_device_made_of_its_child_after_the_loss() {
+    let mut trees = trees(&[
+        (
+            "p",
+            Some(dir(ROOT, "x")),
+            Some(dir(ROOT, "x")),
+            Some(remote(dir(ROOT, "x"))),
+        ),
+        (
+            "n",
+            Some(file("p", "n", 1)),
+            Some(file("p", "n", 1)),
+            Some(remote(file("p", "n", 1))),
+        ),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    trees.set_local("p".into(), local(dir(ROOT, "y"), 1));
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("p", ROOT, "y")]);
+    trees.set_remote("p".into(), remote_at(dir(ROOT, "y"), 2));
+    commits
+        .received(result(2, vec![outcome(op_result::Code::Applied)]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 2));
+    trees.settle();
+    assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
+    let (trashed, edited, moved) = (
+        trees.trashed_here(),
+        trees.edited_here(),
+        trees.moved_here(),
+    );
+    trees.set_remote("p".into(), remote(dir(ROOT, "x")));
+    trees.set_remote("n".into(), remote_at(file(ROOT, "z", 1), 3));
+    trees.forget_lost(
+        trashed,
+        edited,
+        Vec::new(),
+        moved,
+        commits.held_through(),
+        commits.accepted(),
+    );
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("p", ROOT, "y")]);
+    assert_eq!(trees.class("n"), Class::Remote);
+}
+
+#[test]
+fn a_move_recorded_by_the_store_upgrade_is_not_sent_over_a_move_made_after_its_commit() {
+    let (mut trees, mut commits, mut ids) = n_at_x();
+    move_n_to_y_at(9, &mut trees, &mut commits, &mut ids);
+    let mut state = trees.state();
+    let upgraded = MovedHere {
+        seq: 9,
+        upgraded: true,
+    };
+    state.moved_here = BTreeMap::from([("n".into(), upgraded)]);
+    state.past_positions.clear();
+    trees.restore(state).unwrap();
+    let n = remote_at(file(ROOT, "z", 1), 10);
+    let sent = lose_with_n_at(n, 0, &mut trees, &mut commits, &mut ids);
+    assert!(sent.is_empty());
+    assert_eq!(trees.class("n"), Class::Remote);
 }
