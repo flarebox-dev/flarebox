@@ -81,3 +81,40 @@ fn an_edit_undone_while_its_upload_is_out_is_sent_after_the_acknowledgement() {
     let next = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert_eq!(ops(&next), [update("n", 1)]);
 }
+
+#[test]
+fn an_edit_undone_while_its_upload_is_out_is_sent_after_an_acknowledgement_that_waits() {
+    let mut trees = trees(&[
+        (
+            "h",
+            Some(file(ROOT, "x", 9)),
+            Some(file(ROOT, "x", 9)),
+            Some(remote(file(ROOT, "y", 9))),
+        ),
+        synced("n", file(ROOT, "old", 0)),
+    ]);
+    trees.set_local(
+        "h".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "x", 9), 1)
+        },
+    );
+    trees.set_local_changed("n".into(), local(file(ROOT, "x", 1), 2));
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("n", ROOT, "x"), update("n", 1)]);
+    trees.set_local_changed("n".into(), local(file(ROOT, "old", 0), 2));
+    trees.set_remote("n".into(), remote(file(ROOT, "x", 1)));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied); 2],
+    );
+    assert_eq!(
+        trees.waiting().get("n").map(|waiting| &waiting.shape),
+        Some(&Some(file(ROOT, "x", 1)))
+    );
+    assert!(trees.state().local_changes.contains("n"));
+}

@@ -4677,3 +4677,41 @@ fn a_rename_inside_a_deleted_lost_folder_the_bootstrap_has_not_scanned_converges
         (1, Step::Deliver(0)),
     ]);
 }
+
+fn recorded_in_sync(world: &World, device: usize) -> Vec<String> {
+    let trees = &world.devices[device].engine.trees;
+    (trees.state().local_changes.into_iter())
+        .filter(|id| {
+            let local = trees.local().get(id).map(|node| node.shape.clone());
+            koidrive_engine::tree::same(local.as_ref(), trees.synced().get(id))
+        })
+        .collect()
+}
+
+#[test]
+fn devices_that_converge_without_a_loss_record_no_change_l_and_s_agree_on() {
+    let mut runner = TestRunner::deterministic();
+    let strategy = (2..=3usize, phases(Losses::None));
+    let mut recorded = Vec::new();
+    for _ in 0..64 {
+        let (devices, phases) = strategy.new_tree(&mut runner).unwrap().current();
+        let Ok(world) = keep(devices, &phases) else {
+            continue;
+        };
+        recorded.extend((0..devices).flat_map(|device| recorded_in_sync(&world, device)));
+    }
+    assert_eq!(recorded, Vec::<String>::new());
+}
+
+#[test]
+fn a_conflict_copy_the_engine_names_is_no_change_once_the_server_holds_it() {
+    let mut world = converge(2, &[vec![(0, folder("a"))]]).unwrap();
+    let mut steps = vec![(0, user(0, 0, 1, "ß")), (0, user(1, 0, 1, "ss"))];
+    steps.extend(commit(0));
+    world.phase(1, &steps).unwrap();
+    assert_eq!(
+        paths_on(&world, 0),
+        ["a", "a/ss (conflict from device-0 2026-11-09)", "a/ß"]
+    );
+    assert_eq!(recorded_in_sync(&world, 0), Vec::<String>::new());
+}

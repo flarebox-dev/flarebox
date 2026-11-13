@@ -1743,15 +1743,14 @@ impl Synced {
     }
 
     fn apply(self, trees: &mut Trees) -> Vec<(NodeId, Option<Shape>)> {
-        let taken: BTreeMap<&NodeId, &Option<Shape>> = (self.updates.iter())
-            .map(|(id, shape)| (id, shape))
-            .collect();
+        let taken: BTreeMap<NodeId, Option<Shape>> = self.updates.iter().cloned().collect();
+        let left = update_synced(trees, self.updates);
         for (id, shape) in taken {
             if let Some(shape) = shape {
-                trees.sent_shape(id, shape);
+                trees.sent_shape(&id, &shape);
             }
         }
-        update_synced(trees, self.updates)
+        left
     }
 }
 
@@ -1808,19 +1807,20 @@ fn update_synced(
 /// Sets S for every node of `updates` when S stays a valid tree with all of them. Returns whether it
 /// did.
 fn set_synced_together(trees: &mut Trees, updates: &[(NodeId, Option<Shape>)]) -> bool {
-    let before: Vec<(NodeId, Option<Shape>)> = (updates.iter())
-        .map(|(id, _)| (id.clone(), trees.synced().live(id).cloned()))
-        .collect();
+    let mut synced = trees.synced().clone();
+    for (id, shape) in updates {
+        match shape {
+            Some(shape) => synced.insert(id.clone(), shape.clone()),
+            None => synced.remove(id),
+        };
+    }
+    if synced.check(Names::ByKey).is_err() {
+        return false;
+    }
     for (id, shape) in updates {
         trees.set_synced(id.clone(), shape.clone());
     }
-    if trees.synced().check(Names::ByKey).is_ok() {
-        return true;
-    }
-    for (id, shape) in before {
-        trees.set_synced(id, shape);
-    }
-    false
+    true
 }
 
 /// Whether a node outside `batch` keeps the update of `id` to `shape` from fitting, whatever else

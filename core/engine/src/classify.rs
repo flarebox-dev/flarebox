@@ -431,15 +431,27 @@ impl Trees {
     }
 
     pub fn set_remote(&mut self, id: NodeId, node: RemoteNode) {
-        self.apply_remote(id, node, false, false);
+        self.apply_remote(id.clone(), node, false, false);
+        self.end_change_all_trees_hold(&id);
     }
 
     pub fn set_remote_made_here(&mut self, id: NodeId, node: RemoteNode) {
-        self.apply_remote(id, node, true, false);
+        self.apply_remote(id.clone(), node, true, false);
+        self.end_change_all_trees_hold(&id);
     }
 
     pub fn set_remote_edited_here(&mut self, id: NodeId, node: RemoteNode) {
-        self.apply_remote(id, node, true, true);
+        self.apply_remote(id.clone(), node, true, true);
+        self.end_change_all_trees_hold(&id);
+    }
+
+    fn end_change_all_trees_hold(&mut self, id: &str) {
+        let held = (self.l.get(id).zip(self.s.live(id)).zip(self.r.live(id))).is_some_and(
+            |((local, synced), remote)| local.shape.same(synced) && synced.same(remote),
+        );
+        if held {
+            self.local_changes.remove(id);
+        }
     }
 
     fn apply_remote(&mut self, id: NodeId, node: RemoteNode, made_here: bool, edit: bool) {
@@ -761,17 +773,20 @@ impl Trees {
         self.count_held_trash(&id, true);
         self.note_position(&id);
         self.record_edit_in_trash(&id);
+        self.end_change_all_trees_hold(&id);
     }
 
     /// Sets L as this device's user made it: from a scan of the disk, or as the copy that keeps a
     /// change of the user. A shape other than the one L holds is recorded as a change of the user
-    /// ([`TreesState::local_changes`]), and the shape S holds, or the waiting update S takes, ends
-    /// the record.
+    /// ([`TreesState::local_changes`]), and a change back to the shape S holds, or the waiting update
+    /// S takes, ends the record.
     pub fn set_local_changed(&mut self, id: NodeId, node: LocalNode) {
-        if same(Some(&node.shape), self.acknowledged(&id)) {
-            self.local_changes.remove(&id);
-        } else if !(self.l.get(&id)).is_some_and(|old| old.shape.same(&node.shape)) {
-            self.local_changes.insert(id.clone());
+        if !(self.l.get(&id)).is_some_and(|old| old.shape.same(&node.shape)) {
+            if same(Some(&node.shape), self.acknowledged(&id)) {
+                self.local_changes.remove(&id);
+            } else {
+                self.local_changes.insert(id.clone());
+            }
         }
         self.set_local(id, node);
     }

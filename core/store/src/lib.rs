@@ -57,6 +57,28 @@ pub mod migrations {
 
     include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
 
+    pub fn register_functions(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+        use koidrive_engine::names::same_name;
+        use koidrive_engine::tree::same_content;
+        use koidrive_proto::v1::Content;
+        use rusqlite::functions::FunctionFlags;
+
+        let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+        conn.create_scalar_function("same_name", 2, flags, |ctx| {
+            Ok(same_name(&ctx.get::<String>(0)?, &ctx.get::<String>(1)?))
+        })?;
+        conn.create_scalar_function("same_content", 2, flags, |ctx| {
+            let content = |at| {
+                super::decode::<Content>(ctx.get(at)?)
+                    .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))
+            };
+            Ok(match (content(0)?, content(1)?) {
+                (Some(a), Some(b)) => same_content(&a, &b),
+                (a, b) => a.is_none() && b.is_none(),
+            })
+        })
+    }
+
     pub const NAMED: u32 = 1000;
 }
 
@@ -327,6 +349,7 @@ fn applied_migrations(conn: &Connection) -> Result<(u32, BTreeSet<String>)> {
 }
 
 fn migrate(conn: &mut Connection) -> Result<()> {
+    migrations::register_functions(conn)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (version, applied) = applied_migrations(&tx)?;
     if version != NAMED {

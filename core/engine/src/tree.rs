@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use koidrive_proto::v1::{self as proto, NodeKind, NodeStatus};
 
-use crate::names::{name_key, nfc};
+use crate::names::{name_key, same_name};
 
 pub type NodeId = String;
 
@@ -50,8 +50,7 @@ impl Shape {
     }
 
     pub fn same_position(&self, other: &Shape) -> bool {
-        self.parent == other.parent
-            && (self.name == other.name || nfc(&self.name) == nfc(&other.name))
+        self.parent == other.parent && same_name(&self.name, &other.name)
     }
 }
 

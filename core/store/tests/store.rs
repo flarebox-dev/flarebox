@@ -550,6 +550,7 @@ fn differences(steps: &[Step], priorities: &[Vec<usize>]) -> Vec<String> {
         let path = dir.path().join(name);
         std::fs::copy(&base, &path).unwrap();
         let conn = Connection::open(&path).unwrap();
+        koidrive_store::migrations::register_functions(&conn).unwrap();
         conn.pragma_update(None, "synchronous", "OFF").unwrap();
         for step in &order {
             conn.execute_batch(step.sql).unwrap();
@@ -754,6 +755,7 @@ fn rewind(path: &Path, version: usize) {
 fn rebuild(path: &Path, migrate: impl FnOnce(&Connection)) {
     let rebuilt = path.with_extension("rebuilt");
     let conn = Connection::open(&rebuilt).unwrap();
+    koidrive_store::migrations::register_functions(&conn).unwrap();
     conn.pragma_update(None, "foreign_keys", false).unwrap();
     conn.pragma_update(None, "synchronous", "OFF").unwrap();
     migrate(&conn);
@@ -3588,4 +3590,49 @@ fn a_store_from_before_edit_revisions_were_stored_reads_each_as_its_content_revi
             ..node
         }]
     );
+}
+
+#[test]
+fn a_store_from_before_local_changes_were_recorded_records_no_node_l_holds_as_s_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let local = |node_id: &str, shape: Shape, ino: u64| LocalNode {
+        node_id: node_id.into(),
+        shape,
+        identity: FileId {
+            dev: 1,
+            ino: ino.into(),
+            birth_ns: None,
+        },
+        parked: false,
+    };
+    let synced = file_shape("root", "m.txt");
+    let mut touched = synced.clone();
+    if let Some(content) = touched.content.as_mut() {
+        content.mtime_ns += 1;
+    }
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| {
+            tx.put_synced_node(&SyncedNode {
+                node_id: "name".into(),
+                shape: file_shape("root", "\u{d55c}.txt"),
+            })?;
+            tx.put_local_node(&local(
+                "name",
+                file_shape("root", "\u{1112}\u{1161}\u{11ab}.txt"),
+                1,
+            ))?;
+            tx.put_synced_node(&SyncedNode {
+                node_id: "mtime".into(),
+                shape: synced,
+            })?;
+            tx.put_local_node(&local("mtime", touched, 2))?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+    store_before(&path, "local_changes");
+    let mut store = Store::open(&path).unwrap();
+    let state = store.transaction(|tx| tx.engine_state()).unwrap();
+    assert_eq!(state.trees.local_changes, nodes::<0>([]));
 }

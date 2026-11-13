@@ -8,6 +8,6 @@ SELECT local_nodes.node_id
   LEFT JOIN synced_nodes ON synced_nodes.node_id = local_nodes.node_id
  WHERE synced_nodes.node_id IS NULL
     OR synced_nodes.parent_id IS NOT local_nodes.parent_id
-    OR synced_nodes.name IS NOT local_nodes.name
     OR synced_nodes.kind IS NOT local_nodes.kind
-    OR synced_nodes.content IS NOT local_nodes.content;
+    OR NOT same_name(synced_nodes.name, local_nodes.name)
+    OR NOT same_content(synced_nodes.content, local_nodes.content);
