@@ -2533,9 +2533,11 @@ fn plan(
             || trees.waiting().contains_key(*node)
             || trees.class(node) == Class::Same
     };
-    for node in restored.into_iter().filter(unsettled) {
+    let (unsettled, settled): (Vec<&str>, Vec<&str>) = restored.into_iter().partition(unsettled);
+    for node in unsettled {
         *scratch.unsent.entry(node.to_owned()).or_default() += 1;
     }
+    scratch.restoring = settled.into_iter().map(str::to_owned).collect();
     let mut moving: BTreeSet<NodeId> = wants
         .iter()
         .filter_map(|want| match want {
@@ -2611,6 +2613,7 @@ fn plan(
                 })
             }
             Want::Restore { op, .. } => {
+                scratch.restoring.remove(&op.node_id);
                 let trashed = (trees.remote().get(&op.node_id))
                     .filter(|node| node.trashed && op.version_id.is_empty());
                 match trashed {
@@ -2727,6 +2730,21 @@ fn plan(
             }
             continue;
         }
+        if let Some(at) = return_cycle(&wants, &scratch, &moving) {
+            if !room(
+                &mut emitted,
+                &mut bytes,
+                wants[at].as_ref().expect("checked"),
+            ) {
+                break true;
+            }
+            emit(
+                wants[at].take().expect("checked"),
+                &mut scratch,
+                &mut moving,
+            );
+            continue;
+        }
         let held: Vec<NodeId> = (wants.iter().flatten())
             .filter_map(|want| match want {
                 Want::Delete { id, .. } if scratch.fit(want, &moving) == Fit::Merged => {
@@ -2820,41 +2838,86 @@ fn name_cycle(
     scratch: &Scratch,
     moving: &BTreeSet<NodeId>,
 ) -> Option<Vec<usize>> {
-    let blocked: BTreeMap<&str, usize> = (wants.iter().enumerate())
-        .filter_map(|(at, slot)| match slot {
-            Some(want @ Want::Move { id, .. }) if scratch.fit(want, moving) == Fit::NameTaken => {
-                Some((id.as_str(), at))
-            }
-            _ => None,
-        })
-        .collect();
+    let mut blocked: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut returns: BTreeMap<&str, &str> = BTreeMap::new();
+    for (at, slot) in wants.iter().enumerate() {
+        let (want, node) = match slot {
+            Some(want @ Want::Move { id, .. }) => (want, id),
+            Some(want @ Want::Restore { op, .. }) => (want, &op.node_id),
+            _ => continue,
+        };
+        if let Some(returning) = scratch.awaited_return(want, moving) {
+            returns.insert(node, returning);
+        } else if matches!(want, Want::Move { .. }) && scratch.fit(want, moving) == Fit::NameTaken {
+            blocked.insert(node, at);
+        }
+    }
     for &start in blocked.keys() {
         let mut cycle = Vec::new();
+        let mut seen = BTreeSet::new();
         let mut node = start;
-        while let Some(&at) = blocked.get(node) {
-            if cycle.contains(&at) {
+        while seen.insert(node) {
+            if let Some(&at) = blocked.get(node) {
+                cycle.push(at);
+                let Some(Want::Move { id, parent, name }) = &wants[at] else {
+                    unreachable!("indexed from the moves");
+                };
+                let holders: Vec<&NodeId> = (scratch.children.get(parent))
+                    .and_then(|keys| keys.get(&name_key(name)))
+                    .into_iter()
+                    .flatten()
+                    .filter(|holder| *holder != id)
+                    .collect();
+                let [holder] = holders.as_slice() else {
+                    break;
+                };
+                node = holder;
+            } else if let Some(&returning) = returns.get(node) {
+                node = returning;
+            } else {
                 break;
             }
-            cycle.push(at);
-            let Some(Want::Move { id, parent, name }) = &wants[at] else {
-                unreachable!("indexed from the moves");
-            };
-            let holders: Vec<&NodeId> = (scratch.children.get(parent))
-                .and_then(|keys| keys.get(&name_key(name)))
-                .into_iter()
-                .flatten()
-                .filter(|holder| *holder != id)
-                .collect();
-            let [holder] = holders.as_slice() else {
-                break;
-            };
-            if holder.as_str() == start {
+            if node == start {
                 return Some(cycle);
             }
-            node = holder;
         }
     }
     None
+}
+
+fn return_cycle(
+    wants: &[Option<Want>],
+    scratch: &Scratch,
+    moving: &BTreeSet<NodeId>,
+) -> Option<usize> {
+    let awaits: Vec<(usize, &str, &str)> = (wants.iter().enumerate())
+        .filter_map(|(at, slot)| {
+            let want = slot.as_ref()?;
+            let node = match want {
+                Want::Move { id, .. } => id,
+                Want::Restore { op, .. } => &op.node_id,
+                _ => return None,
+            };
+            Some((at, node.as_str(), scratch.awaited_return(want, moving)?))
+        })
+        .collect();
+    let next: BTreeMap<&str, &str> = (awaits.iter())
+        .map(|&(_, node, returning)| (node, returning))
+        .collect();
+    awaits.iter().find_map(|&(at, start, returning)| {
+        let sendable = (wants[at].as_ref()).is_some_and(|want| {
+            matches!(scratch.placement(want, moving), Fit::Valid | Fit::NameTaken)
+        });
+        let mut seen = BTreeSet::from([start]);
+        let mut node = returning;
+        while seen.insert(node) {
+            let Some(&after) = next.get(node) else {
+                break;
+            };
+            node = after;
+        }
+        (sendable && node == start).then_some(at)
+    })
 }
 
 struct Entry {
@@ -2883,6 +2946,7 @@ struct Scratch {
     /// of them, so that it is applied to what this device sent and S shows what the device
     /// holds.
     unsent: BTreeMap<NodeId, usize>,
+    restoring: BTreeSet<NodeId>,
 }
 
 impl Scratch {
@@ -2894,6 +2958,7 @@ impl Scratch {
             merges: BTreeMap::new(),
             protected: BTreeSet::new(),
             unsent: BTreeMap::new(),
+            restoring: BTreeSet::new(),
         };
         for (id, node) in trees.remote().iter() {
             let entry = Entry {
@@ -2936,6 +3001,13 @@ impl Scratch {
     }
 
     fn fit(&self, want: &Want, moving: &BTreeSet<NodeId>) -> Fit {
+        match self.awaited_return(want, moving) {
+            Some(_) => Fit::Wait,
+            None => self.placement(want, moving),
+        }
+    }
+
+    fn placement(&self, want: &Want, moving: &BTreeSet<NodeId>) -> Fit {
         match want {
             Want::Create { id, shape } => self.fit_at(id, &shape.parent, &shape.name),
             Want::Move { id, parent, name } => self.fit_at(id, parent, name),
@@ -2956,6 +3028,49 @@ impl Scratch {
             Want::Restore { op, .. } if self.unsent.contains_key(&op.node_id) => Fit::Wait,
             Want::Restore { .. } => Fit::Valid,
         }
+    }
+
+    fn awaited_return<'a>(&'a self, want: &'a Want, moving: &BTreeSet<NodeId>) -> Option<&'a str> {
+        let trashed_parent = |id: &str| {
+            (self.nodes.get(id))
+                .filter(|entry| !entry.live)
+                .map(|entry| entry.parent.as_str())
+        };
+        let revived = match want {
+            Want::Create { shape, .. } => Some(shape.parent.as_str()),
+            Want::Move { id, parent, .. } => {
+                Some(parent.as_str()).filter(|to| !self.inside(to, id))
+            }
+            Want::Content { id, .. } => trashed_parent(id),
+            Want::Restore { op, .. } => {
+                let target = Some(op.target_parent_id.as_str())
+                    .filter(|target| !target.is_empty() && op.version_id.is_empty());
+                trashed_parent(&op.node_id)
+                    .map(|parent| target.unwrap_or(parent))
+                    .filter(|to| !self.inside(to, &op.node_id))
+            }
+            Want::Delete { .. } => None,
+        };
+        revived.and_then(|id| self.returning_from_trash(id, moving))
+    }
+
+    fn returning_from_trash<'a>(
+        &'a self,
+        id: &'a str,
+        moving: &BTreeSet<NodeId>,
+    ) -> Option<&'a str> {
+        let mut current = id;
+        for _ in 0..=self.nodes.len() {
+            let entry = self.nodes.get(current).filter(|entry| !entry.live)?;
+            let in_trash = |id: &str| self.nodes.get(id).is_some_and(|entry| !entry.live);
+            if self.restoring.contains(current)
+                || (moving.contains(current) && in_trash(&entry.parent))
+            {
+                return Some(current);
+            }
+            current = &entry.parent;
+        }
+        None
     }
 
     /// Whether `id` can take `name` under `parent`. A trashed parent counts: the server revives
