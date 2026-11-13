@@ -4,7 +4,7 @@ Koidrive can send anonymous usage reports to the Koidrive project. They help fix
 
 ## Turn reports on or off
 
-The guided `koi setup` on a terminal asks once, after setup succeeds. Turning reports on here applies to future commands, not the setup that just finished:
+The guided `koi setup` on a terminal asks after setup succeeds. Turning reports on here applies to future commands, not the setup that just finished. If you cancel or close the question without answering, it returns after the next successful interactive command:
 
 ```
 Send reports? [Y/n]
@@ -20,7 +20,7 @@ koi telemetry preview   # prints the waiting reports as the daemon would send th
 koi telemetry reset     # draws a new install id and deletes the reports not sent yet
 ```
 
-The other commands never ask. They send reports only when this profile already chose to send them, or when `KOIDRIVE_TELEMETRY` turns them on. `koi setup`, `koi join`, `koi server deploy`, `koi server add-device` and `koi server claim` also take `--telemetry on` or `--telemetry off`, which stores the choice without asking. `koi setup` doesn't ask with `--json`, or when the `CI` variable is set to any value. With `--interactive` it asks unless `CI` is set to something other than `0` or `false`.
+Other commands ask only to finish an unanswered setup question. They send reports only when this profile already chose to send them, or when `KOIDRIVE_TELEMETRY` turns them on. `koi setup`, `koi join`, `koi server deploy`, `koi server add-device` and `koi server claim` also take `--telemetry on` or `--telemetry off`, which stores the choice without asking. Questions need a terminal on stdin and stderr and never appear with `--json`. CI suppresses them; with `--interactive`, setup can ask when `CI` is `0` or `false`.
 
 A running daemon notices `koi telemetry off` and `reset` at its next ten-minute tick. A daemon that started while reports were off records nothing of its own until it restarts, but it still sends what later commands queue. When the daemon stops, it writes what it holds to disk and leaves the sending to its next run.
 

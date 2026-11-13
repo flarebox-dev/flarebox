@@ -15,9 +15,10 @@ pub(crate) mod fake;
 mod state;
 mod uninstall;
 
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::path::Path;
 use std::process::{Command as Process, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -39,6 +40,9 @@ use crate::error::CliError;
 use crate::ipc;
 use crate::printable;
 use crate::report::{Choice, ChoicesData, Done};
+use crate::terminal::Terminal;
+#[cfg(test)]
+use crate::terminal::read_line;
 use claim::Claim;
 use state::{SetupState, StateFile, Step};
 
@@ -58,9 +62,6 @@ const SERVE_WAIT: Duration = Duration::from_secs(90);
 
 include!(concat!(env!("OUT_DIR"), "/server_bundle.rs"));
 
-/// Whether this command may ask questions on the terminal; [`mode`] decides it once, before anything is asked.
-static GUIDED: AtomicBool = AtomicBool::new(false);
-
 /// Whether a Cloudflare login session is live. Its own signal handling revokes the grant before the command ends,
 /// so main's Ctrl-C handling stands aside while it is.
 static SESSION: AtomicBool = AtomicBool::new(false);
@@ -74,7 +75,7 @@ pub struct LoginArgs {
     /// Ask questions on the terminal, as the guided setup does. Needs a terminal on stdin and stderr, and cannot be
     /// used with --json.
     #[arg(long)]
-    interactive: bool,
+    pub(crate) interactive: bool,
     /// Print the login page instead of opening a browser, and read the address the browser ends on from the terminal.
     /// Needs --interactive.
     #[arg(long)]
@@ -180,21 +181,14 @@ pub fn mode(
     }
 }
 
-/// [`mode`] for this process, which it also records for [`prompt`] and [`confirm`].
 fn this_mode(json: bool, interactive: bool) -> Result<Mode, CliError> {
-    let mode = mode(
+    mode(
         std::io::stdin().is_terminal(),
         std::io::stderr().is_terminal(),
         json,
         std::env::var_os("CI").is_some(),
         interactive,
-    )?;
-    GUIDED.store(mode == Mode::Guided, Ordering::Relaxed);
-    Ok(mode)
-}
-
-pub fn guided(json: bool, login: &LoginArgs) -> bool {
-    this_mode(json, login.interactive).is_ok_and(|mode| mode == Mode::Guided)
+    )
 }
 
 /// The ways to set up this machine, which `koi setup` lists when it does not guide.
@@ -242,6 +236,7 @@ pub async fn setup(
     device_name: &str,
     login: &LoginArgs,
     json: bool,
+    terminal: Arc<Terminal>,
 ) -> Result<Done, CliError> {
     let mode = this_mode(json, login.interactive)?;
     if login.no_browser && !login.interactive {
@@ -271,25 +266,33 @@ pub async fn setup(
         done.next = next;
         return Ok(done);
     }
-    println!("How do you want to set up Koidrive on this machine?");
-    println!(
-        "  1. Log in with Cloudflare: deploy a server to your account, or add this device to the server there"
-    );
-    println!("  2. Enter a pairing code from another device");
-    match prompt("Choose 1 or 2: ").await?.as_str() {
-        "1" => {
+    terminal.intro();
+    let route = terminal
+        .select(
+            "How do you want to set up Koidrive on this machine?",
+            vec![
+                "Log in with Cloudflare".into(),
+                "Enter a pairing code from another device".into(),
+            ],
+        )
+        .await?;
+    match route {
+        0 => {
             crate::telemetry::set_flow(SetupFlow::Cloudflare);
             bundled()?;
-            with_session(login, async |session| {
+            with_session(login, terminal.clone(), async |session| {
                 session.setup(paths, device_name).await
             })
             .await?;
         }
-        "2" => {
+        1 => {
             crate::telemetry::set_flow(SetupFlow::Pairing);
-            let code = prompt("Pairing code: ").await?;
+            terminal.message("On your connected computer, run koi device invite.");
+            let code = terminal.input("Pairing code", true).await?;
             let pair = async {
-                let invitation = crate::pairing::parse(&code, None).map_err(CliError::usage)?;
+                let invitation = crate::pairing::parse(&code, None).map_err(|_| {
+                    CliError::usage("Copy the full pairing code, including its @server address")
+                })?;
                 let request = Request::Pair {
                     server: invitation.server,
                     code: invitation.code,
@@ -299,13 +302,21 @@ pub async fn setup(
             };
             crate::telemetry::step(SetupStep::Pair, pair).await?;
         }
-        other => return Err(CliError::usage(format!("{other:?} is not 1 or 2"))),
+        _ => {
+            return Err(CliError::from(
+                "the terminal returned an invalid setup choice",
+            ));
+        }
     }
+    terminal.message("Check sync: koi status");
+    terminal.message(
+        "To sync a folder, run koi space list, then koi folder link <folder> --space <space>.",
+    );
     Ok(Done::printed())
 }
 
 impl ServerAction {
-    fn login(&self) -> Option<&LoginArgs> {
+    pub(crate) fn login(&self) -> Option<&LoginArgs> {
         match self {
             ServerAction::Deploy { login, .. }
             | ServerAction::AddDevice { login, .. }
@@ -371,13 +382,18 @@ impl ServerAction {
 /// `koi server <action>`. Each logs in with Cloudflare in a browser, so it runs only with `--interactive` and a
 /// terminal on stdin and stderr. Otherwise, with or without `--json`, it stops before the login and names the
 /// `--interactive` command for a person to run.
-pub async fn server(paths: &Paths, action: ServerAction, json: bool) -> Result<Done, CliError> {
+pub async fn server(
+    paths: &Paths,
+    action: ServerAction,
+    json: bool,
+    terminal: Arc<Terminal>,
+) -> Result<Done, CliError> {
     let login = action.login().expect("main sends a claim to the driver");
     if login.interactive && json {
         return Err(CliError::usage("--interactive cannot be used with --json"));
     }
-    let terminal = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
-    if !(login.interactive && terminal) {
+    let attended = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    if !(login.interactive && attended) {
         let argv = action.interactive_argv();
         let words: Vec<&str> = argv.iter().map(String::as_str).collect();
         let message = format!(
@@ -386,13 +402,12 @@ pub async fn server(paths: &Paths, action: ServerAction, json: bool) -> Result<D
         );
         return Err(CliError::new(Code::AuthRequired, message).then(&words));
     }
-    GUIDED.store(true, Ordering::Relaxed);
     match action {
         ServerAction::Deploy { device, login } => {
             not_set_up(paths)?;
             bundled()?;
             let name = device.name();
-            with_session(&login, async |session| {
+            with_session(&login, terminal.clone(), async |session| {
                 session.server_deploy(paths, &name).await
             })
             .await?;
@@ -405,7 +420,7 @@ pub async fn server(paths: &Paths, action: ServerAction, json: bool) -> Result<D
             not_set_up(paths)?;
             bundled()?;
             let name = device.name();
-            with_session(&login, async |session| {
+            with_session(&login, terminal.clone(), async |session| {
                 session
                     .server_add_device(paths, worker.as_deref(), &name)
                     .await
@@ -415,7 +430,7 @@ pub async fn server(paths: &Paths, action: ServerAction, json: bool) -> Result<D
         ServerAction::Claim { .. } => unreachable!("main sends a claim to the driver"),
         ServerAction::Upgrade { worker, yes, login } => {
             bundled()?;
-            with_session(&login, async |session| {
+            with_session(&login, terminal.clone(), async |session| {
                 let found = session.pick(worker.as_deref()).await?;
                 crate::telemetry::step(SetupStep::Upgrade, session.upgrade(&found, yes)).await
             })
@@ -434,7 +449,7 @@ pub async fn server(paths: &Paths, action: ServerAction, json: bool) -> Result<D
             if bucket.is_none() && !resuming {
                 bundled()?;
             }
-            with_session(&login, async |session| {
+            with_session(&login, terminal.clone(), async |session| {
                 let uninstall = session.uninstall(
                     paths,
                     worker.as_deref(),
@@ -518,6 +533,7 @@ fn report_paired(paths: &Paths, response: Response) -> Result<(), CliError> {
 /// signal it exits at once with 130 for Ctrl-C or 143 for SIGTERM, as a shell does for a command the signal ended.
 async fn with_session(
     args: &LoginArgs,
+    terminal: Arc<Terminal>,
     work: impl AsyncFnOnce(&mut Session) -> Result<(), CliError>,
 ) -> Result<(), CliError> {
     let mut terminate = signal(SignalKind::terminate()).map_err(|error| error.to_string())?;
@@ -532,8 +548,9 @@ async fn with_session(
         how
     };
     SESSION.store(true, Ordering::Relaxed);
-    let login = crate::telemetry::step(SetupStep::Login, Session::login(args));
+    let login = crate::telemetry::step(SetupStep::Login, Session::login(args, terminal.clone()));
     let outcome = guarded(login, stopped, work).await;
+    terminal.cancel().await;
     SESSION.store(false, Ordering::Relaxed);
     if let (Err(error), Some(code)) = (&outcome, status) {
         crate::telemetry::flush();
@@ -565,37 +582,7 @@ async fn guarded(
     outcome
 }
 
-/// Asks `question` on stdout and reads one line of the answer from stdin, in a guided command only.
-pub(crate) async fn prompt(question: &str) -> Result<String, CliError> {
-    if !GUIDED.load(Ordering::Relaxed) {
-        return Err(format!(
-            "{} needs an answer, and this command does not ask without a terminal",
-            question.trim_end().trim_end_matches(':')
-        )
-        .into());
-    }
-    print!("{question}");
-    std::io::stdout()
-        .flush()
-        .map_err(|error| error.to_string())?;
-    read_answer(|| read_line(std::io::stdin().lock())).await
-}
-
-/// Reads one line. A closed input is an error rather than an empty answer, so Ctrl-D never reads as Enter.
-fn read_line(mut input: impl std::io::BufRead) -> std::io::Result<String> {
-    let mut line = String::new();
-    match input.read_line(&mut line)? {
-        0 => Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "stdin closed before an answer",
-        )),
-        _ => Ok(line),
-    }
-}
-
-/// Runs the blocking `read` on a thread of its own, so the caller can stop waiting for it: `with_session` ends the
-/// command at Ctrl-C while a prompt waits. The thread is not one of the runtime's blocking threads, which the runtime
-/// waits for when it is dropped, so a read nobody answers stays blocked until the process exits.
+#[cfg(test)]
 async fn read_answer(
     read: impl FnOnce() -> std::io::Result<String> + Send + 'static,
 ) -> Result<String, CliError> {
@@ -610,19 +597,23 @@ async fn read_answer(
     Ok(line.trim().to_owned())
 }
 
-/// Asks a yes-or-no question in a guided command. Otherwise it refuses, naming `flag`.
-async fn confirm(question: &str, yes: bool, flag: &str) -> Result<(), CliError> {
+async fn confirm(
+    terminal: &Terminal,
+    question: &str,
+    yes: bool,
+    flag: &str,
+) -> Result<(), CliError> {
     if yes {
         return Ok(());
     }
-    if !GUIDED.load(Ordering::Relaxed) {
+    if !terminal.guided() {
         return Err(
             format!("{question} Run again with {flag} to go on without a terminal.").into(),
         );
     }
-    match prompt(&format!("{question} [y/N] ")).await?.as_str() {
-        "y" | "Y" | "yes" => Ok(()),
-        _ => Err("stopped; nothing more was changed".into()),
+    match terminal.confirm(question, false).await? {
+        true => Ok(()),
+        false => Err("stopped; nothing more was changed".into()),
     }
 }
 
@@ -664,6 +655,7 @@ trait Cloud {
 
 /// One command's Cloudflare login: the grant and the account the user picked on the consent page.
 struct Session {
+    terminal: Arc<Terminal>,
     http: reqwest::Client,
     grant: Grant,
     /// The Cloudflare API's base URL. Tests point it at a local server.
@@ -694,7 +686,7 @@ impl Cloud for Session {
 
 impl Session {
     /// Logs in with Cloudflare and returns once the code is exchanged for a grant, before any other call.
-    async fn login(args: &LoginArgs) -> Result<Session, CliError> {
+    async fn login(args: &LoginArgs, terminal: Arc<Terminal>) -> Result<Session, CliError> {
         let http = koidrive_cloudflare::http_client().map_err(|error| error.to_string())?;
         let loopback = if args.no_browser {
             None
@@ -709,9 +701,10 @@ impl Session {
         let page = login.authorize_url();
         let code = match &loopback {
             Some(loopback) => {
-                println!(
-                    "Log in with Cloudflare in your browser. If it does not open, open this page:\n{page}"
+                terminal.message(
+                    "Log in with Cloudflare in your browser. If it does not open, open this page:",
                 );
+                terminal.message(page.as_str());
                 open_browser(&page);
                 tokio::time::timeout(LOGIN_WAIT, loopback.callback(&login))
                     .await
@@ -723,13 +716,14 @@ impl Session {
                     })??
             }
             None => {
-                println!(
-                    "Open this page on any device, log in with Cloudflare and select Authorize:\n{page}"
+                terminal.message(
+                    "Open this page on any device, log in with Cloudflare and select Authorize:",
                 );
-                println!(
-                    "The browser then fails to load a page on 127.0.0.1. Copy that page's address."
+                terminal.message(page.as_str());
+                terminal.message(
+                    "The browser then fails to load a page on 127.0.0.1. Copy that page's address.",
                 );
-                let pasted = prompt("Address: ").await?;
+                let pasted = terminal.input("Address", true).await?;
                 let url = Url::parse(&pasted)
                     .map_err(|error| CliError::usage(format!("that is not an address: {error}")))?;
                 login.code_from(&url)?
@@ -737,6 +731,7 @@ impl Session {
         };
         let grant = login.exchange(&http, code).await?;
         Ok(Session {
+            terminal,
             http,
             grant,
             api_base: Url::parse(API_BASE).expect("the API base is a URL"),
@@ -751,10 +746,14 @@ impl Session {
     /// Reads the one account the user picked on the consent page.
     async fn pick_account(&mut self) -> Result<(), CliError> {
         let accounts = self
-            .api()
-            .accounts()
-            .await
-            .map_err(|error| CliError::from(error).context("cannot list the account"))?;
+            .terminal
+            .wait("Checking your Cloudflare account...", async {
+                self.api()
+                    .accounts()
+                    .await
+                    .map_err(|error| CliError::from(error).context("cannot list the account"))
+            })
+            .await?;
         match <[Account; 1]>::try_from(accounts) {
             Ok([account]) => self.account = account,
             Err(accounts) => {
@@ -765,16 +764,17 @@ impl Session {
                 .into());
             }
         }
-        println!(
+        self.terminal.message(&format!(
             "Logged in to the Cloudflare account {}.",
             printable(&self.account.name)
-        );
+        ));
         Ok(())
     }
 
     /// Revokes the grant, retrying three times. A failure leaves the grant active until its tokens expire, so the user
     /// is told where to revoke it.
     async fn end(self) {
+        self.terminal.cancel().await;
         for attempt in 0..4 {
             match self.grant.revoke(&self.http).await {
                 Ok(()) => return,
@@ -1009,22 +1009,15 @@ impl Session {
             0 => return self.deploy(paths, device_name).await,
             1 => found.remove(0),
             _ => {
-                println!("The account has several Koidrive servers:");
-                for (index, server) in found.iter().enumerate() {
-                    println!(
-                        "  {}. {} at {}",
-                        index + 1,
-                        printable(&server.script.id),
-                        printable(server.url.as_str())
-                    );
-                }
-                let choice = prompt("Which one? ").await?;
-                let index = choice
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|index| (1..=found.len()).contains(index))
-                    .ok_or_else(|| format!("{choice:?} is not one of the numbers"))?;
-                found.remove(index - 1)
+                let choices = found
+                    .iter()
+                    .map(|server| format!("{} at {}", server.script.id, server.url))
+                    .collect();
+                let index = self
+                    .terminal
+                    .select("Choose your Koidrive server", choices)
+                    .await?;
+                found.remove(index)
             }
         };
         self.add_device(paths, server, device_name, true).await
@@ -1167,10 +1160,17 @@ impl Session {
                     format!("{reason} Run koi server upgrade, then this command again.").into(),
                 );
             }
-            if confirm(&format!("{reason} Upgrade it now?"), false, "--yes")
-                .await
-                .is_err()
+            if let Err(error) = confirm(
+                &self.terminal,
+                &format!("{reason} Upgrade it now?"),
+                false,
+                "--yes",
+            )
+            .await
             {
+                if error.code == Code::Interrupted {
+                    return Err(error);
+                }
                 return Err(
                     format!("{reason} Run koi server upgrade, then koi setup again.").into(),
                 );
@@ -1236,6 +1236,7 @@ impl Session {
         }
         if !server.script.tags.iter().any(|tag| tag == TAG) {
             confirm(
+                &self.terminal,
                 &format!(
                     "{} was deployed with the deploy button. A push to the repository the button created deploys that repository's code again and replaces this upgrade. Update that repository too, or disconnect its builds in the dashboard. Upgrade now?",
                     server.script.id
@@ -1343,6 +1344,7 @@ impl Session {
             script => format!("the Worker {script} and "),
         };
         confirm(
+            &self.terminal,
             &format!(
                 "Delete {worker}the R2 bucket {} in the {} jurisdiction with its {} objects? Every file in the bucket is lost, also anything another application stored there through R2's S3 API.",
                 state.bucket,
@@ -1640,9 +1642,14 @@ mod tests {
             _ => unreachable!(),
         };
 
-        let error = server(&paths, parse(&["koi", "server", "deploy"]), true)
-            .await
-            .unwrap_err();
+        let error = server(
+            &paths,
+            parse(&["koi", "server", "deploy"]),
+            true,
+            Arc::new(Terminal::new(true, false)),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.code, Code::AuthRequired);
         assert_eq!(
             error.next,
@@ -1650,7 +1657,9 @@ mod tests {
         );
 
         let action = parse(&["koi", "server", "upgrade", "--worker", "fb", "--no-browser"]);
-        let error = server(&paths, action, false).await.unwrap_err();
+        let error = server(&paths, action, false, Arc::new(Terminal::new(true, false)))
+            .await
+            .unwrap_err();
         assert_eq!(error.code, Code::AuthRequired);
         assert_eq!(
             error.next,
@@ -1690,7 +1699,14 @@ mod tests {
             (&["deploy", "--interactive"], &["deploy", "--interactive"]),
         ] {
             let argv = [&["koi", "server"][..], args].concat();
-            let error = server(&paths, parse(&argv), false).await.unwrap_err();
+            let error = server(
+                &paths,
+                parse(&argv),
+                false,
+                Arc::new(Terminal::new(true, false)),
+            )
+            .await
+            .unwrap_err();
             assert_eq!(error.code, Code::AuthRequired, "{args:?}");
             assert_eq!(
                 error.next,

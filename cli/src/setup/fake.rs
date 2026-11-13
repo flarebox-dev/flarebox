@@ -149,6 +149,7 @@ pub(super) async fn login(oauth: &Fake, api: Url) -> Session {
     let http = reqwest::Client::new();
     let grant = login.exchange(&http, code).await.unwrap();
     Session {
+        terminal: std::sync::Arc::new(crate::terminal::Terminal::new(true, false)),
         http,
         grant,
         api_base: api,

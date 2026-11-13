@@ -21,6 +21,7 @@ mod schema;
 mod service;
 mod setup;
 mod telemetry;
+mod terminal;
 
 use std::ffi::OsString;
 use std::io::{self, IsTerminal};
@@ -57,6 +58,7 @@ use crate::request::Begun;
 #[command(
     name = "koi",
     version,
+    color = terminal::clap_color(),
     about = "Koidrive sync client.",
     long_about = "Koidrive keeps your folders in sync through your own server.",
     after_help = "Commands ask questions only when a terminal is attached to stdin and stderr.\nAgents: start with koi status --json."
@@ -73,6 +75,12 @@ struct Cli {
         value_parser = schema_version
     )]
     json: Option<u32>,
+    #[arg(
+        long,
+        global = true,
+        help = "Use line-oriented output without color or animation"
+    )]
+    plain: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -308,6 +316,9 @@ fn schema_version(text: &str) -> Result<u32, String> {
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
+    if let Some(exit) = terminal::helper(&args) {
+        return exit;
+    }
     let command = command_path(&args);
     if let Some(error) = json_versions(&args).find_map(Result::err) {
         return finish(&command, true, Err(CliError::usage(error)), Vec::new());
@@ -330,6 +341,20 @@ fn main() -> ExitCode {
         return finish(&command, json, Ok(help_done(help, "")), Vec::new());
     };
     let reports_pending = command_args.reports_pending();
+    let interactive = match &command_args {
+        Command::Setup { login, .. } => login.interactive,
+        Command::Server { action } => action.login().is_some_and(|login| login.interactive),
+        _ => false,
+    };
+    let guided = setup::mode(
+        io::stdin().is_terminal(),
+        io::stderr().is_terminal(),
+        json,
+        std::env::var_os("CI").is_some(),
+        interactive,
+    )
+    .is_ok_and(|mode| mode == setup::Mode::Guided);
+    let terminal = Arc::new(terminal::Terminal::new(cli.plain, guided));
     let log_format = match &command_args {
         Command::Daemon { .. } if json => Some(LogFormat::Json),
         Command::Daemon { log_format } => Some(*log_format),
@@ -343,7 +368,11 @@ fn main() -> ExitCode {
         .then(|| service::this_service(&paths).ok())
         .flatten()
         .and_then(|service| logfile::CappedLog::of_stderr(service.log_file()));
-    init_logging(log_format, json, agent_log);
+    init_logging(
+        log_format,
+        json || !console::colors_enabled_stderr(),
+        agent_log,
+    );
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -358,54 +387,63 @@ fn main() -> ExitCode {
     let pending_paths = paths.clone();
     let telemetry_paths = paths.clone();
     let (name, flow, switch) = telemetry_of(&command_args);
-    let ask = match &command_args {
-        Command::Setup { login, .. } => setup::guided(json, login),
-        _ => false,
-    };
+    let ask = guided
+        && !daemon_run
+        && (matches!(command_args, Command::Setup { .. }) || telemetry::prompt_pending(&paths));
     let command_name = command.as_str();
+    let work_terminal = terminal.clone();
     runtime.block_on(async {
         let sigint = (!daemon_run).then(|| signal(SignalKind::interrupt()));
+        let sigterm = (!daemon_run).then(|| signal(SignalKind::terminate()));
         let interrupt = async move {
-            let Some(Ok(mut sigint)) = sigint else {
+            let (Some(Ok(mut sigint)), Some(Ok(mut sigterm))) = (sigint, sigterm) else {
                 return std::future::pending().await;
             };
             loop {
-                if sigint.recv().await.is_none() {
+                let received = tokio::select! {
+                    received = sigint.recv() => received.map(|()| 130),
+                    received = sigterm.recv() => received.map(|()| 143),
+                };
+                let Some(status) = received else {
                     return std::future::pending().await;
-                }
+                };
                 if !setup::in_session() {
-                    return Ok::<(), ()>(());
+                    return Ok::<u8, ()>(status);
                 }
             }
         };
         tokio::select! {
             done = async move {
                 telemetry::start(&paths, switch, name, flow).await;
-                let outcome = run(paths, command_args, json).await;
+                let outcome = run(paths, command_args, json, work_terminal.clone()).await;
                 telemetry::finish().await;
                 let pending = match reports_pending && (json || shows_banner) {
                     true => pending_questions(&pending_paths).await,
                     false => Vec::new(),
                 };
                 let succeeded = outcome.is_ok();
+                let prompt_eligible = outcome.as_ref().is_ok_and(|done| done.exit == 0);
                 if json && daemon_run && succeeded {
                     return ExitCode::SUCCESS;
                 }
                 let exit = finish(command_name, json, outcome, pending);
-                if ask && succeeded {
-                    telemetry::ask(&telemetry_paths).await;
+                if ask && prompt_eligible
+                    && let Err(error) = telemetry::ask(&telemetry_paths, &work_terminal).await
+                {
+                    return finish(command_name, json, Err(error), Vec::new());
                 }
                 exit
             } => done,
-            Ok(()) = interrupt => {
+            Ok(status) = interrupt => {
+                terminal.cancel().await;
                 let error = CliError::new(
                     Code::Interrupted,
-                    "interrupted by Ctrl-C; what the command already did stays done",
+                    if status == 143 { "stopped by SIGTERM; what the command already did stays done" } else { "interrupted by Ctrl-C; what the command already did stays done" },
                 );
                 telemetry::flush();
                 let _ = finish(&command, json, Err(error), Vec::new());
                 let _ = io::Write::flush(&mut io::stdout());
-                std::process::exit(Code::Interrupted.exit().into());
+                std::process::exit(status.into());
             }
         }
     })
@@ -454,7 +492,12 @@ fn telemetry_of(
 
 /// Runs the command. After one that may change the folders this profile links or its pairing, or `service start`, it
 /// brings the background service in line with the profile and reports it as `service`.
-async fn run(paths: Paths, command: Command, json: bool) -> Result<Done, CliError> {
+async fn run(
+    paths: Paths,
+    command: Command,
+    json: bool,
+    terminal: Arc<terminal::Terminal>,
+) -> Result<Done, CliError> {
     let asked = matches!(command, Command::Service { .. });
     let reconciles = asked
         || matches!(
@@ -469,7 +512,7 @@ async fn run(paths: Paths, command: Command, json: bool) -> Result<Done, CliErro
                         | setup::ServerAction::AddDevice { .. }
                 }
         );
-    let mut done = execute(paths.clone(), command, json).await?;
+    let mut done = execute(paths.clone(), command, json, terminal).await?;
     if reconciles {
         let report = service::reconcile(&paths, asked).await;
         let text = match report.text() {
@@ -493,14 +536,19 @@ async fn run(paths: Paths, command: Command, json: bool) -> Result<Done, CliErro
     Ok(done)
 }
 
-async fn execute(paths: Paths, command: Command, json: bool) -> Result<Done, CliError> {
+async fn execute(
+    paths: Paths,
+    command: Command,
+    json: bool,
+    terminal: Arc<terminal::Terminal>,
+) -> Result<Done, CliError> {
     match command {
         Command::Daemon { .. } => daemon(paths, json).await,
         Command::Status { check } => status(&paths, check).await,
         Command::Diagnose => diagnose::run(&paths).await,
         Command::Resolve { id, answer } => resolve(&paths, id, answer).await,
         Command::Setup { device, login } => {
-            setup::setup(&paths, &device.name(), &login, json).await
+            setup::setup(&paths, &device.name(), &login, json, terminal).await
         }
         Command::Join {
             code,
@@ -537,7 +585,7 @@ async fn execute(paths: Paths, command: Command, json: bool) -> Result<Done, Cli
             let claim = async { paired(&paths, ipc::run(&paths, request).await?) };
             telemetry::step(SetupStep::Claim, claim).await
         }
-        Command::Server { action } => setup::server(&paths, action, json).await,
+        Command::Server { action } => setup::server(&paths, action, json, terminal).await,
         Command::Space { action } => space(paths, action).await,
         Command::Folder { action } => folder(&paths, action).await,
         Command::Service {
@@ -2925,7 +2973,12 @@ mod tests {
             let paths = Paths::under(dir.path());
             let outcome = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                setup::server(&paths, action, false),
+                setup::server(
+                    &paths,
+                    action,
+                    false,
+                    Arc::new(terminal::Terminal::new(true, false)),
+                ),
             )
             .await
             .unwrap_or_else(|_| panic!("{args:?} waited for a login"));
