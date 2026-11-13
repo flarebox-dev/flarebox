@@ -346,6 +346,7 @@ enum Cut<'a> {
     OpeningDir(&'a Path),
     /// A removal's confirmation just opened this folder.
     Confirming(&'a Path),
+    Searching(&'a Path),
 }
 
 /// The entries one rescan observed, and the parts of the snapshot they replace.
@@ -855,6 +856,7 @@ impl Snapshot {
                 rules,
                 &scan.replaced,
                 again.as_fd(),
+                &mut *scan.cut,
             );
             unsettled.extend(outermost(rules.held().cloned().collect()));
             unsettled.sort();
@@ -1208,6 +1210,7 @@ struct Trees<'a> {
 /// a name the rules leave out, it is reported as ignored and the new one as
 /// created. That search looks only at those names and not below them, since
 /// a save by rename takes a path the same way and leaves no old file to find.
+#[allow(clippy::too_many_arguments)]
 fn find_ignored(
     changes: &mut Vec<Change>,
     trees: Trees<'_>,
@@ -1216,6 +1219,7 @@ fn find_ignored(
     rules: &mut Pending<'_>,
     scopes: &[PathBuf],
     root: BorrowedFd<'_>,
+    cut: &mut dyn FnMut(Cut<'_>),
 ) {
     let Trees { old, new, rest } = trees;
     let roots = outermost(held.keys().cloned().collect());
@@ -1248,6 +1252,7 @@ fn find_ignored(
         rules,
         scopes,
         root,
+        cut,
     );
     for change in changes.iter_mut() {
         match change {
@@ -1275,6 +1280,7 @@ fn hold_back(
     rules: &mut Pending<'_>,
     scopes: &[PathBuf],
     root: BorrowedFd<'_>,
+    cut: &mut dyn FnMut(Cut<'_>),
 ) {
     let Trees { old, new, rest } = trees;
     let replaced: BTreeSet<PathBuf> = (changes.iter())
@@ -1349,7 +1355,7 @@ fn hold_back(
         .filter(|path| earlier.unscanned(path) && !present.contains(&key(path)))
         .collect();
     wanted.extend(seeded.iter().map(|path| (key(path), None)));
-    let undecided = rules.search(root, &mut wanted, &fresh, seeded.is_empty());
+    let undecided = rules.search(root, &mut wanted, &fresh, seeded.is_empty(), cut);
     let relocated = |path: &Path| {
         unaside(
             &(path.ancestors().skip(1))
@@ -1374,7 +1380,7 @@ fn hold_back(
         Change::Removed { .. } | Change::Ignored { .. } => false,
     });
     if taken {
-        rules.search(root, &mut wanted, &HashSet::new(), false);
+        rules.search(root, &mut wanted, &HashSet::new(), false, cut);
         deferred.clear();
     }
     let mut kept = BTreeMap::new();
