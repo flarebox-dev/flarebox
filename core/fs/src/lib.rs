@@ -1368,14 +1368,16 @@ fn hold_back(
             .entry((new[path].id, new[path].kind))
             .or_default() += 1;
     }
+    let mut exempt: BTreeSet<&PathBuf> = BTreeSet::new();
+    for path in removed.iter().chain(held.iter().copied()) {
+        if let Some(left @ 1..) = overwrites.get_mut(&key(path)) {
+            *left -= 1;
+            exempt.insert(path);
+        }
+    }
+    held.retain(|path| !exempt.contains(path));
     let searched: Vec<&PathBuf> = (removed.iter())
-        .filter(|path| match overwrites.get_mut(&key(path)) {
-            Some(left @ 1..) => {
-                *left -= 1;
-                false
-            }
-            _ => true,
-        })
+        .filter(|path| !exempt.contains(path))
         .collect();
     let gone: Vec<&PathBuf> = (searched.iter().copied())
         .chain(held.iter().copied())
