@@ -28,18 +28,22 @@ struct QuestionsView: View {
             }
             .navigationSplitViewColumnWidth(min: 240, ideal: 260)
         } detail: {
-            if let question = model.state.questions.first(where: { $0.id == selection }) {
-                QuestionDetail(question: question, folder: model.folder(spaceID: question.spaceId))
-                    .id(question.id)
-                    .frame(minWidth: 480, minHeight: 360)
-            } else {
-                ContentUnavailableView(
-                    "Nothing needs you",
-                    systemImage: "checkmark.circle",
-                    description: Text("Decisions Koidrive needs from you appear here.")
-                )
+            Group {
+                if let question = model.state.questions.first(where: { $0.id == selection }) {
+                    QuestionDetail(question: question, folder: model.folder(spaceID: question.spaceId))
+                        .id(question.id)
+                        .frame(minWidth: 480, minHeight: 360)
+                } else {
+                    ContentUnavailableView(
+                        "Nothing needs you",
+                        systemImage: "checkmark.circle",
+                        description: Text("Decisions Koidrive needs from you appear here.")
+                    )
+                }
             }
+            .buttonStyle(.secondary)
         }
+        .buttonStyle(.automatic)
         .navigationTitle("Needs You")
         .onAppear(perform: seen)
         .onChange(of: model.unseenQuestionIDs) { seen() }
@@ -174,8 +178,7 @@ private struct QuestionDetail: View {
                         .truncationMode(.middle)
                     Spacer()
                     Button("Copy Path") { copy(fullPath(selectedItem)) }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(Color.koiText)
+                        .controlSize(.small)
                 }
                 .font(.caption)
                 .padding(.horizontal, 20)
@@ -215,10 +218,9 @@ private struct QuestionDetail: View {
             ForEach(orderedAnswers, id: \.self) { answer in
                 if answer == primaryAnswer {
                     Button(question.title(for: answer)) { choose(answer) }
-                        .buttonStyle(.prominent)
+                        .buttonStyle(.primary)
                 } else {
                     Button(question.title(for: answer), role: answer.isDestructive ? .destructive : nil) { choose(answer) }
-                        .foregroundStyle(answer.isDestructive ? Color.statusRed : .primary)
                 }
             }
         }
@@ -301,11 +303,10 @@ struct ConfirmSheet: View {
                 Button(action: confirm) {
                     Text(action).frame(maxWidth: .infinity)
                 }
-                .buttonStyle(DestructiveFillButtonStyle())
+                .buttonStyle(.destructiveConfirm)
                 Button(action: cancel) {
                     Text("Cancel").frame(maxWidth: .infinity)
                 }
-                .controlSize(.large)
                 .keyboardShortcut(.defaultAction)
                 .keyboardShortcut(.cancelAction)
             }
@@ -313,16 +314,6 @@ struct ConfirmSheet: View {
         }
         .padding(20)
         .frame(width: 280)
-    }
-}
-
-struct DestructiveFillButtonStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.body.weight(.medium))
-            .foregroundStyle(.white)
-            .padding(.vertical, 5)
-            .background(RoundedRectangle(cornerRadius: 6).fill(Color.redFill.opacity(configuration.isPressed ? 0.8 : 1)))
     }
 }
 

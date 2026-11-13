@@ -136,10 +136,13 @@ private struct FolderRow: View {
                     .foregroundStyle(folder.state == .halted ? Color.statusRed : .secondary)
             }
             .font(.callout)
-            Button("Show in Finder") {
-                NSWorkspace.shared.open(URL(filePath: folder.path, directoryHint: .isDirectory))
+            Group {
+                Button("Show in Finder") {
+                    NSWorkspace.shared.open(URL(filePath: folder.path, directoryHint: .isDirectory))
+                }
+                Button("Unlink…", action: unlink)
             }
-            Button("Unlink…", action: unlink)
+            .controlSize(.small)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -239,6 +242,7 @@ struct AccountSettings: View {
                                 Button("Add a Device…") {
                                     perform { pairing = try await model.startPairing() }
                                 }
+                                .controlSize(.small)
                             }
                         }
                         if let error {
@@ -246,8 +250,7 @@ struct AccountSettings: View {
                         }
                         HStack {
                             Spacer()
-                            Button("Sign Out…") { confirmingSignOut = true }
-                                .foregroundStyle(Color.statusRed)
+                            Button("Sign Out…", role: .destructive) { confirmingSignOut = true }
                         }
                         .padding(.top, 8)
                     }
@@ -369,8 +372,8 @@ private struct DeviceRow: View {
             }
             Spacer()
             if !device.thisDevice {
-                Button("Remove…", action: remove)
-                    .foregroundStyle(Color.statusRed)
+                Button("Remove…", role: .destructive, action: remove)
+                    .controlSize(.small)
             }
         }
     }
@@ -570,6 +573,7 @@ private struct ProblemRow: View {
                         NSWorkspace.shared.open(parent)
                     }
                 }
+                .controlSize(.small)
             }
         }
         .padding(12)
@@ -615,6 +619,7 @@ struct GeneralSettings: View {
                     Spacer()
                     if loginItemStatus == .requiresApproval {
                         Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
+                            .controlSize(.small)
                     }
                     Toggle("Open Koidrive at login", isOn: $openAtLogin)
                         .labelsHidden()
