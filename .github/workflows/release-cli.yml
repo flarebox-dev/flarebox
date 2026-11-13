@@ -306,7 +306,10 @@ jobs:
   macos-app:
     name: macOS app
     if: github.event_name == 'push'
+    needs: [build, release-ref]
     uses: ./.github/workflows/release-macos.yml
+    with:
+      main-checked: true
     secrets:
       MACOS_DEVELOPER_ID_P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 }}
       MACOS_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}

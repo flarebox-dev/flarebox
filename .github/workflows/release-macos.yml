@@ -10,6 +10,11 @@ name: macOS release
 
 on:
   workflow_call:
+    inputs:
+      main-checked:
+        description: The caller already refused a commit that is not on main, so the signing job starts without checking again and its approval prompt appears together with the caller's.
+        type: boolean
+        default: false
     outputs:
       dmg-artifact:
         description: Name of the workflow artifact that holds the signed disk image
@@ -53,7 +58,7 @@ env:
 jobs:
   release-ref:
     name: macos release (commit on main)
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: (github.event_name == 'push' && !inputs.main-checked) || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -81,7 +86,9 @@ jobs:
   release:
     name: macos release
     needs: release-ref
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: >-
+      !cancelled() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && (needs.release-ref.result == 'success' || (inputs.main-checked && needs.release-ref.result == 'skipped'))
     runs-on: xcode-27
     timeout-minutes: 360
     environment: macos-release

@@ -67,7 +67,7 @@ Only repository admins can then create, move or delete `v*` tags; everyone else,
 4. Deselect **Allow administrators to bypass configured protection rules** and click **Save protection rules**.
 5. Under "Deployment branches and tags", choose **Selected branches and tags**. Click **Add deployment branch or tag rule**, choose **Branch** as the ref type, type `main` and click **Add rule**. Click it again, choose **Tag**, type `v*` and click **Add rule**.
 
-Each signed run then waits on its run page until you click **Review deployments**, select `macos-release` and **Approve and deploy**. A tag run of the CLI distribution workflow asks twice: once when the app job starts, and again when the CLI tarballs are ready for signing. Approve only runs for a commit and version you meant to release ([Managing environments for deployment](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)).
+Each signed run then waits on its run page until you click **Review deployments**, select `macos-release` and **Approve and deploy**. On a tag run of the CLI distribution workflow, the app and the CLI signing jobs both start once the CLI tarballs are built, so one approval covers both. Approve only runs for a commit and version you meant to release ([Managing environments for deployment](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)).
 
 ### 3. Keep the secrets in the environment only
 
