@@ -538,7 +538,7 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
         try {
           info = await this.spaceStub(args.spaceId).rewindInfo(point);
         } catch (error) {
-          console.error("rewind admission failed", error);
+          console.error("rewind admission failed", error instanceof Error ? error.name + ": " + error.message : String(error));
           return failure(Error_Code.RETRY_LATER, "the space could not be read; retry the rewind");
         }
         if (info.historyId !== args.expectedHistoryId) return failure(Error_Code.HISTORY_MISMATCH, "expected_history_id is not the space's current history");
