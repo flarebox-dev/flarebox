@@ -687,6 +687,72 @@ fn a_scoped_rescan_finds_a_hard_link_outside_its_scope_as_a_full_one_does() {
 }
 
 #[test]
+fn a_link_moved_into_an_ignored_folder_while_another_link_stays_included_is_ignored() {
+    for (scope, budget) in [
+        (whole().to_vec(), usize::MAX),
+        (vec![PathBuf::from("f.txt")], usize::MAX),
+        (whole().to_vec(), 100),
+    ] {
+        let dir = large_ignored_tree();
+        let root = dir.path();
+        write(root, "f.txt", "f");
+        fs::hard_link(root.join("f.txt"), root.join("also.txt")).unwrap();
+        let mut rules = rules().with_search_budget(budget);
+        let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
+        let id = snapshot.entries[Path::new("f.txt")].id;
+        fs::rename(root.join("f.txt"), root.join("ig/zz/deep/f.txt")).unwrap();
+
+        let mut paths = scope.clone();
+        let mut changes = Vec::new();
+        for _ in 0..20 {
+            let rescan = snapshot.rescan_with_rules(root, paths, &mut rules).unwrap();
+            changes.extend(rescan.changes);
+            if rescan.unsettled.is_empty() {
+                break;
+            }
+            paths = rescan.unsettled;
+        }
+        assert_eq!(
+            changes,
+            [Change::Ignored {
+                from: "f.txt".into(),
+                to: "ig/zz/deep/f.txt".into(),
+                kind: File,
+                id,
+            }],
+            "{scope:?} {budget}"
+        );
+        assert!(snapshot.entries.contains_key(Path::new("also.txt")));
+    }
+}
+
+#[test]
+fn a_link_removed_while_another_link_stays_included_is_removed() {
+    for budget in [usize::MAX, 100] {
+        let dir = large_ignored_tree();
+        let root = dir.path();
+        write(root, "f.txt", "f");
+        fs::hard_link(root.join("f.txt"), root.join("also.txt")).unwrap();
+        let mut rules = rules().with_search_budget(budget);
+        let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
+        fs::remove_file(root.join("f.txt")).unwrap();
+
+        let mut paths = whole().to_vec();
+        let mut changes = Vec::new();
+        for _ in 0..20 {
+            let rescan = snapshot.rescan_with_rules(root, paths, &mut rules).unwrap();
+            changes.extend(rescan.changes);
+            if rescan.unsettled.is_empty() {
+                break;
+            }
+            paths = rescan.unsettled;
+        }
+        assert_eq!(changes, [removed("f.txt", File)], "{budget}");
+        assert!(snapshot.entries.contains_key(Path::new("also.txt")));
+    }
+}
+
+#[test]
 fn a_held_entry_under_a_folder_that_cannot_be_read_is_not_removed() {
     use std::os::unix::fs::PermissionsExt;
     for left_out in [false, true] {
