@@ -852,6 +852,72 @@ fn a_file_moved_over_another_out_of_a_removed_folder_with_an_older_link_in_an_ig
 }
 
 #[test]
+fn a_file_moved_over_another_out_of_a_removed_folder_is_removed_through_a_bounded_search() {
+    for budget in [usize::MAX, 100] {
+        let dir = large_ignored_tree();
+        let root = dir.path();
+        write(root, "d/f", "f");
+        write(root, "x", "x");
+        fs::hard_link(root.join("d/f"), root.join("ig/zz/deep/l")).unwrap();
+        let mut rules = rules().with_search_budget(budget);
+        let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
+        fs::rename(root.join("d/f"), root.join("x")).unwrap();
+        fs::remove_dir(root.join("d")).unwrap();
+
+        let mut paths = whole().to_vec();
+        let mut changes = Vec::new();
+        for _ in 0..50 {
+            let rescan = snapshot.rescan_with_rules(root, paths, &mut rules).unwrap();
+            changes.extend(rescan.changes);
+            if rescan.unsettled.is_empty() {
+                break;
+            }
+            paths = rescan.unsettled;
+        }
+        changes.sort_by_key(|change| format!("{change:?}"));
+        assert_eq!(
+            changes,
+            [Change::Modified { path: "x".into() }, removed("d", Dir)],
+            "{budget}"
+        );
+    }
+}
+
+#[test]
+fn a_file_moved_over_another_out_of_a_removed_folder_is_removed_by_fresh_rules_through_a_bounded_search()
+ {
+    for budget in [100, 3] {
+        let dir = large_ignored_tree();
+        let root = dir.path();
+        write(root, "d/f", "f");
+        write(root, "x", "x");
+        fs::hard_link(root.join("d/f"), root.join("ig/zz/deep/l")).unwrap();
+        let mut snapshot =
+            Snapshot::scan_with_rules(root, &mut rules().with_search_budget(budget)).unwrap();
+        fs::rename(root.join("d/f"), root.join("x")).unwrap();
+        fs::remove_dir(root.join("d")).unwrap();
+
+        let mut rules = rules().with_search_budget(budget);
+        let mut paths = whole().to_vec();
+        let mut changes = Vec::new();
+        for _ in 0..1000 {
+            let rescan = snapshot.rescan_with_rules(root, paths, &mut rules).unwrap();
+            changes.extend(rescan.changes);
+            if rescan.unsettled.is_empty() {
+                break;
+            }
+            paths = rescan.unsettled;
+        }
+        changes.sort_by_key(|change| format!("{change:?}"));
+        assert_eq!(
+            changes,
+            [Change::Modified { path: "x".into() }, removed("d", Dir)],
+            "{budget}"
+        );
+    }
+}
+
+#[test]
 fn a_link_removed_while_another_link_stays_included_is_removed() {
     for budget in [usize::MAX, 100] {
         let dir = large_ignored_tree();
@@ -1380,13 +1446,11 @@ fn a_file_moved_over_another_out_of_a_deferred_folder_leaves_with_the_folder() {
     let rescan = snapshot
         .rescan_with_rules(root, whole(), &mut rules)
         .unwrap();
+    assert_eq!(rescan.changes, []);
     assert_eq!(
-        rescan.changes,
-        [Change::Modified {
-            path: "top.txt".into()
-        }]
+        rescan.unsettled,
+        [PathBuf::from("b/c"), PathBuf::from("top.txt")]
     );
-    assert_eq!(rescan.unsettled, [PathBuf::from("b/c")]);
     assert_eq!(known(&snapshot), [RULES_FILE, "b", "top.txt"]);
 
     let mut paths = rescan.unsettled;
@@ -1400,12 +1464,17 @@ fn a_file_moved_over_another_out_of_a_deferred_folder_leaves_with_the_folder() {
     };
     assert_eq!(
         changes,
-        [Change::Ignored {
-            from: "b/c".into(),
-            to: "ig/zz/deep/c".into(),
-            kind: Dir,
-            id,
-        }]
+        [
+            Change::Ignored {
+                from: "b/c".into(),
+                to: "ig/zz/deep/c".into(),
+                kind: Dir,
+                id,
+            },
+            Change::Modified {
+                path: "top.txt".into(),
+            },
+        ]
     );
 }
 
