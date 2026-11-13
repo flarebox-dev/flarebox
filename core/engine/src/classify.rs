@@ -1006,10 +1006,12 @@ impl Trees {
     }
 
     /// The nodes whose content L and S hold as R holds it live, a folder's as any folder's, where no
-    /// commit of this device made R's record: `made_here` tells whether a seq is one of this
-    /// device's commits. For [`Trees::forget_lost`] once a bootstrap has replaced R.
+    /// commit of this device made R's record and L holds no unsent edit ([`Trees::unsent_edits`]):
+    /// `made_here` tells whether a seq is one of this device's commits. For [`Trees::forget_lost`]
+    /// once a bootstrap has replaced R.
     pub fn taken_from_others(&self, made_here: impl Fn(u64) -> bool) -> Vec<NodeId> {
         (self.s.iter())
+            .filter(|(id, _)| !self.unsent_edits.contains(*id))
             .filter(|(id, synced)| {
                 let holds = |shape: Option<&Shape>| {
                     shape.is_some_and(|shape| match (&shape.content, &synced.content) {
@@ -1259,6 +1261,18 @@ impl Trees {
             } else {
                 self.set_synced(id, None);
             }
+        }
+        let trashed: BTreeSet<NodeId> = (self.resends.iter())
+            .flat_map(|id| {
+                std::iter::successors(Some(id.as_str()), |id| {
+                    self.l.get(id).map(|node| node.shape.parent.as_str())
+                })
+            })
+            .filter(|id| self.r.get(id).is_some_and(|remote| remote.trashed))
+            .map(str::to_owned)
+            .collect();
+        for id in trashed {
+            self.yield_resends(&id);
         }
         let unproven: Vec<NodeId> = (self.watched_positions.iter())
             .filter(|(id, agreed)| {

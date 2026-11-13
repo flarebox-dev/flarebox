@@ -6960,3 +6960,49 @@ fn r_keeps_the_newest_versions_a_file_held() {
     trees.remove_remote("a");
     assert!(trees.state().replaced_versions.is_empty());
 }
+
+#[test]
+fn an_unsent_edit_with_the_bytes_of_a_download_the_server_lost_beats_a_later_delete() {
+    let (commits, mut trees, _) = downloaded_at_5();
+    let mut state = trees.state();
+    state.unsent_edits.insert("a".into());
+    state.dirty.insert("a".into());
+    trees.restore(state).unwrap();
+    trees.settle();
+    list_after_a_loss(
+        &mut trees,
+        &commits,
+        version(remote(file(ROOT, "a", 1)), "v1"),
+    );
+    let deleted = RemoteNode {
+        meta_rev: 6,
+        ..trashed(file(ROOT, "a", 1))
+    };
+    trees.set_remote("a".into(), deleted);
+    trees.settle();
+    assert_eq!(trees.unsent_edits().iter().collect::<Vec<_>>(), ["a"]);
+    assert_eq!(trees.class("a"), Class::Local);
+}
+
+#[test]
+fn a_lost_create_under_a_folder_deleted_after_the_loss_is_not_sent_again() {
+    let mut trees = trees(&[synced("f", dir(ROOT, "f")), synced("c", file("f", "c", 1))]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let synced = trees.taken_from_others(|_| false);
+    let deleted = RemoteNode {
+        meta_rev: 3,
+        ..trashed(dir(ROOT, "f"))
+    };
+    trees.set_listed_remote("f".into(), deleted);
+    trees.remove_remote("c");
+    trees.forget_lost(
+        Vec::new(),
+        Vec::new(),
+        synced,
+        commits.held_through(),
+        commits.accepted(),
+    );
+    trees.settle();
+    assert_eq!(trees.class("c"), Class::Remote);
+    assert!(build(&mut commits, &mut trees, &mut ids).is_none());
+}
