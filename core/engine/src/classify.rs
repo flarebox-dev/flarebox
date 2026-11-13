@@ -461,9 +461,7 @@ impl Trees {
         }
         let edited_here = made_here
             && !node.trashed
-            && (self.r.get(&id)).is_some_and(|old| {
-                old.edit_rev != node.edit_rev && old.content_rev != node.content_rev
-            });
+            && (self.r.get(&id)).is_some_and(|old| old.edit_rev != node.edit_rev);
         let shape = node.shape.clone();
         if edited_here {
             self.edited_here.insert(id.clone(), node.edit_rev);

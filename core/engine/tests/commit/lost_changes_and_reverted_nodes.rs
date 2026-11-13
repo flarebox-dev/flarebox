@@ -1558,3 +1558,54 @@ fn an_untaken_edit_another_device_moved_after_the_loss_stays_where_it_moved() {
     let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
     assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
 }
+
+#[test]
+fn content_l_went_back_to_while_its_equal_edit_was_in_flight_is_sent_after_a_loss() {
+    let mut trees = trees(&[synced("n", file(ROOT, "n", 1))]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    commit_file(&mut trees, &mut commits, &mut ids, "p", 2);
+    trees.set_local("n".into(), local(file(ROOT, "n", 2), 101));
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 2)]);
+    let resent = RemoteNode {
+        content_rev: 3,
+        ..remote(file(ROOT, "n", 2))
+    };
+    trees.set_remote("n".into(), resent);
+    let in_flight = RemoteNode {
+        content_rev: 3,
+        edit_rev: 4,
+        ..remote(file(ROOT, "n", 2))
+    };
+    trees.set_remote_made_here("n".into(), in_flight);
+    trees.set_local("n".into(), local(file(ROOT, "n", 1), 102));
+    trees.settle();
+    assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
+    let (trashed, edited) = (trees.trashed_here(), trees.edited_here());
+    let synced = trees.taken_from_others(|seq| commits.lost_here(seq));
+    let untaken = trees.untaken_edits(|seq| commits.lost_here(seq));
+    trees.set_listed_remote("n".into(), remote_at(file(ROOT, "n", 7), 1));
+    trees.remove_remote("p");
+    trees.forget_lost(
+        trashed,
+        edited,
+        synced,
+        trees.moved_here(),
+        untaken,
+        commits.held_through(),
+        commits.accepted(),
+    );
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(
+        ops(&commit).iter().any(|op| matches!(
+            op,
+            op::Op::CreateFile(proto::CreateFile { content: Some(content), .. })
+                | op::Op::UpdateContent(proto::UpdateContent { content: Some(content), .. })
+                if content.manifest_digest[..] == [1u8; 32][..]
+        )),
+        "{:?}",
+        ops(&commit)
+    );
+}
