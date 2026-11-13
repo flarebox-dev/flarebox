@@ -83,6 +83,11 @@ enum Snapshots {
         let (server, serverApp) = start(claimed: false)
         server.serverURL = "https://koi.example.com"
 
+        let (unreachable, unreachableApp) = start(claimed: false)
+        unreachable.serverURL = "https://koi.exmaple.com"
+        unreachableApp.session.fakeCore()?.failNext(error: .ServerUnreachable(reason: "A server with the specified hostname could not be found."))
+        await unreachable.connect()
+
         let decidedApp = AppModel.preview(.firstRun, telemetry: TelemetrySetting(enabled: true, decided: true, locked: false))
         let decided = SetupModel(app: decidedApp, mode: .firstRun, deviceName: "Gunwoo's MacBook Pro")
         decided.serverURL = "https://koi.example.com"
@@ -93,6 +98,11 @@ enum Snapshots {
         pair.code = "K7Q4-M2XD"
         pairApp.session.fakeCore()?.failNext(error: .InvalidCode)
         await pair.signIn()
+
+        let (pairing, pairingApp) = start(claimed: true)
+        pairing.serverURL = "https://koi.example.com"
+        await pairing.connect()
+        pairing.code = "K7Q4-M2XD"
 
         let (claim, claimApp) = start(claimed: false)
         claim.serverURL = "https://koi.example.com"
@@ -111,6 +121,23 @@ enum Snapshots {
         try? FileManager.default.createDirectory(at: projects, withIntermediateDirectories: true)
         folder.folderPath = projects.path(percentEncoded: false)
 
+        func addFolder() -> (SetupModel, AppModel) {
+            let app = AppModel.preview(.upToDate)
+            return (SetupModel(app: app, mode: .addFolder, deviceName: "Gunwoo's MacBook Pro"), app)
+        }
+        let documents = FileManager.default.temporaryDirectory.appending(path: "Documents", directoryHint: .isDirectory)
+        try? FileManager.default.createDirectory(at: documents, withIntermediateDirectories: true)
+        let (existing, existingApp) = addFolder()
+        await existing.loadSpaces()
+        existing.folderPath = documents.path(percentEncoded: false)
+        let (noFolder, noFolderApp) = addFolder()
+        await noFolder.loadSpaces()
+        let (overlap, overlapApp) = addFolder()
+        await overlap.loadSpaces()
+        overlap.folderPath = documents.path(percentEncoded: false)
+        overlapApp.session.fakeCore()?.failNext(error: .FolderOverlaps(other: "~/Koidrive/Photos"))
+        await overlap.link()
+
         let (done, doneApp) = start(claimed: false)
         done.serverURL = "https://koi.example.com"
         await done.connect()
@@ -121,8 +148,12 @@ enum Snapshots {
         done.folderPath = projects.path(percentEncoded: false)
         await done.link()
 
-        return [("1-server", server, serverApp), ("1b-server-decided", decided, decidedApp), ("2a-sign-in-error", pair, pairApp), ("2b-claim", claim, claimApp),
-                ("3-folder", folder, folderApp), ("4-done", done, doneApp)]
+        return [("1-server", server, serverApp), ("1a-server-error", unreachable, unreachableApp),
+                ("1b-server-decided", decided, decidedApp), ("2-sign-in", pairing, pairingApp),
+                ("2a-sign-in-error", pair, pairApp), ("2b-claim", claim, claimApp),
+                ("3-folder", folder, folderApp), ("3a-folder-existing", existing, existingApp),
+                ("3b-folder-none", noFolder, noFolderApp), ("3c-folder-overlap", overlap, overlapApp),
+                ("4-done", done, doneApp)]
     }
 
     private static func settingsStates() async -> [(String, AnyView)] {
