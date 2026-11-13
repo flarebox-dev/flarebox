@@ -28,7 +28,7 @@ mod tests {
     unsafe extern "C" {
         fn fork() -> i32;
         fn close(fd: i32) -> i32;
-        fn read(fd: i32, buffer: *mut u8, count: usize) -> isize;
+        fn read(fd: i32, buffer: *mut std::ffi::c_void, count: usize) -> isize;
         fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
         fn _exit(status: i32) -> !;
     }
@@ -62,9 +62,9 @@ mod tests {
                             unsafe { close(fd) };
                         }
                     }
-                    let mut byte = 0;
+                    let mut byte = 0_u8;
                     unsafe {
-                        read(control, &mut byte, 1);
+                        read(control, std::ptr::from_mut(&mut byte).cast(), 1);
                         _exit(0);
                     }
                 }
