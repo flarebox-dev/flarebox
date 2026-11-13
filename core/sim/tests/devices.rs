@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use koidrive_engine::restore::RestoreIntent;
 use koidrive_engine::tree::Content;
 use koidrive_proto::v1::error;
 use koidrive_sim::world::disk::Place;
@@ -4312,6 +4313,30 @@ fn a_file_replaced_in_a_folder_moved_out_of_the_trash_keeps_its_name() {
     for device in 0..2 {
         let files = [("a".into(), None), ("b".into(), Some(new.clone()))];
         assert_eq!(files_on(&world, device), files, "device {device}");
+    }
+}
+
+#[test]
+fn a_file_its_user_removed_and_then_restores_from_the_trash_stays_restored() {
+    let synced = vec![(0, folder("a")), (0, user(1, 0, 1, "b"))];
+    let mut racing = vec![(0, delete(0))];
+    racing.extend(commit(0));
+    racing.extend([(1, delete(1)), (1, SCAN), (1, DELIVER)]);
+    let mut world = converge(2, &[synced, racing]).unwrap();
+    let engine = &mut world.devices[1].engine;
+    let b = (engine.trees.remote().iter())
+        .find(|(_, node)| node.shape.name == "b")
+        .map(|(id, _)| id.clone())
+        .unwrap();
+    let request = engine.ids.uuid_v7(1_700_000_000_000);
+    let intent = RestoreIntent::from_trash(b, None, None).unwrap();
+    assert!(engine.commits.restore(request, intent));
+    world.phase(2, &commit(1)).unwrap();
+    for device in 0..2 {
+        let names: Vec<String> = (files_on(&world, device).into_iter())
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["a", "b"], "device {device}");
     }
 }
 
