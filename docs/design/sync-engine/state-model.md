@@ -264,7 +264,7 @@ These ordering rules keep the counter comparison sound:
 A store restored to before it applied a remote change, with no commit of its own since, still shows *w* = *a*, yet the disk holds effects the store does not remember. So the store keeps an effect counter *e*, the number of disk effects it has acknowledged, and the root marker `.koidrive/space.json` (§6.2) keeps a copy *m*.
 
 - The effects of a batch of *n* are recorded in the store first (§5.2). Before the batch touches the disk, the driver writes *e* + *n* to the marker and flushes it. The transaction that clears the batch, each effect done or failed, sets *e* to that value. A healthy device has *m* = *e*, or *m* = *e* + *n* while a batch of *n* is in flight.
-- On startup, after recovering the effects in flight (§5.3) and before planning from a rescan, the driver compares the two. When *m* is above *e* plus the number of effects recorded in flight, the store is older than the disk: nothing is planned from it, and the space enters recovery (§6.4) with the store as evidence.
+- On startup, before recovering the effects in flight (§5.3) and before planning from a rescan, the driver compares the two. When *m* is above *e* plus the number of effects recorded in flight, the store is older than the disk: nothing is recovered or planned from it, and the space enters recovery (§6.4) with the store as evidence.
 - When *m* is below *e*, the disk or its marker was restored from an older state. The space pauses with a problem (§6.2) instead of reading the older files as local edits.
 
 ### The commit in flight follows its history
