@@ -188,30 +188,63 @@ def comment_lines(src, lang):
 
 def rust_fns(src):
     lines = src.split("\n")
-    comments = comment_lines(src, "rust")
+    tokens = []
+    spans = comment_spans(src, "rust", tokens)
+    events, pos, k = [], 0, 0
+    for text, *_ in tokens:
+        while True:
+            while pos < len(src) and src[pos].isspace():
+                pos += 1
+            if k < len(spans) and spans[k][0] == pos:
+                start, end = spans[k]
+                if is_doc(src[start:end], "rust") and not src.startswith(("//!", "/*!"), start):
+                    events.append((src.count("\n", 0, start) + 1, None))
+                pos, k = end, k + 1
+            else:
+                break
+        assert src.startswith(text, pos), (text, pos)
+        events.append((src.count("\n", 0, pos) + 1, text))
+        pos += len(text)
     fns, seen = {}, {}
-    docs, top, depth = [], None, 0
-    for number, text in enumerate(lines, 1):
-        stripped = text.strip()
-        if depth:
-            depth += stripped.count("[") - stripped.count("]")
+    docs = []
+    i = 0
+    while i < len(events):
+        line, text = events[i]
+        if text is None:
+            docs.append(line)
+            i += 1
             continue
-        if not stripped:
-            continue
-        if stripped.startswith(("//", "/*", "*")) and number in comments:
-            if any(doc for doc, _ in comments[number]) and not stripped.startswith(("//!", "/*!")):
-                docs.append(stripped)
-                top = top or number
-            continue
-        if stripped.startswith("#["):
-            depth = stripped.count("[") - stripped.count("]")
-            continue
-        m = RUST_FN.match(text)
-        if m:
-            name = m.group(2)
+        if text == "#":
+            j = i + 1 + (events[i + 1][1] == "!" if i + 1 < len(events) else 0)
+            if j < len(events) and events[j][1] == "[":
+                depth = 0
+                while j < len(events):
+                    depth += {"[": 1, "]": -1}.get(events[j][1], 0)
+                    j += 1
+                    if not depth:
+                        break
+                i = j
+                continue
+        j, public = i, False
+        if text == "pub":
+            public = True
+            j += 1
+            if j < len(events) and events[j][1] == "(":
+                public = False
+                while j < len(events) and events[j][1] != ")":
+                    j += 1
+                j += 1
+        while j < len(events) and (events[j][1] in ("const", "async", "unsafe", "extern") or (events[j - 1][1] == "extern" and (events[j][1] or "").startswith('"'))):
+            j += 1
+        name = events[j + 1][1] if j + 1 < len(events) and events[j][1] == "fn" else None
+        if name and IDENT.fullmatch(name):
             seen[name] = seen.get(name, 0) + 1
-            fns[(name, seen[name])] = ((m.group(1) or "").strip() == "pub", "\n".join(docs), number, text, top or number)
-        docs, top = [], None
+            doc_text = "\n".join(lines[n - 1].strip() for n in sorted(set(docs)))
+            fns[(name, seen[name])] = (public, doc_text, line, lines[line - 1], min(docs, default=line))
+            i = j + 2
+        else:
+            i += 1
+        docs = []
     return fns
 
 

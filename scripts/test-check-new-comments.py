@@ -311,6 +311,16 @@ class NewComments(unittest.TestCase):
             ("core/a/src/lib.rs", 6),
         )
 
+    def test_brackets_in_attribute_strings_and_comments_keep_the_doc_attached(self):
+        for attribute in ['#[allow(dead_code, reason = "[")]', '#[allow(dead_code, reason = "]")]', "#[allow(dead_code)] // [", "#[allow(/* ] */ dead_code)]"]:
+            with self.subTest(attribute=attribute):
+                self.assertFlags(
+                    {"core/a/src/lib.rs": f"/// Runs.\n{attribute}\npub fn a() {{}}\n"},
+                    {"core/a/src/lib.rs": f"/// Runs.\n{attribute}\nfn helper() {{}}\npub fn a() {{}}\n"},
+                    ("core/a/src/lib.rs", 3),
+                    ("core/a/src/lib.rs", 4),
+                )
+
     def test_deleting_a_pub_fn_doc_comment_passes(self):
         self.assertFlags(
             {"core/a/src/lib.rs": "/// Acknowledges.\npub fn ack() {}\n"},
