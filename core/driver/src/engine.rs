@@ -2334,9 +2334,17 @@ mod tests {
         root: &Path,
         rules: &mut koidrive_fs::Rules,
     ) -> Vec<PathBuf> {
-        let rescan = snapshot
-            .rescan_with_rules(root, [PathBuf::new()], rules)
-            .unwrap();
+        observe_scoped(engine, snapshot, root, rules, PathBuf::new())
+    }
+
+    fn observe_scoped(
+        engine: &mut Engine,
+        snapshot: &mut Snapshot,
+        root: &Path,
+        rules: &mut koidrive_fs::Rules,
+        scope: PathBuf,
+    ) -> Vec<PathBuf> {
+        let rescan = snapshot.rescan_with_rules(root, [scope], rules).unwrap();
         let entry = |path: &Path| snapshot.entries[path];
         let batch: Vec<Observed> = (rescan.changes.into_iter())
             .map(|change| match change {
@@ -2423,6 +2431,42 @@ mod tests {
             }
             let after = holding(&engine, "d/x.txt").map(|(id, _, _)| id);
             assert_eq!(after, Some(before), "budget {budget}");
+        }
+    }
+
+    #[test]
+    fn a_folder_moved_away_and_made_again_at_its_path_stays_in_l_at_both_when_the_paths_are_rescanned_apart()
+     {
+        for order in [["b", "a"], ["a", "b"]] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().to_path_buf();
+            fs::create_dir(root.join("a")).unwrap();
+            fs::write(root.join("a/f.txt"), "f").unwrap();
+            let mut rules = search_rules(usize::MAX);
+            let mut snapshot = Snapshot::default();
+            let (_dir, mut engine) = mapper();
+            observe_rescan(&mut engine, &mut snapshot, &root, &mut rules);
+            let (file, _, _) = holding(&engine, "a/f.txt").unwrap();
+            fs::rename(root.join("a"), root.join("b")).unwrap();
+            fs::create_dir(root.join("a")).unwrap();
+            for scope in order {
+                observe_scoped(&mut engine, &mut snapshot, &root, &mut rules, scope.into());
+            }
+            fs::write(root.join("a/g.txt"), "g").unwrap();
+            observe_scoped(&mut engine, &mut snapshot, &root, &mut rules, "a".into());
+
+            let folders = ["a", "b"].map(|path| holding(&engine, path).map(|(id, _, _)| id));
+            assert!(
+                matches!(&folders, [Some(a), Some(b)] if a != b),
+                "{order:?}: {folders:?}"
+            );
+            assert_eq!(
+                holding(&engine, "b/f.txt").map(|(id, _, _)| id),
+                Some(file),
+                "{order:?}"
+            );
+            assert!(holding(&engine, "a/g.txt").is_some());
+            assert!(holding(&engine, "a/f.txt").is_none());
         }
     }
 
