@@ -1264,3 +1264,69 @@ fn a_restore_of_a_folder_its_user_removed_downloads_the_files_in_it() {
     assert_eq!(trees.class(&f), Class::Remote);
     assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
 }
+
+#[test]
+fn a_restore_the_server_rejects_leaves_the_removal_a_later_move_out_of_the_trash_deletes_again() {
+    let (a, g, missing) = (id(1), id(2), id(3));
+    let folder = dir(&root(), "a");
+    let inside = file(&a, "g", 1);
+    let mut trees = trees(&[
+        (
+            a.clone(),
+            Some(folder.clone()),
+            Some(folder.clone()),
+            Some(trashed(folder)),
+        ),
+        (
+            g.clone(),
+            None,
+            Some(inside.clone()),
+            Some(trashed(inside.clone())),
+        ),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let intent = RestoreIntent::from_trash(a.clone(), Some(missing), None).unwrap();
+    assert!(commits.restore(id(100), intent.clone()));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [restore_op(&intent)]);
+    acknowledge(&mut commits, &mut trees, vec![rejected("NOT_FOUND")]);
+
+    let renamed = LocalNode {
+        shape: dir(&root(), "A"),
+        identity: FileIdentity {
+            dev: 1,
+            ino: 1,
+            birth_ns: Some(0),
+        },
+        parked: false,
+    };
+    trees.set_local(a.clone(), renamed);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    let moved = op::Op::Move(proto::Move {
+        node_id: a.clone(),
+        new_parent_id: root(),
+        new_name: "A".into(),
+        from: None,
+    });
+    assert_eq!(ops(&commit), [moved]);
+    let at_2 = |shape: Shape| RemoteNode {
+        meta_rev: 2,
+        ..remote(shape)
+    };
+    trees.set_remote_made_here(a.clone(), at_2(dir(&root(), "A")));
+    trees.set_remote_made_here(g.clone(), at_2(inside));
+    let result = CommitResult {
+        seq: 2,
+        results: vec![outcome(op_result::Code::Applied)],
+        ..Default::default()
+    };
+    commits.received(result).unwrap();
+    assert!(commits.acknowledge(&mut trees, 2));
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    let delete = op::Op::Delete(proto::Delete {
+        node_id: g.clone(),
+        requires: None,
+    });
+    assert_eq!(ops(&commit), [delete]);
+}

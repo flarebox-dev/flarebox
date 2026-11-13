@@ -828,11 +828,6 @@ impl Commits {
         if ops.is_empty() {
             return None;
         }
-        for op in &ops {
-            if let Some(op::Op::Restore(restore)) = &op.op {
-                trees.forget_removed(&restore.node_id);
-            }
-        }
         trees.watch_content(ops.iter().filter_map(|op| match &op.op {
             Some(op::Op::CreateFile(create)) => Some(create.node_id.clone()),
             Some(op::Op::UpdateContent(update)) => Some(update.node_id.clone()),
@@ -1217,6 +1212,28 @@ impl Commits {
                 _ => None,
             })
             .collect();
+        for (op, outcome) in flight.commit.ops.iter().zip(&result.results) {
+            let Some(op::Op::Restore(restore)) = &op.op else {
+                continue;
+            };
+            let code = op_result::Code::try_from(outcome.code);
+            if !matches!(
+                code,
+                Ok(op_result::Code::Applied | op_result::Code::AppliedRenamed)
+            ) {
+                continue;
+            }
+            let restored = BTreeSet::from([restore.node_id.as_str()]);
+            for (id, node) in trees.remote().iter() {
+                if !node.trashed
+                    && node.meta_rev == result.seq
+                    && trees.local().get(id).is_none()
+                    && (*id == restore.node_id || remote_below(trees, id, &restored))
+                {
+                    synced.set(id, None);
+                }
+            }
+        }
         for (index, (op, outcome)) in flight.commit.ops.iter().zip(&result.results).enumerate() {
             use op_result::Code;
             let code = Code::try_from(outcome.code).unwrap_or(Code::Unspecified);
