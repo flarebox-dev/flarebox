@@ -23,10 +23,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use koidrive_engine::commit::{Base, Commits, Failure, Halt as CommitHalt, Reconnect};
+use koidrive_engine::commit::{Base, Failure, Halt as CommitHalt, Reconnect};
 use koidrive_engine::effects::{self, Stuck};
 use koidrive_engine::ignore::LocalRules;
-use koidrive_engine::state::CommitsState;
 use koidrive_engine::tree::{RemoteNode, Tree};
 use koidrive_fs::{Snapshot, check_root};
 use koidrive_net::{
@@ -1048,11 +1047,7 @@ impl Folder {
         }
         let reconnect = self.step(|engine, tx| {
             if adopt {
-                let state = CommitsState {
-                    accepted: welcome.device_seq,
-                    ..engine.commits.state()
-                };
-                engine.commits = Commits::from_state(state).expect("no commit is in flight");
+                engine.commits.adopt(welcome.device_seq);
             }
             let reconnect = engine.commits.connected(welcome);
             if reconnect == Reconnect::AheadOfServer {

@@ -10,6 +10,7 @@ use koidrive_engine::classify::{Class, Trees};
 use koidrive_engine::effects::{Base, Dir, Displaced, Effect, EffectError, Effects, Location};
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::names::name_key;
+use koidrive_engine::state::{EffectsChanges, EffectsState, TreesChanges, TreesState};
 use koidrive_engine::tree::{
     Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape, same_content,
 };
@@ -291,14 +292,36 @@ fn space(nodes: &[(&str, Option<Shape>, Option<Shape>)]) -> (Trees, Disk) {
     (trees, disk)
 }
 
+fn take_changes(
+    trees: &mut Trees,
+    effects: &mut Effects,
+    kept: &mut (TreesState, EffectsState),
+) -> Result<(), String> {
+    let now = (trees.state(), effects.state());
+    let expected = (
+        TreesChanges::between(&kept.0, &now.0),
+        EffectsChanges::between(&kept.1, &now.1),
+    );
+    let taken = (trees.take_changes(), effects.take_changes());
+    *kept = now;
+    match taken == expected {
+        true => Ok(()),
+        false => Err(format!("took {taken:?}, the states differ by {expected:?}")),
+    }
+}
+
 /// Settles, plans and does effects until none is left, checking the trees and the disk after each.
 fn converge(trees: &mut Trees, disk: &mut Disk, budget: usize) -> Result<Vec<Effect>, String> {
     let (mut effects, mut ids, mut done) = (Effects::default(), IdGen::new(1), Vec::new());
+    trees.take_changes();
+    let mut kept = (trees.state(), effects.state());
     for _ in 0..=budget {
         trees.settle();
+        take_changes(trees, &mut effects, &mut kept)?;
         let Some(record) = effects.plan(trees, None, &mut ids, NOW).cloned() else {
             return Ok(done);
         };
+        take_changes(trees, &mut effects, &mut kept)?;
         if record.counter != effects.cleared() + 1 {
             return Err(format!("counter {}", record.counter));
         }
@@ -306,6 +329,7 @@ fn converge(trees: &mut Trees, disk: &mut Disk, budget: usize) -> Result<Vec<Eff
         effects
             .done(trees, None, &record.effect_id, created)
             .map_err(|e| format!("{e:?}"))?;
+        take_changes(trees, &mut effects, &mut kept)?;
         trees.check().map_err(|e| format!("{e:?}"))?;
         disk.matches(trees)?;
         done.push(record.effect);

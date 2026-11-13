@@ -1413,7 +1413,6 @@ dependencies = [
  "koidrive-proto",
  "proptest",
  "prost",
- "rustix",
  "serde",
  "unicode-normalization",
 ]

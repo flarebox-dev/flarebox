@@ -12,12 +12,13 @@ use prost::Message;
 use crate::classify::{Class, Origin, Trees, Waiting};
 use crate::effects;
 use crate::first_link;
-use crate::guard::{self, GuardState, RemoteRemoval};
+use crate::guard::{self, Guard, RemoteRemoval};
 use crate::ids::{IdGen, unix_ms};
 use crate::names::{MAX_NAME_BYTES, name_key, nfc};
 use crate::question::{Answer, ConflictFile, Question, QuestionKind, Revisions};
 use crate::restore::{Outcome, RESOLVED_KEPT, Rejection, Resolved, RestoreId, RestoreIntent};
-use crate::state::{Agreed, CommitsState, Pending, StateError};
+use crate::state::{Agreed, CommitsChanges, CommitsState, Pending, StateError};
+use crate::tracked::{Marked, TrackedMap, TrackedSet};
 use crate::tree::{Content, Kind, Names, NodeId, Shape, same, same_content};
 
 /// The most ops one commit holds (spec v0 section 13).
@@ -153,55 +154,97 @@ pub enum CommitError {
 /// server rejected an op for, the restores a person asked for, and whether committing has stopped.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Commits {
-    accepted: u64,
-    in_flight: Option<InFlight>,
-    problems: BTreeSet<NodeId>,
-    halted: Option<Halt>,
+    accepted: Marked<u64>,
+    in_flight: Marked<Option<InFlight>>,
+    problems: TrackedSet<NodeId>,
+    halted: Marked<Option<Halt>>,
     /// The most ops the next commit holds after a `LIMIT_EXCEEDED`, doubled back towards
     /// [`MAX_OPS`] by every acknowledged commit.
-    cap: Option<usize>,
+    cap: Marked<Option<usize>>,
     /// Folders whose delete did not fit alone, deleted contents first.
-    split: BTreeSet<NodeId>,
+    split: TrackedSet<NodeId>,
     /// Folders merged into one L holds elsewhere, by the folder they were merged into. Creates and
     /// moves into them go to that folder, and the nodes they bring are reverted, so on disk they
     /// follow into it. An alias ends with its folder's revert: a folder the user moves elsewhere
     /// is then created on its own, and what is created in it goes into it.
-    aliases: BTreeMap<NodeId, NodeId>,
+    aliases: TrackedMap<NodeId, NodeId>,
     /// Restores without an outcome, in request order (see [`Commits::restore`]).
-    restores: BTreeMap<RestoreId, RestoreIntent>,
+    restores: Marked<BTreeMap<RestoreId, RestoreIntent>>,
     /// The last [`RESOLVED_KEPT`] restores that ended, oldest first.
-    resolved: Vec<Resolved>,
+    resolved: Marked<Vec<Resolved>>,
     /// The seq of each of this device's last [`SLOTS_KEPT`] acknowledged commits, by slot.
-    slots: BTreeMap<u64, u64>,
+    slots: TrackedMap<u64, u64>,
     /// The open questions, in the order they were asked.
-    questions: Vec<Question>,
+    questions: Marked<Vec<Question>>,
     /// The local entries a [`Answer::Publish`] to a first link's question released (section 6.4),
     /// until the server applies their create. The person chose to keep them beside what R holds,
     /// so a create of one that takes a conflict name asks nothing.
-    published: BTreeSet<NodeId>,
-    pending: BTreeMap<NodeId, Pending>,
-    guard: GuardState,
+    published: TrackedSet<NodeId>,
+    pending: TrackedMap<NodeId, Pending>,
+    guard: Guard,
 }
 
 impl Commits {
     /// What the store keeps of the commit side.
     pub fn state(&self) -> CommitsState {
         CommitsState {
-            accepted: self.accepted,
-            in_flight: self.in_flight.clone(),
-            problems: self.problems.clone(),
-            halted: self.halted,
-            cap: self.cap,
-            split: self.split.clone(),
-            aliases: self.aliases.clone(),
-            restores: self.restores.clone(),
-            resolved: self.resolved.clone(),
-            slots: self.slots.clone(),
-            questions: self.questions.clone(),
-            published: self.published.clone(),
-            pending: self.pending.clone(),
-            guard: self.guard.clone(),
+            accepted: *self.accepted,
+            in_flight: (*self.in_flight).clone(),
+            problems: (*self.problems).clone(),
+            halted: *self.halted,
+            cap: *self.cap,
+            split: (*self.split).clone(),
+            aliases: (*self.aliases).clone(),
+            restores: (*self.restores).clone(),
+            resolved: (*self.resolved).clone(),
+            slots: (*self.slots).clone(),
+            questions: (*self.questions).clone(),
+            published: (*self.published).clone(),
+            pending: (*self.pending).clone(),
+            guard: self.guard.state(),
         }
+    }
+
+    /// What changed in [`Commits::state`] since the last call, for the store to write.
+    pub fn take_changes(&mut self) -> CommitsChanges {
+        let Self {
+            accepted,
+            in_flight,
+            problems,
+            halted,
+            cap,
+            split,
+            aliases,
+            restores,
+            resolved,
+            slots,
+            questions,
+            published,
+            pending,
+            guard,
+        } = self;
+        CommitsChanges {
+            accepted: accepted.take_changed().copied(),
+            in_flight: in_flight.take_changed().cloned(),
+            problems: problems.take_changes(),
+            halted: halted.take_changed().copied(),
+            cap: cap.take_changed().copied(),
+            split: split.take_changes(),
+            aliases: aliases.take_changes(),
+            restores: restores.take_changed().cloned(),
+            resolved: resolved.take_changed().cloned(),
+            slots: slots.take_changes(),
+            questions: questions.take_changed().cloned(),
+            published: published.take_changes(),
+            pending: pending.take_changes(),
+            guard: guard.take_changes(),
+        }
+    }
+
+    /// Continues from `accepted`, the server's count of this device's commits, in a store that
+    /// never synced the space. Nothing else changes.
+    pub fn adopt(&mut self, accepted: u64) {
+        self.accepted.set(accepted);
     }
 
     /// The commit side the store kept. Refuses a commit in flight that does not take slot
@@ -263,20 +306,20 @@ impl Commits {
             guard,
         } = state;
         Ok(Self {
-            accepted,
-            in_flight,
-            problems,
-            halted,
-            cap,
-            split,
-            aliases,
-            restores,
-            resolved,
-            slots,
-            questions,
-            published,
-            pending,
-            guard,
+            accepted: accepted.into(),
+            in_flight: in_flight.into(),
+            problems: problems.into(),
+            halted: halted.into(),
+            cap: cap.into(),
+            split: split.into(),
+            aliases: aliases.into(),
+            restores: restores.into(),
+            resolved: resolved.into(),
+            slots: slots.into(),
+            questions: questions.into(),
+            published: published.into(),
+            pending: pending.into(),
+            guard: guard.into(),
         })
     }
 
@@ -285,7 +328,7 @@ impl Commits {
     /// this commit is among them, so a node state of a seq at or below it is from before the loss
     /// (section 4.4).
     pub fn held_through(&self) -> u64 {
-        (self.slots.range(..=self.accepted).next_back()).map_or(0, |(_, &seq)| seq)
+        (self.slots.range(..=*self.accepted).next_back()).map_or(0, |(_, &seq)| seq)
     }
 
     /// Whether one of this device's last [`SLOTS_KEPT`] acknowledged commits has seq `seq`, a
@@ -304,13 +347,14 @@ impl Commits {
     /// Forgets the slots above the accepted counter, those of the commits a loss took, once R is
     /// listed again and [`Trees::forget_lost`] no longer needs them.
     pub fn forget_lost_slots(&mut self) {
-        self.slots.split_off(&(self.accepted + 1));
+        let accepted = *self.accepted;
+        self.slots.retain(|slot, _| *slot <= accepted);
     }
 
     /// The accepted counter *a* of section 2.8: the `device_seq` of the last commit whose result
     /// was applied.
     pub fn accepted(&self) -> u64 {
-        self.accepted
+        *self.accepted
     }
 
     pub fn in_flight(&self) -> Option<&InFlight> {
@@ -328,7 +372,7 @@ impl Commits {
     }
 
     pub fn halted(&self) -> Option<Halt> {
-        self.halted
+        *self.halted
     }
 
     /// Lifts a policy halt the way a person chose. With [`Lift::Resend`] the commit in flight
@@ -337,15 +381,15 @@ impl Commits {
     /// [`Lift::Replan`] it is forgotten, and its restores stay queued for the next commit, as when
     /// a refusal forgets a commit. Nothing else changes.
     pub fn lift(&mut self, lift: Lift) -> Result<(), LiftError> {
-        let Some(Halt::Policy { code }) = self.halted else {
+        let Some(Halt::Policy { code }) = *self.halted else {
             return Err(LiftError::NotHalted);
         };
         if code == error::Code::ConfirmationRequired as i32 {
             return Err(LiftError::NeedsConfirmation);
         }
-        self.halted = None;
+        self.halted.set(None);
         if lift == Lift::Replan {
-            self.in_flight = None;
+            self.in_flight.set(None);
         }
         Ok(())
     }
@@ -358,7 +402,7 @@ impl Commits {
         if self.restores.contains_key(&id) || self.resolved.iter().any(|ended| ended.id == id) {
             return false;
         }
-        self.restores.insert(id, intent);
+        self.restores.get_mut().insert(id, intent);
         self.reject_unsent_when_read_only();
         true
     }
@@ -396,7 +440,7 @@ impl Commits {
         }
         let tops = first_link::adopt(trees);
         if let Some(question) = first_link::ask(trees, tops, None, ids, now_ms) {
-            self.questions.push(question);
+            self.questions.get_mut().push(question);
         }
         self.hold(trees);
     }
@@ -440,13 +484,13 @@ impl Commits {
         };
         match self.questions[index].kind {
             QuestionKind::RemoteMassDelete { .. } => {
-                self.questions.remove(index);
+                self.questions.get_mut().remove(index);
                 self.guard.dismiss_remote();
             }
             QuestionKind::Conflict { .. } if answer == Answer::KeepBoth => {
-                self.questions.remove(index);
+                self.questions.get_mut().remove(index);
             }
-            _ => self.questions[index].answer = Some(answer),
+            _ => self.questions.get_mut()[index].answer = Some(answer),
         }
         true
     }
@@ -485,7 +529,7 @@ impl Commits {
         };
         match open {
             Some(index) => {
-                let notice = &mut self.questions[index];
+                let notice = &mut self.questions.get_mut()[index];
                 if let QuestionKind::RemoteMassDelete {
                     exceeded: before, ..
                 } = &notice.kind
@@ -497,7 +541,7 @@ impl Commits {
                 notice.kind = kind(exceeded);
             }
             None if exceeded.is_empty() => {}
-            None => self.questions.push(Question {
+            None => self.questions.get_mut().push(Question {
                 id: ids.uuid_v7(now_ms),
                 asked_at_ms: now_ms,
                 kind: kind(exceeded),
@@ -516,9 +560,11 @@ impl Commits {
         let asked = &self.questions[index];
         let held = asked.holds().cloned().collect::<Vec<_>>();
         match first_link::ask(trees, held, Some(asked), ids, now_ms) {
-            Some(question) if question.answer.is_none() => self.questions[index] = question,
+            Some(question) if question.answer.is_none() => {
+                self.questions.get_mut()[index] = question
+            }
             Some(question) => {
-                self.questions.remove(index);
+                self.questions.get_mut().remove(index);
                 if question.answer == Some(Answer::Discard) {
                     trees.discard(question.shown.clone());
                     let updates = (question.shown.into_iter())
@@ -532,7 +578,7 @@ impl Commits {
                 }
             }
             None => {
-                self.questions.remove(index);
+                self.questions.get_mut().remove(index);
             }
         }
         self.hold(trees);
@@ -550,21 +596,25 @@ impl Commits {
     }
 
     fn resolve(&mut self, id: RestoreId, outcome: Outcome) {
-        let intent = self.restores.remove(&id).expect("a queued restore");
-        self.resolved.push(Resolved {
+        let intent = self
+            .restores
+            .get_mut()
+            .remove(&id)
+            .expect("a queued restore");
+        self.resolved.get_mut().push(Resolved {
             id,
             intent,
             outcome,
         });
         let excess = self.resolved.len().saturating_sub(RESOLVED_KEPT);
-        self.resolved.drain(..excess);
+        self.resolved.get_mut().drain(..excess);
     }
 
     /// On a read-only device nothing is committed, so a queued restore would wait without an
     /// end. Each ends as rejected, except those the commit in flight carries: that commit may
     /// have been applied, and its result decides them.
     fn reject_unsent_when_read_only(&mut self) {
-        if self.halted != Some(Halt::ReadOnly) {
+        if *self.halted != Some(Halt::ReadOnly) {
             return;
         }
         let ops = self.in_flight.as_ref().map(|flight| &flight.commit.ops[..]);
@@ -676,7 +726,7 @@ impl Commits {
         let guarded =
             |question: &Question| matches!(question.kind, QuestionKind::MassDelete { .. });
         let index = self.questions.iter().position(guarded);
-        let mut asked = index.map(|index| self.questions.remove(index));
+        let mut asked = index.map(|index| self.questions.get_mut().remove(index));
         let open = asked.as_ref().map(|question| question.id.clone());
         skip.extend(self.questions.iter().flat_map(Question::holds).cloned());
         let deleted = (trees.dirty().iter())
@@ -696,8 +746,8 @@ impl Commits {
         }
         if let Some(question) = asked {
             let kept = index.filter(|_| open.as_ref() == Some(&question.id));
-            self.questions
-                .insert(kept.unwrap_or(self.questions.len()), question);
+            let at = kept.unwrap_or(self.questions.len());
+            self.questions.get_mut().insert(at, question);
         }
         self.hold(trees);
         self.split.retain(|id| trees.synced().live(id).is_some());
@@ -738,14 +788,14 @@ impl Commits {
         let require_head = (ops.iter().filter_map(|op| op.op.as_ref()))
             .any(|op| trees.resends().contains(op_node(op)));
         let commit_id = ids.uuid_v7(now_ms);
-        for question in &mut self.questions {
+        for question in self.questions.get_mut() {
             if let QuestionKind::Conflict { sent_in, .. } = &mut question.kind
                 && asking.contains(&question.id)
             {
                 *sent_in = Some(commit_id.clone());
             }
         }
-        self.in_flight = Some(InFlight {
+        self.in_flight.set(Some(InFlight {
             commit: proto::Commit {
                 commit_id,
                 base_seq: base.seq,
@@ -753,13 +803,13 @@ impl Commits {
                 base_committed_at_ms: base.committed_at_ms,
                 ops,
                 history_id: history_id.to_owned(),
-                device_seq: self.accepted + 1,
+                device_seq: *self.accepted + 1,
                 require_head,
                 ..Default::default()
             },
             deletes,
             result: None,
-        });
+        }));
         self.in_flight.as_ref().map(|flight| &flight.commit)
     }
 
@@ -774,7 +824,7 @@ impl Commits {
         let mut ops = Vec::new();
         let mut kept = Vec::new();
         let mut taken = BTreeSet::new();
-        for mut question in std::mem::take(&mut self.questions) {
+        for mut question in std::mem::take(self.questions.get_mut()) {
             let QuestionKind::Conflict { original, copy, .. } = &mut question.kind else {
                 kept.push(question);
                 continue;
@@ -844,7 +894,7 @@ impl Commits {
             }
             kept.push(question);
         }
-        self.questions = kept;
+        self.questions.set(kept);
         ops
     }
 
@@ -929,7 +979,7 @@ impl Commits {
         if asked {
             return;
         }
-        self.questions.push(Question {
+        self.questions.get_mut().push(Question {
             id: format!("{commit_id}-{index}"),
             asked_at_ms: unix_ms(commit_id).unwrap_or_default(),
             kind: QuestionKind::Conflict {
@@ -945,7 +995,11 @@ impl Commits {
 
     /// Keeps the result of the commit in flight until it can be acknowledged.
     pub fn received(&mut self, result: proto::CommitResult) -> Result<(), CommitError> {
-        let flight = self.in_flight.as_mut().ok_or(CommitError::NotInFlight)?;
+        let flight = self
+            .in_flight
+            .get_mut()
+            .as_mut()
+            .ok_or(CommitError::NotInFlight)?;
         if result.results.len() != flight.commit.ops.len() {
             return Err(CommitError::ResultMismatch);
         }
@@ -1006,6 +1060,19 @@ impl Commits {
     }
 
     fn retire_pending(&mut self, trees: &Trees) {
+        let held = |id: &str, pending: &Pending| {
+            (trees.remote().get(id))
+                .is_some_and(|remote| nfc(&remote.shape.name) == nfc(&pending.sent))
+        };
+        let landed: Vec<NodeId> = (self.pending.iter())
+            .filter(|(id, pending)| !pending.landed && held(id, pending))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in landed {
+            if let Some(pending) = self.pending.get_mut(&id) {
+                pending.landed = true;
+            }
+        }
         let flight = self.in_flight.as_ref();
         self.pending.retain(|id, pending| {
             let owed_in_flight = flight.is_some_and(|flight| {
@@ -1014,13 +1081,7 @@ impl Commits {
                         if moved.node_id == *id && nfc(&moved.new_name) == nfc(&pending.name))
                 })
             });
-            if (trees.remote().get(id))
-                .is_some_and(|remote| nfc(&remote.shape.name) == nfc(&pending.sent))
-            {
-                pending.landed = true;
-                return true;
-            }
-            (flight.is_some() && !pending.landed) || owed_in_flight
+            held(id, pending) || (flight.is_some() && !pending.landed) || owed_in_flight
         });
     }
 
@@ -1281,7 +1342,11 @@ impl Commits {
         let mut closed = BTreeSet::new();
         for (id, index, sent, code, made) in answers {
             use op_result::Code;
-            let question = self.questions.iter_mut().find(|question| question.id == id);
+            let question = self
+                .questions
+                .get_mut()
+                .iter_mut()
+                .find(|question| question.id == id);
             let Some(question) = question else {
                 continue;
             };
@@ -1316,8 +1381,7 @@ impl Commits {
                 _ => question.answer = None,
             }
         }
-        self.questions
-            .retain(|question| !closed.contains(&question.id));
+        (self.questions.get_mut()).retain(|question| !closed.contains(&question.id));
         for (index, original, copy) in conflicts {
             self.ask_conflict(trees, &flight.commit.commit_id, index, original, copy);
         }
@@ -1328,7 +1392,7 @@ impl Commits {
         trees.watch_content([]);
         trees.watch_positions([]);
         self.retry_waiting(trees, BTreeSet::new(), Vec::new());
-        self.accepted = flight.commit.device_seq;
+        self.accepted.set(flight.commit.device_seq);
         self.slots.insert(flight.commit.device_seq, result.seq);
         while self.slots.len() > SLOTS_KEPT {
             self.slots.pop_first();
@@ -1338,7 +1402,8 @@ impl Commits {
         {
             trees.forget_past_positions_below(oldest);
         }
-        self.cap = self.cap.map(|cap| cap * 2).filter(|cap| *cap < MAX_OPS);
+        self.cap
+            .set(self.cap.map(|cap| cap * 2).filter(|cap| *cap < MAX_OPS));
         true
     }
 
@@ -1409,23 +1474,23 @@ impl Commits {
         };
         match failure {
             Failure::Halted(halt @ (Halt::Recovery | Halt::Policy { .. })) => {
-                self.halted = Some(halt)
+                self.halted.set(Some(halt))
             }
             Failure::Resend => {}
             Failure::Halted(halt) => {
-                self.halted = Some(halt);
-                self.in_flight = None;
+                self.halted.set(Some(halt));
+                self.in_flight.set(None);
             }
-            Failure::Abandoned | Failure::Resync => self.in_flight = None,
+            Failure::Abandoned | Failure::Resync => self.in_flight.set(None),
             Failure::Split => {
-                let flight = self.in_flight.take().expect("checked");
+                let flight = self.in_flight.get_mut().take().expect("checked");
                 let ops = flight.commit.ops;
                 let restored = carried(&self.restores, &ops);
                 let restore = restored
                     .expect("a Restore op in flight is queued")
                     .remove(&0);
                 if ops.len() > 1 {
-                    self.cap = Some(ops.len() / 2);
+                    self.cap.set(Some(ops.len() / 2));
                 } else if let Some(id) = restore {
                     self.resolve(id, Outcome::DoesNotFit);
                 } else if let Some(op) = ops.into_iter().next().and_then(|op| op.op) {
@@ -1448,7 +1513,7 @@ impl Commits {
     /// `MISSING_CHUNKS` when the file changed since it was chunked (section 4.2). False when no
     /// commit is in flight, its result has arrived, or a policy halt keeps it.
     pub fn abandon(&mut self) -> bool {
-        if matches!(self.halted, Some(Halt::Policy { .. })) {
+        if matches!(*self.halted, Some(Halt::Policy { .. })) {
             return false;
         }
         self.in_flight
@@ -1479,12 +1544,12 @@ impl Commits {
     /// (section 6.4). On a read-only device the restores no commit in flight carries end as
     /// rejected.
     pub fn connected(&mut self, welcome: &proto::Welcome) -> Reconnect {
-        let (a, w) = (self.accepted, welcome.device_seq);
-        let policy = matches!(self.halted, Some(Halt::Policy { .. }));
-        let reconnect = match &self.in_flight {
+        let (a, w) = (*self.accepted, welcome.device_seq);
+        let policy = matches!(*self.halted, Some(Halt::Policy { .. }));
+        let reconnect = match &*self.in_flight {
             _ if policy && w >= a => return Reconnect::Idle,
             _ if policy => Reconnect::AheadOfServer,
-            _ if self.halted == Some(Halt::Recovery) => Reconnect::Recovery,
+            _ if *self.halted == Some(Halt::Recovery) => Reconnect::Recovery,
             Some(flight) if flight.commit.history_id != welcome.history_id => Reconnect::Recovery,
             None if w == a => Reconnect::Idle,
             Some(flight) if flight.result.is_none() && (w == a || w == a + 1) => Reconnect::Resend,
@@ -1494,26 +1559,26 @@ impl Commits {
             _ => Reconnect::Recovery,
         };
         if reconnect == Reconnect::Recovery {
-            self.halted = Some(Halt::Recovery);
+            self.halted.set(Some(Halt::Recovery));
             return reconnect;
         }
         if reconnect == Reconnect::AheadOfServer {
-            self.accepted = w;
-            self.in_flight = None;
+            self.accepted.set(w);
+            self.in_flight.set(None);
         }
         if policy {
             return reconnect;
         }
         if welcome.read_only {
-            self.halted = Some(Halt::ReadOnly);
+            self.halted.set(Some(Halt::ReadOnly));
             self.reject_unsent_when_read_only();
             return match reconnect {
                 Reconnect::Resend => Reconnect::Idle,
                 other => other,
             };
         }
-        if self.halted == Some(Halt::ReadOnly) {
-            self.halted = None;
+        if *self.halted == Some(Halt::ReadOnly) {
+            self.halted.set(None);
         }
         reconnect
     }

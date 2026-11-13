@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 
 use koidrive_engine::guard::{Counted, GuardState, RemoteDeletion, Trash};
 use koidrive_engine::question::{Answer, Held, Limit, Question, QuestionKind, Revisions};
+use koidrive_engine::state::GuardChanges;
 use koidrive_engine::tree::{Content, NodeId, Shape};
 use prost::Message;
 use rusqlite::{Row, params};
@@ -190,43 +191,54 @@ impl Tx<'_> {
         Ok(guard)
     }
 
-    /// Changes the stored guard from `old` to `new`. The ledger, the confirmed deletions and their
-    /// limits are written whole when they changed, and the other devices' deletions row by row,
-    /// since each removal that applies one of them changes the guard.
-    pub(crate) fn update_guard(&self, old: &GuardState, new: &GuardState) -> Result<()> {
-        if old.ledger != new.ledger {
-            self.0.execute("DELETE FROM guard_ledger", [])?;
-            let mut stmt = self.0.prepare_cached(
-                "INSERT INTO guard_ledger (node_id, at_ms, files) VALUES (?1, ?2, ?3)",
-            )?;
-            for (id, counted) in &new.ledger {
-                stmt.execute(params![id, counted.at_ms, counted.files])?;
+    /// Writes what changed in the guard, row by row: each deletion in the window, each confirmed deletion with its
+    /// members, and each other device's deletion, counted or dismissed. The limits of the confirmed deletions are
+    /// written whole.
+    pub(crate) fn write_guard(&self, changes: &GuardChanges) -> Result<()> {
+        let GuardChanges {
+            ledger,
+            confirmed,
+            confirmed_limits,
+            remote,
+            dismissed,
+        } = changes;
+        self.write_map(
+            ledger,
+            "DELETE FROM guard_ledger WHERE node_id = ?1",
+            "INSERT OR REPLACE INTO guard_ledger (node_id, at_ms, files) VALUES (?1, ?2, ?3)",
+            |put, id, counted| put.execute(params![id, counted.at_ms, counted.files]),
+        )?;
+        let mut unlist = self
+            .0
+            .prepare_cached("DELETE FROM guard_confirmed_members WHERE top_id = ?1")?;
+        let mut remove = self
+            .0
+            .prepare_cached("DELETE FROM guard_confirmed WHERE top_id = ?1")?;
+        let mut items = self
+            .0
+            .prepare_cached("INSERT INTO guard_confirmed (top_id, files) VALUES (?1, ?2)")?;
+        let mut members = self.0.prepare_cached(
+            "INSERT INTO guard_confirmed_members (top_id, node_id, content_rev, meta_rev)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for (top, item) in confirmed {
+            unlist.execute([top])?;
+            remove.execute([top])?;
+            let Some(item) = item else {
+                continue;
+            };
+            items.execute(params![top, item.files])?;
+            for (node, revisions) in &item.members {
+                let (content_rev, meta_rev) = split(revisions);
+                members.execute(params![top, node, content_rev, meta_rev])?;
             }
         }
-        if old.confirmed != new.confirmed {
-            self.0.execute("DELETE FROM guard_confirmed_members", [])?;
-            self.0.execute("DELETE FROM guard_confirmed", [])?;
-            let mut items = self
-                .0
-                .prepare_cached("INSERT INTO guard_confirmed (top_id, files) VALUES (?1, ?2)")?;
-            let mut members = self.0.prepare_cached(
-                "INSERT INTO guard_confirmed_members (top_id, node_id, content_rev, meta_rev)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for (top, item) in &new.confirmed {
-                items.execute(params![top, item.files])?;
-                for (node, revisions) in &item.members {
-                    let (content_rev, meta_rev) = split(revisions);
-                    members.execute(params![top, node, content_rev, meta_rev])?;
-                }
-            }
-        }
-        if old.confirmed_limits != new.confirmed_limits {
+        if let Some(limits) = confirmed_limits {
             self.0.execute("DELETE FROM guard_confirmed_limits", [])?;
             let mut stmt = self
                 .0
                 .prepare_cached("INSERT INTO guard_confirmed_limits (limit_crossed) VALUES (?1)")?;
-            for limit in &new.confirmed_limits {
+            for limit in limits {
                 stmt.execute(params![limit_name(*limit)])?;
             }
         }
@@ -234,46 +246,40 @@ impl Tx<'_> {
             "DELETE FROM guard_remote
              WHERE top_id = ?1 AND known = ?2 AND trash_group = ?3 AND trashed_seq = ?4",
         )?;
-        for deletion in old.remote.keys() {
-            if !new.remote.contains_key(deletion) {
-                let (known, group, seq) = split_trash(&deletion.trash);
-                remove.execute(params![deletion.top, known, group, seq])?;
-            }
-        }
         let mut put = self.0.prepare_cached(
             "INSERT OR REPLACE INTO guard_remote
              (top_id, known, trash_group, trashed_seq, at_ms, files)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
-        for (deletion, counted) in &new.remote {
-            if old.remote.get(deletion) != Some(counted) {
-                let (known, group, seq) = split_trash(&deletion.trash);
-                let top = &deletion.top;
-                put.execute(params![
+        for (deletion, counted) in remote {
+            let (known, group, seq) = split_trash(&deletion.trash);
+            let top = &deletion.top;
+            match counted {
+                Some(counted) => put.execute(params![
                     top,
                     known,
                     group,
                     seq,
                     counted.at_ms,
                     counted.files
-                ])?;
-            }
+                ])?,
+                None => remove.execute(params![top, known, group, seq])?,
+            };
         }
         let mut remove = self.0.prepare_cached(
             "DELETE FROM guard_remote_dismissed
              WHERE top_id = ?1 AND known = ?2 AND trash_group = ?3 AND trashed_seq = ?4",
         )?;
-        for deletion in old.dismissed.difference(&new.dismissed) {
-            let (known, group, seq) = split_trash(&deletion.trash);
-            remove.execute(params![deletion.top, known, group, seq])?;
-        }
         let mut put = self.0.prepare_cached(
-            "INSERT INTO guard_remote_dismissed (top_id, known, trash_group, trashed_seq)
+            "INSERT OR IGNORE INTO guard_remote_dismissed (top_id, known, trash_group, trashed_seq)
              VALUES (?1, ?2, ?3, ?4)",
         )?;
-        for deletion in new.dismissed.difference(&old.dismissed) {
+        for (deletion, held) in dismissed {
             let (known, group, seq) = split_trash(&deletion.trash);
-            put.execute(params![deletion.top, known, group, seq])?;
+            match held {
+                true => put.execute(params![deletion.top, known, group, seq])?,
+                false => remove.execute(params![deletion.top, known, group, seq])?,
+            };
         }
         Ok(())
     }

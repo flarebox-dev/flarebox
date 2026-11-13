@@ -10,6 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::classify::Trees;
 use crate::ids::IdGen;
 use crate::question::{Answer, Held, Limit, Question, QuestionKind, Revisions};
+use crate::state::GuardChanges;
+use crate::tracked::{Marked, TrackedMap, TrackedSet};
 use crate::tree::{Kind, NodeId};
 
 /// How long a deletion counts.
@@ -184,7 +186,63 @@ pub struct RemoteRemoval {
     pub files: u64,
 }
 
-impl GuardState {
+/// The guard as the commit side keeps it, which records what changed for the store.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Guard {
+    ledger: TrackedMap<NodeId, Counted>,
+    confirmed: TrackedMap<NodeId, Held>,
+    confirmed_limits: Marked<BTreeSet<Limit>>,
+    remote: TrackedMap<RemoteDeletion, Counted>,
+    dismissed: TrackedSet<RemoteDeletion>,
+}
+
+impl From<GuardState> for Guard {
+    fn from(state: GuardState) -> Self {
+        let GuardState {
+            ledger,
+            confirmed,
+            confirmed_limits,
+            remote,
+            dismissed,
+        } = state;
+        Self {
+            ledger: ledger.into(),
+            confirmed: confirmed.into(),
+            confirmed_limits: confirmed_limits.into(),
+            remote: remote.into(),
+            dismissed: dismissed.into(),
+        }
+    }
+}
+
+impl Guard {
+    pub(crate) fn state(&self) -> GuardState {
+        GuardState {
+            ledger: (*self.ledger).clone(),
+            confirmed: (*self.confirmed).clone(),
+            confirmed_limits: (*self.confirmed_limits).clone(),
+            remote: (*self.remote).clone(),
+            dismissed: (*self.dismissed).clone(),
+        }
+    }
+
+    pub(crate) fn take_changes(&mut self) -> GuardChanges {
+        let Self {
+            ledger,
+            confirmed,
+            confirmed_limits,
+            remote,
+            dismissed,
+        } = self;
+        GuardChanges {
+            ledger: ledger.take_changes(),
+            confirmed: confirmed.take_changes(),
+            confirmed_limits: confirmed_limits.take_changed().cloned(),
+            remote: remote.take_changes(),
+            dismissed: dismissed.take_changes(),
+        }
+    }
+
     /// Counts `pending`, every deletion planning would make now, and returns the nodes the
     /// planner must leave alone. `asked` is the guard's open question. A pending deletion that is
     /// not confirmed is counted, and when the window's deletions cross a limit all of them are held
@@ -211,9 +269,7 @@ impl GuardState {
         self.dismissed
             .retain(|deletion| !deletion.undone(trees) && !deletion.removed(trees));
         self.remote.retain(|deletion, _| !deletion.undone(trees));
-        for counted in self.ledger.values_mut() {
-            counted.at_ms = counted.at_ms.min(now_ms);
-        }
+        not_after(&mut self.ledger, now_ms);
         self.ledger.retain(|id, counted| {
             counted.at_ms + WINDOW_MS > now_ms && trees.local().get(id).is_none()
         });
@@ -231,13 +287,7 @@ impl GuardState {
         let mut open: BTreeMap<NodeId, Held> = (pending.into_iter())
             .filter(|(id, _)| !self.confirmed.contains_key(id))
             .collect();
-        for (id, held) in &open {
-            let counted = self.ledger.entry(id.clone()).or_insert(Counted {
-                at_ms: now_ms,
-                files: 0,
-            });
-            counted.files = held.files;
-        }
+        self.count(&open, now_ms);
         let mut carried = match asked {
             Some(Question {
                 kind: QuestionKind::MassDelete { exceeded, .. },
@@ -246,10 +296,10 @@ impl GuardState {
             _ => Vec::new(),
         };
         if !unconfirmed.is_empty() {
-            carried.extend(&self.confirmed_limits);
+            carried.extend(self.confirmed_limits.iter());
         }
         if self.confirmed.is_empty() {
-            self.confirmed_limits.clear();
+            self.confirmed_limits.set(BTreeSet::new());
         }
         let mut checked = Checked::default();
         let was_asked = match asked.take() {
@@ -261,7 +311,7 @@ impl GuardState {
             Some(question) if question.held == open && question.answer == Some(Answer::Delete) => {
                 self.ledger.retain(|top, _| !open.contains_key(top));
                 self.confirmed.extend(open);
-                self.confirmed_limits.extend(carried);
+                self.confirmed_limits.get_mut().extend(carried);
                 return checked;
             }
             Some(question) if question.answer == Some(Answer::Restore) => {
@@ -272,13 +322,7 @@ impl GuardState {
                 self.ledger.retain(|top, _| !open.contains_key(top));
                 checked.restored = deletions(trees, &restored);
                 open = deletions(trees, &left);
-                for (id, held) in &open {
-                    let counted = self.ledger.entry(id.clone()).or_insert(Counted {
-                        at_ms: now_ms,
-                        files: 0,
-                    });
-                    counted.files = held.files;
-                }
+                self.count(&open, now_ms);
                 true
             }
             asked => asked.is_some(),
@@ -309,6 +353,17 @@ impl GuardState {
             shown: BTreeMap::new(),
         });
         checked
+    }
+
+    fn count(&mut self, open: &BTreeMap<NodeId, Held>, now_ms: u64) {
+        for (id, held) in open {
+            let at_ms = self.ledger.get(id).map_or(now_ms, |counted| counted.at_ms);
+            let counted = Counted {
+                at_ms,
+                files: held.files,
+            };
+            self.ledger.insert(id.clone(), counted);
+        }
     }
 
     /// The counts of the deletions in the window. The space is its live files in S and the files
@@ -346,9 +401,7 @@ impl GuardState {
         if dismissed {
             return None;
         }
-        for counted in self.remote.values_mut() {
-            counted.at_ms = counted.at_ms.min(now_ms);
-        }
+        not_after(&mut self.remote, now_ms);
         self.remote.retain(|deletion, _| !deletion.undone(trees));
         let held = self.remote.keys().find(|deletion| takes(deletion)).cloned();
         if !noticed {
@@ -358,7 +411,7 @@ impl GuardState {
                     || counted.at_ms + WINDOW_MS > now_ms
             });
         }
-        let counted = (self.remote.entry(held.unwrap_or(removed))).or_insert(Counted {
+        let counted = (self.remote).get_or_insert_with(held.unwrap_or(removed), || Counted {
             at_ms: now_ms,
             files: 0,
         });
@@ -374,8 +427,19 @@ impl GuardState {
 
     /// The person dismissed the notice: the deletions it counted are not counted again.
     pub(crate) fn dismiss_remote(&mut self) {
-        self.dismissed
-            .extend(std::mem::take(&mut self.remote).into_keys());
+        self.dismissed.extend(self.remote.take_all().into_keys());
+    }
+}
+
+fn not_after<K: Ord + Clone>(counts: &mut TrackedMap<K, Counted>, now_ms: u64) {
+    let later: Vec<K> = (counts.iter())
+        .filter(|(_, counted)| counted.at_ms > now_ms)
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in later {
+        if let Some(counted) = counts.get_mut(&key) {
+            counted.at_ms = now_ms;
+        }
     }
 }
 

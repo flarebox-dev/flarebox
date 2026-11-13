@@ -10,11 +10,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use koidrive_engine::classify::{Origin, Waiting};
 use koidrive_engine::commit::{Halt, InFlight};
 use koidrive_engine::effects::{Base, Dir, Displaced, Effect, EffectRecord, Location};
-use koidrive_engine::state::{Agreed, CommitsState, EffectsState, MovedHere, Pending, TreesState};
+use koidrive_engine::state::{
+    Agreed, CommitsChanges, CommitsState, EffectsChanges, EffectsState, MapChanges, MovedHere,
+    Pending, SetChanges, TreesChanges, TreesState,
+};
 use koidrive_engine::tree::{FileIdentity, Kind, NodeId, Shape};
 use koidrive_proto::v1::{Commit, CommitResult, Content, NodeKind};
 use prost::{Message, Oneof};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{CachedStatement, OptionalExtension, ToSql, params};
 
 use crate::{Error, Result, Tx, decode, ino_columns, ino_from_columns, non_empty};
 
@@ -25,6 +28,30 @@ pub struct EngineState {
     pub trees: TreesState,
     pub commits: CommitsState,
     pub effects: EffectsState,
+}
+
+/// What changed in the engine state since it was last written, as [`Tx::write_engine_changes`] takes it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EngineChanges {
+    pub trees: TreesChanges,
+    pub commits: CommitsChanges,
+    pub effects: EffectsChanges,
+}
+
+impl EngineChanges {
+    /// The changes that take `before` to `after`.
+    pub fn between(before: &EngineState, after: &EngineState) -> Self {
+        let EngineState {
+            trees,
+            commits,
+            effects,
+        } = after;
+        Self {
+            trees: TreesChanges::between(&before.trees, trees),
+            commits: CommitsChanges::between(&before.commits, commits),
+            effects: EffectsChanges::between(&before.effects, effects),
+        }
+    }
 }
 
 /// The node sets of the state, by the name `node_sets` stores them under.
@@ -354,24 +381,83 @@ impl Tx<'_> {
     }
 
     /// Changes the stored engine state from `before`, which must be the state the store holds, to
-    /// `after`. Only the rows of what differs are written: a member of a node set or a node map, a
-    /// waiting update and a failed effect by node, and each of the commit counters, the commit in
-    /// flight, the restores, the open questions and the effect counters as a whole, and the
-    /// mass-delete guard as [`Tx::update_guard`] writes it.
+    /// `after`, writing what differs as [`Tx::write_engine_changes`] does.
     pub fn update_engine_state(&self, before: &EngineState, after: &EngineState) -> Result<()> {
-        let (mut old, mut new) = (before.clone(), after.clone());
+        self.write_engine_changes(&EngineChanges::between(before, after))
+    }
+
+    /// Writes `changes` into the stored engine state. Only the rows of what changed are written: a
+    /// member of a node set or a node map, a waiting update, a failed effect and each other entry by its key, removed
+    /// when the state no longer holds it, and each of the commit counters, the commit in flight, the restores, the
+    /// open questions and the effect counters as a whole.
+    pub fn write_engine_changes(&self, changes: &EngineChanges) -> Result<()> {
+        let EngineChanges {
+            trees,
+            commits,
+            effects,
+        } = changes;
+        let TreesChanges {
+            dirty,
+            unsearched,
+            reverted,
+            parked_as,
+            waiting,
+            watched,
+            watched_positions,
+            trashed_here,
+            discarded,
+            outside,
+            lost,
+            displaced,
+            edited_here,
+            moved_here,
+            past_positions,
+            unsent_edits,
+            replaced_versions,
+            resends,
+            kept_originals,
+        } = trees;
+        let CommitsChanges {
+            accepted,
+            in_flight,
+            problems,
+            halted,
+            cap,
+            split,
+            aliases,
+            restores,
+            resolved,
+            slots,
+            questions,
+            published,
+            pending,
+            guard,
+        } = commits;
+        let EffectsChanges {
+            in_flight: effect,
+            cleared,
+            failed,
+        } = effects;
+
         let mut remove = self
             .0
             .prepare_cached("DELETE FROM node_sets WHERE node_set = ?1 AND node_id = ?2")?;
-        let mut insert = self
-            .0
-            .prepare_cached("INSERT INTO node_sets (node_set, node_id) VALUES (?1, ?2)")?;
-        for ((name, old), (_, new)) in node_sets(&mut old).into_iter().zip(node_sets(&mut new)) {
-            for node in old.difference(new) {
-                remove.execute(params![name, node])?;
-            }
-            for node in new.difference(old) {
-                insert.execute(params![name, node])?;
+        let mut insert = self.0.prepare_cached(
+            "INSERT OR IGNORE INTO node_sets (node_set, node_id) VALUES (?1, ?2)",
+        )?;
+        let sets = [
+            ("dirty", dirty),
+            ("unsearched", unsearched),
+            ("reverted", reverted),
+            ("problems", problems),
+            ("split", split),
+        ];
+        for (name, changes) in sets {
+            for (node, held) in changes {
+                match held {
+                    true => insert.execute(params![name, node])?,
+                    false => remove.execute(params![name, node])?,
+                };
             }
         }
         let mut remove = self
@@ -380,167 +466,96 @@ impl Tx<'_> {
         let mut put = self.0.prepare_cached(
             "INSERT OR REPLACE INTO node_maps (node_map, node_id, target) VALUES (?1, ?2, ?3)",
         )?;
-        for ((name, old), (_, new)) in node_maps(&mut old).into_iter().zip(node_maps(&mut new)) {
-            let (removed, changed) = differences(old, new);
-            for node in removed {
-                remove.execute(params![name, node])?;
-            }
-            for (node, target) in changed {
-                put.execute(params![name, node, target])?;
+        for (name, changes) in [("parked_as", parked_as), ("aliases", aliases)] {
+            for (node, target) in changes {
+                match target {
+                    Some(target) => put.execute(params![name, node, target])?,
+                    None => remove.execute(params![name, node])?,
+                };
             }
         }
-        let mut remove = self
-            .0
-            .prepare_cached("DELETE FROM waiting_updates WHERE node_id = ?1")?;
-        let mut put = self.0.prepare_cached(
+        self.write_map(
+            waiting,
+            "DELETE FROM waiting_updates WHERE node_id = ?1",
             "INSERT OR REPLACE INTO waiting_updates (node_id, parent_id, name, kind, content, slot)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            |put, node, Waiting { shape, origin }| {
+                let slot = match origin {
+                    Origin::Commit(slot) => Some(*slot),
+                    Origin::Other => None,
+                };
+                put.execute(params![
+                    node,
+                    shape.as_ref().and_then(|shape| non_empty(&shape.parent)),
+                    shape.as_ref().map(|shape| &shape.name),
+                    shape.as_ref().map(|shape| node_kind(shape.kind)),
+                    shape
+                        .as_ref()
+                        .and_then(|shape| shape.content.as_ref())
+                        .map(Content::encode_to_vec),
+                    slot,
+                ])
+            },
         )?;
-        let (removed, changed) = differences(&before.trees.waiting, &after.trees.waiting);
-        for node in removed {
-            remove.execute([node])?;
-        }
-        for (node, Waiting { shape, origin }) in changed {
-            let slot = match origin {
-                Origin::Commit(slot) => Some(*slot),
-                Origin::Other => None,
-            };
-            put.execute(params![
-                node,
-                shape.as_ref().and_then(|shape| non_empty(&shape.parent)),
-                shape.as_ref().map(|shape| &shape.name),
-                shape.as_ref().map(|shape| node_kind(shape.kind)),
-                shape
-                    .as_ref()
-                    .and_then(|shape| shape.content.as_ref())
-                    .map(Content::encode_to_vec),
-                slot,
-            ])?;
-        }
-        let mut remove = self
-            .0
-            .prepare_cached("DELETE FROM watched_contents WHERE node_id = ?1")?;
-        let mut put = self.0.prepare_cached(
+        self.write_map(
+            watched,
+            "DELETE FROM watched_contents WHERE node_id = ?1",
             "INSERT OR REPLACE INTO watched_contents (node_id, changed) VALUES (?1, ?2)",
+            |put, node, took| put.execute(params![node, took]),
         )?;
-        let (removed, changed) = differences(&before.trees.watched, &after.trees.watched);
-        for node in removed {
-            remove.execute([node])?;
-        }
-        for (node, took) in changed {
-            put.execute(params![node, took])?;
-        }
-        let mut remove = self
-            .0
-            .prepare_cached("DELETE FROM watched_positions WHERE node_id = ?1")?;
-        let mut put = self.0.prepare_cached(
+        self.write_map(
+            watched_positions,
+            "DELETE FROM watched_positions WHERE node_id = ?1",
             "INSERT OR REPLACE INTO watched_positions (node_id, rev, parent_id, name)
              VALUES (?1, ?2, ?3, ?4)",
+            |put, node, agreed| {
+                put.execute(params![
+                    node,
+                    agreed.as_ref().map(|agreed| agreed.rev),
+                    agreed.as_ref().and_then(|agreed| non_empty(&agreed.parent)),
+                    agreed.as_ref().map(|agreed| &agreed.name),
+                ])
+            },
         )?;
-        let (removed, changed) = differences(
-            &before.trees.watched_positions,
-            &after.trees.watched_positions,
-        );
-        for node in removed {
-            remove.execute([node])?;
-        }
-        for (node, agreed) in changed {
-            put.execute(params![
-                node,
-                agreed.as_ref().map(|agreed| agreed.rev),
-                agreed.as_ref().and_then(|agreed| non_empty(&agreed.parent)),
-                agreed.as_ref().map(|agreed| &agreed.name),
-            ])?;
-        }
-        let mut remove = self
-            .0
-            .prepare_cached("DELETE FROM trashed_here WHERE node_id = ?1")?;
-        let mut put = self
-            .0
-            .prepare_cached("INSERT OR REPLACE INTO trashed_here (node_id, seq) VALUES (?1, ?2)")?;
-        let (removed, changed) = differences(&before.trees.trashed_here, &after.trees.trashed_here);
-        for node in removed {
-            remove.execute([node])?;
-        }
-        for (node, seq) in changed {
-            put.execute(params![node, seq])?;
-        }
-        let mut remove = self
-            .0
-            .prepare_cached("DELETE FROM discarded_nodes WHERE node_id = ?1")?;
-        let mut put = self.0.prepare_cached(
+        self.write_map(
+            trashed_here,
+            "DELETE FROM trashed_here WHERE node_id = ?1",
+            "INSERT OR REPLACE INTO trashed_here (node_id, seq) VALUES (?1, ?2)",
+            |put, node, seq| put.execute(params![node, seq]),
+        )?;
+        self.write_map(
+            discarded,
+            "DELETE FROM discarded_nodes WHERE node_id = ?1",
             "INSERT OR REPLACE INTO discarded_nodes (node_id, parent_id, name, kind, content)
              VALUES (?1, ?2, ?3, ?4, ?5)",
+            |put, node, shape| {
+                put.execute(params![
+                    node,
+                    non_empty(&shape.parent),
+                    shape.name,
+                    node_kind(shape.kind),
+                    shape.content.as_ref().map(Content::encode_to_vec),
+                ])
+            },
         )?;
-        let (removed, changed) = differences(&before.trees.discarded, &after.trees.discarded);
-        for node in removed {
-            remove.execute([node])?;
-        }
-        for (node, shape) in changed {
-            put.execute(params![
-                node,
-                non_empty(&shape.parent),
-                shape.name,
-                node_kind(shape.kind),
-                shape.content.as_ref().map(Content::encode_to_vec),
-            ])?;
-        }
-        let recorded = |trees: &TreesState| -> BTreeMap<NodeId, (Option<FileIdentity>, bool)> {
-            let kept = (trees.outside.iter())
-                .map(|node| (node.clone(), (None, trees.lost.contains(node))));
-            let displaced =
-                (trees.displaced.iter()).map(|(node, held)| (node.clone(), (Some(*held), false)));
-            kept.chain(displaced).collect()
-        };
-        let (old, new) = (recorded(&before.trees), recorded(&after.trees));
-        let mut remove = self
-            .0
-            .prepare_cached("DELETE FROM recorded_nodes WHERE node_id = ?1")?;
-        let mut put = self.0.prepare_cached(
-            "INSERT OR REPLACE INTO recorded_nodes (node_id, displaced, dev, ino, ino_high, birth_ns, lost)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        self.write_recorded(outside, lost, displaced)?;
+        self.write_map(
+            edited_here,
+            "DELETE FROM edited_here WHERE node_id = ?1",
+            "INSERT OR REPLACE INTO edited_here (node_id, seq) VALUES (?1, ?2)",
+            |put, node, seq| put.execute(params![node, seq]),
         )?;
-        let (removed, changed) = differences(&old, &new);
-        for node in removed {
-            remove.execute([node])?;
-        }
-        for (node, (identity, lost)) in changed {
-            put.execute(params![
-                node,
-                identity.is_some(),
-                identity.map(|held| held.dev as i64),
-                identity.map(|held| ino_columns(held.ino).0),
-                identity.map_or(0, |held| ino_columns(held.ino).1),
-                identity.and_then(|held| held.birth_ns),
-                lost,
-            ])?;
-        }
-        let mut remove = self
-            .0
-            .prepare_cached("DELETE FROM edited_here WHERE node_id = ?1")?;
-        let mut put = self
-            .0
-            .prepare_cached("INSERT OR REPLACE INTO edited_here (node_id, seq) VALUES (?1, ?2)")?;
-        let (removed, changed) = differences(&before.trees.edited_here, &after.trees.edited_here);
-        for node in removed {
-            remove.execute([node])?;
-        }
-        for (node, seq) in changed {
-            put.execute(params![node, seq])?;
-        }
-        let mut remove = self
-            .0
-            .prepare_cached("DELETE FROM moved_here WHERE node_id = ?1")?;
-        let mut put = self.0.prepare_cached(
+        self.write_set(
+            unsent_edits,
+            "DELETE FROM unsent_edits WHERE node_id = ?1",
+            "INSERT OR IGNORE INTO unsent_edits (node_id) VALUES (?1)",
+        )?;
+        self.write_map(
+            moved_here,
+            "DELETE FROM moved_here WHERE node_id = ?1",
             "INSERT OR REPLACE INTO moved_here (node_id, seq, upgraded) VALUES (?1, ?2, ?3)",
+            |put, node, moved| put.execute(params![node, moved.seq, moved.upgraded]),
         )?;
-        let (removed, changed) = differences(&before.trees.moved_here, &after.trees.moved_here);
-        for node in removed {
-            remove.execute([node])?;
-        }
-        for (node, moved) in changed {
-            put.execute(params![node, moved.seq, moved.upgraded])?;
-        }
         let mut remove = self
             .0
             .prepare_cached("DELETE FROM past_positions WHERE node_id = ?1")?;
@@ -548,14 +563,9 @@ impl Tx<'_> {
             "INSERT INTO past_positions (node_id, position, rev, parent_id, name)
              VALUES (?1, ?2, ?3, ?4, ?5)",
         )?;
-        let (removed, changed) =
-            differences(&before.trees.past_positions, &after.trees.past_positions);
-        for node in removed {
+        for (node, past) in past_positions {
             remove.execute([node])?;
-        }
-        for (node, past) in changed {
-            remove.execute([node])?;
-            for (index, position) in past.iter().enumerate() {
+            for (index, position) in past.iter().flatten().enumerate() {
                 put.execute(params![
                     node,
                     index,
@@ -567,74 +577,52 @@ impl Tx<'_> {
         }
         let mut remove = self
             .0
-            .prepare_cached("DELETE FROM unsent_edits WHERE node_id = ?1")?;
-        let mut put = self
-            .0
-            .prepare_cached("INSERT OR IGNORE INTO unsent_edits (node_id) VALUES (?1)")?;
-        let (old, new) = (&before.trees.unsent_edits, &after.trees.unsent_edits);
-        for node in old.difference(new) {
-            remove.execute([node])?;
-        }
-        for node in new.difference(old) {
-            put.execute([node])?;
-        }
-        let mut remove = self
-            .0
             .prepare_cached("DELETE FROM replaced_versions WHERE node_id = ?1")?;
         let mut put = self.0.prepare_cached(
             "INSERT INTO replaced_versions (node_id, position, version_id) VALUES (?1, ?2, ?3)",
         )?;
-        let (removed, changed) = differences(
-            &before.trees.replaced_versions,
-            &after.trees.replaced_versions,
-        );
-        for node in removed {
+        for (node, versions) in replaced_versions {
             remove.execute([node])?;
-        }
-        for (node, versions) in changed {
-            remove.execute([node])?;
-            for (position, version) in versions.iter().enumerate() {
+            for (position, version) in versions.iter().flatten().enumerate() {
                 put.execute(params![node, position, version])?;
             }
         }
-        let mut remove = self
-            .0
-            .prepare_cached("DELETE FROM resends WHERE node_id = ?1")?;
-        let mut put = self
-            .0
-            .prepare_cached("INSERT OR IGNORE INTO resends (node_id) VALUES (?1)")?;
-        let (old, new) = (&before.trees.resends, &after.trees.resends);
-        for node in old.difference(new) {
-            remove.execute([node])?;
-        }
-        for node in new.difference(old) {
-            put.execute([node])?;
-        }
-        let mut remove = self
-            .0
-            .prepare_cached("DELETE FROM kept_originals WHERE node_id = ?1")?;
-        let mut put = self.0.prepare_cached(
-            "INSERT OR REPLACE INTO kept_originals (node_id, kept) VALUES (?1, ?2)",
+        self.write_set(
+            resends,
+            "DELETE FROM resends WHERE node_id = ?1",
+            "INSERT OR IGNORE INTO resends (node_id) VALUES (?1)",
         )?;
-        let (removed, changed) =
-            differences(&before.trees.kept_originals, &after.trees.kept_originals);
-        for node in removed {
-            remove.execute([node])?;
-        }
-        for (node, kept) in changed {
-            put.execute(params![node, kept])?;
-        }
+        self.write_map(
+            kept_originals,
+            "DELETE FROM kept_originals WHERE node_id = ?1",
+            "INSERT OR REPLACE INTO kept_originals (node_id, kept) VALUES (?1, ?2)",
+            |put, node, kept| put.execute(params![node, kept]),
+        )?;
 
-        let (old, new) = (&before.commits, &after.commits);
-        if (old.accepted, old.halted, old.cap) != (new.accepted, new.halted, new.cap) {
-            let (halt, code) = halt_row(new.halted);
+        if accepted.is_some() || halted.is_some() || cap.is_some() {
             self.0.execute(
-                "INSERT OR REPLACE INTO commit_state (id, accepted, halt, policy_code, cap)
-                 VALUES (1, ?1, ?2, ?3, ?4)",
-                params![new.accepted, halt, code, new.cap],
+                "INSERT OR IGNORE INTO commit_state (id, accepted) VALUES (1, 0)",
+                [],
             )?;
         }
-        if old.in_flight != new.in_flight {
+        if let Some(accepted) = accepted {
+            self.0.execute(
+                "UPDATE commit_state SET accepted = ?1 WHERE id = 1",
+                [accepted],
+            )?;
+        }
+        if let Some(halted) = halted {
+            let (halt, code) = halt_row(*halted);
+            self.0.execute(
+                "UPDATE commit_state SET halt = ?1, policy_code = ?2 WHERE id = 1",
+                params![halt, code],
+            )?;
+        }
+        if let Some(cap) = cap {
+            self.0
+                .execute("UPDATE commit_state SET cap = ?1 WHERE id = 1", [cap])?;
+        }
+        if let Some(in_flight) = in_flight {
             for table in [
                 "commit_in_flight",
                 "commit_in_flight_deletes",
@@ -642,7 +630,7 @@ impl Tx<'_> {
             ] {
                 self.0.execute(&format!("DELETE FROM {table}"), [])?;
             }
-            if let Some(flight) = &new.in_flight {
+            if let Some(flight) = in_flight {
                 self.0.execute(
                     "INSERT INTO commit_in_flight (id, commit_message, result) VALUES (1, ?1, ?2)",
                     params![
@@ -664,79 +652,142 @@ impl Tx<'_> {
                 }
             }
         }
-        let mut remove = self
-            .0
-            .prepare_cached("DELETE FROM commit_slots WHERE device_seq = ?1")?;
-        let mut put = self.0.prepare_cached(
+        self.write_map(
+            slots,
+            "DELETE FROM commit_slots WHERE device_seq = ?1",
             "INSERT OR REPLACE INTO commit_slots (device_seq, seq) VALUES (?1, ?2)",
+            |put, slot, seq| put.execute(params![slot, seq]),
         )?;
-        let (removed, changed) = differences(&old.slots, &new.slots);
-        for slot in removed {
-            remove.execute([slot])?;
+        if restores.is_some() {
+            self.0
+                .execute("DELETE FROM restore_intents WHERE outcome IS NULL", [])?;
         }
-        for (slot, seq) in changed {
-            put.execute(params![slot, seq])?;
+        if resolved.is_some() {
+            self.0
+                .execute("DELETE FROM restore_intents WHERE outcome IS NOT NULL", [])?;
         }
-        if (&old.restores, &old.resolved) != (&new.restores, &new.resolved) {
-            self.0.execute("DELETE FROM restore_intents", [])?;
-            self.set_restores(&new.restores, &new.resolved)?;
+        if restores.is_some() || resolved.is_some() {
+            let queued = restores.clone().unwrap_or_default();
+            self.set_restores(&queued, resolved.as_deref().unwrap_or_default())?;
         }
-        if old.questions != new.questions {
-            self.set_open_questions(&new.questions)?;
+        if let Some(questions) = questions {
+            self.set_open_questions(questions)?;
         }
-        let mut remove = self
-            .0
-            .prepare_cached("DELETE FROM published_nodes WHERE node_id = ?1")?;
-        for node in old.published.difference(&new.published) {
-            remove.execute([node])?;
-        }
-        let mut insert = self
-            .0
-            .prepare_cached("INSERT INTO published_nodes (node_id) VALUES (?1)")?;
-        for node in new.published.difference(&old.published) {
-            insert.execute([node])?;
-        }
-        let mut remove = self
-            .0
-            .prepare_cached("DELETE FROM pending_names WHERE node_id = ?1")?;
-        let mut put = self.0.prepare_cached(
+        self.write_set(
+            published,
+            "DELETE FROM published_nodes WHERE node_id = ?1",
+            "INSERT OR IGNORE INTO published_nodes (node_id) VALUES (?1)",
+        )?;
+        self.write_map(
+            pending,
+            "DELETE FROM pending_names WHERE node_id = ?1",
             "INSERT OR REPLACE INTO pending_names (node_id, sent, name, landed) VALUES (?1, ?2, ?3, ?4)",
+            |put, node, pending| {
+                put.execute(params![node, pending.sent, pending.name, pending.landed])
+            },
         )?;
-        let (removed, changed) = differences(&old.pending, &new.pending);
-        for node in removed {
-            remove.execute([node])?;
-        }
-        for (node, pending) in changed {
-            put.execute(params![node, pending.sent, pending.name, pending.landed])?;
-        }
-        if old.guard != new.guard {
-            self.update_guard(&old.guard, &new.guard)?;
-        }
+        self.write_guard(guard)?;
 
-        let (old, new) = (&before.effects, &after.effects);
-        if (old.cleared, &old.in_flight) != (new.cleared, &new.in_flight) {
+        if effect.is_some() || cleared.is_some() {
             self.0.execute(
-                "INSERT OR REPLACE INTO effect_state (id, cleared, in_flight) VALUES (1, ?1, ?2)",
-                params![
-                    new.cleared,
-                    new.in_flight
-                        .as_ref()
-                        .map(|record| StoredRecord::from(record).encode_to_vec()),
-                ],
+                "INSERT OR IGNORE INTO effect_state (id, cleared) VALUES (1, 0)",
+                [],
             )?;
         }
+        if let Some(cleared) = cleared {
+            self.0.execute(
+                "UPDATE effect_state SET cleared = ?1 WHERE id = 1",
+                [cleared],
+            )?;
+        }
+        if let Some(effect) = effect {
+            let record = (effect.as_ref()).map(|record| StoredRecord::from(record).encode_to_vec());
+            self.0.execute(
+                "UPDATE effect_state SET in_flight = ?1 WHERE id = 1",
+                [record],
+            )?;
+        }
+        self.write_map(
+            failed,
+            "DELETE FROM failed_effects WHERE node_id = ?1",
+            "INSERT OR REPLACE INTO failed_effects (node_id, effect) VALUES (?1, ?2)",
+            |put, node, effect| {
+                put.execute(params![node, StoredEffect::from(effect).encode_to_vec()])
+            },
+        )?;
+        Ok(())
+    }
+
+    /// The rows of the nodes kept outside the synced folders and of the displaced ones, which share a table: the
+    /// rows that leave go first, so that a node that turns from one into the other takes its new row.
+    fn write_recorded(
+        &self,
+        outside: &SetChanges<NodeId>,
+        lost: &SetChanges<NodeId>,
+        displaced: &MapChanges<NodeId, FileIdentity>,
+    ) -> Result<()> {
         let mut remove = self
             .0
-            .prepare_cached("DELETE FROM failed_effects WHERE node_id = ?1")?;
-        let mut put = self.0.prepare_cached(
-            "INSERT OR REPLACE INTO failed_effects (node_id, effect) VALUES (?1, ?2)",
-        )?;
-        let (removed, changed) = differences(&old.failed, &new.failed);
-        for node in removed {
-            remove.execute([node])?;
+            .prepare_cached("DELETE FROM recorded_nodes WHERE node_id = ?1 AND displaced = ?2")?;
+        let left = (outside.iter().filter(|(_, held)| !held)).map(|(node, _)| (node, false));
+        let gone =
+            (displaced.iter().filter(|(_, held)| held.is_none())).map(|(node, _)| (node, true));
+        for (node, displaced) in left.chain(gone) {
+            remove.execute(params![node, displaced])?;
         }
-        for (node, effect) in changed {
-            put.execute(params![node, StoredEffect::from(effect).encode_to_vec()])?;
+        let mut put = self.0.prepare_cached(
+            "INSERT OR REPLACE INTO recorded_nodes (node_id, displaced, dev, ino, ino_high, birth_ns, lost)
+             VALUES (?1, 1, ?2, ?3, ?4, ?5, 0)",
+        )?;
+        for (node, held) in displaced {
+            if let Some(held) = held {
+                let (ino, ino_high) = ino_columns(held.ino);
+                put.execute(params![node, held.dev as i64, ino, ino_high, held.birth_ns])?;
+            }
+        }
+        let mut put = self.0.prepare_cached(
+            "INSERT OR IGNORE INTO recorded_nodes (node_id, displaced, ino_high, lost) VALUES (?1, 0, 0, 0)",
+        )?;
+        for (node, _) in outside.iter().filter(|(_, held)| *held) {
+            put.execute([node])?;
+        }
+        let mut mark = self.0.prepare_cached(
+            "UPDATE recorded_nodes SET lost = ?2 WHERE node_id = ?1 AND displaced = 0",
+        )?;
+        for (node, held) in lost {
+            mark.execute(params![node, held])?;
+        }
+        Ok(())
+    }
+
+    fn write_set(&self, changes: &SetChanges<NodeId>, remove: &str, insert: &str) -> Result<()> {
+        let mut remove = self.0.prepare_cached(remove)?;
+        let mut insert = self.0.prepare_cached(insert)?;
+        for (node, held) in changes {
+            match held {
+                true => insert.execute([node])?,
+                false => remove.execute([node])?,
+            };
+        }
+        Ok(())
+    }
+
+    /// Writes the entries of `changes`: `put` writes each one the state holds with the statement `insert`, and
+    /// `remove` removes the row of each key it no longer holds.
+    pub(crate) fn write_map<K: ToSql, V>(
+        &self,
+        changes: &MapChanges<K, V>,
+        remove: &str,
+        insert: &str,
+        mut put: impl FnMut(&mut CachedStatement<'_>, &K, &V) -> rusqlite::Result<usize>,
+    ) -> Result<()> {
+        let mut remove = self.0.prepare_cached(remove)?;
+        let mut insert = self.0.prepare_cached(insert)?;
+        for (key, value) in changes {
+            match value {
+                Some(value) => put(&mut insert, key, value)?,
+                None => remove.execute([key])?,
+            };
         }
         Ok(())
     }
@@ -781,22 +832,6 @@ impl Tx<'_> {
 
 fn invalid(what: String) -> Error {
     Error::InvalidEngineState(what)
-}
-
-/// The keys of `before` that `after` lacks, and the entries of `after` that `before` lacks or holds
-/// with another value.
-fn differences<'a, K: Ord, V: PartialEq>(
-    before: &'a BTreeMap<K, V>,
-    after: &'a BTreeMap<K, V>,
-) -> (
-    impl Iterator<Item = &'a K>,
-    impl Iterator<Item = (&'a K, &'a V)>,
-) {
-    let removed = before.keys().filter(|key| !after.contains_key(*key));
-    let changed = after
-        .iter()
-        .filter(|(key, value)| before.get(*key) != Some(*value));
-    (removed, changed)
 }
 
 fn halt_row(halt: Option<Halt>) -> (Option<&'static str>, Option<i32>) {

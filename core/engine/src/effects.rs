@@ -13,7 +13,8 @@ use crate::ids::IdGen;
 use crate::ignore::is_rules_file;
 
 use crate::names::name_key;
-use crate::state::{EffectsState, StateError};
+use crate::state::{EffectsChanges, EffectsState, StateError};
+use crate::tracked::{Marked, TrackedMap};
 use crate::tree::{Content, FileIdentity, Kind, LocalNode, NodeId, Shape, same, same_content};
 
 /// A directory on the way to an entry, with the identity L holds for it. The driver resolves a
@@ -150,18 +151,32 @@ pub enum EffectError {
 /// directory on its path, gives the node a new effect.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Effects {
-    in_flight: Option<EffectRecord>,
-    cleared: u64,
-    failed: BTreeMap<NodeId, Effect>,
+    in_flight: Marked<Option<EffectRecord>>,
+    cleared: Marked<u64>,
+    failed: TrackedMap<NodeId, Effect>,
 }
 
 impl Effects {
     /// What the store keeps of the disk side.
     pub fn state(&self) -> EffectsState {
         EffectsState {
-            in_flight: self.in_flight.clone(),
-            cleared: self.cleared,
-            failed: self.failed.clone(),
+            in_flight: (*self.in_flight).clone(),
+            cleared: *self.cleared,
+            failed: (*self.failed).clone(),
+        }
+    }
+
+    /// What changed in [`Effects::state`] since the last call, for the store to write.
+    pub fn take_changes(&mut self) -> EffectsChanges {
+        let Self {
+            in_flight,
+            cleared,
+            failed,
+        } = self;
+        EffectsChanges {
+            in_flight: in_flight.take_changed().cloned(),
+            cleared: cleared.take_changed().copied(),
+            failed: failed.take_changes(),
         }
     }
 
@@ -182,9 +197,9 @@ impl Effects {
             failed,
         } = state;
         Ok(Self {
-            in_flight,
-            cleared,
-            failed,
+            in_flight: in_flight.into(),
+            cleared: cleared.into(),
+            failed: failed.into(),
         })
     }
 
@@ -194,7 +209,7 @@ impl Effects {
 
     /// The effect counter *e* of section 2.8.
     pub fn cleared(&self) -> u64 {
-        self.cleared
+        *self.cleared
     }
 
     /// The nodes whose last effect failed, with that effect. Each stays blocked until the effect
@@ -249,13 +264,13 @@ impl Effects {
             .retain(|id, _| candidate(trees, id) || trees.waiting().contains_key(id));
         let (node, effect, after) = self.choose(trees, in_flight)?;
         self.failed.remove(&node);
-        self.in_flight = Some(EffectRecord {
+        self.in_flight.set(Some(EffectRecord {
             effect_id: ids.uuid_v7(now_ms),
             node,
-            counter: self.cleared + 1,
+            counter: *self.cleared + 1,
             effect,
             after,
-        });
+        }));
         self.in_flight.as_ref()
     }
 
@@ -427,7 +442,7 @@ impl Effects {
             ),
         }
         self.failed.remove(&record.node);
-        self.cleared = record.counter;
+        self.cleared.set(record.counter);
         Ok(removal)
     }
 
@@ -436,7 +451,7 @@ impl Effects {
     /// and the content it finds there. An entry that L holds as another node is that node's, and a
     /// removal whose node L places elsewhere found its name empty because the node moved.
     pub fn confirms(&self, trees: &Trees, identity: Option<&FileIdentity>) -> bool {
-        let Some(record) = &self.in_flight else {
+        let Some(record) = &*self.in_flight else {
             return false;
         };
         let local = trees.local();
@@ -460,7 +475,7 @@ impl Effects {
     pub fn failed(&mut self, effect_id: &str) -> Result<(), EffectError> {
         let record = self.take(effect_id)?;
         self.failed.insert(record.node, record.effect);
-        self.cleared = record.counter;
+        self.cleared.set(record.counter);
         Ok(())
     }
 
@@ -473,7 +488,7 @@ impl Effects {
         let record = self.take(effect_id)?;
         trees.remove_local(&record.node);
         trees.set_synced(record.node, None);
-        self.cleared = record.counter;
+        self.cleared.set(record.counter);
         Ok(())
     }
 
