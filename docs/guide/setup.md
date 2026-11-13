@@ -33,6 +33,8 @@ Once this machine is connected, setup asks which folder to sync:
 
 Setup then links the folder, as `koi folder link` does, and starts background sync. It ends with the folder to add files to and `koi status`, which shows how sync is going. If you cancel a folder question, this machine stays connected and no folder is linked.
 
+The daemon checks the approved directory and existing-files choice after its server lookup. If the directory is replaced or unapproved files arrive while setup is waiting, it refuses the link; run `koi setup` again to review the folder. A shared-folder name that matches several spaces is refused with their IDs, including when recovering a lost create response. Select the intended shared folder from the list, or use its ID in a script. Dangling paths and folders without write access are refused before a pairing code is redeemed.
+
 After setup succeeds, it asks whether to send anonymous usage reports, unless you already chose or an environment variable decides it. Press Enter for yes. The choice applies to future commands, not the setup that just finished. [Usage reports](telemetry.md) lists what they hold and how to turn them off.
 
 The login asks for four permissions: reading the account's settings, managing its Workers, writing to its R2 buckets, and keeping access while the command runs (`account-settings.read`, `workers-scripts.admin`, `workers-r2.write` and `offline_access`). Koidrive revokes the login when the command ends. If it can't, it says so, and you can revoke it under Manage OAuth authorizations in the Cloudflare dashboard.

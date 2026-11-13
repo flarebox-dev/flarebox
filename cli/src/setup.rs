@@ -26,7 +26,7 @@ use koidrive_cloudflare::{
     Account, Bundle, CLIENT_ID, Cloudflare, Endpoints, Grant, Jurisdiction, Login, Loopback,
     Script, Secret, UploadPlan,
 };
-use koidrive_driver::{Credential, DriverError, Paths};
+use koidrive_driver::{Credential, DirectoryIdentity, DriverError, LinkApproval, Paths};
 use koidrive_ipc::{Code, Next, Request, Response};
 use koidrive_net::{Api, ApiError};
 use koidrive_proto::v1::{ServerInfo, SpaceInfo};
@@ -373,11 +373,18 @@ async fn onboard(paths: &Paths, terminal: &Terminal) -> Result<Done, CliError> {
     let auth = crate::reading(paths, &credential)?;
     let spaces = auth.api().list_spaces(&auth).await?.spaces;
     let target = shared_folder(terminal, &spaces).await?;
-    let (folder, local) = local_folder(terminal, &target).await?;
+    let SelectedFolder {
+        folder,
+        local,
+        directory,
+    } = local_folder(terminal, &target).await?;
     if local == Local::Missing {
         create(&folder)?;
         terminal.message(&format!("Done. Created {}.", folder.display()));
     }
+    let directory = directory
+        .map(Ok)
+        .unwrap_or_else(|| directory_identity(&folder))?;
     let space = match target {
         Target::Existing(space) => space,
         Target::New(name) => match crate::named_space(&auth, &spaces, &name).await? {
@@ -388,7 +395,12 @@ async fn onboard(paths: &Paths, terminal: &Terminal) -> Result<Done, CliError> {
             crate::Named::Existing(space) => space,
         },
     };
-    let (status, outcome) = crate::link(paths, folder.clone(), space.space_id).await?;
+    let approval = LinkApproval {
+        directory,
+        accept_existing_files: local == Local::Files,
+    };
+    let (status, outcome) =
+        crate::link(paths, folder.clone(), space.space_id, Some(approval)).await?;
     terminal.message(&match outcome {
         Outcome::Unchanged => format!(
             "{} is already linked to {}.",
@@ -451,9 +463,9 @@ async fn shared_folder(terminal: &Terminal, spaces: &[SpaceInfo]) -> Result<Targ
         match crate::short_name(name) {
             Ok(_) if name.is_empty() => terminal.message("Enter a name for the shared folder."),
             Ok(_) => {
-                let existing = spaces.iter().find(|space| space.name == name);
+                let existing = crate::existing_space(spaces, name)?;
                 return Ok(match existing {
-                    Some(space) => Target::Existing(space.clone()),
+                    Some(space) => Target::Existing(space),
                     None => Target::New(name.to_owned()),
                 });
             }
@@ -476,7 +488,24 @@ enum Local {
     Files,
 }
 
-async fn local_folder(terminal: &Terminal, target: &Target) -> Result<(PathBuf, Local), CliError> {
+struct SelectedFolder {
+    folder: PathBuf,
+    local: Local,
+    directory: Option<DirectoryIdentity>,
+}
+
+fn directory_identity(folder: &Path) -> Result<DirectoryIdentity, CliError> {
+    std::fs::metadata(folder)
+        .map(|meta| DirectoryIdentity::of(&meta))
+        .map_err(|error| {
+            CliError::from(format!(
+                "{}: {error}",
+                printable(&folder.display().to_string())
+            ))
+        })
+}
+
+async fn local_folder(terminal: &Terminal, target: &Target) -> Result<SelectedFolder, CliError> {
     let default = home()?.join(DEFAULT_FOLDER);
     let shown = default.display().to_string();
     loop {
@@ -499,6 +528,9 @@ async fn local_folder(terminal: &Terminal, target: &Target) -> Result<(PathBuf, 
             }
         };
         let path = folder.display();
+        let directory = (local != Local::Missing)
+            .then(|| directory_identity(&folder))
+            .transpose()?;
         let name = target.name();
         let question = match (local, target) {
             (Local::Missing, Target::New(_)) => {
@@ -508,7 +540,13 @@ async fn local_folder(terminal: &Terminal, target: &Target) -> Result<(PathBuf, 
             (Local::Empty, Target::New(_)) => {
                 format!("Create a shared folder named {name} for {path}?")
             }
-            (Local::Empty, Target::Existing(_)) => return Ok((folder, local)),
+            (Local::Empty, Target::Existing(_)) => {
+                return Ok(SelectedFolder {
+                    folder,
+                    local,
+                    directory,
+                });
+            }
             (Local::Files, Target::Existing(_)) => format!(
                 "{path} contains files. Its files will upload to {name}, and files in {name} will download here. Link this folder?"
             ),
@@ -517,7 +555,11 @@ async fn local_folder(terminal: &Terminal, target: &Target) -> Result<(PathBuf, 
             ),
         };
         if terminal.confirm(&question, local != Local::Files).await? {
-            return Ok((folder, local));
+            return Ok(SelectedFolder {
+                folder,
+                local,
+                directory,
+            });
         }
     }
 }
@@ -525,8 +567,19 @@ async fn local_folder(terminal: &Terminal, target: &Target) -> Result<(PathBuf, 
 fn inspect(folder: &Path) -> Result<Local, String> {
     let shown = printable(&folder.display().to_string());
     let unreadable = |error: std::io::Error| format!("{shown} cannot be read: {error}");
+    if std::fs::symlink_metadata(folder).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        std::fs::metadata(folder).map_err(unreadable)?;
+    }
     match std::fs::metadata(folder) {
         Ok(meta) if meta.is_dir() => {
+            if rustix::fs::access(
+                folder,
+                rustix::fs::Access::WRITE_OK | rustix::fs::Access::EXEC_OK,
+            )
+            .is_err()
+            {
+                return Err(format!("{shown} is not writable"));
+            }
             let mut entries = std::fs::read_dir(folder).map_err(unreadable)?;
             Ok(match entries.next() {
                 Some(_) => Local::Files,
@@ -535,13 +588,25 @@ fn inspect(folder: &Path) -> Result<Local, String> {
         }
         Ok(_) => Err(format!("{shown} is a file, not a folder")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let parent = folder.ancestors().skip(1).find(|dir| dir.exists());
+            let parent = folder
+                .ancestors()
+                .skip(1)
+                .find(|dir| std::fs::symlink_metadata(dir).is_ok());
+            if let Some(parent) = parent {
+                std::fs::metadata(parent).map_err(unreadable)?;
+            }
             match parent {
                 Some(dir) if !dir.is_dir() => Err(format!(
                     "{shown} cannot be created, because {} is a file",
                     printable(&dir.display().to_string())
                 )),
-                Some(dir) if rustix::fs::access(dir, rustix::fs::Access::WRITE_OK).is_err() => {
+                Some(dir)
+                    if rustix::fs::access(
+                        dir,
+                        rustix::fs::Access::WRITE_OK | rustix::fs::Access::EXEC_OK,
+                    )
+                    .is_err() =>
+                {
                     Err(format!(
                         "{shown} cannot be created, because {} is not writable",
                         printable(&dir.display().to_string())
@@ -614,6 +679,9 @@ async fn scripted(
     }
     let folder = crate::absolute(&expanded(folder)?)?;
     let local = inspect(&folder).map_err(CliError::usage)?;
+    let directory = (local != Local::Missing)
+        .then(|| directory_identity(&folder))
+        .transpose()?;
     let credential = Credential::load(&paths.credential()).map_err(|error| error.to_string())?;
     if local == Local::Files && !script.accept_existing_files {
         let linked = if credential.is_some() {
@@ -671,7 +739,15 @@ async fn scripted(
     if local == Local::Missing {
         create(&folder)?;
     }
-    let (status, outcome) = crate::link(paths, folder.clone(), space.to_owned()).await?;
+    let directory = directory
+        .map(Ok)
+        .unwrap_or_else(|| directory_identity(&folder))?;
+    let approval = LinkApproval {
+        directory,
+        accept_existing_files: script.accept_existing_files,
+    };
+    let (status, outcome) =
+        crate::link(paths, folder.clone(), space.to_owned(), Some(approval)).await?;
     let data = SetupData {
         account: AccountData::of(&account),
         folder: FolderData::of(&status),

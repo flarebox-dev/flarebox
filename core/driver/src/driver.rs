@@ -36,6 +36,22 @@ use crate::status::{Account, FolderState, FolderStatus, Status};
 /// How long a sign-out waits for each call to the server before it goes on without it.
 const SERVER_WAIT: Duration = Duration::from_secs(10);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LinkApproval {
+    pub directory: crate::DirectoryIdentity,
+    pub accept_existing_files: bool,
+}
+
+impl LinkApproval {
+    fn check_directory(&self, root: &Path) -> Result<(), DriverError> {
+        let current = fs::metadata(root).map_err(io_error(root))?;
+        if self.directory != crate::DirectoryIdentity::of(&current) {
+            return Err(DriverError::FolderApprovalChanged(root.to_owned()));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DriverError {
     #[error("another Koidrive process is using this profile ({})", koidrive_fs::quoted(.0))]
@@ -78,6 +94,8 @@ pub enum DriverError {
     FolderNotFound(PathBuf),
     #[error("{} is not a folder", koidrive_fs::quoted(.0))]
     NotAFolder(PathBuf),
+    #[error("{} changed after its folder was approved; run koi setup again to review its files", koidrive_fs::quoted(.0))]
+    FolderApprovalChanged(PathBuf),
     #[error(
         "the folder overlaps Koidrive's own files at {}; link a folder that neither holds nor sits inside it",
         koidrive_fs::quoted(.0)
@@ -665,6 +683,15 @@ impl Driver {
     /// its store. The folder starts syncing at once if the driver is running. A folder already linked to that space
     /// stays as it is, and one linked to another space is refused.
     pub async fn link(&self, folder: &Path, space: &str) -> Result<Linked, DriverError> {
+        self.link_approved(folder, space, None).await
+    }
+
+    pub async fn link_approved(
+        &self,
+        folder: &Path,
+        space: &str,
+        approval: Option<LinkApproval>,
+    ) -> Result<Linked, DriverError> {
         let _lifecycle = self.inner.lifecycle.lock().await;
         let credential = self.credential()?;
         let root = fs::canonicalize(folder).map_err(|error| match error.kind() {
@@ -673,6 +700,9 @@ impl Driver {
         })?;
         if !root.is_dir() {
             return Err(DriverError::NotAFolder(root));
+        }
+        if let Some(approval) = approval {
+            approval.check_directory(&root)?;
         }
         let here = (self.inner.folders.lock().unwrap().values())
             .find(|linked| linked.link.root == root)
@@ -696,6 +726,9 @@ impl Driver {
                 resolve_space(auth.api().list_spaces(&auth).await?.spaces, space)?.space_id
                     == space_id
             };
+            if let Some(approval) = approval {
+                approval.check_directory(&root)?;
+            }
             return match same {
                 true => Ok(Linked::Already(status)),
                 false => Err(DriverError::FolderOverlaps(root)),
@@ -728,6 +761,19 @@ impl Driver {
         self.check_placement(&root, &folders)?;
         if let Some(linked) = folders.get(&space.space_id) {
             return Err(DriverError::SpaceAlreadyLinked(linked.link.root.clone()));
+        }
+        if let Some(approval) = approval {
+            approval.check_directory(&root)?;
+            let unapproved_files = !approval.accept_existing_files
+                && fs::read_dir(&root)
+                    .map_err(io_error(&root))?
+                    .try_fold(false, |found, entry| {
+                        entry.map(|entry| found || entry.file_name() != koidrive_fs::PRIVATE_DIR)
+                    })
+                    .map_err(io_error(&root))?;
+            if unapproved_files || !claim::still_locked(&lock, &root) {
+                return Err(DriverError::FolderApprovalChanged(root));
+            }
         }
         match read_marker(&root).map_err(io_error(&root))? {
             Some(marker) if marker.space_id != space.space_id => {

@@ -29,12 +29,14 @@ const TELEMETRY: &str = "Send reports?";
 struct Step {
     wait: Vec<&'static str>,
     input: String,
+    before_answer: Option<Box<dyn Fn()>>,
 }
 
 fn step(wait: &'static str, input: impl Into<String>) -> Step {
     Step {
         wait: vec![wait],
         input: input.into(),
+        before_answer: None,
     }
 }
 
@@ -42,6 +44,7 @@ fn after(wait: &[&'static str], input: impl Into<String>) -> Step {
     Step {
         wait: wait.to_vec(),
         input: input.into(),
+        before_answer: None,
     }
 }
 
@@ -97,7 +100,10 @@ struct Home {
     linked: Arc<Mutex<Vec<FolderStatus>>>,
     requests: Arc<Mutex<Vec<String>>>,
     lose_create: Arc<AtomicBool>,
+    request_hook: RequestHook,
 }
+
+type RequestHook = Arc<Mutex<Option<Box<dyn FnMut(&str) + Send>>>>;
 
 impl Home {
     fn new(spaces: &[&str]) -> Home {
@@ -122,15 +128,17 @@ impl Home {
             linked: Arc::new(Mutex::new(Vec::new())),
             requests: Arc::new(Mutex::new(Vec::new())),
             lose_create: Arc::new(AtomicBool::new(false)),
+            request_hook: Arc::new(Mutex::new(None)),
         };
         let (spaces, requests, lose) = (
             home.spaces.clone(),
             home.requests.clone(),
             home.lose_create.clone(),
         );
+        let hook = home.request_hook.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
-                serve(stream.unwrap(), &spaces, &requests, &lose);
+                serve(stream.unwrap(), &spaces, &requests, &lose, &hook);
             }
         });
         home
@@ -240,7 +248,7 @@ impl Home {
                         serde_json::json!({"response":"status", "status":{"account":null,"running":true,"folders":folders}})
                     }
                     "questions" => serde_json::json!({"response":"questions", "questions":[]}),
-                    "link" => {
+                    "link" | "link_approved" => {
                         let folder = request["folder"].as_str().unwrap();
                         let wanted = request["space"].as_str().unwrap();
                         requests
@@ -384,6 +392,7 @@ fn serve(
     spaces: &Mutex<Vec<SpaceInfo>>,
     requests: &Mutex<Vec<String>>,
     lose_create: &AtomicBool,
+    hook: &RequestHook,
 ) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut first = String::new();
@@ -406,6 +415,9 @@ fn serve(
     let mut words = first.split(' ');
     let (method, path) = (words.next().unwrap(), words.next().unwrap());
     requests.lock().unwrap().push(format!("{method} {path}"));
+    if let Some(hook) = hook.lock().unwrap().as_mut() {
+        hook(&format!("{method} {path}"));
+    }
     let answer = match (method, path) {
         ("POST", "/v1/token") => AccessToken {
             token: "token".into(),
@@ -521,6 +533,7 @@ fn terminal_run(
     }
     let mut child = command.spawn().unwrap();
     let mut text = String::new();
+    let mut raw = Vec::new();
     let mut answered = 0;
     let mut seen = 0;
     let mut signalled = false;
@@ -531,7 +544,8 @@ fn terminal_run(
         match terminal.read(&mut bytes) {
             Ok(0) => break,
             Ok(count) => {
-                text.push_str(&String::from_utf8_lossy(&bytes[..count]));
+                raw.extend_from_slice(&bytes[..count]);
+                text = String::from_utf8_lossy(&raw).into_owned();
                 let visible = console::strip_ansi_codes(&text);
                 let reached = (!signalled)
                     .then(|| steps.get(answered))
@@ -571,6 +585,9 @@ fn terminal_run(
                         .unwrap();
                         signalled = true;
                     } else {
+                        if let Some(before_answer) = &steps[answered].before_answer {
+                            before_answer();
+                        }
                         terminal
                             .write_all(steps[answered].input.as_bytes())
                             .unwrap();
@@ -594,7 +611,7 @@ fn terminal_run(
     }
     let output = Output {
         status: child.wait().unwrap(),
-        stdout: text.into_bytes(),
+        stdout: raw,
         stderr: Vec::new(),
     };
     let restored = rustix::termios::tcgetattr(&terminal).unwrap();
@@ -1299,6 +1316,209 @@ fn scripted_pairing_links_the_folder_without_a_terminal() {
 }
 
 #[test]
+fn files_appearing_during_creation_confirmation_are_not_linked_without_consent() {
+    for rich in [false, true] {
+        let home = Home::new(&["Work"]);
+        home.connect();
+        let folder = home.path().join("Koidrive");
+        let changed = folder.clone();
+        let steps = [
+            step(SPACE, choose(rich, 0)),
+            step(PATH, "\n"),
+            Step {
+                before_answer: Some(Box::new(move || {
+                    fs::create_dir(&changed).unwrap();
+                    fs::write(changed.join("private.docx"), "private document").unwrap();
+                })),
+                ..after(&["Create ", "Koidrive?"], yes(rich, true))
+            },
+        ];
+        let output = terminal_run(
+            home.path(),
+            &steps,
+            &["setup", "--telemetry", "off"],
+            &[],
+            rich,
+            None,
+            false,
+        );
+        let text = shown(output.clone());
+        assert!(!output.status.success(), "{text}");
+        let driver = koidrive_driver::Driver::open(home.paths()).unwrap();
+        assert!(driver.status().folders.is_empty(), "{text}");
+        assert_eq!(
+            fs::read(folder.join("private.docx")).unwrap(),
+            b"private document"
+        );
+    }
+}
+
+#[test]
+fn files_appearing_during_the_link_server_call_still_need_consent() {
+    for rich in [false, true] {
+        let home = Home::new(&["Work"]);
+        home.connect();
+        let folder = home.path().join("Koidrive");
+        fs::create_dir(&folder).unwrap();
+        let changed = folder.clone();
+        let mut lists = 0;
+        *home.request_hook.lock().unwrap() = Some(Box::new(move |request| {
+            if request == "GET /v1/spaces" {
+                lists += 1;
+                if lists == 2 {
+                    fs::write(changed.join("private.docx"), "private document").unwrap();
+                }
+            }
+        }));
+        let steps = [step(SPACE, choose(rich, 0)), step(PATH, "\n")];
+        let output = terminal_run(
+            home.path(),
+            &steps,
+            &["setup", "--telemetry", "off"],
+            &[],
+            rich,
+            None,
+            false,
+        );
+        let text = shown(output.clone());
+        assert!(!output.status.success(), "{text}");
+        let driver = koidrive_driver::Driver::open(home.paths()).unwrap();
+        assert!(driver.status().folders.is_empty(), "{text}");
+        assert_eq!(
+            fs::read(folder.join("private.docx")).unwrap(),
+            b"private document"
+        );
+    }
+}
+
+#[test]
+fn creating_a_shared_folder_does_not_choose_between_duplicate_names() {
+    for rich in [false, true] {
+        let home = Home::new(&["Work", "Work"]);
+        home.connect();
+        let steps = [
+            step(SPACE, choose(rich, 2)),
+            step(NAME, line("Work")),
+            step(PATH, "\n"),
+            step("Create ", yes(rich, true)),
+        ];
+        let output = home.setup(&steps, &["--telemetry", "off"], &[], true, rich, None);
+        let text = shown(output.clone());
+        assert!(!output.status.success(), "{text}");
+        assert!(home.links().is_empty(), "{text}");
+    }
+}
+
+#[test]
+fn replacing_an_approved_directory_during_the_link_server_call_is_refused() {
+    for rich in [false, true] {
+        let home = Home::new(&["Work"]);
+        home.connect();
+        let folder = home.path().join("Koidrive");
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("approved.docx"), "approved document").unwrap();
+        let changed = folder.clone();
+        let saved = home.path().join("Saved");
+        let old = saved.clone();
+        let mut lists = 0;
+        *home.request_hook.lock().unwrap() = Some(Box::new(move |request| {
+            if request == "GET /v1/spaces" {
+                lists += 1;
+                if lists == 2 {
+                    fs::rename(&changed, &old).unwrap();
+                    fs::create_dir(&changed).unwrap();
+                    fs::write(changed.join("private.docx"), "private document").unwrap();
+                }
+            }
+        }));
+        let steps = [
+            step(SPACE, choose(rich, 0)),
+            step(PATH, "\n"),
+            step("Link this folder?", yes(rich, true)),
+        ];
+        let output = terminal_run(
+            home.path(),
+            &steps,
+            &["setup", "--telemetry", "off"],
+            &[],
+            rich,
+            None,
+            false,
+        );
+        let text = shown(output.clone());
+        assert!(!output.status.success(), "{text}");
+        let driver = koidrive_driver::Driver::open(home.paths()).unwrap();
+        assert!(driver.status().folders.is_empty(), "{text}");
+        assert_eq!(
+            fs::read(folder.join("private.docx")).unwrap(),
+            b"private document"
+        );
+        assert_eq!(
+            fs::read(saved.join("approved.docx")).unwrap(),
+            b"approved document"
+        );
+    }
+}
+
+#[test]
+fn a_lost_create_response_does_not_choose_between_duplicate_names() {
+    for rich in [false, true] {
+        let home = Home::new(&[]);
+        home.connect();
+        home.lose_create.store(true, Ordering::Relaxed);
+        let spaces = home.spaces.clone();
+        *home.request_hook.lock().unwrap() = Some(Box::new(move |request| {
+            if request == "POST /v1/spaces" {
+                spaces.lock().unwrap().push(space(0, "Koidrive"));
+            }
+        }));
+        let output = home.setup(
+            &default_folder(rich),
+            &["--telemetry", "off"],
+            &[],
+            true,
+            rich,
+            None,
+        );
+        let text = shown(output.clone());
+        assert!(!output.status.success(), "{text}");
+        assert!(text.contains("several spaces are called"), "{text}");
+        assert!(home.links().is_empty());
+        assert_eq!(home.spaces.lock().unwrap().len(), 2);
+    }
+}
+
+#[test]
+fn a_dangling_path_is_refused_and_the_folder_asked_again() {
+    for rich in [false, true] {
+        let home = Home::new(&["Work"]);
+        home.connect();
+        let dangling = home.path().join("Dangling");
+        let missing = home.path().join("Missing");
+        std::os::unix::fs::symlink(&missing, &dangling).unwrap();
+        let steps = [
+            step(SPACE, choose(rich, 0)),
+            step(PATH, line(dangling.to_str().unwrap())),
+            after(&["cannot be read", PATH], "\n"),
+            step("Create ", yes(rich, true)),
+        ];
+        let output = home.setup(&steps, &["--telemetry", "off"], &[], true, rich, None);
+        let text = shown(output.clone());
+        assert!(output.status.success(), "{text}");
+        assert!(text.contains("cannot be read"), "{text}");
+        assert!(!missing.exists());
+        assert!(
+            fs::symlink_metadata(&dangling)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!home.requests().contains(&"pair".to_owned()));
+        assert_eq!(home.links().len(), 1);
+    }
+}
+
+#[test]
 fn scripted_setup_checks_its_input_before_redeeming_the_code() {
     let home = Home::new(&["Work"]);
     let file = home.path().join("notes.txt");
@@ -1308,7 +1528,40 @@ fn scripted_setup_checks_its_input_before_redeeming_the_code() {
     fs::write(full.join("a.txt"), "a").unwrap();
     let under_file = file.join("Koidrive");
     let empty = home.path().join("Empty");
+    let dangling = home.path().join("Dangling");
+    std::os::unix::fs::symlink(home.path().join("Missing"), &dangling).unwrap();
+    let under_dangling = dangling.join("Child");
+    let readonly = home.path().join("Readonly");
+    fs::create_dir(&readonly).unwrap();
+    fs::set_permissions(&readonly, fs::Permissions::from_mode(0o555)).unwrap();
+    let under_readonly = readonly.join("Child");
     let cases: Vec<(&str, Vec<&str>)> = vec![
+        (
+            "CODE@files.example.com\n",
+            vec!["--folder", readonly.to_str().unwrap(), "--space", "Work"],
+        ),
+        (
+            "CODE@files.example.com\n",
+            vec![
+                "--folder",
+                under_readonly.to_str().unwrap(),
+                "--space",
+                "Work",
+            ],
+        ),
+        (
+            "CODE@files.example.com\n",
+            vec!["--folder", dangling.to_str().unwrap(), "--space", "Work"],
+        ),
+        (
+            "CODE@files.example.com\n",
+            vec![
+                "--folder",
+                under_dangling.to_str().unwrap(),
+                "--space",
+                "Work",
+            ],
+        ),
         (
             "CODE@files.example.com\n",
             vec!["--folder", file.to_str().unwrap(), "--space", "Work"],

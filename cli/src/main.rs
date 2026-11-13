@@ -1112,7 +1112,7 @@ async fn resolve(
 async fn folder(paths: &Paths, action: FolderAction) -> Result<Done, CliError> {
     let request = match action {
         FolderAction::Link { folder, space } => {
-            let (folder, outcome) = link(paths, absolute(&folder)?, space).await?;
+            let (folder, outcome) = link(paths, absolute(&folder)?, space, None).await?;
             let text = linked(&folder, outcome);
             return Ok(Done {
                 outcome,
@@ -1172,8 +1172,17 @@ async fn link(
     paths: &Paths,
     folder: PathBuf,
     space: String,
+    approval: Option<koidrive_driver::LinkApproval>,
 ) -> Result<(FolderStatus, report::Outcome), CliError> {
-    match ipc::run(paths, Request::Link { folder, space }).await? {
+    let request = match approval {
+        Some(approval) => Request::LinkApproved {
+            folder,
+            space,
+            approval,
+        },
+        None => Request::Link { folder, space },
+    };
+    match ipc::run(paths, request).await? {
         Response::Linked { folder } => Ok((folder, report::Outcome::Ok)),
         Response::AlreadyLinked { folder } => Ok((folder, report::Outcome::Unchanged)),
         other => Err(unexpected(other)),
@@ -1441,8 +1450,7 @@ impl Named {
 }
 
 async fn named_space(auth: &Auth, spaces: &[SpaceInfo], name: &str) -> Result<Named, CliError> {
-    let existing = |spaces: &[SpaceInfo]| spaces.iter().find(|space| space.name == name).cloned();
-    if let Some(space) = existing(spaces) {
+    if let Some(space) = existing_space(spaces, name)? {
         return Ok(Named::Existing(space));
     }
     let request = CreateSpaceRequest {
@@ -1451,12 +1459,32 @@ async fn named_space(auth: &Auth, spaces: &[SpaceInfo], name: &str) -> Result<Na
     match auth.api().create_space(auth, &request).await {
         Ok(created) => Ok(Named::Created(created)),
         Err(error) => {
-            let now = auth.api().list_spaces(auth).await.map(|list| list.spaces);
-            match now.ok().as_deref().and_then(existing) {
+            let now = auth.api().list_spaces(auth).await.ok();
+            let existing = match now {
+                Some(list) => existing_space(&list.spaces, name)?,
+                None => None,
+            };
+            match existing {
                 Some(space) => Ok(Named::Existing(space)),
                 None => Err(error.into()),
             }
         }
+    }
+}
+
+fn existing_space(spaces: &[SpaceInfo], name: &str) -> Result<Option<SpaceInfo>, CliError> {
+    let matches: Vec<_> = spaces.iter().filter(|space| space.name == name).collect();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [space] => Ok(Some((*space).clone())),
+        _ => Err(koidrive_driver::DriverError::SpaceAmbiguous {
+            name: name.to_owned(),
+            ids: matches
+                .into_iter()
+                .map(|space| space.space_id.clone())
+                .collect(),
+        }
+        .into()),
     }
 }
 
