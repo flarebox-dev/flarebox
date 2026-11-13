@@ -2522,6 +2522,7 @@ fn an_own_move_acknowledged_before_the_upgrade_is_sent_again_after_a_later_loss(
         Vec::new(),
         Vec::new(),
         moved,
+        Vec::new(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -2829,7 +2830,15 @@ fn a_discarded_file_that_s_no_longer_holds_is_asked_about_again(edited: bool) {
             .build(&mut trees, &mut ids, 1, "history", 1)
             .is_none()
     );
-    trees.forget_lost(Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0, 0);
+    trees.forget_lost(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        0,
+        0,
+    );
     trees.settle();
     assert!(trees.synced().get("secret").is_none());
     assert!(!trees.waiting().contains_key("secret"));

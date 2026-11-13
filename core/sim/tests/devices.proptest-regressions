@@ -28,3 +28,5 @@ cc 983f64c2abba506df7a72b26947385874cb8f2a3521904be65666312cb101dd7 # shrinks to
 cc 18555b6559389c2f0cf875ca50440b251f21be3461f2f0ef389abb726948752b # shrinks to devices = 2, an idle device moves a node back after a loss (GUN-531)
 cc cb2141f762b7ad2e80b01c20c8ab4ea7af51deabc085e16137140c8251998889 # shrinks to devices = 2, a device sends a lost move and edit again over a delete made after a restore (GUN-624)
 cc 9700493386f8883553c86d67eae4848d6e9dc8ca88dc66a6be31804d4456cd17 # shrinks to devices = 2, a folder renamed while another device replaces it with a new folder of that name (GUN-632)
+cc 1fea5eea9698323d68f143f925f2490de3218007401c2e76d89e035fd93b53ec # shrinks to devices = 2, a file another device edits and then deletes across a restore (GUN-591)
+cc 20754178e62a43be85dc2862de50a5a93ced1117fd2e668db6feb7946a37a92e # shrinks to devices = 3, a deleted file another device brings back after restores (GUN-622)

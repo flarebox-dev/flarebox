@@ -638,7 +638,15 @@ fn forgetting_what_the_server_lost_keeps_the_rest_of_s() {
         },
     );
     trees.set_remote("same".into(), remote(file(ROOT, "same", 1)));
-    trees.forget_lost(Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0, 0);
+    trees.forget_lost(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        0,
+        0,
+    );
     assert_eq!(trees.check(), Ok(()));
     let classes = shapes.map(|(id, _)| (id, trees.class(id)));
     assert_eq!(
@@ -675,7 +683,15 @@ fn a_remote_delete_below_a_folder_the_server_lost_stays_a_remote_delete() {
             ..remote(file(ROOT, "one", 1))
         },
     );
-    trees.forget_lost(Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0, 0);
+    trees.forget_lost(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        0,
+        0,
+    );
     assert_eq!(trees.check(), Ok(()));
     assert_eq!(trees.class("one"), Class::Remote);
     assert_eq!(trees.class("two"), Class::Local);
@@ -692,7 +708,15 @@ fn forgotten_after_a_loss() -> Trees {
     trees.set_synced("a".into(), Some(shape.clone()));
     trees.set_remote("a".into(), remote(shape));
     trees.remove_remote("a");
-    trees.forget_lost(Vec::new(), Vec::new(), vec!["a".into()], Vec::new(), 0, 0);
+    trees.forget_lost(
+        Vec::new(),
+        Vec::new(),
+        vec!["a".into()],
+        Vec::new(),
+        Vec::new(),
+        0,
+        0,
+    );
     assert_eq!(trees.class("a"), Class::Local);
     trees
 }

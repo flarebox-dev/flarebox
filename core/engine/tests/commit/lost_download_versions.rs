@@ -95,6 +95,7 @@ fn a_download_the_server_lost_is_not_sent_again_without_a_recorded_version() {
         trees.edited_here(),
         synced,
         Vec::new(),
+        Vec::new(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -189,6 +190,7 @@ fn a_lost_create_under_a_folder_deleted_after_the_loss_is_not_sent_again() {
         Vec::new(),
         Vec::new(),
         synced,
+        Vec::new(),
         Vec::new(),
         commits.held_through(),
         commits.accepted(),

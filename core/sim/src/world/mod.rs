@@ -1349,8 +1349,9 @@ impl World {
                 } = &mut self.devices[d].engine;
                 let trashed = trees.trashed_here();
                 let edited = trees.edited_here();
-                let synced = trees.taken_from_others(|seq| commits.made_here(seq));
+                let synced = trees.taken_from_others(|seq| commits.lost_here(seq));
                 let moved = trees.moved_here();
+                let untaken = trees.untaken_edits(|seq| commits.lost_here(seq));
                 let root = trees.remote().root.clone();
                 let mut listed = BTreeMap::new();
                 for state in nodes.iter().filter(|state| state.node_id != root) {
@@ -1378,6 +1379,7 @@ impl World {
                         edited,
                         synced,
                         moved,
+                        untaken,
                         commits.held_through(),
                         commits.accepted(),
                     );
