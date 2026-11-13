@@ -1757,6 +1757,8 @@ impl World {
                                 let asked = |removed: &BTreeSet<i64>| {
                                     (removed.iter()).any(|write| {
                                         write == lost
+                                            || write > lost
+                                                && held.is_some_and(|held| held.contains_key(write))
                                             || digest.is_some()
                                                 && held.and_then(|held| held.get(write)) == digest
                                     })
