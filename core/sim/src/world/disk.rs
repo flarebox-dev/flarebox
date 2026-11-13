@@ -54,6 +54,9 @@ pub enum Refused {
     /// Recovery found that the effect stopped before it displaced anything, or that its target
     /// is not in the effect's final state any more.
     Interrupted,
+    /// The effect sent the entry it replaced to the local trash, and its target does not hold the
+    /// new content: the user changed or removed the written file, or took its name first.
+    Overtaken,
 }
 
 /// How far an effect gets on the disk before the device crashes.
@@ -249,7 +252,7 @@ impl Disk {
             record.effect,
             Effect::RemoveFile { .. } | Effect::RemoveDir { .. }
         );
-        if until == Cut::Done && outcome.is_ok() && removal {
+        if until == Cut::Done && (outcome.is_ok() && removal || trashed.is_some()) {
             self.trash.insert(record.effect_id.clone());
         }
         self.binned
@@ -291,7 +294,11 @@ impl Disk {
                 if until == Cut::Done {
                     *trashed = self.quarantine.take().and_then(|entry| entry.content);
                 }
-                ino.map(|ino| Some(identity(ino))).ok_or(Refused::Taken)
+                let refused = match displaced {
+                    Some(_) if until == Cut::Done => Refused::Overtaken,
+                    _ => Refused::Taken,
+                };
+                ino.map(|ino| Some(identity(ino))).ok_or(refused)
             }
             Effect::Move {
                 from,
@@ -335,8 +342,10 @@ impl Disk {
     /// entry goes to the local trash. With nothing in quarantine and nothing staged, the effect
     /// is done when its target is in the effect's final state, which for a removal also takes its
     /// entry in the local trash. A removal whose name is empty without that entry fails, since the
-    /// user moved or deleted the entry before the effect reached it. Anything else is an effect
-    /// that stopped early or whose target the user has changed since.
+    /// user moved or deleted the entry before the effect reached it. A write whose replaced entry
+    /// goes or went to the local trash while its target does not hold the new content is
+    /// overtaken. Anything else is an effect that stopped early or whose target the user has
+    /// changed since.
     pub fn recover(&mut self, record: &EffectRecord) -> Applied {
         self.marker = record.counter;
         let staged = std::mem::take(&mut self.staged);
@@ -351,17 +360,17 @@ impl Disk {
             };
         };
         let outcome = match &record.effect {
-            Effect::WriteFile { at, content, .. } if staged => {
-                self.locate(at).and_then(|(place, name)| {
-                    let ino = self.create(place, &name, Some(content.clone()));
-                    Ok(Some(identity(ino.ok_or(Refused::Taken)?)))
-                })
-            }
+            Effect::WriteFile { at, content, .. } if staged => (self.locate(at))
+                .ok()
+                .and_then(|(place, name)| self.create(place, &name, Some(content.clone())))
+                .map(|ino| Some(identity(ino)))
+                .ok_or(Refused::Overtaken),
             Effect::WriteFile { at, content, .. } => {
-                (self.written(at, content).map(Some)).ok_or(Refused::Taken)
+                (self.written(at, content).map(Some)).ok_or(Refused::Overtaken)
             }
             _ => Ok(None),
         };
+        self.trash.insert(record.effect_id.clone());
         self.binned
             .extend(entry.content.as_ref().map(|content| content.mtime_ns));
         Applied {
@@ -378,7 +387,10 @@ impl Disk {
             Effect::CreateDir { at: place } => at(place)?
                 .filter(|ino| self.entries[ino].content.is_none())
                 .map(|ino| Some(identity(ino))),
-            Effect::WriteFile { at, content, .. } => self.written(at, content).map(Some),
+            Effect::WriteFile { at, content, .. } => match self.written(at, content) {
+                None if self.trash.contains(&record.effect_id) => return Err(Refused::Overtaken),
+                written => written.map(Some),
+            },
             Effect::Move {
                 identity: moved,
                 to,

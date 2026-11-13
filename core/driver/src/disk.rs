@@ -975,7 +975,13 @@ fn acknowledge(
                 Settled::Done
             }
             Outcome::Failed { reason, .. } => {
-                engine.effects.failed(&record.effect_id).map_err(refused)?;
+                match reason {
+                    Reason::Overtaken => {
+                        (engine.effects).overtaken(&mut engine.trees, &record.effect_id)
+                    }
+                    _ => engine.effects.failed(&record.effect_id),
+                }
+                .map_err(refused)?;
                 if retry && *reason == Reason::Interrupted {
                     engine.effects.unblock(&record.node);
                 }
@@ -986,6 +992,9 @@ fn acknowledge(
                     Reason::Changed => failed("the entry changed on this device"),
                     Reason::Taken => failed("another entry holds its name"),
                     Reason::Interrupted => failed("it was interrupted"),
+                    Reason::Overtaken => {
+                        failed("the file it replaced is gone and its name changed on this device")
+                    }
                     Reason::Holds(names) => {
                         let quoted: Vec<_> = (names.iter())
                             .map(|name| koidrive_fs::quoted(name).to_string())
