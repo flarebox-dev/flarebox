@@ -738,7 +738,7 @@ fn a_folder_is_not_parked_to_move_below_an_excluded_folder_it_holds() {
         synced("b", dir("x", "b")),
     ]);
     trees.set_rules(&AT_ROOT, rules("*.log\n"));
-    assert!(trees.excluded("x") && trees.excluded("b") && !trees.excluded("a"));
+    assert!(trees.excluded("x") && trees.excluded("b") && trees.excluded("a"));
     assert_eq!(
         effects(&mut trees),
         [],
@@ -917,4 +917,183 @@ fn the_hold_of_a_folder_ends_when_it_leaves_l() {
     assert!(trees.held("f"));
     trees.remove_local("d");
     assert!(!trees.held("f"));
+}
+
+#[test]
+fn a_server_entry_in_a_folder_whose_path_here_the_rules_exclude_is_not_written_there() {
+    let mut trees = trees(&[
+        (
+            "f",
+            Some(dir(ROOT, "ß")),
+            Some(dir(ROOT, "x")),
+            Some(dir(ROOT, "x")),
+        ),
+        incoming("c", file("f", "a", 1)),
+    ]);
+    trees.set_rules(&AT_ROOT, rules("ss/\n"));
+    assert!(trees.excluded("f"));
+    assert!(
+        trees.excluded("c"),
+        "x/a is included, but here it would be ß/a"
+    );
+    assert_eq!(effects(&mut trees), []);
+    assert_eq!(ops(&mut trees), []);
+    assert!(trees.local().get("c").is_none());
+}
+
+#[test]
+fn what_a_folder_moved_into_a_folder_excluded_here_holds_stays_out_too() {
+    let mut trees = trees(&[
+        (
+            "z",
+            Some(dir(ROOT, "ß")),
+            Some(dir(ROOT, "ß")),
+            Some(dir(ROOT, "z")),
+        ),
+        synced("y", dir(ROOT, "y")),
+        (
+            "f",
+            Some(dir("y", "f")),
+            Some(dir("y", "f")),
+            Some(dir("z", "f")),
+        ),
+        synced("c", file("f", "c", 1)),
+        incoming("d", file("f", "d", 2)),
+    ]);
+    trees.set_rules(&AT_ROOT, rules("ss/\n"));
+    assert!(trees.excluded("f") && trees.excluded("c") && trees.excluded("d"));
+    assert_eq!(ops(&mut trees), []);
+    assert_eq!(effects(&mut trees), []);
+    trees.remove_local("c");
+    trees.remove_local("f");
+    assert_eq!(ops(&mut trees), [], "deleting it later sends nothing");
+}
+
+#[test]
+fn what_a_folder_whose_place_here_the_rules_exclude_holds_stays_out_too() {
+    let mut trees = trees(&[
+        synced("q", dir(ROOT, "ß")),
+        (
+            "p",
+            Some(dir("q", "p")),
+            Some(dir("q", "p")),
+            Some(dir(ROOT, "p")),
+        ),
+        (
+            "f",
+            Some(dir(ROOT, "f")),
+            Some(dir(ROOT, "f")),
+            Some(dir("p", "f")),
+        ),
+        synced("c", file("f", "c", 1)),
+        incoming("d", file("f", "d", 2)),
+    ]);
+    trees.set_rules(&AT_ROOT, rules("ss/\n"));
+    assert!(trees.excluded("p") && trees.excluded("f"));
+    assert!(trees.excluded("c") && trees.excluded("d"));
+    assert_eq!(effects(&mut trees), []);
+    trees.remove_local("c");
+    assert_eq!(ops(&mut trees), [], "deleting it later sends nothing");
+}
+
+#[test]
+fn a_server_entry_is_not_written_where_the_rules_exclude_it_in_its_folder_here() {
+    let mut trees = trees(&[
+        (
+            "f",
+            Some(dir(ROOT, "y")),
+            Some(dir(ROOT, "y")),
+            Some(dir(ROOT, "z")),
+        ),
+        ("z", Some(file(ROOT, "z", 2)), None, None),
+        incoming("c", file("f", "c", 1)),
+    ]);
+    trees.set_rules(&AT_ROOT, rules("/y/c\n"));
+    assert!(!trees.excluded("f") && trees.excluded("c"));
+    assert_eq!(
+        effects(&mut trees),
+        [],
+        "f waits for z, so c would land at y/c"
+    );
+    assert!(trees.local().get("c").is_none());
+}
+
+#[test]
+fn what_a_new_server_folder_whose_place_here_the_rules_exclude_holds_stays_out_too() {
+    let mut trees = trees(&[
+        (
+            "p",
+            Some(dir(ROOT, "y")),
+            Some(dir(ROOT, "y")),
+            Some(dir(ROOT, "z")),
+        ),
+        ("z", Some(file(ROOT, "z", 2)), None, None),
+        synced("a", dir("p", "a")),
+        incoming("c", dir("a", "c")),
+        incoming("x", file("c", "x", 1)),
+    ]);
+    trees.set_rules(&AT_ROOT, rules("/y/a/c\n"));
+    assert!(!trees.excluded("p") && !trees.excluded("a"));
+    assert!(trees.excluded("c") && trees.excluded("x"));
+    assert_eq!(effects(&mut trees), []);
+}
+
+#[test]
+fn a_new_server_entry_in_a_folder_the_rules_exclude_at_its_synced_place_stays_out() {
+    let mut trees = trees(&[
+        (
+            "p",
+            Some(dir(ROOT, "w")),
+            Some(dir(ROOT, "y")),
+            Some(dir(ROOT, "z")),
+        ),
+        synced("a", dir("p", "a")),
+        incoming("x", file("a", "x", 1)),
+    ]);
+    trees.set_rules(&AT_ROOT, rules("/y/a\n"));
+    assert!(!trees.excluded("p") && trees.excluded("a"));
+    assert!(trees.excluded("x"));
+    assert!(!nodes(&effects(&mut trees)).contains(&"x"));
+}
+
+#[test]
+fn a_folder_renamed_here_keeps_planning_below_it_fast() {
+    let (depth, files) = (60, 500);
+    let mut trees = Trees::new(ROOT);
+    for i in 0..depth {
+        let parent = if i == 0 {
+            ROOT.to_string()
+        } else {
+            format!("d{}", i - 1)
+        };
+        let shape = dir(&parent, &format!("n{i}"));
+        let here = if i == 0 {
+            dir(ROOT, "renamed")
+        } else {
+            shape.clone()
+        };
+        trees.set_local(format!("d{i}"), local(here, i as u128 + 1));
+        trees.set_synced(format!("d{i}"), Some(shape.clone()));
+        trees.set_remote(format!("d{i}"), remote(shape));
+    }
+    let bottom = format!("d{}", depth - 1);
+    for j in 0..files {
+        let leaf = file(&bottom, &format!("f{j}.txt"), 1);
+        trees.set_local(format!("f{j}"), local(leaf.clone(), 1000 + j as u128));
+        trees.set_synced(format!("f{j}"), Some(leaf.clone()));
+        trees.set_remote(format!("f{j}"), remote(leaf));
+        trees.set_remote(
+            format!("g{j}"),
+            remote(file(&bottom, &format!("g{j}.txt"), 2)),
+        );
+    }
+    trees.set_rules(&AT_ROOT, rules("ss/\n"));
+    let started = std::time::Instant::now();
+    assert_eq!(ops(&mut trees).len(), 1);
+    let took = started.elapsed();
+    assert!(
+        took < std::time::Duration::from_secs(20),
+        "planning took {took:?}"
+    );
+    assert!(!trees.excluded("g0"));
 }
