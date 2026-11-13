@@ -3,6 +3,96 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+#[test]
+fn preview_round_trips_every_timing_field_and_drops_private_fixture_fields() {
+    use koidrive_telemetry::{
+        Recorder, Store,
+        schema::{Counter, Measure},
+    };
+    use serde_json::{Value, json};
+
+    let home = tempfile::tempdir().unwrap();
+    stdout(&koi(home.path(), &["telemetry", "on"], &[]));
+    let recorder = Recorder::on();
+    for measure in Measure::all() {
+        recorder.measure(measure, 1234);
+        if matches!(
+            measure,
+            Measure::FirstSync(_)
+                | Measure::RemoteApplyMilliseconds
+                | Measure::SyncingMilliseconds
+                | Measure::ActiveSyncingMilliseconds
+        ) {
+            for millis in [60_000, 600_000, 5_280_000] {
+                recorder.measure(measure, millis);
+            }
+        }
+    }
+    recorder.count(Counter::CpuMilliseconds, 4567);
+    let pending = recorder.take();
+    let expected = serde_json::to_value(&pending.days[&koidrive_telemetry::today()]).unwrap();
+    let store = Store::new(&home.path().join("state/koidrive"));
+    store.absorb(pending).unwrap();
+    let queue = home.path().join("state/koidrive/telemetry/queue.json");
+    let mut value: Value = serde_json::from_slice(&std::fs::read(&queue).unwrap()).unwrap();
+    let day = &mut value["days"][koidrive_telemetry::today().to_string()];
+    let secrets = [
+        home.path().display().to_string(),
+        "private-name.txt".into(),
+        "private-space-id".into(),
+        "1794527123456".into(),
+    ];
+    day["path"] = json!(secrets[0]);
+    day["name"] = json!(secrets[1]);
+    day["id"] = json!(secrets[2]);
+    day["committed_at_ms"] = json!(1794527123456u64);
+    day["counters"]["private-space-id"] = json!({ "private-name.txt": 1794527123456u64 });
+    day["histograms"]["first_sync_ms"]["private-space-id"] =
+        json!({"shift": 10, "buckets": vec![0;16], "count": 1, "sum": 1794527123456u64});
+    std::fs::write(&queue, serde_json::to_vec(&value).unwrap()).unwrap();
+    let preview = stdout(&koi(home.path(), &["telemetry", "preview"], &[]));
+    let body: Value = serde_json::from_str(&preview).unwrap();
+    let properties = &body["batch"][0]["properties"];
+    assert_eq!(properties["c.process.cpu_ms"], 4567);
+    for metric in [
+        "h.first_sync_ms.0",
+        "h.remote_apply_ms.effect",
+        "h.syncing_ms.completed",
+        "h.syncing_ms.active_age",
+    ] {
+        let histogram = &properties[metric];
+        assert_eq!(histogram["shift"], 10);
+        for bucket in [1, 6, 10, 13] {
+            assert_eq!(histogram["buckets"][bucket], 1);
+        }
+        assert_eq!(histogram["count"], 4);
+    }
+    for (metric, labels) in expected["histograms"].as_object().unwrap() {
+        for (label, histogram) in labels.as_object().unwrap() {
+            assert_eq!(&properties[format!("h.{metric}.{label}")], histogram);
+        }
+    }
+    fn private_free(value: &Value, secrets: &[String]) {
+        match value {
+            Value::Object(fields) => {
+                for (key, value) in fields {
+                    assert!(secrets.iter().all(|secret| !key.contains(secret)));
+                    private_free(value, secrets);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    private_free(value, secrets);
+                }
+            }
+            Value::String(text) => assert!(secrets.iter().all(|secret| !text.contains(secret))),
+            Value::Number(number) => assert_ne!(number.as_u64(), Some(1794527123456)),
+            _ => {}
+        }
+    }
+    private_free(&body, &secrets);
+}
+
 fn koi(home: &Path, args: &[&str], vars: &[(&str, &str)]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_koi"));
     command

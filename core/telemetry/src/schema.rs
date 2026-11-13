@@ -244,6 +244,7 @@ pub enum Outcome {
 /// A daily sum: a metric and the label it is counted under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Counter {
+    CpuMilliseconds,
     /// A CLI command ran. Only its name; never its arguments.
     Command(Command),
     /// What the daemon synced, over all its linked folders.
@@ -258,10 +259,12 @@ impl Counter {
         (Command::ALL.into_iter().map(Counter::Command))
             .chain(Synced::ALL.map(Counter::Sync))
             .chain(Failure::all().map(Counter::Failure))
+            .chain([Counter::CpuMilliseconds])
     }
 
     pub(crate) fn key(self) -> (&'static str, &'static str) {
         match self {
+            Counter::CpuMilliseconds => ("process", "cpu_ms"),
             Counter::Command(command) => ("command", command.name()),
             Counter::Sync(synced) => ("sync", synced.name()),
             Counter::Failure(failure) => failure.key(),
@@ -535,16 +538,80 @@ impl Level {
 
 /// A daily distribution of durations or sizes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Measure {}
+pub enum Measure {
+    FirstSync(FileCount),
+    DownloadFilesPerSecond,
+    DownloadBytesPerSecond,
+    UploadFilesPerSecond,
+    UploadBytesPerSecond,
+    RemoteApplyMilliseconds,
+    SyncingMilliseconds,
+    ActiveSyncingMilliseconds,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileCount(u8);
+
+impl FileCount {
+    pub fn bucket(files: u64) -> Self {
+        Self(magnitude(files).min(21))
+    }
+
+    fn name(self) -> &'static str {
+        [
+            "0",
+            "1",
+            "2_3",
+            "4_7",
+            "8_15",
+            "16_31",
+            "32_63",
+            "64_127",
+            "128_255",
+            "256_511",
+            "512_1023",
+            "1024_2047",
+            "2048_4095",
+            "4096_8191",
+            "8192_16383",
+            "16384_32767",
+            "32768_65535",
+            "65536_131071",
+            "131072_262143",
+            "262144_524287",
+            "524288_1048575",
+            "1048576_plus",
+        ][usize::from(self.0)]
+    }
+}
 
 impl Measure {
     pub fn all() -> impl Iterator<Item = Measure> {
-        std::iter::empty()
+        (0..=21)
+            .map(|bucket| Measure::FirstSync(FileCount(bucket)))
+            .chain([
+                Measure::DownloadFilesPerSecond,
+                Measure::DownloadBytesPerSecond,
+                Measure::UploadFilesPerSecond,
+                Measure::UploadBytesPerSecond,
+                Measure::RemoteApplyMilliseconds,
+                Measure::SyncingMilliseconds,
+                Measure::ActiveSyncingMilliseconds,
+            ])
     }
 
     /// The metric, the label and the histogram's shift.
     pub(crate) fn key(self) -> (&'static str, &'static str, u8) {
-        match self {}
+        match self {
+            Measure::FirstSync(files) => ("first_sync_ms", files.name(), 10),
+            Measure::DownloadFilesPerSecond => ("download_per_second", "files", 0),
+            Measure::DownloadBytesPerSecond => ("download_per_second", "bytes", 10),
+            Measure::UploadFilesPerSecond => ("upload_per_second", "files", 0),
+            Measure::UploadBytesPerSecond => ("upload_per_second", "bytes", 10),
+            Measure::RemoteApplyMilliseconds => ("remote_apply_ms", "effect", 10),
+            Measure::SyncingMilliseconds => ("syncing_ms", "completed", 10),
+            Measure::ActiveSyncingMilliseconds => ("syncing_ms", "active_age", 10),
+        }
     }
 }
 
@@ -958,6 +1025,62 @@ mod tests {
         assert_eq!(counters.len(), Counter::all().count());
         let levels: std::collections::BTreeSet<_> = Level::all().map(Level::key).collect();
         assert_eq!(levels.len(), Level::ALL.len());
+    }
+
+    #[test]
+    fn timing_measures_have_closed_unique_keys_and_separate_large_file_counts() {
+        let keys: std::collections::BTreeSet<_> = Measure::all().map(Measure::key).collect();
+        assert_eq!(keys.len(), Measure::all().count());
+        assert_eq!(FileCount::bucket(0).name(), "0");
+        assert_eq!(FileCount::bucket(1).name(), "1");
+        assert_eq!(FileCount::bucket(100_000).name(), "65536_131071");
+        assert_eq!(FileCount::bucket(400_000).name(), "262144_524287");
+        assert_eq!(FileCount::bucket(u64::MAX).name(), "1048576_plus");
+    }
+
+    #[test]
+    fn duration_histograms_distinguish_minutes_and_round_trip_with_shift_ten() {
+        let recorder = crate::Recorder::on();
+        for measure in Measure::all().filter(|measure| {
+            matches!(
+                measure,
+                Measure::FirstSync(_)
+                    | Measure::RemoteApplyMilliseconds
+                    | Measure::SyncingMilliseconds
+                    | Measure::ActiveSyncingMilliseconds
+            )
+        }) {
+            let (metric, label, shift) = measure.key();
+            assert_eq!(shift, 10);
+            for millis in [1023, 60_000, 600_000, 5_280_000, 16_777_215, 16_777_216] {
+                recorder.measure_on(1, measure, millis);
+            }
+            let mut report = recorder.take().days.remove(&1).unwrap();
+            let histogram = &report.histograms[metric][label];
+            assert_eq!(histogram.buckets[0], 1);
+            assert_eq!(histogram.buckets[6], 1);
+            assert_eq!(histogram.buckets[10], 1);
+            assert_eq!(histogram.buckets[13], 1);
+            assert_eq!(histogram.buckets[14], 1);
+            assert_eq!(histogram.buckets[15], 1);
+            assert_eq!(histogram.count, 6);
+            let stored = serde_json::to_value(&report).unwrap();
+            assert_eq!(
+                serde_json::from_value::<DailyReport>(stored).unwrap(),
+                report
+            );
+            report
+                .histograms
+                .get_mut(metric)
+                .unwrap()
+                .get_mut(label)
+                .unwrap()
+                .shift = 0;
+            let rejected =
+                serde_json::from_value::<DailyReport>(serde_json::to_value(report).unwrap())
+                    .unwrap();
+            assert!(rejected.is_empty());
+        }
     }
 
     #[test]

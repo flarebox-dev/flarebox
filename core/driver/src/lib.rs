@@ -38,6 +38,7 @@ mod restore;
 mod scripted;
 mod share;
 mod status;
+mod timing;
 pub mod update;
 mod volume;
 

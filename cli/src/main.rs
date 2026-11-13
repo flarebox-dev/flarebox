@@ -981,7 +981,7 @@ async fn daemon(paths: Paths, json: bool) -> Result<Done, CliError> {
 async fn daemon_driver(paths: Paths) -> Result<Driver, DriverError> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        match Driver::open(paths.clone()) {
+        match Driver::open_with_telemetry(paths.clone(), telemetry::recorder()) {
             Err(DriverError::Busy(_))
                 if tokio::time::Instant::now() < deadline
                     && tokio::net::UnixStream::connect(paths.socket())

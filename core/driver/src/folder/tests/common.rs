@@ -114,6 +114,7 @@ impl Remote {
                 .chunks
                 .insert(chunk.hash.clone(), bytes.to_vec());
             receipts.push(self.space.put_chunk(&chunk.hash, chunk.size, NOW));
+            crate::timing::add_bytes(&upload.timing_bytes, u64::from(chunk.size));
         }
         receipts
     }
@@ -280,6 +281,7 @@ impl Device {
     fn take(&mut self, step: Result<Vec<Work>, Stop>) -> Result<(), Stop> {
         self.work.extend(step?);
         let folder = &mut self.folder;
+        folder.record_status(folder.view().state);
         let stored = folder
             .store
             .transaction(|tx| Engine::load(tx, &folder.link.space_id))

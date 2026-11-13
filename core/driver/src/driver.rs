@@ -269,6 +269,7 @@ pub struct Driver {
 }
 
 struct Inner {
+    telemetry: koidrive_telemetry::Recorder,
     paths: Paths,
     _lock: Flock,
     matcher: Arc<dyn Matcher>,
@@ -424,6 +425,13 @@ impl Driver {
     /// Opens the profile at `paths`: takes its lock, reads its configuration and credential, and finds its linked
     /// folders. Nothing syncs until [`Driver::start`].
     pub fn open(paths: Paths) -> Result<Self, DriverError> {
+        Self::open_with_telemetry(paths, koidrive_telemetry::Recorder::off())
+    }
+
+    pub fn open_with_telemetry(
+        paths: Paths,
+        telemetry: koidrive_telemetry::Recorder,
+    ) -> Result<Self, DriverError> {
         DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -482,6 +490,7 @@ impl Driver {
         );
         Ok(Driver {
             inner: Arc::new(Inner {
+                telemetry,
                 matcher,
                 local,
                 trash_cap: config.trash.cap(),
@@ -1188,6 +1197,7 @@ impl Driver {
         Store::open(&store_path)
             .and_then(|mut store| store.transaction(|tx| tx.set_link(&link)))
             .map_err(store_error(&store_path))?;
+        crate::timing::Timing::initialize(&store_path, link.linked_at_ms);
         tracing::info!(space_id = link.space_id, path = %koidrive_fs::quoted(&link.root), "linked a folder");
         let status = Arc::new(
             crate::lifecycle::Lifecycle::open(&store_path, folder_status(&link, None, 0, 0))
@@ -1710,6 +1720,7 @@ impl Driver {
             .store(&folder.link.space_id)
             .map_err(|error| error.to_string())?;
         Ok(FolderTask {
+            telemetry: self.inner.telemetry.clone(),
             link: folder.link.clone(),
             store,
             auth,

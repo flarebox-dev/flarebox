@@ -7,6 +7,7 @@
 //! the project's own host.
 
 mod consent;
+mod cpu;
 mod panic;
 mod recorder;
 pub mod schema;
@@ -15,6 +16,7 @@ mod store;
 mod system;
 
 pub use consent::{Mode, Source, Status, VARIABLE, resolve, should_ask};
+pub use cpu::Cpu;
 pub use panic::install_panic_hook;
 pub use recorder::{Pending, Recorder};
 pub use schema::{DailyReport, Event, EventUuid, InstallId};

@@ -1,0 +1,108 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::{Recorder, schema::Counter};
+
+#[derive(Default)]
+pub struct Cpu {
+    previous: Option<(u32, u64)>,
+}
+
+impl Cpu {
+    pub fn sample(&mut self, recorder: &Recorder) {
+        if !recorder.is_on() {
+            return;
+        }
+        self.record(recorder, crate::today(), process_nanoseconds());
+    }
+
+    fn record(&mut self, recorder: &Recorder, day: u32, nanos: Option<u64>) {
+        let previous = self.previous.take();
+        let Some(nanos) = nanos else { return };
+        self.previous = Some((day, nanos));
+        if let Some((before_day, before)) = previous
+            && before_day == day
+            && nanos >= before
+        {
+            recorder.count_on(
+                day,
+                Counter::CpuMilliseconds,
+                nanos / 1_000_000 - before / 1_000_000,
+            );
+        }
+    }
+}
+
+fn process_nanoseconds() -> Option<u64> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let time = rustix::time::clock_gettime_dynamic(rustix::time::DynamicClockId::Known(
+            rustix::time::ClockId::ProcessCPUTime,
+        ))
+        .ok()?;
+        u64::try_from(time.tv_sec)
+            .ok()?
+            .checked_mul(1_000_000_000)?
+            .checked_add(u64::try_from(time.tv_nsec).ok()?)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_totals_omit_cross_day_intervals_errors_and_rewound_clocks() {
+        let recorder = Recorder::on();
+        let mut cpu = Cpu::default();
+        for (day, nanos) in [
+            (1, Some(0)),
+            (1, Some(5_000_000)),
+            (2, Some(100_000_000)),
+            (2, Some(107_000_000)),
+            (2, None),
+            (2, Some(900_000_000)),
+            (2, Some(903_000_000)),
+            (2, Some(1)),
+        ] {
+            cpu.record(&recorder, day, nanos);
+        }
+        let value = serde_json::to_value(recorder.take().days).unwrap();
+        assert_eq!(value["1"]["counters"]["process"]["cpu_ms"], 5);
+        assert_eq!(value["2"]["counters"]["process"]["cpu_ms"], 10);
+    }
+
+    #[test]
+    fn cpu_off_has_no_clock_or_report_state() {
+        let mut cpu = Cpu::default();
+        cpu.sample(&Recorder::off());
+        assert_eq!(cpu.previous, None);
+    }
+
+    #[test]
+    fn submillisecond_samples_accumulate_and_multiday_gaps_are_not_attributed() {
+        let recorder = Recorder::on();
+        let mut cpu = Cpu::default();
+        for (day, nanos) in [
+            (1, 1),
+            (1, 500_000),
+            (1, 1_000_001),
+            (4, 900_000_000),
+            (4, 902_000_000),
+        ] {
+            cpu.record(&recorder, day, Some(nanos));
+        }
+        let value = serde_json::to_value(recorder.take().days).unwrap();
+        assert_eq!(value["1"]["counters"]["process"]["cpu_ms"], 1);
+        assert_eq!(value["4"]["counters"]["process"]["cpu_ms"], 2);
+        assert!(value.get("2").is_none());
+        assert!(value.get("3").is_none());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn process_clock_is_available() {
+        assert!(process_nanoseconds().is_some());
+    }
+}

@@ -121,7 +121,7 @@ impl Recorder {
         });
     }
 
-    pub(crate) fn measure_on(&self, day: u32, measure: Measure, value: u64) {
+    pub fn measure_on(&self, day: u32, measure: Measure, value: u64) {
         let (metric, label, shift) = measure.key();
         self.with(|pending| {
             let report = pending.days.entry(day).or_insert_with(|| DailyReport {
