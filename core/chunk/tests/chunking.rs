@@ -285,6 +285,10 @@ fn hex(s: &str) -> Vec<u8> {
 }
 
 proptest! {
+    #![proptest_config(koidrive_test_support::regression_config(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/chunking.proptest-regressions"),
+        ProptestConfig::default().cases,
+    ))]
     #[test]
     fn chunks_partition_the_input(data in proptest::collection::vec(any::<u8>(), 0..6000)) {
         let config = small_config();

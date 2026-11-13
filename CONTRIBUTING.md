@@ -22,9 +22,11 @@ Each change to the local store's schema is one SQL file in `core/store/migration
 
 ## Property-test regressions
 
-The sim and driver properties save each failure as a separate `cc-<seed>.txt` file in a `.cases` directory beside the legacy regression file. Commit the generated case file with the fix. Independent cases do not edit a shared list.
+Property tests use `koidrive_test_support::regression_config` to save each failure as a separate `cc-<seed>.txt` file in a `.cases` directory beside the legacy regression file. Automatic saves include a `# shrinks to` description. Commit the generated case file with the fix. Independent cases do not edit a shared list.
 
 The properties also read the legacy files, so cases appended by an older branch still replay. To move those lines, run `python3 scripts/split-proptest-regressions.py <legacy-file>`. The command preserves each `cc` line and leaves the legacy file readable. CI replays the saved cases with `PROPTEST_CASES=0` and prints their seeds and property names.
+
+CI rejects property blocks that use default persistence. `PROPTEST_CASES` overrides each property's default case count.
 
 ## AI assistance
 

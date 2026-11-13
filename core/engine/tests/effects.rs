@@ -1790,7 +1790,10 @@ fn spaces() -> impl Strategy<Value = Vec<Node>> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(2048))]
+    #![proptest_config(koidrive_test_support::regression_config(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/effects.proptest-regressions"),
+        2048,
+    ))]
 
     /// From any S = L and any R, doing the planned effects in order on a disk that never replaces
     /// an entry ends with L = S = R, nothing parked and the disk equal to L, within three effects

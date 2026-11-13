@@ -20,4 +20,5 @@ serde = { version = "1.0.229", features = ["derive"], optional = true }
 unicode-normalization = "0.1"
 
 [dev-dependencies]
+koidrive-test-support = { path = "../test-support" }
 proptest = "1.12.0"

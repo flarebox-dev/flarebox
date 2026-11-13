@@ -40,7 +40,10 @@ fn name() -> impl Strategy<Value = String> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
+    #![proptest_config(koidrive_test_support::regression_config(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/names.proptest-regressions"),
+        512,
+    ))]
 
     #[test]
     fn name_key_is_idempotent(s in "\\PC{0,40}") {

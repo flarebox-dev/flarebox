@@ -753,6 +753,10 @@ fn spaces() -> impl Strategy<Value = Vec<(bool, Change, Change)>> {
 }
 
 proptest! {
+    #![proptest_config(koidrive_test_support::regression_config(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/trees.proptest-regressions"),
+        ProptestConfig::default().cases,
+    ))]
     /// Balasubramaniam and Pierce, Definition 4.1.2 in ID form, against an independent equality:
     /// a side that did not change takes the other side's value, and a node changed on both sides is
     /// never settled by overwriting.
@@ -963,7 +967,10 @@ fn searches() -> impl Strategy<Value = Vec<(Draw, Draw, u8)>> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(4096))]
+    #![proptest_config(koidrive_test_support::regression_config(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/trees.proptest-regressions"),
+        4096,
+    ))]
 
     /// Settling stops only when no non-empty set of the remaining Same updates can be made
     /// together with S still valid, checked by trying every such set.

@@ -1312,6 +1312,7 @@ version = "0.0.0-dev"
 dependencies = [
  "fastcdc",
  "koidrive-proto",
+ "koidrive-test-support",
  "proptest",
  "sha2",
 ]
@@ -1420,6 +1421,7 @@ version = "0.0.0-dev"
 dependencies = [
  "koidrive-ignore",
  "koidrive-proto",
+ "koidrive-test-support",
  "proptest",
  "prost",
  "serde",
@@ -1470,6 +1472,7 @@ name = "koidrive-ignore"
 version = "0.0.0-dev"
 dependencies = [
  "koidrive-engine",
+ "koidrive-test-support",
  "proptest",
  "tempfile",
  "unicode-normalization",
@@ -1500,6 +1503,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "koidrive-proto",
+ "koidrive-test-support",
  "proptest",
  "prost",
  "reqwest",
