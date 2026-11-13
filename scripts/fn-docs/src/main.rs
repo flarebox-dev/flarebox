@@ -10,6 +10,14 @@ use syn::{
     Meta, Signature, TraitItemFn, Visibility,
 };
 
+fn cfgs(attrs: &[Attribute]) -> String {
+    attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("cfg"))
+        .map(|attr| format!("{} ", attr.to_token_stream()))
+        .collect()
+}
+
 #[derive(Default)]
 struct Fns {
     scope: Vec<String>,
@@ -48,8 +56,9 @@ impl Fns {
             .filter(|line| !line.is_empty())
             .collect();
         self.found.push(format!(
-            "{}\t{}\t{public}\t{line}\t{top}\t{}",
+            "{}\t{}{}\t{public}\t{line}\t{top}\t{}",
             self.scope.join("::").escape_default(),
+            cfgs(attrs).escape_default(),
             sig.ident,
             text.join("\n").escape_default()
         ));
@@ -64,7 +73,7 @@ impl Fns {
 
 impl<'a> Visit<'a> for Fns {
     fn visit_item_mod(&mut self, item: &'a ItemMod) {
-        self.within(format!("mod {}", item.ident), |fns| {
+        self.within(format!("{}mod {}", cfgs(&item.attrs), item.ident), |fns| {
             visit::visit_item_mod(fns, item)
         });
     }
@@ -75,7 +84,11 @@ impl<'a> Visit<'a> for Fns {
             .as_ref()
             .map(|(_, path, _)| format!("{} for ", path.to_token_stream()))
             .unwrap_or_default();
-        let scope = format!("impl {of}{}", item.self_ty.to_token_stream());
+        let scope = format!(
+            "{}impl {of}{}",
+            cfgs(&item.attrs),
+            item.self_ty.to_token_stream()
+        );
         let outer = std::mem::replace(&mut self.trait_impl, item.trait_.is_some());
         self.within(scope, |fns| visit::visit_item_impl(fns, item));
         self.trait_impl = outer;
@@ -84,9 +97,10 @@ impl<'a> Visit<'a> for Fns {
     fn visit_item_trait(&mut self, item: &'a ItemTrait) {
         let public = matches!(item.vis, Visibility::Public(_));
         let outer = std::mem::replace(&mut self.public_trait, public);
-        self.within(format!("trait {}", item.ident), |fns| {
-            visit::visit_item_trait(fns, item)
-        });
+        self.within(
+            format!("{}trait {}", cfgs(&item.attrs), item.ident),
+            |fns| visit::visit_item_trait(fns, item),
+        );
         self.public_trait = outer;
     }
 
@@ -96,24 +110,27 @@ impl<'a> Visit<'a> for Fns {
             matches!(item.vis, Visibility::Public(_)),
             &item.sig,
         );
-        self.within(format!("fn {}", item.sig.ident), |fns| {
-            visit::visit_item_fn(fns, item)
-        });
+        self.within(
+            format!("{}fn {}", cfgs(&item.attrs), item.sig.ident),
+            |fns| visit::visit_item_fn(fns, item),
+        );
     }
 
     fn visit_impl_item_fn(&mut self, item: &'a ImplItemFn) {
         let public = self.trait_impl || matches!(item.vis, Visibility::Public(_));
         self.add(&item.attrs, public, &item.sig);
-        self.within(format!("fn {}", item.sig.ident), |fns| {
-            visit::visit_impl_item_fn(fns, item)
-        });
+        self.within(
+            format!("{}fn {}", cfgs(&item.attrs), item.sig.ident),
+            |fns| visit::visit_impl_item_fn(fns, item),
+        );
     }
 
     fn visit_trait_item_fn(&mut self, item: &'a TraitItemFn) {
         self.add(&item.attrs, self.public_trait, &item.sig);
-        self.within(format!("fn {}", item.sig.ident), |fns| {
-            visit::visit_trait_item_fn(fns, item)
-        });
+        self.within(
+            format!("{}fn {}", cfgs(&item.attrs), item.sig.ident),
+            |fns| visit::visit_trait_item_fn(fns, item),
+        );
     }
 }
 
