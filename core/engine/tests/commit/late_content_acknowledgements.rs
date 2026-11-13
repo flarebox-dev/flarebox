@@ -62,3 +62,22 @@ fn a_late_acknowledgement_takes_what_was_sent_when_the_other_device_reverts_it()
     assert_eq!(trees.local().live("n"), Some(&file(ROOT, "a", 0)));
     assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
 }
+
+#[test]
+fn an_edit_undone_while_its_upload_is_out_is_sent_after_the_acknowledgement() {
+    let mut trees = trees(&[synced("n", file(ROOT, "a", 1))]);
+    trees.set_local_changed("n".into(), local(file(ROOT, "a", 2), 1));
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("n", 2)]);
+    trees.set_local_changed("n".into(), local(file(ROOT, "a", 1), 1));
+    trees.set_remote("n".into(), remote(file(ROOT, "a", 2)));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    assert!(trees.state().local_changes.contains("n"));
+    let next = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&next), [update("n", 1)]);
+}

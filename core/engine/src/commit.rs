@@ -1743,6 +1743,14 @@ impl Synced {
     }
 
     fn apply(self, trees: &mut Trees) -> Vec<(NodeId, Option<Shape>)> {
+        let taken: BTreeMap<&NodeId, &Option<Shape>> = (self.updates.iter())
+            .map(|(id, shape)| (id, shape))
+            .collect();
+        for (id, shape) in taken {
+            if let Some(shape) = shape {
+                trees.sent_shape(id, shape);
+            }
+        }
         update_synced(trees, self.updates)
     }
 }

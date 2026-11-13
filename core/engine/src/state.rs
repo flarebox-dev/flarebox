@@ -104,8 +104,9 @@ pub struct TreesState {
     /// again as a resend.
     pub resends: BTreeSet<NodeId>,
     /// The nodes L holds a change of this device's user in: a scan found L's shape changed, a
-    /// rekey made L's copy, or a commit of this device that the server lost made it. A node leaves
-    /// once S takes L's shape or L no longer holds it.
+    /// rekey made L's copy, L holds a shape other than the one the server took from a commit of
+    /// this device, or a commit of this device that the server lost made it. A node leaves once S
+    /// takes L's shape, a scan finds L back at the shape S holds, or L no longer holds it.
     pub local_changes: BTreeSet<NodeId>,
 }
 
