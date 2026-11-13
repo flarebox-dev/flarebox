@@ -149,6 +149,6 @@ The disk image always goes through a new submission, because a rebuilt disk imag
 
 ## Limits
 
-- The DMG runs on Apple silicon only. `scripts/build-ffi.sh` builds the Rust library for the runner's architecture, and the release runners are arm64, so there is no Intel or universal build yet.
+- The DMG requires macOS 26 or later on Apple silicon.
 - There is no update feed and no Homebrew cask.
 - A run cannot wait for an earlier submission of the disk image. Every run builds a new disk image and submits it.

@@ -12,7 +12,7 @@ macos_dir="$(cd "$(dirname "$0")/.." && pwd)"
 repo_root="$(cd "$macos_dir/../.." && pwd)"
 package_dir="$macos_dir/KoidriveFFI"
 work_dir="$macos_dir/build/ffi"
-export MACOSX_DEPLOYMENT_TARGET=14.0
+export MACOSX_DEPLOYMENT_TARGET=26.0
 
 cd "$repo_root"
 target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"

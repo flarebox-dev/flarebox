@@ -1,6 +1,6 @@
 # Install
 
-Install the `koi` command on Linux or macOS:
+Install the `koi` command on Linux x86_64 or arm64, or macOS on Apple silicon:
 
 ```sh
 curl -fsSL https://koidrive.com/install.sh | sh

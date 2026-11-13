@@ -28,7 +28,7 @@ printf '#!/bin/sh\nexit 1\n' > "$tmp/other/koi"
 for each in "$tag" "$upgrade"; do
     release=$releases/download/$each
     mkdir -p "$release"
-    for platform in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
+    for platform in aarch64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
         if [ "$platform" = "$target" ]; then source=$tmp/package; else source=$tmp/other; fi
         tar -czf "$release/koidrive-$platform.tar.gz" -C "$source" koi
     done

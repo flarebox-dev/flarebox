@@ -35,7 +35,7 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           LINUX: '[{"target":"x86_64-unknown-linux-musl","runner":"ubuntu-latest"},{"target":"aarch64-unknown-linux-musl","runner":"ubuntu-latest"}]'
-          MACOS: '[{"target":"aarch64-apple-darwin","runner":"macos-15"},{"target":"x86_64-apple-darwin","runner":"macos-15-intel"}]'
+          MACOS: '[{"target":"aarch64-apple-darwin","runner":"macos-15"}]'
         run: |
           linux=true
           macos=true
