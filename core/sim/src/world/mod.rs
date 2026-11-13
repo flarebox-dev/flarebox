@@ -592,6 +592,11 @@ impl World {
     /// the restore took from the server, and a write the restore took stays in the files the
     /// server holds it in now.
     fn recovered(&mut self) {
+        for device in &mut self.devices {
+            if device.recovering.is_none() {
+                device.rolled_back = false;
+            }
+        }
         for names in &mut self.restored_names {
             names.clear();
         }
@@ -2316,6 +2321,22 @@ mod tests {
     use koidrive_engine::tree::{Kind, Shape};
 
     use super::*;
+
+    #[test]
+    fn a_completed_phase_retires_only_live_devices_rollback_evidence() {
+        let mut world = World::new(2);
+        world.step(0, &Step::CopyStore).unwrap();
+        world.step(0, &Step::RollBack).unwrap();
+        world.devices[1].rolled_back = true;
+        world.devices[1].recovering = Some("store recovery".into());
+        world.phase(0, &[]).unwrap();
+        assert!(!world.devices[0].rolled_back);
+        assert!(world.devices[1].rolled_back);
+        assert!(matches!(
+            world.recover(0, "spurious recovery".into()),
+            Err(Failure::Broken(_))
+        ));
+    }
 
     #[test]
     fn a_stuck_pending_name_requires_its_own_author_to_be_recovering() {
