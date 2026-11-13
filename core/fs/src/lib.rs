@@ -881,9 +881,9 @@ impl Snapshot {
                 again.as_fd(),
                 &mut *scan.cut,
             );
-            for arrival in &arrivals {
-                scan.new.retain(|path, _| !path.starts_with(arrival));
-            }
+            let arrivals: BTreeSet<PathBuf> = arrivals.into_iter().collect();
+            scan.new
+                .retain(|path, _| !path.ancestors().any(|above| arrivals.contains(above)));
             unsettled.extend(outermost(rules.held().cloned().collect()));
             unsettled.sort();
         }
@@ -1288,18 +1288,22 @@ fn find_ignored(
             Change::Created { .. } | Change::Modified { .. } => {}
         }
     }
-    let saved: Vec<PathBuf> = (changes.iter())
+    let created: BTreeSet<&PathBuf> = (changes.iter())
+        .filter_map(|change| match change {
+            Change::Created {
+                path,
+                kind: EntryKind::File,
+            } => Some(path),
+            _ => None,
+        })
+        .collect();
+    let saved: BTreeSet<PathBuf> = (changes.iter())
         .filter_map(|change| match change {
             Change::Removed {
                 path,
                 kind: EntryKind::File,
-            } => Some(path.clone()),
+            } if created.contains(path) => Some(path.clone()),
             _ => None,
-        })
-        .filter(|path| {
-            (changes.iter()).any(|change| {
-                matches!(change, Change::Created { path: at, kind: EntryKind::File } if at == path)
-            })
         })
         .collect();
     changes
