@@ -1442,13 +1442,14 @@ impl Trees {
     }
 
     /// The changes of other devices that this device has not taken yet, for [`Trees::forget_lost`]
-    /// once a bootstrap has replaced R: the nodes L holds as S does while R holds them in the trash,
-    /// and the files whose content L and S hold alike, with no waiting S update to other content,
+    /// once a bootstrap has replaced R: the nodes L holds as S does, with no local change below them,
+    /// while R holds them in the trash, and the files whose content L and S hold alike, with no waiting S update to other content,
     /// while R holds other content live. Neither holds an unsent edit or content an edit of this
     /// device set ([`Trees::edited_here`]). Each edit comes with whether a commit of this device
     /// that the server lost made R's record of the file's position: `lost_here` tells whether a seq
     /// is one of those commits.
     pub fn untaken_changes(&self, lost_here: impl Fn(u64) -> bool) -> Vec<(NodeId, Untaken)> {
+        let holding_changes = self.holding_changes();
         (self.s.iter())
             .filter(|(id, _)| {
                 !self.unsent_edits.contains(*id) && !self.edited_here.contains_key(*id)
@@ -1456,7 +1457,8 @@ impl Trees {
             .filter_map(|(id, synced)| {
                 let remote = self.r.get(id)?;
                 if remote.trashed {
-                    let unchanged = self.l.live(id).is_some_and(|local| local.same(synced));
+                    let unchanged = self.l.live(id).is_some_and(|local| local.same(synced))
+                        && !holding_changes.contains(id);
                     return unchanged.then(|| (id.clone(), Untaken::Delete));
                 }
                 let held = synced.content.as_ref()?;

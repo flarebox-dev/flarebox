@@ -4369,3 +4369,30 @@ fn a_kept_child_of_a_lost_folder_stays_deleted_across_a_second_restore() {
     ];
     converge(3, &phases).unwrap();
 }
+
+#[test]
+fn a_rename_inside_a_lost_folder_another_device_deleted_converges() {
+    let made = vec![(0, user(1, 0, 0, "a"))];
+    let moved = vec![
+        (0, Step::Backup),
+        (0, user(0, 0, 0, "b")),
+        (0, Step::Scan),
+        (0, COMMIT),
+        (0, COMMIT),
+        (0, Step::Deliver(0)),
+        (0, Step::Deliver(0)),
+        (0, user(3, 0, 1, "a")),
+    ];
+    let racing = vec![
+        (0, user(4, 1, 0, "a")),
+        (0, Step::Scan),
+        (0, COMMIT),
+        (0, COMMIT),
+        (1, Step::Deliver(0)),
+        (1, Step::Deliver(0)),
+        (1, Step::Deliver(0)),
+        (1, user(3, 0, 1, "A")),
+        (0, Step::Restore),
+    ];
+    converge(2, &[made, moved, racing]).unwrap();
+}
