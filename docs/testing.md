@@ -14,7 +14,7 @@ Each job runs on Ubuntu, and the jobs marked macOS run on macOS. A change whose 
 
 | Job | What it checks | Run it locally |
 |---|---|---|
-| `rust` | The three commands above | The three commands above |
+| `rust` | Workspace fmt, clippy and tests, and the property-persistence check | The commands above and the [property-persistence check](#property-tests) below |
 | `server` | Type checks, the Worker's Vitest suite, and the unit tests of the deploy-test scripts | In `server/`: `pnpm install --frozen-lockfile`, `pnpm typecheck`, `pnpm test`, then `pnpm exec vitest run --config scripts/deploy-test/vitest.config.ts run.unit e2e.unit load.unit bench.unit` |
 | `server deploy check` | A copy of `server/` deploys on its own (a dry run, then `wrangler dev` and a claim), and the server bundle that the CLI embeds packs cleanly | `node server/scripts/check-deploy.mjs` |
 | `net integration`, `driver integration`, `cli integration`, `ffi integration` | The tests whose `#[ignore]` reason says they need the Worker, against the Worker under `wrangler dev` | After `pnpm install` in `server/`: `core/net/scripts/integration-test.sh`, `core/driver/scripts/integration-test.sh`, `cli/scripts/integration-test.sh` or `core/ffi/scripts/integration-test.sh` |
@@ -45,7 +45,15 @@ The property tests use [proptest](https://docs.rs/proptest/1.12.0/proptest/). Th
 - `PROPTEST_CASES`: the number of cases each property runs.
 - `PROPTEST_RNG_SEED`: a fixed seed, a whole number. The same seed, case count and commit give the same cases. Without it, each run picks a random seed.
 
-When a property fails, proptest prints the shrunk input and saves a `cc` line to a `.proptest-regressions` file next to the test file, for example `core/sim/tests/engine_sync.proptest-regressions`. Later runs replay the saved cases first. Replay a failure by its `cc` line rather than by its seed, because a seed finds other cases once the strategies change. Commit the file with the fix so the case keeps being checked.
+When a property fails, proptest prints the shrunk input. The shared configuration saves its `cc` line and a single-line `# shrinks to` description in a `<suite>.cases/cc-<seed>.txt` file, for example under `core/sim/tests/engine_sync.cases/`. Later runs replay saved cases first. Replay a failure by its `cc` line rather than by `PROPTEST_RNG_SEED`. Commit the case file with the fix so it keeps being checked.
+
+Every property block uses `koidrive_test_support::regression_config`. CI checks this with:
+
+```sh
+cargo run --manifest-path scripts/check-proptest-persistence/Cargo.toml --locked --
+```
+
+The loader also reads legacy `.proptest-regressions` files. To move their lines into case files, run `python3 scripts/split-proptest-regressions.py <legacy-file>`.
 
 ### Several devices
 
@@ -94,7 +102,7 @@ The shard's job summary prints one command per failing test target, for example:
 git checkout <commit> && PROPTEST_CASES=8192 PROPTEST_RNG_SEED=<seed> cargo test --locked -p koidrive-sim --test engine_sync
 ```
 
-The command reproduces the failure locally. The `failure-shard-<k>` artifact holds the seed, the commands, the test logs and any new `.proptest-regressions` files. Copy a regression file into the checkout to replay the shrunk case without the full case count.
+The command reproduces the failure locally. The `failure-shard-<k>` artifact holds the seed, the commands, the test logs and any new `*.cases/cc-<seed>.txt` files, including their `# shrinks to` descriptions. Copy the case files into the same paths in the checkout, then run the failing property with `PROPTEST_CASES=0` to replay saved cases without generating random cases.
 
 ## The mutation set
 

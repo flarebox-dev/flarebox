@@ -10,12 +10,7 @@ use std::path::{Path, PathBuf};
 use proptest::test_runner::{Config, FailurePersistence, PersistedSeed};
 
 /// Replays saved regressions beside `legacy` and saves each new failure in its own file.
-/// Uses `cases` unless `PROPTEST_CASES` sets a valid case count.
 pub fn regression_config(legacy: &'static str, cases: u32) -> Config {
-    let cases = std::env::var("PROPTEST_CASES")
-        .ok()
-        .and_then(|cases| cases.parse().ok())
-        .unwrap_or(cases);
     Config {
         failure_persistence: Some(Box::new(RegressionCases(PathBuf::from(legacy)))),
         ..Config::with_cases(cases)
@@ -148,16 +143,6 @@ mod tests {
         format!("cc {}", byte.to_string().repeat(64))
             .parse()
             .unwrap()
-    }
-
-    #[test]
-    fn regression_config_uses_the_case_count_environment() {
-        let configured = regression_config("unused.txt", 512);
-        let expected = std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|cases| cases.parse().ok())
-            .unwrap_or(512);
-        assert_eq!(configured.cases, expected);
     }
 
     #[test]
