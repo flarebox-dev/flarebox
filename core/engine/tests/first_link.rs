@@ -895,6 +895,7 @@ fn a_discard_whose_s_update_waits_stays_after_a_server_loss() {
         trashed,
         edited,
         Vec::new(),
+        Vec::new(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -1104,7 +1105,7 @@ fn a_file_the_user_took_back_from_a_discard_is_sent_again_once_the_server_loses_
     applied(&mut commits, &mut trees, 3, 2);
 
     trees.remove_remote("l-b");
-    trees.forget_lost(Vec::new(), Vec::new(), Vec::new(), 0, 0);
+    trees.forget_lost(Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0, 0);
     trees.settle();
     let mut effects = Effects::default();
     if let Some(record) = effects.plan(&trees, commits.in_flight(), &mut ids, NOW) {

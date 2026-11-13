@@ -1077,7 +1077,7 @@ fn a_parked_folder_the_server_lost_is_created_again_after_a_delete_empties_it() 
             ..local(dir(ROOT, "albums"), 1)
         },
     );
-    trees.forget_lost(Vec::new(), Vec::new(), Vec::new(), 0, 0);
+    trees.forget_lost(Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0, 0);
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
     let removed = effects.plan(&trees, None, &mut ids, NOW).cloned().unwrap();
@@ -1170,6 +1170,7 @@ fn a_delete_the_server_lost_is_sent_again() {
         trashed,
         Vec::new(),
         Vec::new(),
+        Vec::new(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -1211,6 +1212,7 @@ fn a_delete_the_server_lost_is_sent_again_only_for_what_it_saw() {
     trees.set_remote("restored".into(), restored);
     trees.forget_lost(
         trashed,
+        Vec::new(),
         Vec::new(),
         Vec::new(),
         commits.held_through(),
@@ -1287,6 +1289,7 @@ fn an_edit_the_server_lost_is_sent_again() {
         Vec::new(),
         edited,
         Vec::new(),
+        Vec::new(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -1312,6 +1315,7 @@ fn an_edit_the_server_lost_is_not_sent_again_over_a_later_edit() {
         Vec::new(),
         edited,
         Vec::new(),
+        Vec::new(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -1333,6 +1337,7 @@ fn an_edit_the_server_lost_is_sent_again_over_a_later_delete() {
     trees.forget_lost(
         Vec::new(),
         edited,
+        Vec::new(),
         Vec::new(),
         commits.held_through(),
         commits.accepted(),
@@ -1735,7 +1740,7 @@ fn a_reverted_file_the_server_lost_is_created_again_under_its_id() {
     )]);
     trees.revert("h".into());
     trees.remove_remote("h");
-    trees.forget_lost(Vec::new(), Vec::new(), Vec::new(), 0, 0);
+    trees.forget_lost(Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0, 0);
     trees.settle();
     let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
@@ -1767,7 +1772,7 @@ fn a_reverted_file_whose_s_update_waits_is_created_again_under_its_id_once_the_s
     assert!(trees.waiting().contains_key("n"), "S still has h at y");
     assert!(trees.reverted().contains("n"));
     trees.remove_remote("n");
-    trees.forget_lost(Vec::new(), Vec::new(), Vec::new(), 0, 0);
+    trees.forget_lost(Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0, 0);
     trees.settle();
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert!(
@@ -3072,6 +3077,7 @@ fn a_move_and_edit_whose_s_update_waits_lost_at_5() -> (Trees, Commits, IdGen) {
         trashed,
         edited,
         Vec::new(),
+        Vec::new(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -3105,6 +3111,7 @@ fn a_move_and_edit_whose_s_update_waits_is_not_overwritten_by_a_change_after_the
     trees.forget_lost(
         trashed,
         edited,
+        Vec::new(),
         Vec::new(),
         commits.held_through(),
         commits.accepted(),
@@ -3156,6 +3163,7 @@ fn a_create_the_server_lost_while_its_s_update_waits_is_sent_again() {
         trashed,
         edited,
         Vec::new(),
+        Vec::new(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -3185,6 +3193,7 @@ fn a_move_another_device_made_after_a_loss_is_taken() {
     trees.forget_lost(
         trashed,
         edited,
+        Vec::new(),
         moved,
         commits.held_through(),
         commits.accepted(),
@@ -3237,6 +3246,7 @@ fn lose_with_n_at(
     trees.forget_lost(
         trashed,
         edited,
+        Vec::new(),
         moved,
         commits.held_through(),
         commits.accepted(),
@@ -3458,6 +3468,7 @@ fn an_edit_of_a_file_the_server_went_back_to_holding_in_the_trash_is_kept_from_a
         trashed_here,
         edited,
         Vec::new(),
+        Vec::new(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -3493,6 +3504,7 @@ fn a_file_in_the_trash_after_a_loss_that_l_did_not_edit_is_not_recorded() {
         trashed_here,
         edited,
         Vec::new(),
+        Vec::new(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -3522,6 +3534,7 @@ fn an_edit_to_the_content_a_lost_commit_replaced() -> (Trees, Commits, IdGen) {
     trees.forget_lost(
         trashed,
         edited,
+        Vec::new(),
         Vec::new(),
         commits.held_through(),
         commits.accepted(),
@@ -3566,6 +3579,7 @@ fn an_edit_this_device_committed_to_the_content_a_lost_commit_replaced_is_sent_a
         trashed,
         edited,
         Vec::new(),
+        Vec::new(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -3594,6 +3608,7 @@ fn a_write_to_the_content_the_server_went_back_to_seen_after_the_bootstrap_is_se
     trees.forget_lost(
         trashed,
         edited,
+        Vec::new(),
         Vec::new(),
         commits.held_through(),
         commits.accepted(),
@@ -3628,6 +3643,7 @@ fn an_edit_sent_after_a_loss_and_lost_in_a_second_one_is_sent_again() {
     trees.forget_lost(
         trashed,
         edited,
+        Vec::new(),
         Vec::new(),
         commits.held_through(),
         commits.accepted(),
@@ -3665,6 +3681,7 @@ fn an_edit_the_server_took_first_from_another_device_is_sent_again_as_an_edit_af
         trashed,
         edited,
         synced,
+        Vec::new(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -3698,6 +3715,7 @@ fn an_edit_the_server_kept_is_not_sent_again_after_a_loss() {
     trees.forget_lost(
         trashed,
         edited,
+        Vec::new(),
         Vec::new(),
         commits.held_through(),
         commits.accepted(),
@@ -3857,6 +3875,7 @@ fn a_kept_move_that_another_device_reverses_before_a_loss_is_not_sent_again() {
         gone,
         edited,
         Vec::new(),
+        Vec::new(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -3911,6 +3930,7 @@ fn a_kept_create_that_another_device_deletes_after_a_loss_stays_deleted() {
     trees.forget_lost(
         gone,
         edited,
+        Vec::new(),
         Vec::new(),
         commits.held_through(),
         commits.accepted(),
@@ -4014,6 +4034,7 @@ fn an_effect_on_a_node_whose_update_waits_keeps_its_slot_for_a_loss() {
         gone,
         edited,
         Vec::new(),
+        Vec::new(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -4047,6 +4068,7 @@ fn a_move_and_edit_lost_while_r_holds_it_in_the_trash() -> (Trees, Commits, IdGe
     trees.forget_lost(
         gone,
         edited,
+        Vec::new(),
         Vec::new(),
         commits.held_through(),
         commits.accepted(),
@@ -4091,6 +4113,7 @@ fn a_lost_update_is_not_the_effects_base_while_it_cannot_fit() {
     trees.forget_lost(
         gone,
         edited,
+        Vec::new(),
         Vec::new(),
         commits.held_through(),
         commits.accepted(),
@@ -4193,6 +4216,7 @@ fn a_removal_the_server_lost_while_it_waits_is_sent_again() {
     trees.forget_lost(
         gone,
         edited,
+        Vec::new(),
         Vec::new(),
         commits.held_through(),
         commits.accepted(),
@@ -6243,7 +6267,14 @@ fn a_late_acknowledgement_after_a_rollback_keeps_an_agreement_the_server_kept() 
     trees.set_remote("u".into(), remote_at(file(ROOT, "u", 3), 5));
     trees.settle();
     trees.remove_remote("u");
-    trees.forget_lost(Vec::new(), Vec::new(), Vec::new(), 4, commits.accepted());
+    trees.forget_lost(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        4,
+        commits.accepted(),
+    );
     trees.settle();
     commits
         .received(result(2, vec![outcome(op_result::Code::Applied)]))
@@ -6279,7 +6310,14 @@ fn a_late_create_acknowledgement_after_a_rollback_keeps_an_agreement_r_still_hol
     );
     trees.set_local("n".into(), local(file(ROOT, "b", 1), 1));
     trees.settle();
-    trees.forget_lost(Vec::new(), Vec::new(), Vec::new(), 0, commits.accepted());
+    trees.forget_lost(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        0,
+        commits.accepted(),
+    );
     trees.settle();
     commits
         .received(result(8, vec![outcome(op_result::Code::Applied)]))
@@ -6313,7 +6351,14 @@ fn a_late_create_acknowledgement_after_a_rollback_drops_the_agreement_the_server
     );
     trees.settle();
     trees.remove_remote("n");
-    trees.forget_lost(Vec::new(), Vec::new(), Vec::new(), 7, commits.accepted());
+    trees.forget_lost(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        7,
+        commits.accepted(),
+    );
     trees.settle();
     trees.set_remote("n".into(), remote_at(file(ROOT, "b", 1), 9));
     commits
@@ -6358,7 +6403,14 @@ fn a_reused_revision_does_not_keep_an_agreement_the_server_lost() {
             ..remote_at(file(ROOT, "b", 2), 12)
         },
     );
-    trees.forget_lost(Vec::new(), Vec::new(), Vec::new(), 7, commits.accepted());
+    trees.forget_lost(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        7,
+        commits.accepted(),
+    );
     trees.settle();
     commits
         .received(result(9, vec![outcome(op_result::Code::Applied)]))
@@ -6406,6 +6458,7 @@ fn an_agreement_survives_a_loss_only_on_a_kept_seq_or_its_exact_record() {
             );
         }
         trees.forget_lost(
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -6582,6 +6635,7 @@ fn an_edit_of_a_file_in_the_trash_after_a_loss_is_kept_from_a_resend_after_a_res
     trees.forget_lost(
         trashed_here,
         edited,
+        Vec::new(),
         Vec::new(),
         commits.held_through(),
         commits.accepted(),
@@ -7214,6 +7268,7 @@ fn list_after_a_loss(trees: &mut Trees, commits: &Commits, restored: RemoteNode)
         Vec::new(),
         Vec::new(),
         synced,
+        Vec::new(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -7247,6 +7302,7 @@ fn a_resend_lost_in_a_second_loss_is_not_sent_again_as_this_devices_edit() {
         trashed,
         edited,
         synced,
+        Vec::new(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -7349,6 +7405,7 @@ fn a_download_the_server_lost_is_not_sent_again_without_a_recorded_version() {
         Vec::new(),
         trees.edited_here(),
         synced,
+        Vec::new(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -7443,6 +7500,7 @@ fn a_lost_create_under_a_folder_deleted_after_the_loss_is_not_sent_again() {
         Vec::new(),
         Vec::new(),
         synced,
+        Vec::new(),
         commits.held_through(),
         commits.accepted(),
     );
