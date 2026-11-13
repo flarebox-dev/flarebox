@@ -153,7 +153,6 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "after a server loss, a write another device took can end in two files (GUN-389)"]
     fn devices_converge_across_server_restores(devices in 2..=3usize, phases in phases(Losses::Restores)) {
         converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
