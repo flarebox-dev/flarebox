@@ -245,7 +245,6 @@ pub enum Outcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Counter {
     CpuMilliseconds,
-    UnfinishedSyncing,
     /// A CLI command ran. Only its name; never its arguments.
     Command(Command),
     /// What the daemon synced, over all its linked folders.
@@ -260,13 +259,12 @@ impl Counter {
         (Command::ALL.into_iter().map(Counter::Command))
             .chain(Synced::ALL.map(Counter::Sync))
             .chain(Failure::all().map(Counter::Failure))
-            .chain([Counter::CpuMilliseconds, Counter::UnfinishedSyncing])
+            .chain([Counter::CpuMilliseconds])
     }
 
     pub(crate) fn key(self) -> (&'static str, &'static str) {
         match self {
             Counter::CpuMilliseconds => ("process", "cpu_ms"),
-            Counter::UnfinishedSyncing => ("sync", "unfinished"),
             Counter::Command(command) => ("command", command.name()),
             Counter::Sync(synced) => ("sync", synced.name()),
             Counter::Failure(failure) => failure.key(),
@@ -1102,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    fn unfinished_syncing_round_trips_and_stored_active_ages_are_dropped() {
+    fn stored_unfinished_span_counters_and_active_ages_are_dropped() {
         for shift in [0, 10] {
             let report: DailyReport = serde_json::from_value(serde_json::json!({
                 "day": 1,
@@ -1119,11 +1117,9 @@ mod tests {
                 serde_json::to_value(report).unwrap(),
                 serde_json::json!({
                     "day": 1,
-                    "counters": { "sync": { "unfinished": 2 } },
                 })
             );
         }
-        assert_eq!(Counter::UnfinishedSyncing.key(), ("sync", "unfinished"));
     }
 
     #[test]

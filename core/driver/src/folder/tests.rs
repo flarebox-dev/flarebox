@@ -19,5 +19,5 @@ include!("tests/server_loss_recovery.rs");
 include!("tests/status_and_failure_reporting.rs");
 include!("tests/sync_transfers_and_retries.rs");
 
-#[path = "telemetry_tests.rs"]
+#[path = "tests/telemetry.rs"]
 mod telemetry_tests;

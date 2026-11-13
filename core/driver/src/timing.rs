@@ -18,7 +18,7 @@ use koidrive_proto::v1::{
 };
 use koidrive_telemetry::{
     Recorder,
-    schema::{Counter, FileCount, Measure},
+    schema::{FileCount, Measure},
 };
 
 use crate::status::FolderState;
@@ -72,7 +72,7 @@ struct First {
 
 #[derive(Default)]
 struct State {
-    syncing: Option<(Instant, u32)>,
+    syncing: Option<Instant>,
     download: Burst,
     upload: Burst,
     origins: BTreeMap<String, Origin>,
@@ -200,18 +200,9 @@ impl Timing {
     pub fn status(&mut self, status: FolderState, at: Time) {
         let Some(state) = &mut self.state else { return };
         let syncing = matches!(status, FolderState::Bootstrapping | FolderState::CatchingUp);
-        if let Some((_, day)) = &mut state.syncing
-            && *day < at.day()
-        {
-            for unfinished in (*day).max(at.day().saturating_sub(30))..at.day() {
-                self.recorder
-                    .count_on(unfinished, Counter::UnfinishedSyncing, 1);
-            }
-            *day = at.day();
-        }
         if syncing {
-            state.syncing.get_or_insert((at.mono, at.day()));
-        } else if let Some((start, _)) = state.syncing.take() {
+            state.syncing.get_or_insert(at.mono);
+        } else if let Some(start) = state.syncing.take() {
             self.recorder.measure_on(
                 at.day(),
                 Measure::SyncingMilliseconds,
@@ -632,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn syncing_spans_count_unfinished_days_and_finish_on_real_transitions() {
+    fn syncing_spans_record_only_when_the_state_ends() {
         let recorder = Recorder::on();
         let mut timing = tracker(&recorder);
         let at = time();
@@ -640,10 +631,7 @@ mod tests {
         timing.status(FolderState::Bootstrapping, at);
         timing.status(FolderState::CatchingUp, later(at, Duration::from_secs(10)));
         timing.status(FolderState::CatchingUp, later(at, Duration::from_secs(60)));
-        let value = reports(&recorder);
-        assert_eq!(value["1"]["counters"]["sync"]["unfinished"], 1);
-        assert!(value["2"]["histograms"]["syncing_ms"]["active_age"].is_null());
-        assert!(value["2"]["histograms"]["syncing_ms"]["completed"].is_null());
+        assert!(recorder.take().days.is_empty());
         timing.status(FolderState::Offline, later(at, Duration::from_secs(90)));
         timing.status(FolderState::Halted, later(at, Duration::from_secs(100)));
         timing.status(FolderState::Stopped, later(at, Duration::from_secs(110)));
@@ -661,34 +649,50 @@ mod tests {
     }
 
     #[test]
-    fn unfinished_reports_cannot_reveal_the_start_minute_across_midnight() {
-        let mut unfinished = Vec::new();
-        for minute in [17, 47] {
-            let recorder = Recorder::on();
-            let mut timing = tracker(&recorder);
-            let at = Time {
-                mono: Instant::now(),
-                unix_ms: 20_000 * 86_400_000 + (22 * 3600 + minute * 60 + 23) * 1000,
-            };
-            let seconds = (20_001 * 86_400_000 + 30 * 60_000 - at.unix_ms) / 1000;
-            for elapsed in (0..=seconds).step_by(5) {
-                timing.status(
-                    FolderState::Bootstrapping,
-                    later(at, Duration::from_secs(elapsed as u64)),
-                );
+    fn complete_report_histories_do_not_reveal_a_midnight_crossing() {
+        for seconds in [90, 3600] {
+            let mut histories = Vec::new();
+            for linked_ms in [
+                20_001 * 86_400_000 - seconds * 500,
+                20_001 * 86_400_000 + 12 * 3_600_000,
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let store = dir.path().join("store.sqlite");
+                Timing::initialize(&store, linked_ms);
+                let recorder = Recorder::on();
+                let at = Time {
+                    mono: Instant::now(),
+                    unix_ms: linked_ms,
+                };
+                let mut timing = Timing::open_at(&store, linked_ms, at);
+                timing.enable(recorder.clone());
+                let mut history = Vec::new();
+                for elapsed in (0..seconds).step_by(5) {
+                    timing.status(
+                        FolderState::Bootstrapping,
+                        later(at, Duration::from_secs(elapsed as u64)),
+                    );
+                    let value = reports(&recorder);
+                    assert_eq!(value, json!({}));
+                    history.push(value);
+                }
+                let finished = later(at, Duration::from_secs(seconds as u64));
+                timing.status(FolderState::UpToDate, finished);
+                timing.first_sync(100_000, finished);
+                let value = reports(&recorder);
+                for (metric, label) in [
+                    ("first_sync_ms", "65536_131071"),
+                    ("syncing_ms", "completed"),
+                ] {
+                    let histogram = &value["20001"]["histograms"][metric][label];
+                    assert_eq!(histogram["count"], 1);
+                    assert_eq!(histogram["sum"], seconds * 1000);
+                }
+                history.push(value);
+                histories.push(history);
             }
-            let value = reports(&recorder);
-            assert!(!value.to_string().contains("active_age"));
-            assert!(value["20000"]["histograms"].is_null());
-            assert!(value["20001"].is_null());
-            unfinished.push(value["20000"]["counters"].clone());
-            timing.status(
-                FolderState::Stopped,
-                later(at, Duration::from_secs(seconds as u64)),
-            );
+            assert_eq!(histories[0], histories[1]);
         }
-        assert_eq!(unfinished[0], unfinished[1]);
-        assert_eq!(unfinished[0], json!({"sync": {"unfinished": 1}}));
     }
 
     #[test]
