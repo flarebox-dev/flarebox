@@ -765,6 +765,22 @@ fn a_reverted_folder_published_over_the_servers_name_is_moved_to_the_name_l_hold
 }
 
 #[test]
+fn an_open_recovery_question_keeps_s_for_what_it_holds() {
+    let mut trees = trees(
+        &[("d", dir(ROOT, "a")), ("f", file("d", "f", 1))],
+        &[("d", dir(ROOT, "a")), ("f", file(ROOT, "f", 1))],
+        &[],
+    );
+    let (mut commits, mut ids) = recovered(&mut trees, 0);
+    assert_eq!(ops(&mut commits, &mut trees, &mut ids), []);
+    trees.settle();
+    assert_eq!(trees.synced().live("d"), Some(&dir(ROOT, "a")));
+    assert_eq!(trees.synced().live("f"), Some(&file(ROOT, "f", 1)));
+    asked(&commits, RecoveryGroup::CreatedAfterRestorePoint, &["d"]);
+    asked(&commits, RecoveryGroup::ChangedOnThisDevice, &["f"]);
+}
+
+#[test]
 fn a_discarded_file_in_a_kept_folder_the_server_merged_stays_discarded() {
     let mut trees = trees(
         &[("d", dir(ROOT, "a")), ("f", file("d", "f", 1))],

@@ -712,12 +712,17 @@ impl Trees {
 
     pub(crate) fn resend_folders_of_changes(&mut self) {
         let lacking = |id: &NodeId| self.r.get(id).is_none() && self.acknowledged(id).is_some();
-        let changed: Vec<NodeId> = (self.changes().into_iter())
-            .filter(|id| lacking(id))
+        let released: Vec<NodeId> = (self.changes().into_iter())
+            .filter(|id| !self.held(id))
             .cloned()
             .collect();
-        let mut folders: Vec<NodeId> = (self.holding_changes().into_iter())
-            .filter(|id| lacking(id) && !changed.contains(id))
+        let changed: Vec<NodeId> = released.iter().filter(|id| lacking(id)).cloned().collect();
+        let holding: BTreeSet<NodeId> = (released.iter())
+            .flat_map(|id| self.local_chain(id).skip(1))
+            .map(str::to_owned)
+            .collect();
+        let mut folders: Vec<NodeId> = (holding.into_iter())
+            .filter(|id| lacking(id) && !self.held(id) && !changed.contains(id))
             .collect();
         folders.sort_by_key(|id| std::cmp::Reverse(self.local_chain(id).count()));
         for id in changed.into_iter().chain(folders.iter().cloned()) {
