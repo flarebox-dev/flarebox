@@ -1162,7 +1162,7 @@ mod tests {
         let (url, https) = releases_url(Some(&base)).unwrap();
         let next = format!("{}&page=2", url);
         let not_modified = format!(
-            "HTTP/1.1 304 Not Modified\r\nlink: <{next}>; rel=\"next\"\r\ncontent-length: 0\r\n\r\n"
+            "HTTP/1.1 304 Not Modified\r\nlink: <{next}>; rel=\"next\"\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
         );
         let first = page(
             serde_json::json!([listed("v0.1.0", false, &[ASSET])]),
