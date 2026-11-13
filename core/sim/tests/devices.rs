@@ -586,8 +586,6 @@ fn a_replacement_cut_between_quarantine_and_placement_is_ended_by_the_restart() 
     assert_eq!(world.devices[1].disk.entries().len(), 1);
 }
 
-/// A batch of downloads reaches the disk and the device crashes before the store hears of any of
-/// them. The restart ends every effect of the batch from what the disk shows.
 #[test]
 fn a_crash_after_a_batch_of_downloads_reached_the_disk_is_ended_by_the_restart() {
     let mut racing = vec![(0, file("a")), (0, file("b")), (0, file("c.txt"))];
@@ -602,8 +600,6 @@ fn a_crash_after_a_batch_of_downloads_reached_the_disk_is_ended_by_the_restart()
     assert_eq!(world.devices[1].disk.entries().len(), 3);
 }
 
-/// A batch of replacements stops with the last old file in quarantine, after the others reached
-/// the disk. The restart ends each of them, and no write is lost.
 #[test]
 fn a_crash_in_the_middle_of_a_batch_of_replacements_is_ended_by_the_restart() {
     let synced = vec![(0, file("a")), (0, file("b")), (0, file("c.txt"))];

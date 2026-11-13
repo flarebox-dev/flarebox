@@ -343,8 +343,6 @@ fn converge(trees: &mut Trees, disk: &mut Disk, budget: usize) -> Result<Vec<Eff
     Err(format!("more than {budget} effects"))
 }
 
-/// As [`converge`], with batches of at most `limit` effects. Each batch goes to the disk in the order it was planned,
-/// rotated by `turn`, and every outcome reaches the engine after the whole batch is on the disk.
 fn converge_in_batches(
     trees: &mut Trees,
     disk: &mut Disk,
@@ -1821,8 +1819,6 @@ proptest! {
         }
     }
 
-    /// As above with batches: every effect of a batch applies to the disk in any order before the engine hears of
-    /// any, and the batches end where one effect at a time does.
     #[test]
     fn batches_of_effects_bring_the_disk_to_the_remote_tree(
         nodes in spaces(),

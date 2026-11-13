@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Several effects in one section (design §5.2), each recovered after a
-//! failure at every step.
-
 mod common;
 
 use std::cell::Cell;

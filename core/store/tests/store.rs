@@ -835,8 +835,6 @@ fn table_rows(conn: &Connection, table: &str, columns: &[String]) -> Vec<String>
     rows
 }
 
-/// Takes `effect_state.in_flight`, which the upgrade moves to `effects_in_flight`, out of the rows `kept` holds for
-/// `effect_state`, and returns the rows `effects_in_flight` must then hold.
 fn moved_in_flight(
     path: &Path,
     kept: &mut BTreeMap<String, (Vec<String>, Vec<String>)>,

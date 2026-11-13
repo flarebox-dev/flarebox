@@ -334,7 +334,6 @@ struct Running {
 }
 
 impl Pending {
-    /// The record of a batch of one effect.
     fn record(&self) -> &EffectRecord {
         match self.effects.as_slice() {
             [planned] => &planned.record,
@@ -343,7 +342,6 @@ impl Pending {
     }
 }
 
-/// How the effect of a batch of one ended.
 fn one(settled: Vec<(String, Settled)>) -> Settled {
     match <[_; 1]>::try_from(settled) {
         Ok([(_, settled)]) => settled,
@@ -352,12 +350,10 @@ fn one(settled: Vec<(String, Settled)>) -> Settled {
 }
 
 impl Running {
-    /// Plans, stages and applies a batch of one effect. `None` when nothing is planned.
     fn step(&mut self, server: &Server) -> Option<Settled> {
         self.step_batch(server).map(one)
     }
 
-    /// Plans, stages and applies a batch of effects. `None` when nothing is planned.
     fn step_batch(&mut self, server: &Server) -> Option<Vec<(String, Settled)>> {
         let pending = self.disk.next(&mut self.engine, &mut self.store).unwrap()?;
         let staged = ready(pending.stage(server)).unwrap();
@@ -387,7 +383,6 @@ pub(crate) struct Server {
     pub call_error: Mutex<Option<CallError>>,
     /// Runs once, before the first chunk is handed over.
     during: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    /// How many downloads were asked for, and the hash of each chunk handed over, in order.
     calls: Mutex<u32>,
     handed: Mutex<Vec<Vec<u8>>>,
 }
@@ -2602,8 +2597,6 @@ const MOVED: &[u8] = b"the moved file";
 const REMOVED: &[u8] = b"the removed file";
 const NEWER_NOTES: &[u8] = b"the notes as the other device wrote them";
 
-/// Five independent effects, which one batch holds: a new folder, a new file, a replaced file, a moved file and a
-/// removed file.
 fn five_effects(folder: &Folder, server: &mut Server) {
     fs::write(folder.root.join("notes.txt"), SYNCED).unwrap();
     fs::write(folder.root.join("a.txt"), MOVED).unwrap();
@@ -2627,7 +2620,6 @@ fn five_effects(folder: &Folder, server: &mut Server) {
     );
 }
 
-/// What the user sees once the five effects are done.
 fn five_effects_done() -> BTreeMap<PathBuf, Option<Vec<u8>>> {
     BTreeMap::from([
         (PathBuf::from("docs"), None),
@@ -2637,9 +2629,6 @@ fn five_effects_done() -> BTreeMap<PathBuf, Option<Vec<u8>>> {
     ])
 }
 
-/// Checks a folder whose effects are all done and acknowledged: no effect is in flight or blocked, L holds R's shape
-/// and S holds L's for every node, in memory and in the store, the marker equals the effect counter, nothing is left
-/// in quarantine or staging, and the displaced bytes are in the trash.
 fn assert_all_done(folder: &Folder, running: &Running, context: &str) {
     assert_eq!(running.engine.effects.in_flight(), [], "{context}");
     assert!(running.engine.effects.blocked().is_empty(), "{context}");
@@ -2722,9 +2711,6 @@ fn independent_effects_are_applied_in_one_section_and_acknowledged_in_one_transa
     assert_all_done(&folder, &running, "uninterrupted");
 }
 
-/// A crash at any point of a batch, between any two steps of any of its effects, leaves a folder the next start
-/// recovers: every effect of the batch is acknowledged by the start, none is lost or done twice, the displaced bytes
-/// are at their name or in the trash, and planning again ends with the folder an uninterrupted batch leaves.
 #[test]
 fn a_crash_at_every_cut_of_a_batch_is_recovered_on_the_next_start() {
     let reached = {
@@ -2807,8 +2793,6 @@ fn a_crash_at_every_cut_of_a_batch_is_recovered_on_the_next_start() {
     }
 }
 
-/// Six new files of three contents, two of which several files hold: the batch downloads each distinct chunk once,
-/// in one transfer, and writes it into every file that lists it.
 #[test]
 fn a_batch_downloads_each_distinct_chunk_once_for_every_file_that_holds_it() {
     let folder = Folder::new();
@@ -2858,7 +2842,6 @@ fn a_batch_downloads_each_distinct_chunk_once_for_every_file_that_holds_it() {
     assert_eq!(running.step_batch(&server), None);
 }
 
-/// A chunk the server no longer has fails the writes that list it, and the rest of the batch is downloaded and done.
 #[test]
 fn a_chunk_the_server_lost_fails_only_the_writes_of_the_batch_that_list_it() {
     let folder = Folder::new();
