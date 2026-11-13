@@ -256,6 +256,7 @@ pub struct Trees {
     l_names: ByName,
     /// Every node of L, placed or parked, by its identity.
     l_identities: HashMap<FileIdentity, BTreeSet<NodeId>>,
+    displaced_identities: HashMap<FileIdentity, BTreeSet<NodeId>>,
     /// The nodes of S.
     s_names: ByName,
     /// Nodes whose S position neither placed L nor R holds, which [`Trees::settle`] tries to
@@ -322,6 +323,7 @@ impl Trees {
             changed: BTreeSet::new(),
             l_names: ByName::default(),
             l_identities: HashMap::new(),
+            displaced_identities: HashMap::new(),
             s_names: ByName::default(),
             orphaned: BTreeSet::new(),
             remote_rules_files: BTreeSet::new(),
@@ -610,11 +612,8 @@ impl Trees {
         if node.trashed && !self.trashed_here.contains_key(&id) {
             self.kept_originals.remove(&id);
         }
-        if node.trashed {
-            self.displaced.remove(&id);
-            if self.l.get(&id).is_none() {
-                self.halves.remove(&id);
-            }
+        if node.trashed && !self.halves.contains_key(&id) {
+            self.drop_displaced(&id);
         }
         if (self.edited_here.get(&id)).is_some_and(|&seq| node.trashed || node.edit_rev != seq) {
             self.edited_here.remove(&id);
@@ -777,9 +776,8 @@ impl Trees {
         self.kept_originals.remove(id);
         self.count_held_trash(id, false);
         self.count_trashed(id, false);
-        self.displaced.remove(id);
-        if self.l.get(id).is_none() {
-            self.halves.remove(id);
+        if !self.halves.contains_key(id) {
+            self.drop_displaced(id);
         }
         self.edited_here.remove(id);
         self.replaced_versions.remove(id);
@@ -834,7 +832,7 @@ impl Trees {
             let children: Vec<NodeId> = self.l_names.children(&id).cloned().collect();
             self.outside.extend(children);
         }
-        self.displaced.remove(&id);
+        self.drop_displaced(&id);
         self.kept_originals.remove(&id);
         (self.l_identities.entry(node.identity).or_default()).insert(id.clone());
         self.mark(&id);
@@ -1121,29 +1119,43 @@ impl Trees {
         };
         self.remove_local(id);
         if self.r.live(id).is_some() {
-            self.displaced.insert(id.to_owned(), identity);
+            self.put_displaced(id, identity);
         }
     }
 
-    /// Takes a file out of L as [`Trees::remove_local`] does, after a scan of part of the tree found it gone, and keeps
-    /// it as [`Trees::displace_local`] does until [`HALF_WAIT_MS`] after `at_ms`: an entry with its identity that a
-    /// later scan finds is the file moved, and the file counts as deleted only once the wait ends
-    /// ([`Trees::release_halves`]). A file whose identity has no birth time can't be told from another, and returns
+    fn put_displaced(&mut self, id: &str, identity: FileIdentity) {
+        self.drop_displaced(id);
+        self.displaced.insert(id.to_owned(), identity);
+        (self.displaced_identities.entry(identity).or_default()).insert(id.to_owned());
+    }
+
+    fn drop_displaced(&mut self, id: &str) {
+        let Some(identity) = self.displaced.remove(id) else {
+            return;
+        };
+        if let Some(ids) = self.displaced_identities.get_mut(&identity) {
+            ids.remove(id);
+            if ids.is_empty() {
+                self.displaced_identities.remove(&identity);
+            }
+        }
+    }
+
+    /// Takes a file or folder out of L as [`Trees::remove_local`] does, after a scan of part of the tree found it gone,
+    /// and keeps it as [`Trees::displace_local`] does until [`HALF_WAIT_MS`] after `at_ms`: an entry with its identity
+    /// that a later scan finds is the node moved, and the node counts as deleted only once the wait ends
+    /// ([`Trees::release_halves`]). A node whose identity has no birth time can't be told from another, and returns
     /// false without a change.
     pub fn vanish_local(&mut self, id: &str, at_ms: u64) -> bool {
         let Some(node) = self.l.get(id) else {
             return false;
         };
         let identity = node.identity;
-        if node.parked
-            || node.shape.kind != Kind::File
-            || identity.birth_ns.is_none()
-            || self.recorded_local(id)
-        {
+        if node.parked || identity.birth_ns.is_none() || self.recorded_local(id) {
             return false;
         }
         self.remove_local(id);
-        self.displaced.insert(id.to_owned(), identity);
+        self.put_displaced(id, identity);
         self.halves.insert(id.to_owned(), at_ms);
         true
     }
@@ -1159,25 +1171,30 @@ impl Trees {
 
     /// The file [`Trees::hold_link`] holds with `identity`: the greatest ID when several have it.
     pub fn link_with_identity(&self, identity: &FileIdentity) -> Option<&NodeId> {
-        (self.halves.keys().rev()).find(|id| {
-            (self.l.get(id)).is_some_and(|node| node.identity == *identity && !node.parked)
+        (self.locals_with_identity(identity).rev()).find(|id| {
+            self.halves.contains_key(*id) && (self.l.get(id)).is_some_and(|node| !node.parked)
         })
     }
 
-    /// Ends every wait of [`Trees::vanish_local`] and [`Trees::hold_link`] that began at least [`HALF_WAIT_MS`]
-    /// before `now_ms`. A wait that began after `now_ms` counts as begun at `now_ms`.
-    pub fn release_halves(&mut self, now_ms: u64) {
+    /// Ends every wait of [`Trees::vanish_local`] and [`Trees::hold_link`] that ends at or before `due_ms`, the time
+    /// [`Trees::halves_due`] gave.
+    pub fn release_halves(&mut self, due_ms: u64) {
         let due: Vec<NodeId> = (self.halves.iter())
-            .filter(|(_, at)| (**at).min(now_ms).saturating_add(HALF_WAIT_MS) <= now_ms)
+            .filter(|(_, at)| at.saturating_add(HALF_WAIT_MS) <= due_ms)
             .map(|(id, _)| id.clone())
             .collect();
         for id in due {
             self.halves.remove(&id);
             if self.l.get(&id).is_none() {
-                self.displaced.remove(&id);
+                self.drop_displaced(&id);
             }
             self.mark(&id);
         }
+    }
+
+    /// The nodes that wait for the other half of a move, each with when its wait began.
+    pub fn halves(&self) -> &BTreeMap<NodeId, u64> {
+        &self.halves
     }
 
     /// When the earliest wait of [`Trees::release_halves`] ends, if any is left.
@@ -1197,9 +1214,9 @@ impl Trees {
     /// identity without a birth time finds none: the record can outlive the node's copy, and the file system may
     /// give its inode to another file, which only the birth time tells apart.
     pub fn displaced_with_identity(&self, identity: &FileIdentity) -> Option<&NodeId> {
-        (self.displaced.iter().rev())
-            .find(|(_, held)| *held == identity && identity.birth_ns.is_some())
-            .map(|(id, _)| id)
+        (self.displaced_identities.get(identity))
+            .filter(|_| identity.birth_ns.is_some())
+            .and_then(|ids| ids.last())
     }
 
     /// Whether S holds the node at a position that neither placed L nor R holds, the nodes
@@ -1224,14 +1241,15 @@ impl Trees {
     /// position, or else the position the local copy has, and keeps its content, so the content
     /// is still compared with the last synced one when the node is included again. Otherwise, or
     /// when S can hold the node at neither position, S drops the node, which is then resolved
-    /// like a node never synced: what R holds is downloaded, and what only L holds is uploaded.
+    /// like a node never synced: what R holds is downloaded, and what only L holds is uploaded. A node that waits for
+    /// the other half of a move ([`Trees::vanish_local`]) keeps its S entry.
     fn released(&self, id: &str) -> Option<Vec<Option<Shape>>> {
         let synced = self.s.live(id)?;
         let local = self.l.get(id);
         let remote = self.r.live(id);
         let held = |shape: Option<&Shape>| shape.is_some_and(|shape| shape.same_position(synced));
         let placed = local.filter(|node| !node.parked).map(|node| &node.shape);
-        if held(placed) || held(remote) || !self.ignored(id) {
+        if held(placed) || held(remote) || self.halves.contains_key(id) || !self.ignored(id) {
             return None;
         }
         let at = |shape: &Shape| {
@@ -1311,6 +1329,7 @@ impl Trees {
         if let Some(ignored) = self.ignored_by_paths(id) {
             return ignored;
         }
+        let deleted_here = self.l.get(id).is_none() && self.s.live(id).is_some();
         let mut above = Vec::new();
         let mut current = id;
         for _ in 0..self.r.len() {
@@ -1326,7 +1345,8 @@ impl Trees {
             let apart = apart(self.l.get(folder).map(|node| &node.shape))
                 || apart(self.s.live(folder))
                 || self.outside.contains(folder)
-                || self.displaced.contains_key(folder);
+                || (self.displaced.contains_key(folder)
+                    && !(deleted_here && self.halves.contains_key(folder)));
             above.push((folder, current, apart));
             current = folder;
         }
@@ -2885,6 +2905,7 @@ impl Trees {
             changed: _,
             l_names: _,
             l_identities: _,
+            displaced_identities: _,
             s_names: _,
             orphaned: _,
             remote_rules_files: _,
@@ -3048,6 +3069,10 @@ impl Trees {
         self.outside = outside.into();
         self.lost = lost.into();
         self.displaced = displaced.into();
+        self.displaced_identities = HashMap::new();
+        for (id, identity) in self.displaced.iter() {
+            (self.displaced_identities.entry(*identity).or_default()).insert(id.clone());
+        }
         self.halves = halves.into();
         self.edited_here = edited_here.into();
         self.moved_here = moved_here.into();

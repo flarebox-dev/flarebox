@@ -1042,7 +1042,7 @@ impl World {
         if device.engine.scan_left(&device.disk, NOW as u64) > 0 {
             note(
                 &mut self.seen,
-                "a scan of part of the disk holds a file for the other half of its move",
+                "a scan of part of the disk holds an entry for the other half of its move",
             );
         }
         device.persist()
@@ -1064,7 +1064,7 @@ impl World {
             );
         }
         if (held.iter()).any(|id| device.engine.trees.local().get(id).is_some()) {
-            note(&mut self.seen, "a full scan finds where a held file went");
+            note(&mut self.seen, "a full scan finds where a held entry went");
         }
         self.scanned[d] = self.clock;
         let changed = device.engine != device.store;
