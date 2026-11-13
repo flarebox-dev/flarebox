@@ -1285,6 +1285,115 @@ fn a_restore_that_loses_no_rename_allows_no_unasked_rename() {
     world.devices[0].disk.rename(a, Place::Root, "b").unwrap();
     assert!(world.phase(3, &[]).is_err());
 }
+
+fn an_edit_of_a_trashed_conflict_named_file() -> (World, koidrive_proto::v1::NodeState) {
+    let mut world = converge(2, &[vec![(0, file("a")), (1, file("a")), (0, folder("b"))]]).unwrap();
+    let conflict = world
+        .space()
+        .nodes()
+        .into_iter()
+        .find(|node| node.name.contains("(conflict from "))
+        .unwrap();
+    let target = |device: usize| {
+        let disk = &world.devices[device].disk;
+        disk.visible()
+            .iter()
+            .position(|ino| disk.entries()[ino].name == conflict.name)
+            .unwrap()
+    };
+    let (author, other) = (target(1), target(0));
+    let mut deleted = vec![(1, overwrite(author))];
+    deleted.extend(commit(1));
+    deleted.push((1, delete(author)));
+    deleted.extend(commit(1));
+    world.run(1, &deleted).unwrap();
+    let trashed = world
+        .space()
+        .nodes()
+        .into_iter()
+        .find(|node| node.node_id == conflict.node_id)
+        .unwrap();
+    assert_eq!(
+        trashed.status,
+        koidrive_proto::v1::NodeStatus::Trashed as i32
+    );
+    assert_eq!(trashed.name, conflict.name);
+    let mut edit = vec![(0, overwrite(other)), (0, SCAN)];
+    edit.extend([(0, DELIVER); 8]);
+    world.run(2, &edit).unwrap();
+    world.devices[0]
+        .engine
+        .trees
+        .set_synced(conflict.node_id.clone(), None);
+    world.devices[0].persist().unwrap();
+    (world, conflict)
+}
+
+#[test]
+fn an_edit_revives_a_file_at_the_conflict_name_the_server_already_holds() {
+    let (mut world, conflict) = an_edit_of_a_trashed_conflict_named_file();
+    world.phase(2, &[]).unwrap();
+    let revived = world
+        .space()
+        .nodes()
+        .into_iter()
+        .find(|node| node.node_id == conflict.node_id)
+        .unwrap();
+    assert_eq!(revived.status, koidrive_proto::v1::NodeStatus::Live as i32);
+    assert_eq!(
+        (revived.parent_id, revived.name),
+        (conflict.parent_id, conflict.name)
+    );
+    assert_eq!(revived.current.unwrap().content.unwrap().mtime_ns, 4);
+}
+
+#[test]
+fn a_revival_at_an_unasked_name_or_parent_is_rejected() {
+    for rename in [true, false] {
+        let (mut world, conflict) = an_edit_of_a_trashed_conflict_named_file();
+        let folder = world
+            .space()
+            .nodes()
+            .into_iter()
+            .find(|node| node.name == "b")
+            .unwrap()
+            .node_id;
+        world.run(2, &[(0, COMMIT)]).unwrap();
+        let device = &mut world.devices[0];
+        let mut state = device.engine.commits.state();
+        let moved = state
+            .in_flight
+            .as_mut()
+            .unwrap()
+            .commit
+            .ops
+            .iter_mut()
+            .find_map(|op| match &mut op.op {
+                Some(koidrive_proto::v1::op::Op::Move(moved))
+                    if moved.node_id == conflict.node_id =>
+                {
+                    Some(moved)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            (&moved.new_parent_id, &moved.new_name),
+            (&conflict.parent_id, &conflict.name)
+        );
+        if rename {
+            moved.new_name = "invented".into();
+        } else {
+            moved.new_parent_id = folder;
+        }
+        device.engine.commits = koidrive_engine::commit::Commits::from_state(state).unwrap();
+        device.persist().unwrap();
+        let failure = world.phase(2, &[]).unwrap_err();
+        assert!(
+            matches!(failure, Failure::Diverged(why) if why.contains("never gave to anything"))
+        );
+    }
+}
 /// A restore that loses an edit lets a device send the position L holds for the file again, here
 /// when it revives the file that another device's delete trashed after the restore.
 #[test]
