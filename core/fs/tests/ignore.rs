@@ -677,12 +677,22 @@ fn a_scoped_rescan_finds_a_hard_link_outside_its_scope_as_a_full_one_does() {
         snapshot
             .rescan_with_rules(root, whole(), &mut rules)
             .unwrap();
+        let id = snapshot.entries[Path::new("a")].id;
         fs::remove_file(root.join("a")).unwrap();
 
         let rescan = snapshot
             .rescan_with_rules(root, paths.clone(), &mut rules)
             .unwrap();
-        assert_eq!(rescan.changes, [removed("a", File)], "{paths:?}");
+        assert_eq!(
+            rescan.changes,
+            [Change::Ignored {
+                from: "a".into(),
+                to: "ig/link".into(),
+                kind: File,
+                id,
+            }],
+            "{paths:?}"
+        );
     }
 }
 
