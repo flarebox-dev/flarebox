@@ -691,3 +691,35 @@ fn a_bulk_delete_with_a_file_moved_over_another_keeps_the_file_at_its_path() {
         server_nodes(&remote)
     );
 }
+
+#[test]
+fn a_file_deleted_in_a_scan_of_part_of_the_tree_leaves_the_server_once_the_wait_for_its_move_ends() {
+    for restart in [false, true] {
+        let mut remote = Remote::new();
+        let (site, mut a) = linked(&mut remote, "a");
+        a.create(&mut remote, &site.root.join("notes.txt"), b"written on a");
+        fs::remove_file(site.root.join("notes.txt")).unwrap();
+        eventually("the scan finds the file gone", || {
+            a.scan(Duration::from_millis(100));
+            a.folder.engine.trees.local().is_empty()
+        });
+        assert!(a.folder.engine.trees.halves_due().is_some());
+        assert!(a.work.iter().all(|work| matches!(work, Work::HalvesAfter(_))));
+        assert_eq!(remote.names(), ["notes.txt"]);
+
+        if restart {
+            drop(a);
+            a = site.start();
+            assert!(a.folder.engine.trees.halves_due().is_some());
+            a.connect(&remote);
+            a.scan_until(|a| a.folder.scanned);
+            assert_eq!(a.run(&mut remote), ["subscribe", "send"]);
+        } else {
+            assert_eq!(a.run(&mut remote), ["wait for halves", "send"]);
+        }
+        assert!(remote.names().is_empty(), "restart: {restart}");
+        a.settle();
+        assert!(a.run(&mut remote).is_empty());
+        assert_eq!(a.state(), FolderState::UpToDate);
+    }
+}
