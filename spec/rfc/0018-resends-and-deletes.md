@@ -54,6 +54,8 @@ A device whose user deleted a file it held as S does, before a resend of it arri
 
 The delete is then sent with a base past the resend, and §4 applies it. A record that also renames or moves the file is not taken, so R7 still keeps a move the delete did not see. A listing shows no such step and changes nothing here (GUN-581).
 
+A record that moves a file's edit revision but not its `content_rev` (§3) is a remote edit to a device whose L no longer holds the file. S forgets the file, and the device downloads it again, as it does for an edit that brings new content. A device that adopted a resend above therefore keeps the author's edit that follows it, and it sends no delete over that edit.
+
 A device that upgrades its store sets each stored node's edit revision to its `content_rev`. It does this with an `ALTER TABLE` that adds the column, then an `UPDATE`, or with a nullable column whose NULL reads as `content_rev`.
 
 ## 8. Mixed versions and stored state
