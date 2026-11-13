@@ -1464,6 +1464,11 @@ pub(crate) struct ObserveFault {
     pub paused: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static BEFORE_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Why the task stopped syncing before it was asked to.
 #[derive(Debug, thiserror::Error)]
 enum Halt {
@@ -1662,11 +1667,6 @@ impl FolderTask {
             Ok(lock) => Arc::new(lock),
             Err(problem) => return Halt::Person(Halted::Claim, problem),
         };
-        let local = self.local.clone();
-        let mut folder = match Folder::open(self.link.clone(), &lock, &self.store, local) {
-            Ok(folder) => folder,
-            Err(stop) => return stop.into(),
-        };
         if let Err(error) = self
             .status
             .claimed(locked.expect("a claimed folder has an identity"))
@@ -1676,6 +1676,15 @@ impl FolderTask {
                 format!("the folder's lifecycle cannot be saved: {error}"),
             );
         }
+        #[cfg(test)]
+        if let Some(before_open) = BEFORE_OPEN.with(|hook| hook.borrow_mut().take()) {
+            before_open();
+        }
+        let local = self.local.clone();
+        let mut folder = match Folder::open(self.link.clone(), &lock, &self.store, local) {
+            Ok(folder) => folder,
+            Err(stop) => return stop.into(),
+        };
         let mut from_disk = self.observe(lock.clone(), folder.sections(), folder.snapshot());
         let mut config = SessionConfig::new(
             &self.link.space_id,
