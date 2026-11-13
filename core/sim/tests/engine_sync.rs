@@ -20,7 +20,7 @@ include!("engine_sync/waiting_updates.rs");
 proptest! {
     #![proptest_config(koidrive_test_support::regression_config(
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/engine_sync.proptest-regressions"),
-        std::env::var("PROPTEST_CASES").ok().and_then(|cases| cases.parse().ok()).unwrap_or(1024),
+        1024,
     ))]
 
     #[test]
@@ -80,7 +80,7 @@ proptest! {
 proptest! {
     #![proptest_config(koidrive_test_support::regression_config(
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/engine_sync.proptest-regressions"),
-        std::env::var("PROPTEST_CASES").ok().and_then(|cases| cases.parse().ok()).unwrap_or(128),
+        128,
     ))]
 
     /// Section 6.1: removing a folder that holds more than half of a space of at least 20 files
@@ -125,7 +125,7 @@ proptest! {
 proptest! {
     #![proptest_config(koidrive_test_support::regression_config(
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/engine_sync.proptest-regressions"),
-        std::env::var("PROPTEST_CASES").ok().and_then(|cases| cases.parse().ok()).unwrap_or(256),
+        256,
     ))]
 
     /// Section 6.4: on the first link of a folder to a space that holds something, what both hold

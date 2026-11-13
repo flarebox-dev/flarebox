@@ -10,7 +10,12 @@ use std::path::{Path, PathBuf};
 use proptest::test_runner::{Config, FailurePersistence, PersistedSeed};
 
 /// Replays saved regressions beside `legacy` and saves each new failure in its own file.
+/// Uses `cases` unless `PROPTEST_CASES` sets a valid case count.
 pub fn regression_config(legacy: &'static str, cases: u32) -> Config {
+    let cases = std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|cases| cases.parse().ok())
+        .unwrap_or(cases);
     Config {
         failure_persistence: Some(Box::new(RegressionCases(PathBuf::from(legacy)))),
         ..Config::with_cases(cases)
@@ -56,12 +61,13 @@ impl RegressionCases {
         seeds.into_iter().collect()
     }
 
-    fn save(&self, seed: &PersistedSeed) -> io::Result<()> {
+    fn save(&self, seed: &PersistedSeed, value: &dyn Debug) -> io::Result<()> {
         let directory = self.0.with_extension("cases");
         fs::create_dir_all(&directory)?;
         let path = directory.join(case_name(seed));
         let mut file = tempfile::NamedTempFile::new_in(&directory)?;
-        writeln!(file, "{seed}")?;
+        let value = format!("{value:?}").replace(['\r', '\n'], " ");
+        writeln!(file, "{seed} # shrinks to {value}")?;
         match file.persist_noclobber(&path) {
             Ok(_) => (),
             Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
@@ -112,9 +118,9 @@ impl FailurePersistence for RegressionCases {
         &mut self,
         _: Option<&'static str>,
         seed: PersistedSeed,
-        _: &dyn Debug,
+        value: &dyn Debug,
     ) {
-        if let Err(error) = self.save(&seed) {
+        if let Err(error) = self.save(&seed, value) {
             eprintln!("cannot save proptest regression {seed}: {error}");
         }
     }
@@ -145,15 +151,45 @@ mod tests {
     }
 
     #[test]
+    fn regression_config_uses_the_case_count_environment() {
+        let configured = regression_config("unused.txt", 512);
+        let expected = std::env::var("PROPTEST_CASES")
+            .ok()
+            .and_then(|cases| cases.parse().ok())
+            .unwrap_or(512);
+        assert_eq!(configured.cases, expected);
+    }
+
+    #[test]
+    fn saved_cases_keep_a_single_line_shrink_description() {
+        struct Value;
+        impl Debug for Value {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("first\nsecond\rthird")
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let mut cases = RegressionCases(root.path().join("property.txt"));
+        cases.save_persisted_failure2(None, seed('1'), &Value);
+        let saved = cases.0.with_extension("cases").join(case_name(&seed('1')));
+        assert_eq!(
+            fs::read_to_string(saved).unwrap(),
+            format!("{} # shrinks to first second third\n", seed('1'))
+        );
+        assert_eq!(cases.load(), vec![seed('1')]);
+    }
+
+    #[test]
     fn independent_failures_add_independent_immutable_files() {
         let root = tempfile::tempdir().unwrap();
         let cases = RegressionCases(root.path().join("property.txt"));
-        cases.save(&seed('1')).unwrap();
+        cases.save(&seed('1'), &()).unwrap();
         let first = cases.0.with_extension("cases").join(case_name(&seed('1')));
         fs::write(&first, format!("{} # shrinks to original\n", seed('1'))).unwrap();
         let original = fs::read(&first).unwrap();
-        cases.save(&seed('2')).unwrap();
-        cases.save(&seed('1')).unwrap();
+        cases.save(&seed('2'), &()).unwrap();
+        cases.save(&seed('1'), &"replacement").unwrap();
         assert_eq!(fs::read(first).unwrap(), original);
         assert_eq!(
             fs::read_dir(cases.0.with_extension("cases"))
@@ -173,8 +209,8 @@ mod tests {
             format!("# legacy\n{} # shrinks to old\n{}\n", seed('2'), seed('1')),
         )
         .unwrap();
-        cases.save(&seed('2')).unwrap();
-        cases.save(&seed('3')).unwrap();
+        cases.save(&seed('2'), &()).unwrap();
+        cases.save(&seed('3'), &()).unwrap();
         assert_eq!(cases.load(), vec![seed('1'), seed('2'), seed('3')]);
     }
 
@@ -186,7 +222,7 @@ mod tests {
         std::thread::scope(|scope| {
             for byte in ['1', '2', '1', '3'] {
                 let cases = &cases;
-                scope.spawn(move || cases.save(&seed(byte)).unwrap());
+                scope.spawn(move || cases.save(&seed(byte), &()).unwrap());
             }
         });
         fs::write(
@@ -202,7 +238,7 @@ mod tests {
     fn a_filename_cannot_hide_a_different_seed() {
         let root = tempfile::tempdir().unwrap();
         let cases = RegressionCases(root.path().join("property.txt"));
-        cases.save(&seed('1')).unwrap();
+        cases.save(&seed('1'), &()).unwrap();
         fs::write(
             cases.0.with_extension("cases").join(case_name(&seed('1'))),
             format!("{}\n", seed('2')),
@@ -216,7 +252,7 @@ mod tests {
     fn a_case_file_cannot_hide_multiple_seeds() {
         let root = tempfile::tempdir().unwrap();
         let cases = RegressionCases(root.path().join("property.txt"));
-        cases.save(&seed('1')).unwrap();
+        cases.save(&seed('1'), &()).unwrap();
         fs::write(
             cases.0.with_extension("cases").join(case_name(&seed('1'))),
             format!("{}\n{}\n", seed('1'), seed('2')),
@@ -263,7 +299,7 @@ mod tests {
     fn malformed_regressions_fail_instead_of_disappearing() {
         let root = tempfile::tempdir().unwrap();
         let cases = RegressionCases(root.path().join("property.txt"));
-        cases.save(&seed('1')).unwrap();
+        cases.save(&seed('1'), &()).unwrap();
         fs::write(
             cases.0.with_extension("cases").join(case_name(&seed('1'))),
             "cc broken\n",

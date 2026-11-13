@@ -517,6 +517,10 @@ fn case_with(
 }
 
 proptest! {
+    #![proptest_config(koidrive_test_support::regression_config(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/git_oracle.proptest-regressions"),
+        ProptestConfig::default().cases,
+    ))]
     #[test]
     fn agrees_with_git_case_sensitive(case in case(false)) {
         compare::<Exact>(&case, false, same, same)?;
@@ -534,7 +538,10 @@ proptest! {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(10_000))]
+    #![proptest_config(koidrive_test_support::regression_config(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/git_oracle.proptest-regressions"),
+        10_000,
+    ))]
 
     #[test]
     fn ignorecase_lines_hold_no_letter_git_leaves_unfolded(line in line(true)) {

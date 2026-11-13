@@ -14,5 +14,6 @@ unicode-normalization = "0.1"
 
 [dev-dependencies]
 koidrive-engine = { path = "../engine" }
+koidrive-test-support = { path = "../test-support" }
 proptest = "1.12.0"
 tempfile = "3.27.0"

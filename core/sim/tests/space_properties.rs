@@ -251,7 +251,10 @@ fn check_tree(space: &SpaceDo, root: &str) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(koidrive_test_support::regression_config(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/space_properties.proptest-regressions"),
+        256,
+    ))]
 
     #[test]
     fn random_commits_keep_the_tree_valid_and_deterministic(actions in prop::collection::vec(action(), 1..60)) {

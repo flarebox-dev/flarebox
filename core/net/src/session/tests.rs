@@ -1558,6 +1558,10 @@ mod refusal_reader {
     }
 
     proptest! {
+        #![proptest_config(koidrive_test_support::regression_config(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/proptest-regressions/session/tests.txt"),
+            ProptestConfig::default().cases,
+        ))]
         #[test]
         fn arbitrary_answers_are_bounded_and_never_panic(
             framing in prop_oneof![Just(None), Just(chunked()), (0usize..100_000).prop_map(length)],

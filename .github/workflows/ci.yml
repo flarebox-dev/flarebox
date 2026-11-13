@@ -341,6 +341,14 @@ jobs:
         if: runner.environment != 'self-hosted'
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked --features koidrive-cli/test-install-inventory -- -D warnings
+      - name: Require per-seed persistence for every property test
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/check-proptest-persistence-target
+        run: |
+          nice -n 10 cargo fmt --manifest-path scripts/check-proptest-persistence/Cargo.toml --check
+          nice -n 10 cargo clippy --manifest-path scripts/check-proptest-persistence/Cargo.toml --all-targets --locked -- -D warnings
+          nice -n 10 cargo test --manifest-path scripts/check-proptest-persistence/Cargo.toml --locked
+          nice -n 10 cargo run --manifest-path scripts/check-proptest-persistence/Cargo.toml --locked --
       - name: Test the scenario splitter
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/test-split-target
@@ -353,11 +361,15 @@ jobs:
         run: |
           python3 scripts/test-split-proptest-regressions.py -v
           LC_ALL=C PYTHONUTF8=0 PYTHONCOERCECLOCALE=0 python3 scripts/test-split-proptest-regressions.py -v
-      - name: Replay every saved sim and driver regression without random cases
+      - name: Replay saved property regressions without random cases
         env:
           PROPTEST_CASES: '0'
         run: |
-          cargo test --locked -p koidrive-sim --test devices --test engine_sync -- --show-output
+          cargo test --locked -p koidrive-sim --test devices --test engine_sync --test space_properties -- --show-output
+          cargo test --locked -p koidrive-engine --test names --test trees --test effects -- --show-output
+          cargo test --locked -p koidrive-chunk --test chunking -- --show-output
+          cargo test --locked -p koidrive-ignore --test properties --test git_oracle -- --show-output
+          cargo test --locked -p koidrive-net --lib -- --show-output
           cargo test --locked -p koidrive-driver --lib batches_leave_l_a_tree_that_holds_the_disk -- --show-output
       - name: Test release updates with a tag-derived version
         run: |

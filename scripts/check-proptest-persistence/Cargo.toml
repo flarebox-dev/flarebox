@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "check-proptest-persistence"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+syn = { version = "2", features = ["full"] }

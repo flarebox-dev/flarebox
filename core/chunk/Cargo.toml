@@ -15,5 +15,6 @@ koidrive-proto = { path = "../proto" }
 sha2 = "0.11.1"
 
 [dev-dependencies]
+koidrive-test-support = { path = "../test-support" }
 proptest = "1.12.0"
 sha2 = "0.11.1"
