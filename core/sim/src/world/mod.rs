@@ -46,8 +46,7 @@
 //! - No write is in two files of the server, except one a restore took from the server while a
 //!   disk held it (section 4.4). Until the devices are quiet again, it may be in one file for each
 //!   node that held it, or for each device that held it in a node the restore rolled back to
-//!   other content, including the nodes a restore brings it back into, and then in the files the
-//!   server holds it in.
+//!   other content, and then in the files the server holds it in.
 //! - Every write was in the server's live tree at some time, unless the user who made it
 //!   overwrote or deleted it first.
 
@@ -939,12 +938,6 @@ impl World {
         }
         for write in self.writers.keys() {
             let taken = (held_before.difference(&held_after)).any(|(_, held)| held == write);
-            let brought = (held_after.difference(&held_before)).any(|(_, held)| held == write);
-            if let Some(exposure) = self.exposed.get_mut(write).filter(|_| brought) {
-                for (id, _) in held_after.iter().filter(|(_, held)| held == write) {
-                    exposure.nodes.entry(id.clone()).or_insert((1, false));
-                }
-            }
             if !taken && (!stored(&self.held, *write) || stored(&backup.held, *write)) {
                 continue;
             }

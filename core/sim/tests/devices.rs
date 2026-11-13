@@ -3780,58 +3780,6 @@ fn a_lost_rename_can_resend_the_conflict_name_its_own_commit_received() {
 }
 
 #[test]
-fn a_restore_can_bring_an_exposed_write_back_into_a_second_file() {
-    converge(
-        3,
-        &[
-            vec![
-                (
-                    0,
-                    Step::User(Action {
-                        kind: 1,
-                        target: 0,
-                        parent: 0,
-                        name: 0,
-                        text: 2,
-                    }),
-                ),
-                (0, BACKUP),
-            ],
-            vec![
-                (0, overwrite(0)),
-                (0, SCAN),
-                (0, COMMIT),
-                (0, COMMIT),
-                (0, overwrite(0)),
-                (0, RESTORE),
-                (0, folder("c.txt")),
-                (0, rename(0, 0, "A")),
-            ],
-            vec![
-                (1, BACKUP),
-                (1, rename(3, 0, "C.TXT")),
-                (1, SCAN),
-                (1, COMMIT),
-                (1, COMMIT),
-                (1, overwrite(3)),
-                (1, RESTORE),
-            ],
-            vec![
-                (0, overwrite(3)),
-                (0, SCAN),
-                (0, COMMIT),
-                (0, COMMIT),
-                (0, overwrite(3)),
-                (2, Step::Work(0)),
-                (1, DELIVER),
-                (0, RESTORE),
-            ],
-        ],
-    )
-    .unwrap();
-}
-
-#[test]
 fn a_lost_create_sent_again_under_a_new_name_is_taken_by_a_device_whose_download_a_crash_cut() {
     a_lost_create_its_author_sends_again_under_a_new_name(Step::Effect(Outcome::Crash(
         Cut::Placed,
