@@ -14,7 +14,7 @@ export interface Config {
 export const S4_WRITERS_PER_SPACE = 25;
 export const MAX_WRITERS = 400;
 export const MAX_STEPS_MS = 180 * 60_000;
-export const FALLBACK_ROWS_PER_COMMIT = 60;
+export const FALLBACK_ROWS_PER_COMMIT = 25;
 const BUDGET_MARGIN = 1.25;
 
 const DEFAULT_STEPS: Record<ScenarioName, number[]> = { s1: [1, 5, 10, 25, 50, 100, 200], s4: [1, 4, 16] };
