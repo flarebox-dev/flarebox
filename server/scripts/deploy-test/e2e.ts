@@ -255,7 +255,7 @@ interface Folder {
   problem: string | null;
 }
 
-interface Device {
+export interface Device {
   name: string;
   dir: string;
   folder: string;
@@ -266,6 +266,8 @@ function device(name: string): Device {
   const dir = temp(name);
   const xdg = { XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"), XDG_RUNTIME_DIR: join(dir, "run") };
   for (const path of [...Object.values(xdg), join(dir, "folder")]) mkdirSync(path, { recursive: true, mode: 0o700 });
+  mkdirSync(join(xdg.XDG_CONFIG_HOME, "koidrive"), { recursive: true, mode: 0o700 });
+  writeFileSync(join(xdg.XDG_CONFIG_HOME, "koidrive", "config.toml"), "[service]\nbackground = false\n");
   return { name, dir, folder: join(dir, "folder"), env: { ...process.env, ...xdg } };
 }
 
@@ -289,7 +291,8 @@ function folder(on: Device): Folder {
   return status.data.folders[0] ?? fail(on.name + " has no linked folder");
 }
 
-async function startDaemon(on: Device): Promise<void> {
+export async function startDaemon(on: Device): Promise<void> {
+  if (answers(on)) fail("a daemon already answers for " + on.name + "'s profile, so the one started here could not take it");
   console.log("\n$ koi _daemon >> daemon.log &   # " + on.name);
   const log = openSync(join(on.dir, "daemon.log"), "a");
   const daemon = spawn(env("KOI"), ["_daemon"], { env: { ...on.env, KOIDRIVE_LOG: "info,koidrive_driver=debug,koidrive_engine=debug" }, detached: true, stdio: ["ignore", log, log] });
@@ -297,21 +300,29 @@ async function startDaemon(on: Device): Promise<void> {
   writeFileSync(join(on.dir, "daemon.pid"), String(daemon.pid));
   const runtime = join(on.env.XDG_RUNTIME_DIR!, "koidrive");
   await until(on.name + "'s daemon to answer", 30_000, () => {
-    if (daemon.exitCode !== null) fail(on.name + "'s daemon exited with " + daemon.exitCode + ": " + readFileSync(join(on.dir, "daemon.log"), "utf8").slice(-2000));
+    if (daemon.exitCode !== null || daemon.signalCode !== null) fail(on.name + "'s daemon exited with " + (daemon.exitCode ?? daemon.signalCode) + ": " + readFileSync(join(on.dir, "daemon.log"), "utf8").slice(-2000));
     if (!existsSync(runtime) || !readdirSync(runtime).some((name) => /^daemon-[0-9a-f]{8}\.sock$/.test(name))) return undefined;
-    try {
-      return (JSON.parse(koi(on, ["status", "--json"], null)) as { data: { running: boolean } }).data.running ? true : undefined;
-    } catch {
-      return undefined;
-    }
+    return answers(on) ? true : undefined;
   });
+}
+
+function answers(on: Device): boolean {
+  try {
+    return (JSON.parse(koi(on, ["status", "--json"], null)) as { data: { running: boolean } }).data.running;
+  } catch {
+    return false;
+  }
 }
 
 async function stopDaemon(on: Device): Promise<void> {
   const file = join(on.dir, "daemon.pid");
   const pid = Number(readFileSync(file, "utf8"));
   console.log("\n$ kill -TERM <daemon>   # " + on.name);
-  process.kill(pid, "SIGTERM");
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch (error) {
+    fail(on.name + "'s daemon was gone before it was stopped (" + String(error) + "): " + readFileSync(join(on.dir, "daemon.log"), "utf8").slice(-2000));
+  }
   await until(on.name + "'s daemon to exit", 30_000, () => {
     try {
       process.kill(pid, 0);

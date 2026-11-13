@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { afterEach, describe, expect, it } from "vitest";
 import { CommitRecordSchema, NodeKind, type NodeState, NodeStateSchema, NodeStatus } from "../../src/gen/koidrive/v1/model_pb";
-import { type Content, contents, format, keypair, listing, matches, seal, trees, unseal } from "./e2e.ts";
+import { type Content, contents, format, keypair, listing, matches, seal, startDaemon, trees, unseal } from "./e2e.ts";
 import { replay, rewindMismatch } from "./rewind.ts";
 
 const roots: string[] = [];
@@ -115,5 +115,28 @@ describe("the sealed pairing code", () => {
     expect(sealed.toString()).not.toContain("K7QM");
     expect(unseal(keys.privateKey, sealed)).toBe("K7QM-2XPD@koidrive-test-1-1.example.workers.dev");
     expect(() => unseal(keypair().privateKey, sealed)).toThrow();
+  });
+});
+
+describe("starting a device's daemon", () => {
+  it("refuses when another daemon already answers for the profile, without starting one", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "koidrive-e2e-unit-"));
+    roots.push(dir);
+    const koi = join(dir, "koi");
+    writeFileSync(
+      koi,
+      '#!/bin/sh\ncase "$1" in\n  status) printf \'{"data":{"running":true,"folders":[]}}\\n\' ;;\n  _daemon) touch "$(dirname "$0")/started"; echo "another Koidrive daemon or command is using this profile" >&2; exit 1 ;;\nesac\n',
+    );
+    chmodSync(koi, 0o755);
+    const previous = process.env.KOI;
+    process.env.KOI = koi;
+    try {
+      const device = { name: "mac", dir, folder: join(dir, "folder"), env: { ...process.env, XDG_RUNTIME_DIR: join(dir, "run") } };
+      await expect(startDaemon(device)).rejects.toThrow("a daemon already answers for mac's profile");
+      expect(existsSync(join(dir, "started"))).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.KOI;
+      else process.env.KOI = previous;
+    }
   });
 });
