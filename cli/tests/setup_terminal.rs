@@ -314,7 +314,15 @@ impl Home {
         let daemon = self.daemon(paired);
         let mut arguments = vec!["setup", "--interactive", "--no-browser"];
         arguments.extend(args);
-        let output = terminal_run(self.path(), steps, &arguments, vars, rich, interrupt, false);
+        let output = terminal_run(
+            self.path(),
+            steps,
+            &arguments,
+            vars,
+            rich,
+            interrupt,
+            TerminalInput::Direct,
+        );
         daemon.finish();
         output
     }
@@ -496,15 +504,7 @@ fn koi(home: &Path) -> Command {
     command
 }
 
-fn terminal_run(
-    home: &Path,
-    steps: &[Step],
-    args: &[&str],
-    vars: &[(&str, &str)],
-    rich: bool,
-    interrupt: Option<(usize, rustix::process::Signal)>,
-    queued_enter: bool,
-) -> Output {
+fn terminal_pair() -> (File, File) {
     let master = rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR).unwrap();
     rustix::pty::grantpt(&master).unwrap();
     rustix::pty::unlockpt(&master).unwrap();
@@ -526,14 +526,32 @@ fn terminal_run(
         },
     )
     .unwrap();
+    (File::from(master), slave)
+}
+
+enum TerminalInput {
+    Direct,
+    QueuedEnter,
+    ControllingProxy,
+    FullProxy,
+    DifferentTerminal,
+}
+
+fn terminal_run(
+    home: &Path,
+    steps: &[Step],
+    args: &[&str],
+    vars: &[(&str, &str)],
+    rich: bool,
+    interrupt: Option<(usize, rustix::process::Signal)>,
+    input: TerminalInput,
+) -> Output {
+    let queued_enter = matches!(input, TerminalInput::QueuedEnter);
+    let (mut terminal, slave) = terminal_pair();
+    let mut other = matches!(input, TerminalInput::DifferentTerminal).then(terminal_pair);
     let original = rustix::termios::tcgetattr(&slave).unwrap();
     let mut command = koi(home);
-    command
-        .args(args)
-        .stdin(slave.try_clone().unwrap())
-        .stdout(slave.try_clone().unwrap())
-        .stderr(slave)
-        .env("TERM", "xterm-256color");
+    command.args(args).env("TERM", "xterm-256color");
     if args.first() == Some(&"setup") {
         command.arg("--no-app");
     }
@@ -543,7 +561,46 @@ fn terminal_run(
     for (key, value) in vars {
         command.env(key, value);
     }
-    let mut terminal = File::from(master);
+    if matches!(
+        input,
+        TerminalInput::ControllingProxy
+            | TerminalInput::FullProxy
+            | TerminalInput::DifferentTerminal
+    ) {
+        let output = if matches!(input, TerminalInput::FullProxy) {
+            "fd=os.open('/dev/tty',os.O_WRONLY); os.dup2(fd,1); os.dup2(fd,2); os.close(fd);"
+        } else {
+            ""
+        };
+        let mut wrapper = Command::new("python3");
+        wrapper
+            .args(["-c", &format!("import fcntl,os,sys,termios; os.setsid(); fcntl.ioctl(0,termios.TIOCSCTTY,0); fd=os.open('/dev/tty',os.O_RDONLY); os.dup2(fd,0); os.close(fd); {output} os.execv(sys.argv[1],sys.argv[1:])")])
+            .arg(command.get_program())
+            .args(command.get_args())
+            .current_dir(home);
+        for (name, value) in command.get_envs() {
+            match value {
+                Some(value) => {
+                    wrapper.env(name, value);
+                }
+                None => {
+                    wrapper.env_remove(name);
+                }
+            }
+        }
+        command = wrapper;
+    }
+    command
+        .stdin(slave.try_clone().unwrap())
+        .stdout(slave.try_clone().unwrap());
+    match &other {
+        Some((_, output)) => {
+            command.stderr(output.try_clone().unwrap());
+        }
+        None => {
+            command.stderr(slave);
+        }
+    }
     if queued_enter {
         terminal.write_all(b"\r").unwrap();
     }
@@ -625,8 +682,25 @@ fn terminal_run(
             panic!("setup did not finish: {text}");
         }
     }
+    let status = child.wait().unwrap();
+    if let Some((output, _)) = &mut other {
+        let mut bytes = [0; 4096];
+        loop {
+            match output.read(&mut bytes) {
+                Ok(0) => break,
+                Ok(count) => raw.extend_from_slice(&bytes[..count]),
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        || error.raw_os_error() == Some(5) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("other terminal read failed: {error}"),
+            }
+        }
+    }
     let output = Output {
-        status: child.wait().unwrap(),
+        status,
         stdout: raw,
         stderr: Vec::new(),
     };
@@ -661,6 +735,138 @@ fn rich_setup_masks_pairing_input() {
     assert!(output.status.success(), "{text}");
     assert!(text.contains("This device is set up"), "{text}");
     assert!(!text.contains("CODE@files.example.com"), "{text}");
+}
+
+#[test]
+fn setup_accepts_input_reopened_from_the_controlling_terminal() {
+    for rich in [false, true] {
+        let home = Home::new(&[]);
+        let daemon = home.daemon(true);
+        let output = terminal_run(
+            home.path(),
+            &full(rich, if rich { "n" } else { "n\n" }),
+            &["setup", "--interactive", "--no-browser"],
+            &[],
+            rich,
+            None,
+            TerminalInput::ControllingProxy,
+        );
+        daemon.finish();
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success(), "{text}");
+        assert!(!text.contains("Invalid argument"), "{text}");
+        assert!(!text.contains("CODE@files.example.com"), "{text}");
+        assert!(home.connected(), "{text}");
+        assert_eq!(home.links().len(), 1, "{text}");
+    }
+}
+
+#[test]
+fn setup_accepts_all_standard_descriptors_reopened_from_the_controlling_terminal() {
+    for rich in [false, true] {
+        let home = Home::new(&[]);
+        let daemon = home.daemon(true);
+        let output = terminal_run(
+            home.path(),
+            &full(rich, if rich { "n" } else { "n\n" }),
+            &["setup", "--interactive", "--no-browser"],
+            &[],
+            rich,
+            None,
+            TerminalInput::FullProxy,
+        );
+        daemon.finish();
+        let text = shown(output.clone());
+        assert!(output.status.success(), "{text}");
+        assert!(!text.contains("CODE@files.example.com"), "{text}");
+        assert!(home.connected(), "{text}");
+        assert_eq!(home.links().len(), 1, "{text}");
+    }
+}
+
+#[test]
+fn keyboard_ctrl_c_through_controlling_proxies_restores_input_and_reaps_helpers() {
+    for rich in [false, true] {
+        for stage in 0..2 {
+            for input in [TerminalInput::ControllingProxy, TerminalInput::FullProxy] {
+                let home = Home::new(&[]);
+                let daemon = home.daemon(true);
+                let mut steps = full(rich, if rich { "n" } else { "n\n" });
+                steps.truncate(stage + 1);
+                steps[stage].input = "\u{3}".into();
+                let output = terminal_run(
+                    home.path(),
+                    &steps,
+                    &["setup", "--interactive", "--no-browser"],
+                    &[],
+                    rich,
+                    None,
+                    input,
+                );
+                daemon.finish();
+                let text = shown(output.clone());
+                assert_eq!(output.status.code(), Some(130), "{text}");
+                assert!(!home.connected());
+                assert!(home.links().is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn signals_through_the_controlling_terminal_reap_helpers_and_restore_input() {
+    for rich in [false, true] {
+        for signal in [rustix::process::Signal::INT, rustix::process::Signal::TERM] {
+            for input in [TerminalInput::ControllingProxy, TerminalInput::FullProxy] {
+                let home = Home::new(&[]);
+                let daemon = home.daemon(true);
+                let output = terminal_run(
+                    home.path(),
+                    &full(rich, if rich { "n" } else { "n\n" }),
+                    &["setup", "--interactive", "--no-browser"],
+                    &[],
+                    rich,
+                    Some((1, signal)),
+                    input,
+                );
+                daemon.finish();
+                assert_eq!(
+                    output.status.code(),
+                    Some(if signal == rustix::process::Signal::INT {
+                        130
+                    } else {
+                        143
+                    }),
+                    "{}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+                assert!(!home.connected());
+                assert!(home.links().is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn setup_rejects_a_different_output_terminal_for_controlling_input() {
+    let home = Home::new(&[]);
+    let output = terminal_run(
+        home.path(),
+        &[],
+        &["setup", "--interactive", "--no-browser"],
+        &[],
+        true,
+        None,
+        TerminalInput::DifferentTerminal,
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("stdin and stderr are not the same terminal"),
+        "{text}"
+    );
+    assert!(!text.contains(ROUTE), "{text}");
+    assert!(!home.connected());
 }
 
 #[test]
@@ -828,7 +1034,7 @@ fn cancelled_reporting_returns_after_the_next_successful_interactive_command() {
             &[],
             rich,
             None,
-            false,
+            TerminalInput::Direct,
         );
         let text = String::from_utf8(output.stdout).unwrap();
         assert!(output.status.success(), "{text}");
@@ -838,7 +1044,15 @@ fn cancelled_reporting_returns_after_the_next_successful_interactive_command() {
         assert_eq!(settings["enabled"], false);
         assert!(settings["install_id"].is_null());
         assert!(!state.join("prompt.json").exists());
-        let output = terminal_run(home.path(), &[], &["status"], &[], rich, None, false);
+        let output = terminal_run(
+            home.path(),
+            &[],
+            &["status"],
+            &[],
+            rich,
+            None,
+            TerminalInput::Direct,
+        );
         assert!(output.status.success());
         assert!(!String::from_utf8_lossy(&output.stdout).contains("Send reports?"));
     }
@@ -873,7 +1087,7 @@ fn failed_status_check_preserves_its_exit_and_defers_consent() {
             &[],
             rich,
             None,
-            false,
+            TerminalInput::Direct,
         );
         let text = String::from_utf8(output.stdout).unwrap();
         assert_eq!(output.status.code(), Some(4), "{text}");
@@ -896,7 +1110,7 @@ fn queued_enter_cannot_answer_deferred_consent() {
             &[],
             rich,
             None,
-            true,
+            TerminalInput::QueuedEnter,
         );
         let text = String::from_utf8(output.stdout).unwrap();
         assert!(output.status.success(), "{text}");
@@ -922,7 +1136,7 @@ fn no_color_applies_to_warnings_after_a_cancelled_question() {
         &[("NO_COLOR", "1"), ("CLICOLOR_FORCE", "1")],
         true,
         None,
-        false,
+        TerminalInput::Direct,
     );
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(output.status.success(), "{text}");
@@ -1356,7 +1570,7 @@ fn files_appearing_during_creation_confirmation_are_not_linked_without_consent()
             &[],
             rich,
             None,
-            false,
+            TerminalInput::Direct,
         );
         let text = shown(output.clone());
         assert!(!output.status.success(), "{text}");
@@ -1394,7 +1608,7 @@ fn files_appearing_during_the_link_server_call_still_need_consent() {
             &[],
             rich,
             None,
-            false,
+            TerminalInput::Direct,
         );
         let text = shown(output.clone());
         assert!(!output.status.success(), "{text}");
@@ -1459,7 +1673,7 @@ fn replacing_an_approved_directory_during_the_link_server_call_is_refused() {
             &[],
             rich,
             None,
-            false,
+            TerminalInput::Direct,
         );
         let text = shown(output.clone());
         assert!(!output.status.success(), "{text}");
