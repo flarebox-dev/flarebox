@@ -896,3 +896,115 @@ fn a_parked_folder_the_server_lost_is_created_again_after_a_delete_empties_it() 
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert!(matches!(&ops(&commit)[..], [op::Op::CreateDir(c)] if c.node_id == "albums"));
 }
+
+fn a_trashed_folder_renamed_out_of_its_trashed_parent() -> Vec<Row> {
+    vec![
+        ("p", None, None, Some(trashed(dir(ROOT, "p")))),
+        (
+            "z",
+            Some(dir(ROOT, "b")),
+            Some(dir(ROOT, "z")),
+            Some(trashed(dir("p", "z"))),
+        ),
+    ]
+}
+
+fn create_dir(node: &str, parent: &str, name: &str) -> op::Op {
+    op::Op::CreateDir(proto::CreateDir {
+        node_id: node.into(),
+        parent_id: parent.into(),
+        name: name.into(),
+    })
+}
+
+#[test]
+fn a_create_into_a_trashed_folder_is_sent_after_the_folders_own_move() {
+    let mut rows = a_trashed_folder_renamed_out_of_its_trashed_parent();
+    rows.push(("c", Some(dir("z", "c")), None, None));
+    let mut trees = trees(&rows);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(
+        ops(&commit),
+        [mv("z", ROOT, "b"), create_dir("c", "z", "c")]
+    );
+}
+
+#[test]
+fn a_create_below_a_trashed_folder_is_sent_after_the_folders_own_move() {
+    let mut rows = a_trashed_folder_renamed_out_of_its_trashed_parent();
+    rows.push((
+        "d",
+        Some(dir("z", "d")),
+        Some(dir("z", "d")),
+        Some(trashed(dir("z", "d"))),
+    ));
+    rows.push(("c", Some(dir("d", "c")), None, None));
+    let mut trees = trees(&rows);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(
+        ops(&commit),
+        [mv("z", ROOT, "b"), create_dir("c", "d", "c")]
+    );
+}
+
+#[test]
+fn a_move_into_a_trashed_folder_is_sent_after_the_folders_own_move() {
+    let mut rows = a_trashed_folder_renamed_out_of_its_trashed_parent();
+    rows.push((
+        "f",
+        Some(file("z", "f", 1)),
+        Some(file(ROOT, "f", 1)),
+        Some(remote(file(ROOT, "f", 1))),
+    ));
+    let mut trees = trees(&rows);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("z", ROOT, "b"), mv("f", "z", "f")]);
+}
+
+#[test]
+fn an_edit_in_a_trashed_folder_is_sent_after_the_folders_own_move() {
+    let mut rows = a_trashed_folder_renamed_out_of_its_trashed_parent();
+    rows.push((
+        "f",
+        Some(file("z", "f", 2)),
+        Some(file("z", "f", 1)),
+        Some(trashed(file("z", "f", 1))),
+    ));
+    let mut trees = trees(&rows);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("z", ROOT, "b"), update("f", 2)]);
+}
+
+#[test]
+fn a_trashed_folder_moving_onto_the_name_of_a_folder_moving_into_it_goes_through_a_pending_name() {
+    let rows = vec![
+        ("p", None, None, Some(trashed(dir(ROOT, "p")))),
+        (
+            "a",
+            Some(dir(ROOT, "n")),
+            Some(dir(ROOT, "a")),
+            Some(trashed(dir("p", "a"))),
+        ),
+        (
+            "n",
+            Some(dir("a", "n")),
+            Some(dir(ROOT, "n")),
+            Some(remote(dir(ROOT, "n"))),
+        ),
+    ];
+    let mut trees = trees(&rows);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(
+        ops(&commit),
+        [
+            mv("a", ROOT, "n (pending)"),
+            mv("n", "a", "n"),
+            mv("a", ROOT, "n"),
+        ]
+    );
+}

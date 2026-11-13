@@ -1,0 +1,1 @@
+cc f016758bff36dfc9b83e301df061bf67e7c918ff6cb43f1b5adf2b02507913af # shrinks to devices = 2, a create into a trashed folder is sent before the folder's own move and revives its trashed parent (GUN-656)

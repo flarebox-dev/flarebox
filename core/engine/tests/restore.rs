@@ -1034,3 +1034,29 @@ fn an_edit_sent_with_a_restore_from_the_trash_is_an_edit_of_this_device() {
     let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert!(commits.edits_in_flight(&sent.commit_id, &n));
 }
+
+#[test]
+fn a_restore_into_a_trashed_folder_is_sent_after_the_folders_own_move() {
+    let (p, a, f) = (id(1), id(2), id(3));
+    let rows = [
+        in_trash(p.clone(), dir(&root(), "p")),
+        (
+            a.clone(),
+            Some(dir(&root(), "b")),
+            Some(dir(&root(), "a")),
+            Some(trashed(dir(&p, "a"))),
+        ),
+        in_trash(f.clone(), file(&a, "f", 1)),
+    ];
+    let mut trees = trees(&rows);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let intent = from_trash(&f);
+    commits.restore(id(100), intent.clone());
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    let moved = op::Op::Move(proto::Move {
+        node_id: a.clone(),
+        new_parent_id: root(),
+        new_name: "b".into(),
+    });
+    assert_eq!(ops(&commit), [moved, restore_op(&intent)]);
+}
