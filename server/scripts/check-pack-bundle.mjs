@@ -7,10 +7,28 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import "./check-release-version.mjs";
 
 const packer = join(dirname(fileURLToPath(import.meta.url)), "pack-bundle.mjs");
 const DRY_RUN = "$ wrangler deploy --dry-run";
 const assets = join(dirname(packer), "..", "web", "dist");
+
+test("the packed Worker and manifest use the CLI release version", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pack-bundle-version-"));
+  try {
+    const cargo = readFileSync(join(dirname(packer), "../../Cargo.toml"), "utf8");
+    const version = cargo.split("[workspace.package]")[1].match(/^version = "([^"]+)"/m)[1];
+    const output = join(dir, "out");
+    const run = spawnSync(process.execPath, [packer, output], { encoding: "utf8" });
+    assert.equal(run.status, 0, run.stderr);
+    const manifest = JSON.parse(readFileSync(join(output, "manifest.json"), "utf8"));
+    assert.equal(manifest.version, version);
+    const worker = readFileSync(join(output, "worker", manifest.main_module), "utf8");
+    assert.ok(worker.includes(JSON.stringify(version)), "the Worker does not contain the release version");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 async function packWhile(during) {
   const dir = mkdtempSync(join(tmpdir(), "pack-bundle-test-"));

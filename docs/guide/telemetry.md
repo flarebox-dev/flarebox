@@ -4,7 +4,7 @@ Koidrive can send anonymous usage reports to the Koidrive project. They help fix
 
 ## Turn reports on or off
 
-The guided `koi setup` on a terminal asks once:
+The guided `koi setup` on a terminal asks once, after setup succeeds. Turning reports on here applies to future commands, not the setup that just finished:
 
 ```
 Send reports? [Y/n]

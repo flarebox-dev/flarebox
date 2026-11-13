@@ -360,6 +360,8 @@ jobs:
           node-version: 24
           cache: pnpm
           cache-dependency-path: server/pnpm-lock.yaml
+      - name: Check the committed standalone release version before generating it
+        run: node --test server/scripts/check-release-version.mjs
       - name: Deploy a copy of server/ on its own (dry run, then wrangler dev and a claim)
         run: node server/scripts/check-deploy.mjs
       - name: Install server dependencies

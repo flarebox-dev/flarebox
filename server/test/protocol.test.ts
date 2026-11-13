@@ -3,7 +3,7 @@
 import { create, type DescMessage, fromBinary, type MessageShape, toBinary } from "@bufbuild/protobuf";
 import { exports } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import pkg from "../package.json";
+import release from "../release.json";
 import {
   ClaimRequestSchema,
   CreateSpaceRequestSchema,
@@ -77,7 +77,7 @@ describe("protocol version negotiation (spec v0 section 9.1)", () => {
     const response = await exports.default.fetch(BASE + "/v1/server");
     const info = fromBinary(ServerInfoSchema, new Uint8Array(await response.arrayBuffer()));
     expect(info.serverVersion).toBe(SERVER_VERSION);
-    expect(SERVER_VERSION).toBe(pkg.version);
+    expect(SERVER_VERSION).toBe(release.version);
     expect([info.protoMin, info.protoMax]).toEqual([PROTO_MIN, PROTO_MAX]);
     expect(PROTO_MIN).toBeGreaterThanOrEqual(1);
     expect(PROTO_MIN).toBeLessThanOrEqual(Math.max(1, PROTO_MAX - 1));

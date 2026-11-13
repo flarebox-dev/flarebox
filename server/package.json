@@ -1,6 +1,5 @@
 {
   "name": "koidrive-server",
-  "version": "0.0.0",
   "private": true,
   "description": "Koidrive server: a Worker with Durable Objects and R2.",
   "license": "AGPL-3.0-or-later",
@@ -10,8 +9,8 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "check:deploy": "node scripts/check-deploy.mjs",
-    "typecheck": "wrangler types && tsc --noEmit && tsc --noEmit -p test && tsc --noEmit -p scripts/deploy-test && pnpm --filter koidrive-web typecheck",
-    "build:web": "pnpm --filter koidrive-web build",
+    "typecheck": "node scripts/release-version.mjs && wrangler types && tsc --noEmit && tsc --noEmit -p test && tsc --noEmit -p scripts/deploy-test && pnpm --filter koidrive-web typecheck",
+    "build:web": "node scripts/release-version.mjs && pnpm --filter koidrive-web build",
     "test": "pnpm build:web && vitest run"
   },
   "cloudflare": {

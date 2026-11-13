@@ -16,15 +16,15 @@ You need one server, in a Cloudflare account you own, and at least one device si
 koi setup
 ```
 
-On a terminal, `koi setup` first asks whether to send anonymous usage reports, unless you already chose or an environment variable decides it. Press Enter for yes. [Usage reports](telemetry.md) lists what they hold and how to turn them off.
-
-Then it asks how to set up this machine:
+On a terminal, `koi setup` asks how to set up this machine:
 
 1. Log in with Cloudflare. Your browser opens Cloudflare's login page. Pick the account and select Authorize. Then Koidrive looks for its servers in that account:
    - With no server, it deploys one. It creates an R2 bucket, uploads the server as a Worker, turns on its `workers.dev` address, and claims the server with this device.
    - With one server, it adds this device to it.
    - With several, it asks which one.
 2. Enter a pairing code from another device, written as `<code>@<host>`. For a code without the host, run `koi join <code> --server <address>` instead. See [Add another device](#add-another-device).
+
+After setup succeeds, it asks whether to send anonymous usage reports, unless you already chose or an environment variable decides it. Press Enter for yes. The choice applies to future commands, not the setup that just finished. [Usage reports](telemetry.md) lists what they hold and how to turn them off.
 
 The login asks for four permissions: reading the account's settings, managing its Workers, writing to its R2 buckets, and keeping access while the command runs (`account-settings.read`, `workers-scripts.admin`, `workers-r2.write` and `offline_access`). Koidrive revokes the login when the command ends. If it can't, it says so, and you can revoke it under Manage OAuth authorizations in the Cloudflare dashboard.
 

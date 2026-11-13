@@ -67,7 +67,7 @@ Recovery reuses `ClaimRequest` and its endpoint, so it needs no proto change; sp
 
 ### 3.2 Versions clients see
 
-- `SERVER_VERSION` (`server/src/version.ts`) equals the version in `server/package.json`; a test keeps them equal. Clients read it from `ServerInfo.server_version` and `Welcome.server_version`.
+- The release version comes from `[workspace.package].version` in `Cargo.toml`. Server builds and bundle packing export it to `server/release.json`, which the Worker and bundle manifest read. The checked-in export lets a standalone copy of `server/` build without Rust or the rest of the repository. Do not edit the export by hand. Clients read it from `ServerInfo.server_version` and `Welcome.server_version`.
 - `PROTO_MIN` and `PROTO_MAX` are in `ServerInfo`. `Hello` carries the client's range; the server picks the highest common minor version and reports it in `Welcome.proto`, or sends `Goodbye` with code 4002 and its range when there is none (spec §9.1). A test keeps `PROTO_MIN ≤ max(1, PROTO_MAX − 1)`, so a release always serves clients one minor version behind.
 
 ### 3.3 Upgrade notices

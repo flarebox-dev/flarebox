@@ -7,7 +7,6 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
-  readFileSync,
   readdirSync,
   realpathSync,
   rmSync,
@@ -18,6 +17,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { releaseVersion } from "./release-version.mjs";
 
 const DRY_RUN_MS = 2 * 60_000;
 
@@ -59,8 +59,7 @@ if (existsSync(output) && (!statSync(output).isDirectory() || readdirSync(output
 const require = createRequire(join(server, "package.json"));
 const { unstable_readConfig } = await import(pathToFileURL(require.resolve("wrangler")).href);
 const config = unstable_readConfig({ config: join(server, "wrangler.jsonc") });
-const version = /SERVER_VERSION = "([^"]+)"/.exec(readFileSync(join(server, "src", "version.ts"), "utf8"))?.[1];
-if (!version) fail("src/version.ts has no SERVER_VERSION");
+const version = releaseVersion(server);
 if (config.r2_buckets.length !== 1) fail("wrangler.jsonc must bind exactly one R2 bucket, found " + config.r2_buckets.length);
 if (!config.assets?.directory || !config.assets.binding) fail("wrangler.jsonc must set assets.directory and assets.binding");
 const fromAssets = relative(realPath(resolve(server, config.assets.directory)), realPath(output));

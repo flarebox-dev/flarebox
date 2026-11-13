@@ -43,6 +43,20 @@ fn reports_are_off_until_someone_turns_them_on() {
 }
 
 #[test]
+fn noninteractive_setup_never_asks_about_reports() {
+    for (args, vars) in [
+        (vec!["setup"], vec![]),
+        (vec!["setup"], vec![("CI", "1")]),
+        (vec!["setup", "--json"], vec![]),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let text = stdout(&koi(home.path(), &args, &vars));
+        assert!(!text.contains("Send anonymous usage reports"), "{text}");
+        assert!(!home.path().join("state/koidrive/telemetry").exists());
+    }
+}
+
+#[test]
 fn a_command_run_with_reports_on_is_counted_by_name_only() {
     let home = tempfile::tempdir().unwrap();
     stdout(&koi(home.path(), &["telemetry", "on"], &[]));
