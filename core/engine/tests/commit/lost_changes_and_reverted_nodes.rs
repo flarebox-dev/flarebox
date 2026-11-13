@@ -170,7 +170,8 @@ fn a_local_edit_on_a_reverted_file_is_kept_on_disk_and_uploaded() {
     trees.set_local("a".into(), local(file(ROOT, "x", 2), 1));
     let mut effects = Effects::default();
     let record = effects
-        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+        .first()
         .unwrap()
         .clone();
     assert!(
@@ -276,7 +277,9 @@ fn a_reverted_file_deleted_remotely_keeps_its_unuploaded_edit_as_a_new_file() {
     assert!(trees.reverted().contains("a"));
     let mut effects = Effects::default();
     assert_eq!(
-        effects.plan(&trees, commits.in_flight(), &mut ids, NOW),
+        effects
+            .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+            .first(),
         None
     );
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
@@ -346,7 +349,8 @@ fn two_reverted_files_that_block_each_other_are_placed_through_parking() {
     let mut effects = Effects::default();
     for _ in 0..8 {
         let Some(record) = effects
-            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+            .first()
             .cloned()
         else {
             break;
@@ -393,7 +397,8 @@ fn a_folder_deleted_around_a_parked_node_is_brought_back_for_it() {
         for ino in 10..18 {
             trees.settle();
             let Some(record) = effects
-                .plan(&trees, commits.in_flight(), &mut ids, NOW)
+                .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+                .first()
                 .cloned()
             else {
                 break;
@@ -442,7 +447,8 @@ fn a_parked_file_rekeyed_for_its_edit_is_moved_out_from_where_it_was_parked() {
     let (mut commits, mut ids, mut effects) =
         (Commits::default(), IdGen::new(1), Effects::default());
     let parking = effects
-        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+        .first()
         .unwrap()
         .clone();
     assert!(
@@ -457,7 +463,8 @@ fn a_parked_file_rekeyed_for_its_edit_is_moved_out_from_where_it_was_parked() {
     trees.set_local("b".into(), local(file(ROOT, "x", 3), 3));
     trees.settle();
     let remove = effects
-        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+        .first()
         .unwrap()
         .clone();
     assert_eq!(remove.node, "c");
@@ -467,8 +474,8 @@ fn a_parked_file_rekeyed_for_its_edit_is_moved_out_from_where_it_was_parked() {
     trees.settle();
     assert!(
         effects
-            .plan(&trees, commits.in_flight(), &mut ids, NOW)
-            .is_none()
+            .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+            .is_empty()
     );
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert_eq!(commit.ops.len(), 2);
@@ -498,7 +505,8 @@ fn a_parked_file_rekeyed_for_its_edit_is_moved_out_from_where_it_was_parked() {
     for ino in 10..16 {
         trees.settle();
         let Some(record) = effects
-            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+            .first()
             .cloned()
         else {
             break;
@@ -652,7 +660,8 @@ fn a_file_whose_s_update_waits_is_removed_or_uploaded_anew_after_a_remote_delete
         let mut removed = false;
         for _ in 0..4 {
             let Some(record) = effects
-                .plan(&trees, commits.in_flight(), &mut ids, NOW)
+                .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+                .first()
                 .cloned()
             else {
                 break;
@@ -709,7 +718,10 @@ fn a_parked_reverted_folder_the_server_lacks_is_removed_even_when_its_name_is_ta
     trees.revert("n".into());
     trees.settle();
     let mut effects = Effects::default();
-    let record = effects.plan(&trees, None, &mut IdGen::new(1), NOW).cloned();
+    let record = effects
+        .plan(&trees, None, &mut IdGen::new(1), NOW, BatchLimit::ONE)
+        .first()
+        .cloned();
     let record = record.expect("an effect for the parked folder");
     assert!(
         matches!(record.effect, Effect::RemoveDir { .. }),

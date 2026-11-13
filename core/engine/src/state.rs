@@ -160,8 +160,8 @@ pub struct CommitsState {
 /// What [`Effects`](crate::effects::Effects) holds.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EffectsState {
-    /// The effect in flight. Its `counter` is `cleared + 1`.
-    pub in_flight: Option<EffectRecord>,
+    /// The effects in flight, in the order they were planned. The `counter` of each is `cleared` plus their number.
+    pub in_flight: Vec<EffectRecord>,
     /// The effect counter *e*, the number of effects cleared so far.
     pub cleared: u64,
     /// The effect that failed last for each blocked node.
@@ -342,7 +342,7 @@ impl GuardChanges {
 /// ([`Effects::take_changes`](crate::effects::Effects::take_changes)).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EffectsChanges {
-    pub in_flight: Option<Option<EffectRecord>>,
+    pub in_flight: Option<Vec<EffectRecord>>,
     pub cleared: Option<u64>,
     pub failed: MapChanges<NodeId, Effect>,
 }
@@ -435,7 +435,7 @@ pub enum StateError {
     RestoreNotQueued(usize),
     /// A restore is queued and also has an outcome, or has two outcomes.
     RestoreResolved(RestoreId),
-    /// The effect in flight does not carry the counter after the cleared one.
+    /// An effect in flight does not carry the effects cleared plus the effects in flight as its counter.
     EffectCounter {
         cleared: u64,
         counter: u64,

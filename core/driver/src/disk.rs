@@ -5,15 +5,16 @@
 //!
 //! [`Disk::start`] runs before the observer. It binds a [`Space`] to a duplicate of the locked descriptor, reads the
 //! root marker's counter *m* before anything writes it, and compares it with the store's effect counter *e*. It
-//! recovers the effect in flight and acknowledges it, requires *m* = *e* afterwards, and deletes staged downloads no
-//! effect owns. Then each effect takes three calls:
+//! recovers the effects in flight and acknowledges them, requires *m* = *e* afterwards, and deletes staged downloads
+//! no effect owns. Then each batch of effects takes three calls:
 //!
-//! 1. [`Disk::next`] plans the next effect and commits it with the ID generator's state. A [`Pending`] exists only
-//!    after that commit, so the store holds every effect before the disk sees it.
-//! 2. [`Pending::stage`] downloads a written file into staging, which no scan reports. It borrows neither the store
-//!    nor the engine, so the task keeps handling other inputs meanwhile.
-//! 3. [`Disk::apply`] is the effect section. With no await in between, it writes the effect's counter to the
-//!    marker, applies the effect with the quarantine protocol and acknowledges the outcome in one store transaction.
+//! 1. [`Disk::next`] plans the next batch of independent effects and commits it with the ID generator's state. A
+//!    [`Pending`] exists only after that commit, so the store holds every effect before the disk sees it.
+//! 2. [`Pending::stage`] downloads the files the batch writes into staging, which no scan reports, fetching each
+//!    distinct chunk once. It borrows neither the store nor the engine, so the task keeps handling other inputs
+//!    meanwhile.
+//! 3. [`Disk::apply`] is the effect section. With no await in between, it writes the batch's counter to the
+//!    marker, applies each effect with the quarantine protocol and acknowledges the outcomes in one store transaction.
 //!
 //! Observations reach L through [`Disk::observed`]. It refuses a batch scanned from another folder than the locked
 //! one, and drops the changes a batch reports at or below the paths of an effect section that ran while the batch
@@ -23,14 +24,14 @@
 //! removals and moves included, and carries the content of every file L holds there, read from the disk again.
 //!
 //! A [`Stop`] ends the task. The engine in memory may then be ahead of the store; the next start loads it again and
-//! recovers the effect in flight. A root that is no longer at its linked path is never treated as a missing parent.
+//! recovers the effects in flight. A root that is no longer at its linked path is never treated as a missing parent.
 //! `core/fs` refuses every rename, `mkdir` and marker write once the path names another folder, and that refusal
 //! stops the task with the flight kept. The check and the rename that follows it are not one atomic step, so another
 //! process that moves the still locked root in between can still receive that one rename (design §5.2 accepts the
 //! same window for parents). Nothing is ever written into a folder that replaced the root, since every write goes
 //! through the locked descriptor.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io;
@@ -44,8 +45,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use koidrive_chunk::ChunkerConfig;
 use koidrive_engine::effects::{
-    Base as EngineBase, Displaced as EngineDisplaced, Effect as EngineEffect, EffectRecord,
-    Location as EngineLocation, location_of,
+    Base as EngineBase, BatchLimit, Displaced as EngineDisplaced, Effect as EngineEffect,
+    EffectRecord, Location as EngineLocation, location_of,
 };
 use koidrive_engine::ignore::is_rules_file;
 use koidrive_engine::tree::{Content, Kind};
@@ -54,7 +55,8 @@ use koidrive_fs::{
     Outcome, Reason, Reclaimed, RootProblem, Space, Step,
 };
 use koidrive_net::{CallError, ChunkError, Session, StopReason, Transfer};
-use koidrive_proto::v1::{ChunkRef, Commit, op};
+use koidrive_proto::v1::error::Code;
+use koidrive_proto::v1::{ChunkRef, Commit, VersionInfo, op};
 use koidrive_store::{Link, Store, Tx};
 use prost::Message;
 use rustix::fs::{Mode, OFlags};
@@ -70,8 +72,14 @@ use crate::status::WaitKind;
 const SPANS: usize = 1024;
 /// The wait before staging again after a transfer failed for now, when the server named none.
 const STAGE_AGAIN: Duration = Duration::from_secs(30);
+/// The most effects one batch holds: as many as one call for download targets takes chunks, with the contents of its
+/// writes after the first within 64 MiB.
+pub(crate) const BATCH: BatchLimit = BatchLimit {
+    effects: koidrive_net::MAX_CHUNKS_PER_CALL,
+    bytes: 64 << 20,
+};
 
-/// Why the task stops. The effect in flight, if any, stays in the store for the next start to recover.
+/// Why the task stops. The effects in flight, if any, stay in the store for the next start to recover.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Stop {
     #[error("{} no longer names the folder this task locked (it was moved, replaced or removed)", koidrive_fs::quoted(.0))]
@@ -123,7 +131,7 @@ impl Stop {
     }
 }
 
-/// Why [`Pending::stage`] returned without a staged file. The effect stays in flight.
+/// Why [`Pending::stage`] returned without staging the batch. Its effects stay in flight.
 #[derive(Debug)]
 pub(crate) enum Stall {
     /// The transfer failed for now with `why`. Stage again after `wait`.
@@ -254,13 +262,20 @@ pub(crate) struct Disk {
     /// or removed a rules file, or it moved a folder, whose rules files the trees hold by path. Set until a batch
     /// answers that request, and so has passed the rules of a scan of the section's paths.
     rules_after: Option<Requests>,
+    /// The most each batch of effects holds: [`BATCH`] outside tests.
+    batch: BatchLimit,
     hook: Hook,
 }
 
-/// A planned effect the store holds.
+/// A planned batch of effects the store holds, in the order they were planned.
 pub(crate) struct Pending {
     pub timing_bytes: crate::timing::Bytes,
     space: Arc<Space>,
+    effects: Vec<Planned>,
+}
+
+#[derive(Clone)]
+struct Planned {
     record: EffectRecord,
     effect: Effect,
     contents: Expected,
@@ -268,12 +283,9 @@ pub(crate) struct Pending {
     version: Option<String>,
 }
 
-/// An effect ready to apply: a write's file is staged and flushed, or the reason it cannot be fetched.
+/// A batch ready to apply: each write's file is staged and flushed, or holds the reason it cannot be fetched.
 pub(crate) struct Staged {
-    record: EffectRecord,
-    effect: Effect,
-    contents: Expected,
-    unfetchable: Option<String>,
+    effects: Vec<(Planned, Option<String>)>,
 }
 
 /// Where chunk lists and chunks come from: the session and [`Transfer`] in the folder task.
@@ -323,17 +335,17 @@ impl Disk {
     ///
     /// 1. The root check of design §6.2 through that descriptor: the linked path still names it, it is on the linked
     ///    device, and its marker names the space. Nothing is written when it fails.
-    /// 2. The counters: with *e* the store's effect counter and *upper* one more while an effect is in flight, a
+    /// 2. The counters: with *e* the store's effect counter and *upper* that plus the number of effects in flight, a
     ///    marker above *upper* is [`Stop::StoreBehind`] and one below *e* is [`Stop::DiskBehind`]. Both leave the
     ///    marker, staging and quarantine as they are, for recovery (§6.4).
     /// 3. The no-replace probe.
-    /// 4. The effect in flight is recovered without staging anything again, and acknowledged. An interrupted one is
-    ///    planned again; one that met another state on disk stays blocked, and so does one that recovery found done
-    ///    where L shows another entry ([`koidrive_engine::effects::Effects::confirms`]). The marker must then equal
-    ///    *e*.
+    /// 4. The effects in flight are recovered in one section without staging anything again, and acknowledged in one
+    ///    transaction. An interrupted one is planned again; one that met another state on disk stays blocked, and so
+    ///    does one that recovery found done where L shows another entry
+    ///    ([`koidrive_engine::effects::Effects::confirms`]). The marker must then equal *e*.
     /// 5. Staged files without an effect are deleted.
     ///
-    /// The observer then resets the paths of a recovered effect to L, so it reads a file the effect placed before
+    /// The observer then resets the paths of the recovered effects to L, so it reads a file an effect placed before
     /// the crash once, whatever the snapshot it starts from says about that file.
     pub fn start(
         lock: &File,
@@ -360,6 +372,7 @@ impl Disk {
             spans: VecDeque::new(),
             forgotten: 0,
             rules_after: None,
+            batch: BATCH,
             hook,
         };
         if !disk.space.held()? {
@@ -374,7 +387,8 @@ impl Disk {
         }
         let marker = disk.marker()?;
         let cleared = engine.effects.cleared();
-        let upper = cleared + u64::from(engine.effects.in_flight().is_some());
+        let records = engine.effects.in_flight().to_vec();
+        let upper = cleared + records.len() as u64;
         if marker > upper {
             return Err(Stop::StoreBehind { marker, upper });
         }
@@ -384,24 +398,26 @@ impl Disk {
         if !disk.space.probe_no_replace()? {
             return Err(Stop::NoReplace);
         }
-        if let Some(record) = engine.effects.in_flight().cloned() {
-            let (effect, mut contents) = translate(&record)?;
-            let marker = disk.counter(record.counter);
+        if let Some(first) = records.first() {
+            let mut translated = (records.iter().map(translate)).collect::<Result<Vec<_>, _>>()?;
+            let marker = disk.counter(first.counter);
             let hook = &mut disk.hook;
-            let outcome = disk.space.recover(
-                &marker,
-                &effect,
-                &mut contents,
-                SystemTime::now(),
-                &mut |step| hook(Cut::Step(step)),
-            )?;
-            let outcome = confirmed(outcome, engine);
-            acknowledge(&record, &outcome, true, &link.space_id, engine, store, hook)?;
+            let mut step = |step| hook(Cut::Step(step));
+            let mut section = disk.space.section(&marker, &mut step)?;
+            let now = SystemTime::now();
+            for (effect, contents) in &mut translated {
+                section.recover(effect, contents, now)?;
+            }
+            let outcomes: Vec<_> = (records.iter().zip(section.finish()?))
+                .map(|(record, outcome)| (record, confirmed(outcome, record, engine)))
+                .collect();
+            acknowledge(&outcomes, true, &link.space_id, engine, store, hook)?;
             let (marker, cleared) = (disk.marker()?, engine.effects.cleared());
             if marker != cleared {
                 return Err(Stop::DiskBehind { marker, cleared });
             }
-            let scopes = scopes(&effect.action, &outcome);
+            let scopes = (translated.iter().zip(&outcomes))
+                .flat_map(|((effect, _), (_, outcome))| scopes(&effect.action, outcome));
             disk.sections.request(engine.resets(scopes));
         }
         disk.space.clear_staging(None)?;
@@ -425,10 +441,10 @@ impl Disk {
         })
     }
 
-    /// Plans the next effect and records it, with the ID generator, in one store transaction. Returns `None` when
-    /// nothing is planned, including while an effect is in flight. The nodes planning unblocks are stored unblocked
-    /// also then. A record that cannot become a `core/fs` effect (a name that is not a single file name) is never
-    /// committed, and stops the task.
+    /// Plans the next batch of effects ([`BATCH`]) and records it, with the ID generator, in one store transaction.
+    /// Returns `None` when nothing is planned, including while a batch is in flight. The nodes planning unblocks are
+    /// stored unblocked also then. A batch with a record that cannot become a `core/fs` effect (a name that is not a
+    /// single file name) is never committed, and stops the task.
     pub fn next(
         &mut self,
         engine: &mut Engine,
@@ -437,36 +453,44 @@ impl Disk {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_millis() as u64);
-        let space = &self.space;
+        let (space, batch) = (&self.space, self.batch);
         let hook = &mut self.hook;
         let pending = store.transaction(|tx| -> Result<_, Stop> {
             let blocked = engine.effects.blocked().len();
-            let Some(record) = engine
-                .effects
+            let records = (engine.effects)
                 .plan(
                     &engine.trees,
                     engine.commits.in_flight(),
                     &mut engine.ids,
                     now_ms,
+                    batch,
                 )
-                .cloned()
-            else {
+                .to_vec();
+            if records.is_empty() {
                 if engine.effects.blocked().len() != blocked {
                     engine.checkpoint(tx)?;
                 }
                 return Ok(None);
-            };
-            let (effect, contents) = translate(&record)?;
-            let version = version_of(tx, &record)?;
+            }
+            let mut versions = None;
+            let effects = (records.into_iter())
+                .map(|record| {
+                    let (effect, contents) = translate(&record)?;
+                    let version = version_of(tx, &mut versions, &record)?;
+                    Ok(Planned {
+                        record,
+                        effect,
+                        contents,
+                        version,
+                    })
+                })
+                .collect::<Result<Vec<_>, Stop>>()?;
             engine.checkpoint(tx)?;
             hook(Cut::BeforePlan);
             Ok(Some(Pending {
                 timing_bytes: None,
                 space: space.clone(),
-                record,
-                effect,
-                contents,
-                version,
+                effects,
             }))
         })?;
         if pending.is_some() {
@@ -475,80 +499,91 @@ impl Disk {
         Ok(pending)
     }
 
-    /// The effect section, which has no await. It checks that `staged` is the effect in flight and that the root is
-    /// held, applies the effect with a marker holding the record's counter, acknowledges the outcome in one
-    /// transaction, and asks the observer to reset the paths the effect acted on to L as acknowledged. A write whose
-    /// content could not be fetched only writes the marker and drops its staged file, and fails. So does an effect
-    /// that L no longer takes ([`EffectRecord::applies`]), because a batch changed L after the plan. Nothing else under the
-    /// root is touched for it.
+    /// The effect section, which has no await. It checks that `staged` is the batch in flight and that the root is
+    /// held, applies every effect of the batch in one `core/fs` section with a marker holding the batch's counter,
+    /// acknowledges the outcomes in one transaction, and asks the observer to reset the paths the effects acted on to
+    /// L as acknowledged. Returns how each effect ended, with its node, in the order of the batch. A write whose
+    /// content could not be fetched only drops its staged file, and fails. So does an effect that L no longer takes
+    /// ([`EffectRecord::applies`]), because a batch changed L after the plan. Nothing else under the root is touched
+    /// for them.
     pub fn apply(
         &mut self,
         staged: Staged,
         engine: &mut Engine,
         store: &mut Store,
-    ) -> Result<Settled, Stop> {
-        let Staged {
-            record,
-            effect,
-            mut contents,
-            unfetchable,
-        } = staged;
-        if engine.effects.in_flight() != Some(&record) {
+    ) -> Result<Vec<(String, Settled)>, Stop> {
+        let Staged { mut effects } = staged;
+        let records = effects.iter().map(|(planned, _)| &planned.record);
+        if !records.eq(engine.effects.in_flight()) {
             return Err(Stop::Record {
-                effect_id: record.effect_id,
-                what: "it is not the effect in flight".into(),
+                effect_id: (effects.first())
+                    .map(|(planned, _)| planned.record.effect_id.clone())
+                    .unwrap_or_default(),
+                what: "it is not the batch of effects in flight".into(),
             });
         }
+        let Some(counter) = effects.first().map(|(planned, _)| planned.record.counter) else {
+            return Ok(Vec::new());
+        };
         if !self.space.held()? {
             return Err(Stop::Withdrawn(self.path.clone()));
         }
-        let marker = self.counter(record.counter);
+        let marker = self.counter(counter);
         self.sections.epoch.fetch_add(1, Ordering::SeqCst);
         let hook = &mut self.hook;
         let mut step = |step| hook(Cut::Step(step));
         let now = SystemTime::now();
-        let outcome = match &unfetchable {
-            None if record.applies(&engine.trees, engine.commits.in_flight()) => {
-                self.space
-                    .apply(&marker, &effect, &mut contents, now, &mut step)?
+        let mut section = self.space.section(&marker, &mut step)?;
+        let mut applied = Vec::with_capacity(effects.len());
+        for (planned, unfetchable) in &mut effects {
+            let applies = unfetchable.is_none()
+                && (planned.record).applies(&engine.trees, engine.commits.in_flight());
+            match applies {
+                true => section.apply(&planned.effect, &mut planned.contents, now)?,
+                false => section.recover(&planned.effect, &mut planned.contents, now)?,
             }
-            _ => confirmed(
-                self.space
-                    .recover(&marker, &effect, &mut contents, now, &mut step)?,
-                engine,
-            ),
-        };
-        let settled = acknowledge(
-            &record,
-            &outcome,
-            false,
-            &self.space_id,
-            engine,
-            store,
-            hook,
-        )?;
+            applied.push(applies);
+        }
+        let outcomes: Vec<_> = (effects.iter().zip(section.finish()?).zip(applied))
+            .map(|(((planned, _), outcome), applied)| match applied {
+                true => (&planned.record, outcome),
+                false => (&planned.record, confirmed(outcome, &planned.record, engine)),
+            })
+            .collect();
+        let settled = acknowledge(&outcomes, false, &self.space_id, engine, store, hook)?;
         let end = self.sections.epoch.fetch_add(1, Ordering::SeqCst) + 1;
-        let scopes = scopes(&effect.action, &outcome);
-        let moved_folder = matches!(effect.action, Action::Move { .. })
-            && (engine.trees.local().get(&record.node))
-                .is_some_and(|node| node.shape.kind == Kind::Dir);
         let rules_file = |scope: &PathBuf| {
             (scope.file_name()).is_some_and(|name| is_rules_file(&name.to_string_lossy()))
         };
-        let requested = (self.sections).request(engine.resets(scopes.iter().cloned()));
-        if !scopes.is_empty() && (moved_folder || scopes.iter().any(rules_file)) {
+        let mut scopes_of_batch = Vec::new();
+        let mut rules_changed = false;
+        for ((planned, _), (_, outcome)) in effects.iter().zip(&outcomes) {
+            let scopes = scopes(&planned.effect.action, outcome);
+            let moved_folder = matches!(planned.effect.action, Action::Move { .. })
+                && (engine.trees.local().get(&planned.record.node))
+                    .is_some_and(|node| node.shape.kind == Kind::Dir);
+            rules_changed |= !scopes.is_empty() && (moved_folder || scopes.iter().any(rules_file));
+            scopes_of_batch.extend(scopes);
+        }
+        let requested = (self.sections).request(engine.resets(scopes_of_batch.iter().cloned()));
+        if rules_changed {
             self.rules_after = Some(requested);
         }
-        self.spans.push_back((end, scopes));
+        self.spans.push_back((end, scopes_of_batch));
         while self.spans.len() > SPANS {
             if let Some((end, _)) = self.spans.pop_front() {
                 self.forgotten = end;
             }
         }
-        Ok(match (settled, unfetchable) {
-            (Settled::Failed(_), Some(why)) => Settled::Failed(why),
-            (settled, _) => settled,
-        })
+        Ok((effects.into_iter().zip(settled))
+            .map(|((planned, unfetchable), settled)| {
+                let settled = match (settled, unfetchable) {
+                    (Settled::Failed(_), Some(why)) => Settled::Failed(why),
+                    (settled, _) => settled,
+                };
+                (planned.record.node, settled)
+            })
+            .collect())
     }
 
     /// Puts an observation batch into L in one transaction, after giving the trees the rules files it lists. Refuses
@@ -648,6 +683,11 @@ impl Disk {
     /// answers a reset with a batch also when the scan found nothing, so the wait ends without a change on disk.
     pub fn awaits_rules(&self) -> bool {
         self.rules_after.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_batch(&mut self, batch: BatchLimit) {
+        self.batch = batch;
     }
 
     /// Asks the observer to reset `paths` to L and scan them again.
@@ -763,163 +803,285 @@ impl Upload {
 }
 
 impl Pending {
-    /// Downloads a written file into staging, writing each chunk at every offset the content lists it, cuts the file
-    /// to the content's size, sets its modification time to the content's and its executable bit, and flushes it.
-    /// Every chunk is checked against its hash and size, and the chunk list against the manifest digest before
-    /// anything is fetched. Other effects stage nothing.
+    /// Downloads the files the batch writes into staging. Every chunk is checked against its hash and size, and each
+    /// chunk list against its manifest digest before anything is fetched. The distinct chunks of the whole batch are
+    /// fetched in one transfer, so a chunk that several files or offsets hold is downloaded once, and written at every
+    /// offset of every file that lists it. A file whose chunks have all arrived is cut to its content's size, given
+    /// its modification time and executable bit, and flushed. Other effects stage nothing.
     ///
-    /// A content that cannot be fetched does not stall. That is a chunk the server refused as gone or whose bytes
-    /// never matched, a malformed manifest, or a content that omits its chunk list when the store's R has no version
-    /// with that content. The effect then fails when it is applied, with that reason.
+    /// A content that cannot be fetched does not stall the batch. That is a chunk the server refused as gone or
+    /// whose bytes never matched, a malformed manifest, or a content that omits its chunk list when the store's R has
+    /// no version with that content. Each write that lists such a chunk fails when the batch is applied, with that
+    /// reason, and the transfer goes on for the others. A transfer the server asks to retry later stalls the whole
+    /// batch, which is staged again from the start.
     pub async fn stage(&self, fetch: &impl Fetch) -> Result<Staged, Stall> {
-        let EngineEffect::WriteFile { content, .. } = &self.record.effect else {
-            return Ok(self.staged(None));
-        };
-        let chunks = if content.chunks.is_empty() && content.chunk_count > 0 {
-            let Some(version) = &self.version else {
-                return Ok(self.staged(Some(
-                    "its content omits the chunk list, and the remote tree has no version with that content".into(),
-                )));
+        let mut unfetchable: Vec<Option<String>> = vec![None; self.effects.len()];
+        let mut writes: Vec<(usize, &Content, Manifest)> = Vec::new();
+        for (index, planned) in self.effects.iter().enumerate() {
+            let EngineEffect::WriteFile { content, .. } = &planned.record.effect else {
+                continue;
             };
-            match fetch.version_chunks(version).await {
-                Ok(chunks) => chunks,
-                Err(error) => return self.failed_transfer(error, false),
-            }
-        } else {
-            content.chunks.clone()
-        };
-        let manifest = match Manifest::parse(content, chunks) {
-            Ok(manifest) => manifest,
-            Err(why) => return Ok(self.staged(Some(why))),
-        };
-        let id = &self.record.effect_id;
-        let file = self.space.stage(id).map_err(halt)?;
-        let mut corrupt = false;
-        let mut received = 0;
-        let fetched = fetch
-            .download(&manifest.distinct, &mut |chunk, bytes| {
-                if !koidrive_net::matches(chunk, bytes) {
-                    corrupt = true;
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "the bytes do not match the chunk's hash and size",
-                    ));
+            let chunks = if content.chunks.is_empty() && content.chunk_count > 0 {
+                let Some(version) = &planned.version else {
+                    unfetchable[index] = Some(
+                        "its content omits the chunk list, and the remote tree has no version with that content"
+                            .into(),
+                    );
+                    continue;
+                };
+                match fetch.version_chunks(version).await {
+                    Ok(chunks) => chunks,
+                    Err(error) => {
+                        let id = &planned.record.effect_id;
+                        unfetchable[index] = Some(failed_transfer(id, error, false)?);
+                        continue;
+                    }
                 }
-                for offset in manifest.offsets.get(&chunk.hash).into_iter().flatten() {
-                    file.write_all_at(bytes, *offset)?;
+            } else {
+                content.chunks.clone()
+            };
+            match Manifest::parse(content, chunks) {
+                Ok(manifest) => writes.push((index, content, manifest)),
+                Err(why) => unfetchable[index] = Some(why),
+            }
+        }
+        let mut targets: HashMap<ChunkKey, Vec<(usize, &[u64])>> = HashMap::new();
+        let mut distinct: Vec<&ChunkRef> = Vec::new();
+        for (write, (_, _, manifest)) in writes.iter().enumerate() {
+            for chunk in &manifest.distinct {
+                let holders = targets.entry(key(chunk)).or_default();
+                if holders.is_empty() {
+                    distinct.push(chunk);
                 }
-                crate::timing::add_bytes(&self.timing_bytes, bytes.len() as u64);
-                received += 1;
-                Ok(())
-            })
-            .await;
-        if let Err(error) = fetched {
-            return self.failed_transfer(error, corrupt);
+                holders.push((write, &manifest.offsets[&chunk.hash]));
+            }
         }
-        if received != manifest.distinct.len() {
-            return Ok(self.staged(Some(format!(
-                "the transfer handed over {received} of its {} distinct chunks",
-                manifest.distinct.len()
-            ))));
-        }
-        file.set_len(content.size).map_err(halt)?;
-        if file.metadata().map_err(halt)?.size() != content.size {
-            return Ok(self.staged(Some(
-                "the staged file does not have the content's size".into(),
-            )));
-        }
-        let mtime = rustix::fs::Timespec {
-            tv_sec: content.mtime_ns.div_euclid(1_000_000_000),
-            tv_nsec: content.mtime_ns.rem_euclid(1_000_000_000) as _,
+        let mut missing: Vec<usize> = (writes.iter())
+            .map(|(_, _, manifest)| manifest.distinct.len())
+            .collect();
+        let mut created: HashSet<usize> = HashSet::new();
+        let mut received: HashSet<ChunkKey> = HashSet::new();
+        let open = |unfetchable: &[Option<String>], missing: &[usize], write: usize| {
+            unfetchable[writes[write].0].is_none() && missing[write] > 0
         };
-        rustix::fs::futimens(
-            &file,
-            &rustix::fs::Timestamps {
-                last_access: mtime,
-                last_modification: mtime,
-            },
-        )
-        .map_err(|error| halt(error.into()))?;
-        drop(file);
-        self.space
-            .finish_staged(id, content.executable)
-            .map_err(halt)?;
-        Ok(self.staged(None))
+        loop {
+            let wanted: Vec<ChunkRef> = (distinct.iter())
+                .filter(|chunk| !received.contains(&key(chunk)))
+                .filter(|chunk| {
+                    (targets[&key(chunk)].iter())
+                        .any(|(write, _)| open(&unfetchable, &missing, *write))
+                })
+                .map(|chunk| (*chunk).clone())
+                .collect();
+            if wanted.is_empty() {
+                break;
+            }
+            let mut corrupt = None;
+            let mut local = None;
+            let fetched = fetch
+                .download(&wanted, &mut |chunk, bytes| {
+                    if !koidrive_net::matches(chunk, bytes) {
+                        corrupt = Some(chunk.hash.clone());
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "the bytes do not match the chunk's hash and size",
+                        ));
+                    }
+                    let chunk = key(chunk);
+                    for (write, offsets) in targets.get(&chunk).into_iter().flatten() {
+                        let (index, content, _) = &writes[*write];
+                        if unfetchable[*index].is_some() {
+                            continue;
+                        }
+                        let id = &self.effects[*index].record.effect_id;
+                        let file = match created.insert(*write) {
+                            true => self.space.stage(id),
+                            false => self.space.open_staged(id),
+                        };
+                        let file = match file {
+                            Ok(file) => file,
+                            Err(error) => return Err(local.insert(error).kind().into()),
+                        };
+                        for offset in *offsets {
+                            file.write_all_at(bytes, *offset)?;
+                        }
+                        missing[*write] -= 1;
+                        if missing[*write] == 0 {
+                            match finish_file(&file, content) {
+                                Ok(why) => unfetchable[*index] = why,
+                                Err(error) => return Err(local.insert(error).kind().into()),
+                            }
+                        }
+                    }
+                    crate::timing::add_bytes(&self.timing_bytes, bytes.len() as u64);
+                    received.insert(chunk);
+                    Ok(())
+                })
+                .await;
+            let Err(error) = fetched else {
+                break;
+            };
+            if let Some(error) = local {
+                return Err(halt(error));
+            }
+            let named = match &corrupt {
+                Some(hash) => Some(vec![hash.clone()]),
+                None => chunk_hashes(&error),
+            };
+            let holds = |write: usize| {
+                named.as_ref().is_none_or(|hashes| {
+                    (hashes.iter()).any(|hash| writes[write].2.offsets.contains_key(hash))
+                })
+            };
+            let failing: Vec<usize> = (0..writes.len())
+                .filter(|write| open(&unfetchable, &missing, *write) && holds(*write))
+                .collect();
+            let Some(first) = failing.first() else {
+                break;
+            };
+            let id = &self.effects[writes[*first].0].record.effect_id;
+            let why = failed_transfer(id, error, corrupt.is_some())?;
+            for write in failing {
+                unfetchable[writes[write].0] = Some(why.clone());
+            }
+        }
+        for (write, (index, content, manifest)) in writes.iter().enumerate() {
+            if unfetchable[*index].is_some() {
+                continue;
+            }
+            let id = &self.effects[*index].record.effect_id;
+            if manifest.distinct.is_empty() {
+                let file = self.space.stage(id).map_err(halt)?;
+                unfetchable[*index] = finish_file(&file, content).map_err(halt)?;
+            } else if missing[write] > 0 {
+                let all = manifest.distinct.len();
+                unfetchable[*index] = Some(format!(
+                    "the transfer handed over {} of its {all} distinct chunks",
+                    all - missing[write]
+                ));
+            }
+            if unfetchable[*index].is_none() {
+                self.space
+                    .finish_staged(id, content.executable)
+                    .map_err(halt)?;
+            }
+        }
+        Ok(Staged {
+            effects: self.effects.iter().cloned().zip(unfetchable).collect(),
+        })
     }
+}
 
-    fn staged(&self, unfetchable: Option<String>) -> Staged {
-        Staged {
-            record: self.record.clone(),
-            effect: self.effect.clone(),
-            contents: self.contents.clone(),
-            unfetchable,
+/// A chunk by its hash and size.
+type ChunkKey = (Vec<u8>, u32);
+
+fn key(chunk: &ChunkRef) -> ChunkKey {
+    (chunk.hash.clone(), chunk.size)
+}
+
+fn chunk_hashes(error: &ChunkError) -> Option<Vec<Vec<u8>>> {
+    match error {
+        ChunkError::Call(CallError::Server(refusal))
+            if refusal.code() == Code::MissingChunks && !refusal.0.missing_chunks.is_empty() =>
+        {
+            Some(refusal.0.missing_chunks.clone())
         }
+        ChunkError::Call(_) => None,
+        ChunkError::SourceChanged { hash }
+        | ChunkError::Corrupt { hash }
+        | ChunkError::Refused { hash, .. }
+        | ChunkError::Unavailable { hash, .. }
+        | ChunkError::NoTarget { hash }
+        | ChunkError::Io { hash, .. } => Some(vec![hash.clone()]),
     }
+}
 
-    /// What a failed transfer means for the effect: a chunk the server no longer has, or whose bytes never matched,
-    /// fails it; a refusal the server asks to retry stalls it; anything else halts the task with the effect in flight.
-    fn failed_transfer(&self, error: ChunkError, corrupt: bool) -> Result<Staged, Stall> {
-        match corrupt {
-            true => failures::failed(Failure::Download(failures::Transfer::Corrupt)),
-            false => failures::transfer_failed(&error, Failure::Download),
+/// Cuts a staged file whose chunks are all written to its content's size and gives it the content's modification
+/// time. Returns why the effect fails when the file does not then have that size.
+fn finish_file(file: &File, content: &Content) -> io::Result<Option<String>> {
+    file.set_len(content.size)?;
+    if file.metadata()?.size() != content.size {
+        return Ok(Some(
+            "the staged file does not have the content's size".into(),
+        ));
+    }
+    let mtime = rustix::fs::Timespec {
+        tv_sec: content.mtime_ns.div_euclid(1_000_000_000),
+        tv_nsec: content.mtime_ns.rem_euclid(1_000_000_000) as _,
+    };
+    rustix::fs::futimens(
+        file,
+        &rustix::fs::Timestamps {
+            last_access: mtime,
+            last_modification: mtime,
+        },
+    )?;
+    Ok(None)
+}
+
+/// What a failed transfer means for the writes that list the chunk it names, or for every write of the batch still
+/// waiting for chunks when it names none: a chunk the server no longer has, or whose bytes never matched, fails them
+/// with the reason returned; a refusal the server asks to retry stalls the batch; anything else halts the task with
+/// the batch in flight, naming `effect_id`.
+fn failed_transfer(effect_id: &str, error: ChunkError, corrupt: bool) -> Result<String, Stall> {
+    match corrupt {
+        true => failures::failed(Failure::Download(failures::Transfer::Corrupt)),
+        false => failures::transfer_failed(&error, Failure::Download),
+    }
+    let disposition = match &error {
+        _ if corrupt => None,
+        ChunkError::Corrupt { .. } | ChunkError::NoTarget { .. } => None,
+        ChunkError::Refused {
+            status: 404 | 410, ..
+        } => None,
+        ChunkError::Refused {
+            error: Some(refusal),
+            ..
+        } => Some(policy::after_refusal(refusal)),
+        ChunkError::Call(call)
+            if matches!(call.code(), Some(Code::NotFound | Code::MissingChunks)) =>
+        {
+            None
         }
-        let disposition = match &error {
-            _ if corrupt => None,
-            ChunkError::Corrupt { .. } | ChunkError::NoTarget { .. } => None,
-            ChunkError::Refused {
-                status: 404 | 410, ..
-            } => None,
-            ChunkError::Refused {
-                error: Some(refusal),
-                ..
-            } => Some(policy::after_refusal(refusal)),
-            ChunkError::Call(call)
-                if call.code() == Some(koidrive_proto::v1::error::Code::NotFound) =>
-            {
-                None
-            }
-            ChunkError::Call(call) => Some(policy::after_call_error(call)),
-            ChunkError::Refused { .. } | ChunkError::Unavailable { .. } => {
-                Some(Disposition::Backoff)
-            }
-            ChunkError::SourceChanged { .. } | ChunkError::Io { .. } => Some(Disposition::Halt),
-        };
-        let why = match &error {
-            ChunkError::Refused {
-                error: Some(refusal),
-                ..
-            }
-            | ChunkError::Call(CallError::Server(refusal)) => policy::describe(refusal),
-            other => other.to_string(),
-        };
-        let kind = policy::wait_kind(match &error {
-            ChunkError::Refused {
-                error: Some(refusal),
-                ..
-            }
-            | ChunkError::Call(CallError::Server(refusal)) => Some(refusal),
-            _ => None,
-        });
-        let later = |wait| Stall::Later {
-            wait,
-            why: format!("downloading a file's content failed: {why}"),
-            kind,
-        };
-        match disposition {
-            None => Ok(self.staged(Some(format!("its content cannot be downloaded: {error}")))),
-            Some(Disposition::RetryAfter(wait)) => Err(later(wait)),
-            Some(Disposition::Backoff) => Err(later(STAGE_AGAIN)),
-            Some(Disposition::Halt) => {
-                let what = format!("its content could not be downloaded: {error}");
-                Err(Stall::Halt(match &error {
-                    ChunkError::Call(call) => Stop::after_call(call, what),
-                    ChunkError::Refused { .. } => Stop::Refused(what),
-                    _ => Stop::Record {
-                        effect_id: self.record.effect_id.clone(),
-                        what,
-                    },
-                }))
-            }
+        ChunkError::Call(call) => Some(policy::after_call_error(call)),
+        ChunkError::Refused { .. } | ChunkError::Unavailable { .. } => Some(Disposition::Backoff),
+        ChunkError::SourceChanged { .. } | ChunkError::Io { .. } => Some(Disposition::Halt),
+    };
+    let why = match &error {
+        ChunkError::Refused {
+            error: Some(refusal),
+            ..
+        }
+        | ChunkError::Call(CallError::Server(refusal)) => policy::describe(refusal),
+        other => other.to_string(),
+    };
+    let kind = policy::wait_kind(match &error {
+        ChunkError::Refused {
+            error: Some(refusal),
+            ..
+        }
+        | ChunkError::Call(CallError::Server(refusal)) => Some(refusal),
+        _ => None,
+    });
+    let later = |wait| Stall::Later {
+        wait,
+        why: format!("downloading a file's content failed: {why}"),
+        kind,
+    };
+    match disposition {
+        None => Ok(format!("its content cannot be downloaded: {error}")),
+        Some(Disposition::RetryAfter(wait)) => Err(later(wait)),
+        Some(Disposition::Backoff) => Err(later(STAGE_AGAIN)),
+        Some(Disposition::Halt) => {
+            let what = format!("its content could not be downloaded: {error}");
+            Err(Stall::Halt(match &error {
+                ChunkError::Call(call) => Stop::after_call(call, what),
+                ChunkError::Refused { .. } => Stop::Refused(what),
+                _ => Stop::Record {
+                    effect_id: effect_id.to_owned(),
+                    what,
+                },
+            }))
         }
     }
 }
@@ -928,26 +1090,45 @@ fn halt(error: io::Error) -> Stall {
     Stall::Halt(Stop::Io(error))
 }
 
-/// Records the outcome of the effect in flight in one transaction: done with the identity of the entry it created,
-/// or failed. The mass-delete guard counts a removal done for another device's deletion, and a notice it opens or
-/// updates is stored in the same transaction. With `retry`, an interrupted effect is unblocked in the same
-/// transaction, so it is planned again. An outcome that L no longer takes ([`EffectRecord::applies`]) is never
-/// written to L, whatever the disk holds. The effect fails and is unblocked, and the planner leaves it out until L
-/// changes.
+/// Records the outcome of each effect of the batch in flight, in the batch's order, in one transaction: done with the
+/// identity of the entry it created, or failed. The mass-delete guard counts a removal done for another device's
+/// deletion, and a notice it opens or updates is stored in the same transaction. With `retry`, an interrupted effect
+/// is unblocked in the same transaction, so it is planned again. An outcome that L no longer takes
+/// ([`EffectRecord::applies`]) is never written to L, whatever the disk holds. The effect fails and is unblocked, and
+/// the planner leaves it out until L changes.
 fn acknowledge(
-    record: &EffectRecord,
-    outcome: &Outcome,
+    outcomes: &[(&EffectRecord, Outcome)],
     retry: bool,
     space_id: &str,
     engine: &mut Engine,
     store: &mut Store,
     hook: &mut Hook,
+) -> Result<Vec<Settled>, Stop> {
+    let settled = store.transaction(|tx| -> Result<_, Stop> {
+        let settled = (outcomes.iter())
+            .map(|(record, outcome)| settle(record, outcome, retry, engine))
+            .collect::<Result<Vec<_>, Stop>>()?;
+        engine.ask(tx, space_id)?;
+        engine.checkpoint(tx)?;
+        hook(Cut::BeforeAck);
+        Ok(settled)
+    })?;
+    hook(Cut::AfterAck);
+    Ok(settled)
+}
+
+/// Gives the engine the outcome of one effect of the batch in flight.
+fn settle(
+    record: &EffectRecord,
+    outcome: &Outcome,
+    retry: bool,
+    engine: &mut Engine,
 ) -> Result<Settled, Stop> {
     let refused = |error| Stop::Record {
         effect_id: record.effect_id.clone(),
         what: format!("the engine refused its outcome: {error:?}"),
     };
-    let settled = store.transaction(|tx| -> Result<_, Stop> {
+    {
         let settled = match outcome {
             _ if !record.applies(&engine.trees, engine.commits.in_flight()) => {
                 engine.effects.failed(&record.effect_id).map_err(refused)?;
@@ -1012,27 +1193,23 @@ fn acknowledge(
                 }
             }
         };
-        engine.ask(tx, space_id)?;
-        engine.checkpoint(tx)?;
-        hook(Cut::BeforeAck);
         Ok(settled)
-    })?;
-    hook(Cut::AfterAck);
-    Ok(settled)
+    }
 }
 
-/// `outcome` as recovery reports it for the effect in flight, unless L refutes a done
+/// `outcome` as recovery reports it for `record`, an effect in flight, unless L refutes a done
 /// ([`koidrive_engine::effects::Effects::confirms`]). Then the effect fails as it would have on the entry recovery
 /// found: a removal finds its entry missing, and a write or a new folder finds its name taken.
-fn confirmed(outcome: Outcome, engine: &Engine) -> Outcome {
+fn confirmed(outcome: Outcome, record: &EffectRecord, engine: &Engine) -> Outcome {
     let Outcome::Done { identity } = &outcome else {
         return outcome;
     };
-    if (engine.effects).confirms(&engine.trees, identity.map(file_identity).as_ref()) {
+    let identity = identity.map(file_identity);
+    if (engine.effects).confirms(&engine.trees, &record.effect_id, identity.as_ref()) {
         return outcome;
     }
-    let reason = match engine.effects.in_flight().map(|record| &record.effect) {
-        Some(EngineEffect::RemoveDir { .. } | EngineEffect::RemoveFile { .. }) => Reason::Missing,
+    let reason = match &record.effect {
+        EngineEffect::RemoveDir { .. } | EngineEffect::RemoveFile { .. } => Reason::Missing,
         _ => Reason::Taken,
     };
     Outcome::Failed {
@@ -1042,26 +1219,31 @@ fn confirmed(outcome: Outcome, engine: &Engine) -> Outcome {
 }
 
 /// The version of a write whose content omits its chunk list: the version R holds for the node, if it has that
-/// content.
-fn version_of(tx: &Tx<'_>, record: &EffectRecord) -> Result<Option<String>, Stop> {
+/// content. `versions` keeps the current version of each node of the store's R once a write of the batch read them.
+fn version_of(
+    tx: &Tx<'_>,
+    versions: &mut Option<HashMap<String, VersionInfo>>,
+    record: &EffectRecord,
+) -> Result<Option<String>, Stop> {
     let EngineEffect::WriteFile { content, .. } = &record.effect else {
         return Ok(None);
     };
     if !content.chunks.is_empty() || content.chunk_count == 0 {
         return Ok(None);
     }
-    Ok(tx
-        .remote_nodes()?
-        .into_iter()
-        .find(|node| node.node_id == record.node)
-        .and_then(|node| node.current)
+    if versions.is_none() {
+        let current = (tx.remote_nodes()?.into_iter())
+            .filter_map(|node| Some((node.node_id, node.current?)))
+            .collect();
+        *versions = Some(current);
+    }
+    Ok((versions.as_ref())
+        .and_then(|versions| versions.get(&record.node))
         .filter(|version| {
-            version
-                .content
-                .as_ref()
+            (version.content.as_ref())
                 .is_some_and(|found| found.manifest_digest == content.manifest_digest)
         })
-        .map(|version| version.version_id))
+        .map(|version| version.version_id.clone()))
 }
 
 /// The paths an effect acted on, relative to the root: its target, the source of a move or of a replacement that

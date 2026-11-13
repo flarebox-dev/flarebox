@@ -12,7 +12,7 @@ use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
 use crate::resolve::{Folder, Space, check_name};
-use crate::root::{flush, rename_no_replace, replace_file};
+use crate::root::{Flush, rename_no_replace, replace_file};
 use crate::{FileType, list, stat_at};
 
 /// The folder inside the private folder that holds the local trash.
@@ -96,13 +96,13 @@ impl Space {
         let mut index = read_index(private.fd())?;
         index.entries.insert(entry.to_owned(), kept);
         self.recheck(&private)?;
-        write_index(private.fd(), &index)?;
+        write_index(private.fd(), &index, Flush::Plain)?;
         cut();
         self.recheck(from)?;
         self.recheck(&trash)?;
         rename_no_replace(from.fd(), name, trash.fd(), OsStr::new(entry))?;
-        flush(from.fd())?;
-        flush(trash.fd())
+        self.flush_folder(from, Flush::Plain)?;
+        self.flush_folder(&trash, Flush::Barrier)
     }
 
     /// Reclaims the local trash at `now`: entries older than
@@ -174,7 +174,7 @@ impl Space {
             index.entries.remove(&entry);
         }
         self.recheck(&private)?;
-        write_index(private.fd(), &index)?;
+        write_index(private.fd(), &index, Flush::Full)?;
         Ok(reclaimed)
     }
 }
@@ -257,11 +257,12 @@ fn read_index(private: BorrowedFd<'_>) -> io::Result<Index> {
     serde_json::from_str(&text).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
-fn write_index(private: BorrowedFd<'_>, index: &Index) -> io::Result<()> {
+fn write_index(private: BorrowedFd<'_>, index: &Index, then: Flush) -> io::Result<()> {
     replace_file(
         private.as_fd(),
         INDEX,
         INDEX_TEMP,
         &serde_json::to_vec_pretty(index)?,
+        then,
     )
 }

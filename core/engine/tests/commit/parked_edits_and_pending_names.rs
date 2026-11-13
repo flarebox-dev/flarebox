@@ -21,7 +21,8 @@ fn a_parked_edit_whose_name_a_new_folder_holds_is_sent() {
         (Effects::default(), Commits::default(), IdGen::new(1));
     assert_eq!(
         effects
-            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+            .first()
             .map(|record| record.effect.clone()),
         None
     );
@@ -62,8 +63,8 @@ fn a_blocker_at_its_r_position_is_not_parked() {
         (Effects::default(), Commits::default(), IdGen::new(1));
     assert!(
         effects
-            .plan(&trees, commits.in_flight(), &mut ids, NOW)
-            .is_none()
+            .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+            .is_empty()
     );
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert!(uploads(&ops(&commit), 2), "{:?}", ops(&commit));
@@ -194,7 +195,11 @@ fn a_parked_edit_whose_name_goes_to_a_folder_this_device_excludes_is_not_held_ba
     trees.set_rules::<&str>(&[], Some(RuleFile::parse(b"x/\n")));
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    let park = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
+    let park = effects
+        .plan(&trees, None, &mut ids, NOW, BatchLimit::ONE)
+        .first()
+        .unwrap()
+        .clone();
     assert!(matches!(
         &park.effect,
         Effect::Move {
@@ -212,7 +217,10 @@ fn a_parked_edit_whose_name_goes_to_a_folder_this_device_excludes_is_not_held_ba
     trees.set_remote("n".into(), remote(dir(ROOT, "x")));
     trees.settle();
     assert!(trees.excluded("n") && !trees.excluded("h"));
-    let back = effects.plan(&trees, None, &mut ids, NOW).cloned();
+    let back = effects
+        .plan(&trees, None, &mut ids, NOW, BatchLimit::ONE)
+        .first()
+        .cloned();
     assert_eq!(
         back.map(|record| record.effect),
         Some(Effect::Move {
@@ -255,7 +263,8 @@ fn a_parked_edit_whose_name_a_synced_folder_holds_is_sent() {
         (Effects::default(), Commits::default(), IdGen::new(1));
     assert_eq!(
         effects
-            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+            .first()
             .map(|record| record.effect.clone()),
         None
     );
@@ -318,7 +327,11 @@ fn a_parked_edit_goes_back_to_its_name_when_another_folder_gets_that_name() {
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
     let mut moved_back = false;
-    while let Some(record) = effects.plan(&trees, None, &mut ids, NOW).cloned() {
+    while let Some(record) = effects
+        .plan(&trees, None, &mut ids, NOW, BatchLimit::ONE)
+        .first()
+        .cloned()
+    {
         moved_back |= matches!(
             &record.effect,
             Effect::Move { from: Location::Parked(_), to: Location::At { dirs, name, .. }, .. }
@@ -418,11 +431,16 @@ fn a_remote_move_waits_exactly_while_a_commit_in_flight_moves_the_node() {
         trees.set_remote("n".into(), remote(file(ROOT, "remote", 1)));
         trees.settle();
         let mut effects = Effects::default();
-        let planned = effects.plan(&trees, commits.in_flight(), &mut ids, NOW);
+        let planned = effects
+            .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+            .first();
         assert_eq!(planned, None, "{name}");
         exit(&mut commits, &mut trees);
         trees.settle();
-        let planned = (effects.plan(&trees, commits.in_flight(), &mut ids, NOW)).cloned();
+        let planned = (effects
+            .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+            .first())
+        .cloned();
         if commits.in_flight().is_some() {
             assert_eq!(planned, None, "{name}");
             continue;
@@ -462,9 +480,11 @@ fn a_rename_of_a_node_whose_update_waits_is_kept_from_an_effect_planned_before_i
     trees.settle();
     let mut effects = Effects::default();
     let record = loop {
-        let record = (effects.plan(&trees, commits.in_flight(), &mut ids, NOW))
-            .cloned()
-            .unwrap();
+        let record = (effects
+            .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+            .first())
+        .cloned()
+        .unwrap();
         if record.node == "n" {
             break record;
         }

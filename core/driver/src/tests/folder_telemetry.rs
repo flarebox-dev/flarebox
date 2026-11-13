@@ -315,3 +315,25 @@ fn resent_commits_without_a_burst_do_not_inflate_later_uploads() {
         "counted {counted} files for a 20-file burst"
     );
 }
+
+#[test]
+fn every_effect_of_a_batch_records_its_remote_apply() {
+    let mut remote = Remote::new_at(Time::now().unix_ms - 10_000);
+    let (site_a, mut a) = linked(&mut remote, "a");
+    let (site_b, mut b) = linked(&mut remote, "b");
+    let recorder = Recorder::on();
+    b.folder.timing.enable(recorder.clone());
+    for name in ["first", "second", "third"] {
+        a.create(&mut remote, &site_a.root.join(name), name.as_bytes());
+    }
+    b.pull_at_once(&remote);
+    assert!(matches!(b.work.front(), Some(Work::Stage(_))));
+    assert_eq!(b.folder.engine.effects.in_flight().len(), 3);
+    b.rest(&mut remote);
+    for name in ["first", "second", "third"] {
+        assert_eq!(fs::read(site_b.root.join(name)).unwrap(), name.as_bytes());
+    }
+    let applied = histograms(&recorder);
+    assert_eq!(applied["remote_apply_ms"]["effect"]["count"], 3);
+    assert_eq!(applied["download_per_second"]["files"]["count"], 1);
+}

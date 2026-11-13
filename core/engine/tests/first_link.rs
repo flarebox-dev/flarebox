@@ -5,7 +5,7 @@
 
 use koidrive_engine::classify::Trees;
 use koidrive_engine::commit::{Commits, Failure, Reconnect};
-use koidrive_engine::effects::{Effect, Effects, Stuck, stuck};
+use koidrive_engine::effects::{BatchLimit, Effect, Effects, Stuck, stuck};
 use koidrive_engine::first_link::adopt;
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::ignore::RuleFile;
@@ -270,7 +270,12 @@ fn a_first_link_holds_what_matches_nothing_under_one_question_and_sends_nothing_
 fn a_remote_node_whose_name_a_held_entry_takes_is_not_downloaded() {
     let (_, trees, mut ids) = linked();
     let mut effects = Effects::default();
-    assert_eq!(effects.plan(&trees, None, &mut ids, NOW), None);
+    assert_eq!(
+        effects
+            .plan(&trees, None, &mut ids, NOW, BatchLimit::ONE)
+            .first(),
+        None
+    );
 }
 
 #[test]
@@ -532,7 +537,11 @@ fn discarded(commits: &mut Commits, trees: &mut Trees, ids: &mut IdGen) -> Vec<(
     let mut done = Vec::new();
     for ino in 100.. {
         trees.settle();
-        let Some(record) = effects.plan(trees, commits.in_flight(), ids, NOW).cloned() else {
+        let Some(record) = effects
+            .plan(trees, commits.in_flight(), ids, NOW, BatchLimit::ONE)
+            .first()
+            .cloned()
+        else {
             break;
         };
         let identity = FileIdentity {
@@ -633,7 +642,8 @@ fn a_discarded_folder_the_user_puts_an_entry_in_is_sent_with_it() {
     let mut effects = Effects::default();
     let mut removed = Vec::new();
     while let Some(record) = effects
-        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+        .first()
         .cloned()
     {
         if matches!(
@@ -704,7 +714,8 @@ fn a_discarded_folder_whose_subfolder_the_user_puts_an_entry_in_is_sent_with_it(
     let mut effects = Effects::default();
     let mut touched = Vec::new();
     while let Some(record) = effects
-        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+        .first()
         .cloned()
     {
         touched.push(record.node.clone());
@@ -769,7 +780,8 @@ fn a_discarded_file_the_user_edits_is_sent_with_its_folder() {
     let mut effects = Effects::default();
     let mut touched = Vec::new();
     while let Some(record) = effects
-        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+        .first()
         .cloned()
     {
         touched.push(record.node.clone());
@@ -824,7 +836,9 @@ fn an_adopted_folder_keeps_its_rules_unknown() {
     );
     assert!(trees.held("r-new"));
     assert_eq!(
-        Effects::default().plan(&trees, commits.in_flight(), &mut ids, NOW),
+        Effects::default()
+            .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+            .first(),
         None
     );
 }
@@ -935,7 +949,8 @@ fn a_discarded_entry_the_rules_leave_out_for_a_while_goes_to_the_local_trash_onc
             "a discarded entry is not sent: {done:?}"
         );
         let Some(record) = effects
-            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+            .first()
             .cloned()
         else {
             break;
@@ -974,7 +989,11 @@ fn run_effects(
     for ino in first_ino.. {
         trees.settle();
         assert_eq!(ops(commits, trees, ids), [], "{done:?}");
-        let Some(record) = effects.plan(trees, commits.in_flight(), ids, NOW).cloned() else {
+        let Some(record) = effects
+            .plan(trees, commits.in_flight(), ids, NOW, BatchLimit::ONE)
+            .first()
+            .cloned()
+        else {
             break;
         };
         let identity = FileIdentity {
@@ -1099,7 +1118,8 @@ fn a_discarded_entry_stays_discarded_when_the_server_merges_its_folder_into_anot
     for ino in 100.. {
         trees.settle();
         let Some(record) = effects
-            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+            .first()
             .cloned()
         else {
             break;
@@ -1227,7 +1247,10 @@ fn a_file_the_user_took_back_from_a_discard_is_sent_again_once_the_server_loses_
     );
     trees.settle();
     let mut effects = Effects::default();
-    if let Some(record) = effects.plan(&trees, commits.in_flight(), &mut ids, NOW) {
+    if let Some(record) = effects
+        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+        .first()
+    {
         assert_ne!(record.node, "l-b", "{record:?}");
     }
     assert_eq!(

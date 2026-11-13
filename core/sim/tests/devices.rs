@@ -260,8 +260,9 @@ fn reaches(losses: Losses, events: &[&str]) {
 }
 
 /// The events of `World::seen` that the sample must reach.
-const EVENTS: [&str; 28] = [
+const EVENTS: [&str; 29] = [
     "effect failed before the disk",
+    "a batch of effects ends in one transaction",
     "effect refused by the disk",
     "effect parked a node",
     "crash before an effect reached the disk",
@@ -583,6 +584,39 @@ fn a_replacement_cut_between_quarantine_and_placement_is_ended_by_the_restart() 
         1
     );
     assert_eq!(world.devices[1].disk.entries().len(), 1);
+}
+
+#[test]
+fn a_crash_after_a_batch_of_downloads_reached_the_disk_is_ended_by_the_restart() {
+    let mut racing = vec![(0, file("a")), (0, file("b")), (0, file("c.txt"))];
+    racing.extend(commit(0));
+    racing.extend([(1, DELIVER), (1, CRASH)]);
+    let world = converge(2, &[racing]).unwrap();
+    assert_eq!(
+        world.seen["crash after part of a batch reached the disk"],
+        1
+    );
+    assert_eq!(world.seen["restart ends a batch of effects"], 1);
+    assert_eq!(world.devices[1].disk.entries().len(), 3);
+}
+
+#[test]
+fn a_crash_in_the_middle_of_a_batch_of_replacements_is_ended_by_the_restart() {
+    let synced = vec![(0, file("a")), (0, file("b")), (0, file("c.txt"))];
+    let mut racing = vec![(0, overwrite(0)), (0, overwrite(1)), (0, overwrite(2))];
+    racing.extend(commit(0));
+    let cut = Step::Effect(Outcome::Crash(Cut::Quarantined));
+    racing.extend([(1, DELIVER), (1, cut)]);
+    let world = converge(2, &[synced, racing]).unwrap();
+    assert_eq!(
+        world.seen["crash after part of a batch reached the disk"],
+        1
+    );
+    assert_eq!(
+        world.seen["restart ends an effect that left an entry in quarantine"],
+        1
+    );
+    assert_eq!(world.devices[1].disk.entries().len(), 3);
 }
 
 /// As above, and the user makes a file at the free name while the device is down. The download

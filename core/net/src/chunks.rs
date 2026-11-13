@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::io;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -28,6 +29,8 @@ use crate::session::Session;
 pub const MAX_CHUNKS_PER_CALL: usize = 1000;
 /// How many chunks a [`Transfer`] uploads at once unless it is given another [`UploadGate`].
 pub const DEFAULT_UPLOAD_CONCURRENCY: usize = 4;
+/// How many chunks a [`Transfer`] downloads at once unless it is given another number.
+pub const DEFAULT_DOWNLOAD_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 const TARGET_MARGIN: Duration = Duration::from_secs(60);
 const MAX_PREALLOCATION: usize = 4 << 20;
 const SMALL_ANSWER: usize = 64 << 10;
@@ -123,6 +126,8 @@ pub struct Transfer {
     pub backoff: Backoff,
     /// Bounds the chunks this transfer uploads at once, together with every other transfer that shares the gate.
     pub gate: UploadGate,
+    /// How many chunks one download fetches at once.
+    pub download_concurrency: NonZeroUsize,
     /// Attempts per chunk, and rounds of asking the server again for chunks it deferred or whose target expired. Only a
     /// round in which no chunk was uploaded or found present counts.
     pub attempts: u32,
@@ -137,6 +142,7 @@ impl Transfer {
             uploads: api.uploads().clone(),
             backoff: Backoff::default(),
             gate: UploadGate::new(DEFAULT_UPLOAD_CONCURRENCY),
+            download_concurrency: DEFAULT_DOWNLOAD_CONCURRENCY,
             attempts: 5,
             attempt_timeout: Duration::from_secs(120),
             stall_timeout: Duration::from_secs(60),
@@ -277,8 +283,11 @@ impl Transfer {
         Ok(receipts)
     }
 
-    /// Downloads each distinct chunk once, checks it against its hash and size, and hands it to `write` in order.
-    /// Bytes that do not match are fetched again and never passed on.
+    /// Downloads each distinct chunk once, checks it against its hash and size, and hands it to `write` once, in the
+    /// order the chunks arrive, so the caller writes each at its offsets. Up to `download_concurrency` chunks are
+    /// fetched at once, with targets asked for at most [`MAX_CHUNKS_PER_CALL`] at a time. Bytes that do not match are
+    /// fetched again and never passed on. The first chunk that fails for good ends the download, and the chunks still
+    /// in flight are dropped.
     ///
     /// As with [`Transfer::upload`], the future `write` returns borrows neither the chunk nor `write` itself.
     pub async fn download<W: Future<Output = io::Result<()>>>(
@@ -296,28 +305,18 @@ impl Transfer {
                 .into_iter()
                 .filter_map(|t| Some((t.hash, t.target?)))
                 .collect();
-            for chunk in batch {
-                let mut renewed = 0;
-                let bytes = loop {
-                    let target = match targets.get(&chunk.hash) {
-                        Some(target) if !expiring(target) => target.clone(),
-                        _ => self.download_target(session, chunk).await?,
-                    };
-                    match self.retrying(|| self.get(&target, chunk)).await? {
-                        Some(bytes) => break bytes,
-                        None if renewed < self.attempts => {
-                            renewed += 1;
-                            targets.remove(&chunk.hash);
-                        }
-                        None => {
-                            let message = "the server kept refusing the download ticket".to_owned();
-                            return Err(ChunkError::Unavailable {
-                                hash: chunk.hash.clone(),
-                                message,
-                            });
-                        }
-                    }
+            let mut waiting = batch.iter();
+            let mut running = FuturesUnordered::new();
+            loop {
+                while running.len() < self.download_concurrency.get()
+                    && let Some(chunk) = waiting.next()
+                {
+                    running.push(self.fetch(session, chunk, targets.remove(&chunk.hash)));
+                }
+                let Some(fetched) = running.next().await else {
+                    break;
                 };
+                let (chunk, bytes) = fetched?;
                 write(chunk, bytes).await.map_err(|source| ChunkError::Io {
                     hash: chunk.hash.clone(),
                     source,
@@ -325,6 +324,32 @@ impl Transfer {
             }
         }
         Ok(())
+    }
+
+    async fn fetch<'c>(
+        &self,
+        session: &Session,
+        chunk: &'c ChunkRef,
+        mut target: Option<Target>,
+    ) -> Result<(&'c ChunkRef, Bytes), ChunkError> {
+        let mut renewed = 0;
+        loop {
+            let current = match target.take() {
+                Some(target) if !expiring(&target) => target,
+                _ => self.download_target(session, chunk).await?,
+            };
+            match self.retrying(|| self.get(&current, chunk)).await? {
+                Some(bytes) => return Ok((chunk, bytes)),
+                None if renewed < self.attempts => renewed += 1,
+                None => {
+                    let message = "the server kept refusing the download ticket".to_owned();
+                    return Err(ChunkError::Unavailable {
+                        hash: chunk.hash.clone(),
+                        message,
+                    });
+                }
+            }
+        }
     }
 
     async fn download_target(

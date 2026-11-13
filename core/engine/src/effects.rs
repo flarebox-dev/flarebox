@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Applying remote changes to disk (docs/design/sync-engine.md sections 2.5, 5.2 and 5.3): the one
-//! effect in flight for a node whose only change is remote, parking for remote states that cannot
+//! Applying remote changes to disk (docs/design/sync-engine.md sections 2.5, 5.2 and 5.3): the batch
+//! of effects in flight for nodes whose only change is remote, parking for remote states that cannot
 //! be reached one move at a time, and the effect counter of section 2.8.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -93,8 +93,8 @@ pub enum Effect {
 pub struct EffectRecord {
     pub effect_id: String,
     pub node: NodeId,
-    /// The value the driver writes to the root marker before it touches the disk: one more than
-    /// the effects cleared so far (section 2.8).
+    /// The value the driver writes to the root marker before it touches the disk: the effects
+    /// cleared so far plus the effects in flight (section 2.8).
     pub counter: u64,
     pub effect: Effect,
     /// L's shape for the node once the effect is done, or ⊥ for a removal.
@@ -137,23 +137,38 @@ impl EffectRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EffectError {
-    /// The ID is not the effect in flight.
+    /// The ID is not an effect in flight.
     NotInFlight(String),
     /// A created or written entry was reported done without its file identity.
     MissingIdentity,
-    /// L does not take the outcome of the effect in flight ([`EffectRecord::applies`]).
+    /// L does not take the outcome of this effect in flight ([`EffectRecord::applies`]).
     DoesNotApply(String),
 }
 
-/// The disk side of a space: the effect in flight, the effects cleared so far, and the effect that
+/// The disk side of a space: the effects in flight, the effects cleared so far, and the effect that
 /// failed last for each blocked node. An effect that failed is never emitted again unchanged, so it
 /// is not retried blindly; a change to anything it was computed from, such as the identity of a
 /// directory on its path, gives the node a new effect.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Effects {
-    in_flight: Marked<Option<EffectRecord>>,
+    in_flight: Marked<Vec<EffectRecord>>,
     cleared: Marked<u64>,
     failed: TrackedMap<NodeId, Effect>,
+}
+
+/// The most one batch of effects holds: [`Effects::plan`] stops adding effects at `effects`, and adds a write
+/// only while the contents of the batch's writes stay within `bytes`, except for its first effect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BatchLimit {
+    pub effects: usize,
+    pub bytes: u64,
+}
+
+impl BatchLimit {
+    pub const ONE: BatchLimit = BatchLimit {
+        effects: 1,
+        bytes: 0,
+    };
 }
 
 impl Effects {
@@ -180,11 +195,11 @@ impl Effects {
         }
     }
 
-    /// The disk side the store kept. Refuses an effect in flight whose counter is not one more
-    /// than the effects cleared.
+    /// The disk side the store kept. Refuses an effect in flight whose counter is not the effects cleared plus the
+    /// effects in flight.
     pub fn from_state(state: EffectsState) -> Result<Self, StateError> {
-        if let Some(record) = &state.in_flight
-            && state.cleared.checked_add(1) != Some(record.counter)
+        let upper = state.cleared.checked_add(state.in_flight.len() as u64);
+        if let Some(record) = (state.in_flight.iter()).find(|record| Some(record.counter) != upper)
         {
             return Err(StateError::EffectCounter {
                 cleared: state.cleared,
@@ -203,8 +218,14 @@ impl Effects {
         })
     }
 
-    pub fn in_flight(&self) -> Option<&EffectRecord> {
-        self.in_flight.as_ref()
+    /// The effects in flight, in the order they were planned.
+    pub fn in_flight(&self) -> &[EffectRecord] {
+        &self.in_flight
+    }
+
+    /// The effect in flight with `effect_id`.
+    pub fn flight(&self, effect_id: &str) -> Option<&EffectRecord> {
+        (self.in_flight.iter()).find(|record| record.effect_id == effect_id)
     }
 
     /// The effect counter *e* of section 2.8.
@@ -224,18 +245,24 @@ impl Effects {
         self.failed.remove(node).is_some()
     }
 
-    /// Emits the next effect, unless one is in flight. A dirty node whose only change is remote, or
-    /// that is parked, gets the effect that makes L equal to R when it applies to L as it is: its
-    /// parent is a directory there, no other entry there holds its name key, and a move does not go
-    /// into the node's own subtree. A directory is removed only once it is empty. When no such
-    /// effect applies, a node that blocks one is parked, if it is a candidate itself or its S
-    /// update waits ([`Trees::waiting`]), since the commit layer does not plan it either: the entry
-    /// holding a name, or a directory that would move into its own subtree. A blocker that already
-    /// sits where R has it is not parked, since its own effect would move it straight back and take
-    /// the name again. A node whose park failed gets no effect until L changes: the parked
-    /// directory always has room, so the park failed on the entry itself, and the node's own effect
-    /// would fail on it too, taking turns with the park for as long as L stays as it is. A rename
-    /// that changes only case or normalization goes through the parked directory too.
+    /// Emits the next batch of effects, unless effects are in flight, and returns what it emitted. A dirty
+    /// node whose only change is remote, or that is parked, gets the effect that makes L equal to R when it applies
+    /// to L as it is: its parent is a directory there, no other entry there holds its name key, and a move does not
+    /// go into the node's own subtree. A directory is removed only once it is empty. When no such effect applies, a
+    /// node that blocks one is parked, if it is a candidate itself or its S update waits ([`Trees::waiting`]), since
+    /// the commit layer does not plan it either: the entry holding a name, or a directory that would move into its
+    /// own subtree. A blocker that already sits where R has it is not parked, since its own effect would move it
+    /// straight back and take the name again. A node whose park failed gets no effect until L changes: the parked
+    /// directory always has room, so the park failed on the entry itself, and the node's own effect would fail on
+    /// it too, taking turns with the park for as long as L stays as it is. A rename that changes only case or
+    /// normalization goes through the parked directory too.
+    ///
+    /// A batch holds effects that each apply to L as it is and that leave each other applying: no two give a name
+    /// key in one folder to their nodes, and none changes a folder on another's path, since a batch never holds a
+    /// folder's move. A park, a move out of the parked directory, a folder's move and an effect on a rules file are
+    /// planned alone. So applying the batch in any order, or only part of it, gives what applying it one effect at a
+    /// time does. Every effect of a batch carries the same counter, the effects cleared plus the batch's size, which
+    /// the driver writes to the root marker before it touches the disk (section 2.8).
     ///
     /// A parked node with a local change, such as an edit observed in the parked directory, is
     /// only moved out: to its R position, or to the position L keeps for it when R has none. Its
@@ -256,29 +283,34 @@ impl Effects {
         in_flight: Option<&InFlight>,
         ids: &mut IdGen,
         now_ms: u64,
-    ) -> Option<&EffectRecord> {
-        if self.in_flight.is_some() || !trees.rules_known() {
-            return None;
+        limit: BatchLimit,
+    ) -> &[EffectRecord] {
+        if !self.in_flight.is_empty() || !trees.rules_known() || limit.effects == 0 {
+            return &[];
         }
         self.failed
             .retain(|id, _| candidate(trees, id) || trees.waiting().contains_key(id));
-        let (node, effect, after) = self.choose(trees, in_flight)?;
-        self.failed.remove(&node);
-        self.in_flight.set(Some(EffectRecord {
-            effect_id: ids.uuid_v7(now_ms),
-            node,
-            counter: *self.cleared + 1,
-            effect,
-            after,
-        }));
-        self.in_flight.as_ref()
+        let chosen = self.choose(trees, in_flight, limit);
+        let counter = *self.cleared + chosen.len() as u64;
+        for (node, effect, after) in chosen {
+            self.failed.remove(&node);
+            self.in_flight.get_mut().push(EffectRecord {
+                effect_id: ids.uuid_v7(now_ms),
+                node,
+                counter,
+                effect,
+                after,
+            });
+        }
+        self.in_flight.as_slice()
     }
 
     fn choose(
         &self,
         trees: &Trees,
         in_flight: Option<&InFlight>,
-    ) -> Option<(NodeId, Effect, Option<Shape>)> {
+        limit: BatchLimit,
+    ) -> Vec<(NodeId, Effect, Option<Shape>)> {
         let view = View::new(trees);
         let writes_rules = |id: &str| {
             let remote = trees.remote().live(id)?;
@@ -319,8 +351,13 @@ impl Effects {
             ) && view.park(id).map(|(park, _)| park).as_ref() == failed
         };
         let mut blockers = BTreeSet::new();
-        let mut chosen = None;
+        let mut chosen = Vec::new();
+        let mut claimed = BTreeSet::new();
+        let mut bytes = 0;
         for id in trees.dirty() {
+            if chosen.len() >= limit.effects {
+                break;
+            }
             if !candidate(trees, id) || trees.held(id) || (!gates.is_empty() && gated(id)) {
                 continue;
             }
@@ -328,9 +365,26 @@ impl Effects {
                 Step::Apply(effect, _)
                     if self.failed.get(id) == Some(&effect) || park_failed(id) => {}
                 Step::Apply(_, Some(after)) if view.holds_position(id, &after, in_flight) => {}
+                Step::Apply(effect, after) if !batchable(trees, id, &effect) => {
+                    if chosen.is_empty() {
+                        return vec![(id.clone(), effect, after)];
+                    }
+                }
                 Step::Apply(effect, after) => {
-                    chosen = Some((id.clone(), effect, after));
-                    break;
+                    let claim =
+                        (after.as_ref()).map(|after| (after.parent.clone(), name_key(&after.name)));
+                    let size = match &effect {
+                        Effect::WriteFile { content, .. } => content.size,
+                        _ => 0,
+                    };
+                    if !chosen.is_empty() && bytes + size > limit.bytes {
+                        break;
+                    }
+                    if claim.as_ref().is_none_or(|claim| !claimed.contains(claim)) {
+                        bytes += size;
+                        claimed.extend(claim);
+                        chosen.push((id.clone(), effect, after));
+                    }
                 }
                 Step::Blocked(Some(blocker)) => {
                     blockers.insert(blocker);
@@ -338,15 +392,19 @@ impl Effects {
                 Step::Blocked(None) | Step::Skip => {}
             }
         }
-        chosen.or_else(|| {
-            blockers.into_iter().find_map(|id| {
+        if !chosen.is_empty() {
+            return chosen;
+        }
+        (blockers.into_iter())
+            .find_map(|id| {
                 if !view.parkable(&id) {
                     return None;
                 }
                 let (effect, after) = view.park(&id)?;
                 (self.failed.get(&id) != Some(&effect)).then_some((id, effect, after))
             })
-        })
+            .into_iter()
+            .collect()
     }
 
     /// The driver did the effect. L takes the node's new shape, with `identity` for an entry the
@@ -376,12 +434,11 @@ impl Effects {
         effect_id: &str,
         identity: Option<FileIdentity>,
     ) -> Result<Option<RemoteRemoval>, EffectError> {
-        if (self.in_flight.as_ref()).is_some_and(|record| {
-            record.effect_id == effect_id && !record.applies(trees, in_flight)
-        }) {
+        let flight = self.flight(effect_id);
+        if flight.is_some_and(|record| !record.applies(trees, in_flight)) {
             return Err(EffectError::DoesNotApply(effect_id.to_owned()));
         }
-        let identity = match self.in_flight.as_ref().map(|record| &record.effect) {
+        let identity = match flight.map(|record| &record.effect) {
             Some(Effect::CreateDir { .. } | Effect::WriteFile { .. }) => {
                 identity.ok_or(EffectError::MissingIdentity)?
             }
@@ -442,7 +499,7 @@ impl Effects {
             ),
         }
         self.failed.remove(&record.node);
-        self.cleared.set(record.counter);
+        self.cleared.set(*self.cleared + 1);
         Ok(removal)
     }
 
@@ -450,12 +507,20 @@ impl Effects {
     /// with `identity` for the entry it created (section 5.3). Recovery judges a target by the name
     /// and the content it finds there. An entry that L holds as another node is that node's, and a
     /// removal whose node L places elsewhere found its name empty because the node moved.
-    pub fn confirms(&self, trees: &Trees, identity: Option<&FileIdentity>) -> bool {
-        let Some(record) = &*self.in_flight else {
+    pub fn confirms(
+        &self,
+        trees: &Trees,
+        effect_id: &str,
+        identity: Option<&FileIdentity>,
+    ) -> bool {
+        let Some(record) = self.flight(effect_id) else {
             return false;
         };
         let local = trees.local();
-        if (local.iter()).any(|(id, node)| *id != record.node && Some(&node.identity) == identity) {
+        if (identity.into_iter())
+            .flat_map(|identity| trees.locals_with_identity(identity))
+            .any(|id| *id != record.node)
+        {
             return false;
         }
         match &record.effect {
@@ -475,7 +540,7 @@ impl Effects {
     pub fn failed(&mut self, effect_id: &str) -> Result<(), EffectError> {
         let record = self.take(effect_id)?;
         self.failed.insert(record.node, record.effect);
-        self.cleared.set(record.counter);
+        self.cleared.set(*self.cleared + 1);
         Ok(())
     }
 
@@ -488,14 +553,37 @@ impl Effects {
         let record = self.take(effect_id)?;
         trees.remove_local(&record.node);
         trees.set_synced(record.node, None);
-        self.cleared.set(record.counter);
+        self.cleared.set(*self.cleared + 1);
         Ok(())
     }
 
     fn take(&mut self, effect_id: &str) -> Result<EffectRecord, EffectError> {
-        self.in_flight
-            .take_if(|record| record.effect_id == effect_id)
-            .ok_or_else(|| EffectError::NotInFlight(effect_id.to_owned()))
+        let position = (self.in_flight.iter())
+            .position(|record| record.effect_id == effect_id)
+            .ok_or_else(|| EffectError::NotInFlight(effect_id.to_owned()))?;
+        Ok(self.in_flight.get_mut().remove(position))
+    }
+}
+
+/// Whether `effect` of node `id` may share a batch with other effects ([`Effects::plan`]): it names no entry
+/// through the parked directory, moves no folder and touches no rules file, so it changes no path another effect
+/// of the batch takes and no rule another effect was planned under.
+fn batchable(trees: &Trees, id: &str, effect: &Effect) -> bool {
+    let plain = |at: &Location| matches!(at, Location::At { base: Base::Root, name, .. } if !is_rules_file(name));
+    match effect {
+        Effect::CreateDir { at } | Effect::RemoveDir { at, .. } => plain(at),
+        Effect::WriteFile { at, replaces, .. } => {
+            plain(at)
+                && replaces
+                    .as_ref()
+                    .is_none_or(|displaced| plain(&displaced.at))
+        }
+        Effect::RemoveFile { displaced } => plain(&displaced.at),
+        Effect::Move { from, to, .. } => {
+            plain(from)
+                && plain(to)
+                && (trees.local().get(id)).is_some_and(|node| node.shape.kind == Kind::File)
+        }
     }
 }
 
@@ -592,7 +680,8 @@ pub fn stuck(
             Some(((*id).clone(), Stuck::HeldBy(by)))
         })
         .collect();
-    let idle = effects.in_flight().is_none() && effects.choose(trees, in_flight).is_none();
+    let idle = effects.in_flight().is_empty()
+        && effects.choose(trees, in_flight, BatchLimit::ONE).is_empty();
     let parked: Vec<(NodeId, Stuck)> = (planned.iter())
         .filter(|_| idle)
         .filter(|id| !stuck.contains_key(**id))

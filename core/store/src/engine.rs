@@ -308,19 +308,25 @@ impl Tx<'_> {
         state.commits.questions = self.open_questions()?;
         state.commits.guard = self.guard()?;
 
-        if let Some((cleared, in_flight)) = self
+        if let Some(cleared) = self
             .0
-            .query_row(
-                "SELECT cleared, in_flight FROM effect_state WHERE id = 1",
-                [],
-                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
-            )
+            .query_row("SELECT cleared FROM effect_state WHERE id = 1", [], |row| {
+                row.get::<_, u64>(0)
+            })
             .optional()?
         {
             state.effects.cleared = cleared;
-            state.effects.in_flight = decode::<StoredRecord>(in_flight)?
-                .map(EffectRecord::try_from)
-                .transpose()?;
+        }
+        let mut stmt = self
+            .0
+            .prepare_cached("SELECT record FROM effects_in_flight ORDER BY position")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let record = StoredRecord::decode(row.get::<_, Vec<u8>>(0)?.as_slice())?;
+            state
+                .effects
+                .in_flight
+                .push(EffectRecord::try_from(record)?);
         }
         let mut stmt = self
             .0
@@ -362,6 +368,7 @@ impl Tx<'_> {
             "resends",
             "kept_originals",
             "effect_state",
+            "effects_in_flight",
             "failed_effects",
             "restore_intents",
             "open_question_shapes",
@@ -389,7 +396,7 @@ impl Tx<'_> {
     /// Writes `changes` into the stored engine state. Only the rows of what changed are written: a
     /// member of a node set or a node map, a waiting update, a failed effect and each other entry by its key, removed
     /// when the state no longer holds it, and each of the commit counters, the commit in flight, the restores, the
-    /// open questions and the effect counters as a whole.
+    /// open questions, the effect counter and the effects in flight as a whole.
     pub fn write_engine_changes(&self, changes: &EngineChanges) -> Result<()> {
         let EngineChanges {
             trees,
@@ -700,12 +707,17 @@ impl Tx<'_> {
                 [cleared],
             )?;
         }
-        if let Some(effect) = effect {
-            let record = (effect.as_ref()).map(|record| StoredRecord::from(record).encode_to_vec());
-            self.0.execute(
-                "UPDATE effect_state SET in_flight = ?1 WHERE id = 1",
-                [record],
+        if let Some(effects) = effect {
+            self.0.execute("DELETE FROM effects_in_flight", [])?;
+            let mut put = self.0.prepare_cached(
+                "INSERT INTO effects_in_flight (position, record) VALUES (?1, ?2)",
             )?;
+            for (position, record) in effects.iter().enumerate() {
+                put.execute(params![
+                    position as u64,
+                    StoredRecord::from(record).encode_to_vec()
+                ])?;
+            }
         }
         self.write_map(
             failed,
@@ -872,7 +884,7 @@ fn required<T>(value: Option<T>, what: &str) -> Result<T> {
     value.ok_or_else(|| invalid(format!("{what} is missing")))
 }
 
-/// An [`EffectRecord`] as `effect_state.in_flight` stores it. The effect types are the engine's
+/// An [`EffectRecord`] as `effects_in_flight.record` stores it. The effect types are the engine's
 /// own and have no wire format, so these messages give them one here. Their tags never change
 /// meaning once shipped.
 #[derive(Clone, PartialEq, Message)]

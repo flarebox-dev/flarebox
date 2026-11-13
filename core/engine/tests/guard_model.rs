@@ -47,7 +47,7 @@ use std::hash::{Hash, Hasher};
 
 use koidrive_engine::classify::Trees;
 use koidrive_engine::commit::Commits;
-use koidrive_engine::effects::Effects;
+use koidrive_engine::effects::{BatchLimit, Effects};
 use koidrive_engine::guard::{WINDOW_MS, Window};
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::question::{Answer, QuestionKind};
@@ -298,13 +298,14 @@ impl World {
                 events.push(Event::Restore(member));
             }
         }
-        if (Effects::default().plan(
+        if !(Effects::default().plan(
             &self.trees,
             self.commits.in_flight(),
             &mut self.ids.clone(),
             self.now,
+            BatchLimit::ONE,
         ))
-        .is_some()
+        .is_empty()
         {
             events.extend([Event::Step, Event::StepAll]);
         }
@@ -525,7 +526,9 @@ impl World {
                     self.commits.in_flight(),
                     &mut self.ids,
                     self.now,
+                    BatchLimit::ONE,
                 )
+                .first()
                 .cloned()
             else {
                 break;
@@ -598,7 +601,9 @@ impl World {
                 self.commits.in_flight(),
                 &mut self.ids,
                 self.now,
+                BatchLimit::ONE,
             )
+            .first()
             .cloned()
         {
             self.ino += 1;

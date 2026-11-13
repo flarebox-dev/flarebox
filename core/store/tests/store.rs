@@ -5,7 +5,7 @@ use std::path::Path;
 
 use koidrive_engine::classify::{Origin, Trees, Waiting};
 use koidrive_engine::commit::{Commits, Halt, InFlight, Reconnect};
-use koidrive_engine::effects::{Base, Dir, Displaced, Effect, EffectRecord, Location};
+use koidrive_engine::effects::{Base, BatchLimit, Dir, Displaced, Effect, EffectRecord, Location};
 use koidrive_engine::guard::{Counted, GuardState, RemoteDeletion, Trash};
 use koidrive_engine::ids::{IdGen, uuid_v7};
 use koidrive_engine::question::{
@@ -93,6 +93,7 @@ fn migrations_apply_from_empty() {
             "discarded_nodes",
             "edited_here",
             "effect_state",
+            "effects_in_flight",
             "engine_state",
             "failed_effects",
             "guard_confirmed",
@@ -306,8 +307,10 @@ fn a_store_from_any_past_version_upgrades_and_keeps_every_row() {
         let path = dir.path().join(format!("{version}.db"));
         populate(&path);
         rewind(&path, version);
-        let kept = every_row(&path);
+        let mut kept = every_row(&path);
         assert_eq!(kept.values().any(|(_, rows)| !rows.is_empty()), version > 0);
+        let moved = moved_in_flight(&path, &mut kept);
+        assert_eq!(moved.len(), usize::from(version >= 3));
 
         drop(Store::open(&path).unwrap());
 
@@ -321,6 +324,12 @@ fn a_store_from_any_past_version_upgrades_and_keeps_every_row() {
                 "{table} from version {version}"
             );
         }
+        let in_flight = ["position".to_owned(), "record".to_owned()];
+        assert_eq!(
+            table_rows(&conn, "effects_in_flight", &in_flight),
+            moved,
+            "effects_in_flight from version {version}"
+        );
     }
 }
 
@@ -336,6 +345,8 @@ fn a_store_written_by_alpha_1_upgrades_and_keeps_every_row() {
     let mut kept = every_row(&path);
     let (_, discarded) = kept.remove("discarded_nodes").unwrap();
     assert_eq!(discarded.len(), 1);
+    let moved = moved_in_flight(&path, &mut kept);
+    assert_eq!(moved.len(), 1);
     let fresh = dir.path().join("fresh.db");
     drop(Store::open(&fresh).unwrap());
 
@@ -369,6 +380,8 @@ fn a_store_written_by_alpha_1_upgrades_and_keeps_every_row() {
     for (table, (columns, rows)) in kept {
         assert_eq!(table_rows(&conn, &table, &columns), rows, "{table}");
     }
+    let in_flight = ["position".to_owned(), "record".to_owned()];
+    assert_eq!(table_rows(&conn, "effects_in_flight", &in_flight), moved);
 }
 
 #[test]
@@ -761,6 +774,15 @@ fn rebuild(path: &Path, migrate: impl FnOnce(&Connection)) {
         ))
         .unwrap();
     }
+    if columns(&conn, "main", "effect_state").contains(&"in_flight".to_owned())
+        && !columns(&conn, "original", "effects_in_flight").is_empty()
+    {
+        conn.execute_batch(
+            "UPDATE main.effect_state SET in_flight =
+                (SELECT record FROM original.effects_in_flight WHERE position = 0)",
+        )
+        .unwrap();
+    }
     conn.execute_batch("DETACH original").unwrap();
     drop(conn);
     for suffix in ["", "-wal", "-shm"] {
@@ -811,6 +833,27 @@ fn table_rows(conn: &Connection, table: &str, columns: &[String]) -> Vec<String>
         .unwrap();
     rows.sort();
     rows
+}
+
+fn moved_in_flight(
+    path: &Path,
+    kept: &mut BTreeMap<String, (Vec<String>, Vec<String>)>,
+) -> Vec<String> {
+    let conn = Connection::open(path).unwrap();
+    let Some((columns, rows)) = kept.get_mut("effect_state") else {
+        return Vec::new();
+    };
+    if !columns.contains(&"in_flight".to_owned()) {
+        return Vec::new();
+    }
+    columns.retain(|column| column != "in_flight");
+    *rows = table_rows(&conn, "effect_state", columns);
+    conn.execute_batch(
+        "CREATE TEMP TABLE moved AS
+            SELECT 0 AS position, in_flight AS record FROM effect_state WHERE in_flight IS NOT NULL",
+    )
+    .unwrap();
+    table_rows(&conn, "moved", &["position".into(), "record".into()])
 }
 
 fn every_row(path: &Path) -> BTreeMap<String, (Vec<String>, Vec<String>)> {
@@ -1382,7 +1425,7 @@ fn engine_state() -> EngineState {
             },
         },
         effects: EffectsState {
-            in_flight: Some(EffectRecord {
+            in_flight: vec![EffectRecord {
                 effect_id: "e1".into(),
                 node: "n".into(),
                 counter: 3,
@@ -1392,7 +1435,7 @@ fn engine_state() -> EngineState {
                     replaces: Some(displaced.clone()),
                 },
                 after: Some(engine_shape("p", "inner.txt")),
-            }),
+            }],
             cleared: 2,
             failed: BTreeMap::from([
                 (
@@ -1447,7 +1490,7 @@ fn engine_state_survives_a_reopen() {
 }
 
 /// The tables of the engine state besides the nodes of R, L and S.
-const ENGINE_TABLES: [&str; 31] = [
+const ENGINE_TABLES: [&str; 32] = [
     "node_sets",
     "node_maps",
     "waiting_updates",
@@ -1464,6 +1507,7 @@ const ENGINE_TABLES: [&str; 31] = [
     "resends",
     "kept_originals",
     "effect_state",
+    "effects_in_flight",
     "failed_effects",
     "restore_intents",
     "open_questions",
@@ -1600,7 +1644,7 @@ fn an_engine_state_update_writes_rows_for_the_change_alone() {
         after.commits.in_flight = None;
         after.commits.resolved.pop();
         after.effects.cleared += 1;
-        after.effects.in_flight = None;
+        after.effects.in_flight = Vec::new();
         after.effects.failed.remove("node-4");
         Store::open(&path)
             .unwrap()
@@ -1642,7 +1686,7 @@ fn engine_state_updates_store_every_part() {
     changed.commits.cap = Some(2);
     changed.commits.in_flight.as_mut().unwrap().result = None;
     changed.commits.restores.clear();
-    changed.effects.in_flight = None;
+    changed.effects.in_flight = Vec::new();
     changed.trees.waiting.clear();
     let guard = &mut changed.commits.guard;
     guard.confirmed_limits.insert(Limit::Deletions);
@@ -2887,7 +2931,8 @@ fn a_discarded_file_that_s_no_longer_holds_is_asked_about_again(edited: bool) {
     assert!(built.is_none(), "a discarded file was uploaded: {built:?}");
     let mut effects = Effects::default();
     while let Some(record) = effects
-        .plan(&trees, commits.in_flight(), &mut ids, 1)
+        .plan(&trees, commits.in_flight(), &mut ids, 1, BatchLimit::ONE)
+        .first()
         .cloned()
     {
         assert_ne!(record.node, "secret", "edited: {edited}, {record:?}");
@@ -2925,7 +2970,8 @@ fn a_discarded_file_that_s_no_longer_holds_is_asked_about_again(edited: bool) {
     assert_eq!(created, edited);
     if !edited {
         let removed = effects
-            .plan(&trees, commits.in_flight(), &mut ids, 1)
+            .plan(&trees, commits.in_flight(), &mut ids, 1, BatchLimit::ONE)
+            .first()
             .cloned()
             .unwrap();
         assert_eq!(removed.node, "secret");
@@ -3385,7 +3431,10 @@ fn a_discarded_folder_is_not_sent_while_a_question_asks_again_about_what_it_hold
             .cloned();
         assert!(built.is_none(), "sent before the answer: {built:?}");
         let mut effects = Effects::default();
-        if let Some(record) = effects.plan(&trees, commits.in_flight(), &mut ids, 1) {
+        if let Some(record) = effects
+            .plan(&trees, commits.in_flight(), &mut ids, 1, BatchLimit::ONE)
+            .first()
+        {
             assert!(record.node != "dir" && record.node != "c", "{record:?}");
         }
 
@@ -3407,6 +3456,39 @@ fn a_discarded_folder_is_not_sent_while_a_question_asks_again_about_what_it_hold
         };
         assert_eq!(sent, expected, "{answer:?}");
     }
+}
+
+#[test]
+fn a_store_from_before_effects_were_planned_in_batches_keeps_its_effect_in_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let before = engine_state();
+    assert_eq!(before.effects.in_flight.len(), 1);
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| tx.set_engine_state(&before))
+        .unwrap();
+    store_before(&path, "effects_in_flight");
+    let stored: Option<Vec<u8>> = Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT in_flight FROM effect_state", [], |row| row.get(0))
+        .unwrap();
+    assert!(stored.is_some());
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(applied(&path), all_migrations());
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
+    let mut after = before.clone();
+    let mut second = after.effects.in_flight[0].clone();
+    second.effect_id = "e2".into();
+    second.node = "n2".into();
+    after.effects.in_flight.push(second);
+    store
+        .transaction(|tx| tx.update_engine_state(&before, &after))
+        .unwrap();
+    drop(store);
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), after);
 }
 
 #[test]

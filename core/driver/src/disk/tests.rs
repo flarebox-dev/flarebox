@@ -56,7 +56,7 @@ fn a_delete_the_user_made_before_a_recovered_removal_stays_local() {
         .unwrap()
         .unwrap();
     assert!(matches!(
-        pending.record.effect,
+        pending.record().effect,
         EngineEffect::RemoveFile { .. }
     ));
     let restored = remote(NODE, "report.txt", Some(saved));
@@ -98,7 +98,7 @@ fn an_edit_the_user_made_before_a_recovered_download_stays_an_edit() {
         .unwrap()
         .unwrap();
     assert!(matches!(
-        pending.record.effect,
+        pending.record().effect,
         EngineEffect::WriteFile { .. }
     ));
     let advanced = remote(
@@ -179,7 +179,7 @@ fn a_same_byte_save_before_a_removal_does_not_delete_the_restored_file() {
         .unwrap()
         .unwrap();
     assert!(matches!(
-        pending.record.effect,
+        pending.record().effect,
         EngineEffect::RemoveFile { .. }
     ));
     let restored = remote(NODE, "report.txt", Some(saved));
@@ -194,10 +194,10 @@ fn a_same_byte_save_before_a_removal_does_not_delete_the_restored_file() {
         .unwrap();
     let staged = ready(pending.stage(&server)).unwrap();
     assert_eq!(
-        running
+        one(running
             .disk
             .apply(staged, &mut running.engine, &mut running.store)
-            .unwrap(),
+            .unwrap()),
         Settled::Done
     );
     let engine = &mut running.engine;
@@ -333,9 +333,28 @@ struct Running {
     _lock: claim::Flock,
 }
 
+impl Pending {
+    fn record(&self) -> &EffectRecord {
+        match self.effects.as_slice() {
+            [planned] => &planned.record,
+            effects => panic!("a batch of {} effects", effects.len()),
+        }
+    }
+}
+
+fn one(settled: Vec<(String, Settled)>) -> Settled {
+    match <[_; 1]>::try_from(settled) {
+        Ok([(_, settled)]) => settled,
+        Err(settled) => panic!("a batch of {} effects: {settled:?}", settled.len()),
+    }
+}
+
 impl Running {
-    /// Plans, stages and applies one effect. `None` when nothing is planned.
     fn step(&mut self, server: &Server) -> Option<Settled> {
+        self.step_batch(server).map(one)
+    }
+
+    fn step_batch(&mut self, server: &Server) -> Option<Vec<(String, Settled)>> {
         let pending = self.disk.next(&mut self.engine, &mut self.store).unwrap()?;
         let staged = ready(pending.stage(server)).unwrap();
         Some(
@@ -362,8 +381,11 @@ pub(crate) struct Server {
     /// While set, every download is refused with this error.
     pub refusal: Mutex<Option<ServerError>>,
     pub call_error: Mutex<Option<CallError>>,
+    pub missing: BTreeSet<Vec<u8>>,
     /// Runs once, before the first chunk is handed over.
     during: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    calls: Mutex<u32>,
+    handed: Mutex<Vec<Vec<u8>>>,
 }
 
 impl Server {
@@ -391,8 +413,23 @@ impl Fetch for Server {
         chunks: &[ChunkRef],
         write: &mut (dyn FnMut(&ChunkRef, &[u8]) -> io::Result<()> + Send),
     ) -> Result<(), ChunkError> {
+        *self.calls.lock().unwrap() += 1;
         if let Some(error) = self.call_error.lock().unwrap().clone() {
             return Err(ChunkError::Call(error));
+        }
+        let missing: Vec<Vec<u8>> = (chunks.iter())
+            .filter(|chunk| self.missing.contains(&chunk.hash))
+            .map(|chunk| chunk.hash.clone())
+            .collect();
+        if !missing.is_empty() {
+            return Err(ChunkError::Call(CallError::Server(ServerError(
+                koidrive_proto::v1::Error {
+                    code: koidrive_proto::v1::error::Code::MissingChunks as i32,
+                    message: "some chunks are not stored".into(),
+                    missing_chunks: missing,
+                    retry_after_ms: 0,
+                },
+            ))));
         }
         if let Some(error) = self.refusal.lock().unwrap().clone() {
             return Err(ChunkError::Refused {
@@ -429,6 +466,7 @@ impl Fetch for Server {
             if self.corrupt {
                 bytes[0] ^= 1;
             }
+            self.handed.lock().unwrap().push(chunk.hash.clone());
             write(chunk, &bytes).map_err(|source| ChunkError::Io {
                 hash: chunk.hash.clone(),
                 source,
@@ -722,7 +760,7 @@ fn cuts(scenario: &Scenario) -> Vec<Cut> {
 /// store, the disk holds the effect's result, the marker equals the effect counter, and nothing is left in
 /// quarantine or staging.
 fn assert_done(scenario: &Scenario, folder: &Folder, running: &Running, context: &str) {
-    assert!(running.engine.effects.in_flight().is_none(), "{context}");
+    assert!(running.engine.effects.in_flight().is_empty(), "{context}");
     assert!(running.engine.effects.blocked().is_empty(), "{context}");
     let remote = running.engine.trees.remote().live(NODE);
     let local = running.local(NODE).map(|node| &node.shape);
@@ -780,7 +818,7 @@ fn crash_and_finish(scenario: &Scenario, cut: Cut, cuts: &[Cut]) {
     );
 
     let mut running = folder.start(no_hook()).unwrap();
-    assert!(running.engine.effects.in_flight().is_none(), "{context}");
+    assert!(running.engine.effects.in_flight().is_empty(), "{context}");
     assert_eq!(
         folder.marker(),
         running.engine.effects.cleared(),
@@ -965,14 +1003,14 @@ fn refuse_and_finish(scenario: &Scenario, refuse: fn(&mut Trees), cut: Option<Cu
         batch(&mut running, refuse);
         assert!(
             !pending
-                .record
+                .record()
                 .applies(&running.engine.trees, running.engine.commits.in_flight()),
             "{context}"
         );
         if apply {
             let (disk, engine, store) =
                 (&mut running.disk, &mut running.engine, &mut running.store);
-            let settled = disk.apply(staged, engine, store).unwrap();
+            let settled = one(disk.apply(staged, engine, store).unwrap());
             let why = "L changed since it was planned";
             assert_eq!(settled, Settled::Failed(why.into()), "{context}");
         }
@@ -990,7 +1028,7 @@ fn refuse_and_finish(scenario: &Scenario, refuse: fn(&mut Trees), cut: Option<Cu
         running.engine.trees.local(),
         "{context}"
     );
-    assert!(running.engine.effects.in_flight().is_none(), "{context}");
+    assert!(running.engine.effects.in_flight().is_empty(), "{context}");
     assert!(running.engine.effects.blocked().is_empty(), "{context}");
     assert_eq!(running.engine.effects.cleared(), 1, "{context}");
     assert_eq!(folder.marker(), 1, "{context}");
@@ -1092,7 +1130,7 @@ fn three_cleared_and_one_in_flight() -> (Folder, Server, String) {
             .step(&server);
     }));
     let (_, engine) = folder.open();
-    let record = engine.effects.in_flight().unwrap().clone();
+    let record = engine.effects.in_flight().first().unwrap().clone();
     assert_eq!(record.counter, 4);
     (folder, server, record.effect_id)
 }
@@ -1154,7 +1192,11 @@ fn a_marker_above_what_the_store_accounts_for_keeps_every_trace() {
     assert_eq!(tree(&folder.root), before);
     let (_, engine) = folder.open();
     assert_eq!(
-        engine.effects.in_flight().map(|record| &record.effect_id),
+        engine
+            .effects
+            .in_flight()
+            .first()
+            .map(|record| &record.effect_id),
         Some(&effect_id)
     );
 
@@ -1195,7 +1237,13 @@ fn an_interrupted_effect_is_planned_again_after_a_restart() {
             .step(&server);
     }));
     let (_, engine) = folder.open();
-    let interrupted = engine.effects.in_flight().unwrap().effect_id.clone();
+    let interrupted = engine
+        .effects
+        .in_flight()
+        .first()
+        .unwrap()
+        .effect_id
+        .clone();
     let mut running = folder.start(no_hook()).unwrap();
     assert!(running.engine.effects.blocked().is_empty());
     let pending = running
@@ -1203,11 +1251,11 @@ fn an_interrupted_effect_is_planned_again_after_a_restart() {
         .next(&mut running.engine, &mut running.store)
         .unwrap()
         .expect("planned again");
-    assert_eq!(pending.record.node, NODE);
-    assert_ne!(pending.record.effect_id, interrupted);
+    assert_eq!(pending.record().node, NODE);
+    assert_ne!(pending.record().effect_id, interrupted);
     assert_eq!(
-        pending.record.effect,
-        engine.effects.in_flight().unwrap().effect
+        pending.record().effect,
+        engine.effects.in_flight().first().unwrap().effect
     );
 }
 
@@ -1265,7 +1313,7 @@ fn an_effect_that_met_a_taken_name_or_a_changed_file_stays_blocked() {
             .disk
             .apply(staged, &mut running.engine, &mut running.store)
             .unwrap();
-        assert_eq!(settled, Settled::Failed(disturb.into()));
+        assert_eq!(one(settled), Settled::Failed(disturb.into()));
         assert_eq!(
             fs::read(folder.root.join("report.txt")).unwrap(),
             b"the user's own words"
@@ -1427,7 +1475,7 @@ fn a_restart_does_not_take_a_file_that_l_holds_as_another_node_for_a_download() 
         .next(&mut running.engine, &mut running.store)
         .unwrap()
         .expect("the download");
-    assert_eq!(pending.record.node, NODE);
+    assert_eq!(pending.record().node, NODE);
     drop((running, pending));
     fs::rename(folder.root.join("b.txt"), folder.root.join("a.txt")).unwrap();
 
@@ -1505,7 +1553,7 @@ fn a_root_replaced_during_a_download_receives_nothing() {
         other => panic!("{:?}", other.map(|_| ())),
     }
     assert_eq!(tree(&folder.root), BTreeMap::new());
-    assert!(running.engine.effects.in_flight().is_some());
+    assert!(!running.engine.effects.in_flight().is_empty());
     let aside = folder.dir.path().join("moved");
     assert!(!aside.join("report.txt").exists());
 }
@@ -1534,7 +1582,7 @@ fn a_root_replaced_before_an_effect_applies_receives_nothing() {
     assert_eq!(tree(&aside), before);
     drop(running);
     let (_, engine) = folder.open();
-    assert!(engine.effects.in_flight().is_some());
+    assert!(!engine.effects.in_flight().is_empty());
 }
 
 /// Observes until `done` accepts the changes seen so far, and returns them as one batch.
@@ -1702,14 +1750,14 @@ fn a_download_that_fails_for_now_keeps_the_effect_and_stages_again() {
         Err(Stall::Later { wait, .. }) => assert_eq!(wait, STAGE_AGAIN),
         other => panic!("{:?}", other.map(|_| ())),
     }
-    assert!(running.engine.effects.in_flight().is_some());
+    assert!(!running.engine.effects.in_flight().is_empty());
     assert!(!folder.root.join("report.txt").exists());
     let staged = ready(pending.stage(&server)).unwrap();
     assert_eq!(
-        running
+        one(running
             .disk
             .apply(staged, &mut running.engine, &mut running.store)
-            .unwrap(),
+            .unwrap()),
         Settled::Done
     );
     assert_eq!(fs::read(folder.root.join("report.txt")).unwrap(), REMOTE);
@@ -1922,7 +1970,7 @@ fn a_record_whose_name_is_not_a_file_name_is_never_committed() {
     ));
     drop(running);
     let (_, engine) = folder.open();
-    assert!(engine.effects.in_flight().is_none());
+    assert!(engine.effects.in_flight().is_empty());
     assert_eq!(folder.marker(), 0);
 }
 
@@ -2067,10 +2115,10 @@ fn a_rename_dropped_with_a_stale_batch_reaches_l_after_the_rescan() {
         renamed(seen, "report.txt", "mine.txt")
     });
     assert_eq!(
-        running
+        one(running
             .disk
             .apply(staged, &mut running.engine, &mut running.store)
-            .unwrap(),
+            .unwrap()),
         Settled::Failed("the entry is not there".into())
     );
     let before = running.local(NODE).unwrap().clone();
@@ -2467,14 +2515,14 @@ fn a_removal_counts_against_the_files_s_holds_after_it() {
     let staged = ready(pending.stage(&Server::default())).unwrap();
     assert!(
         pending
-            .record
+            .record()
             .applies(&running.engine.trees, running.engine.commits.in_flight())
     );
     assert_eq!(
-        running
+        one(running
             .disk
             .apply(staged, &mut running.engine, &mut running.store)
-            .unwrap(),
+            .unwrap()),
         Settled::Done
     );
     assert!(!path.exists());
@@ -2551,4 +2599,407 @@ fn a_parked_fork_whose_name_is_taken_is_uploaded_from_the_parked_directory() {
         .flat_map(|chunk| upload.read(chunk).unwrap().to_vec())
         .collect();
     assert_eq!(read, b"the person's own c.txt");
+}
+
+const BATCHED: [&str; 5] = [
+    "0190f0a0-0000-7000-8000-0000000000c1",
+    "0190f0a0-0000-7000-8000-0000000000c2",
+    "0190f0a0-0000-7000-8000-0000000000c3",
+    "0190f0a0-0000-7000-8000-0000000000c4",
+    "0190f0a0-0000-7000-8000-0000000000c5",
+];
+const MOVED: &[u8] = b"the moved file";
+const REMOVED: &[u8] = b"the removed file";
+const NEWER_NOTES: &[u8] = b"the notes as the other device wrote them";
+
+fn five_effects(folder: &Folder, server: &mut Server) {
+    fs::write(folder.root.join("notes.txt"), SYNCED).unwrap();
+    fs::write(folder.root.join("a.txt"), MOVED).unwrap();
+    fs::write(folder.root.join("old.txt"), REMOVED).unwrap();
+    let moved = disk_content(&folder.root.join("a.txt"));
+    let written = server.hold(REMOTE, ChunkerConfig::V0);
+    let replacing = server.hold(NEWER_NOTES, ChunkerConfig::V0);
+    folder.seed(
+        &[
+            remote(BATCHED[0], "docs", None),
+            remote(BATCHED[1], "report.txt", Some(written)),
+            remote(BATCHED[2], "notes.txt", Some(replacing)),
+            remote(BATCHED[3], "b.txt", Some(moved)),
+        ],
+        &[
+            (BATCHED[2], SPACE, "notes.txt"),
+            (BATCHED[3], SPACE, "a.txt"),
+            (BATCHED[4], SPACE, "old.txt"),
+        ],
+        0,
+    );
+}
+
+fn five_effects_done() -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    BTreeMap::from([
+        (PathBuf::from("docs"), None),
+        (PathBuf::from("report.txt"), Some(REMOTE.to_vec())),
+        (PathBuf::from("notes.txt"), Some(NEWER_NOTES.to_vec())),
+        (PathBuf::from("b.txt"), Some(MOVED.to_vec())),
+    ])
+}
+
+fn assert_all_done(folder: &Folder, running: &Running, context: &str) {
+    assert_eq!(running.engine.effects.in_flight(), [], "{context}");
+    assert!(running.engine.effects.blocked().is_empty(), "{context}");
+    let (_, stored) = folder.open();
+    for node in BATCHED {
+        let remote = running.engine.trees.remote().live(node);
+        let local = running.local(node).map(|node| &node.shape);
+        assert!(
+            koidrive_engine::tree::same(local, remote),
+            "{context}: {node}: L {local:?}, R {remote:?}"
+        );
+        assert_eq!(
+            running.engine.trees.synced().get(node),
+            local,
+            "{context}: {node}: S"
+        );
+        assert_eq!(
+            stored.trees.synced().get(node),
+            local,
+            "{context}: {node}: S in the store"
+        );
+    }
+    assert_eq!(visible(folder), five_effects_done(), "{context}");
+    assert_eq!(
+        folder.marker(),
+        running.engine.effects.cleared(),
+        "{context}"
+    );
+    assert_eq!(
+        names(folder, QUARANTINE_DIR),
+        Vec::<String>::new(),
+        "{context}"
+    );
+    assert_eq!(
+        names(folder, STAGING_DIR),
+        Vec::<String>::new(),
+        "{context}"
+    );
+    for bytes in [SYNCED, REMOVED] {
+        assert!(
+            trashed(folder, bytes),
+            "{context}: displaced bytes are not in the trash"
+        );
+    }
+}
+
+#[test]
+fn independent_effects_are_applied_in_one_section_and_acknowledged_in_one_transaction() {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    five_effects(&folder, &mut server);
+    let reached = Arc::new(Mutex::new(Vec::new()));
+    let record = reached.clone();
+    let mut running = folder
+        .start(Some(Box::new(move |cut| record.lock().unwrap().push(cut))))
+        .unwrap();
+
+    let settled = running.step_batch(&server).expect("a batch");
+
+    let mut nodes: Vec<&str> = settled.iter().map(|(node, _)| node.as_str()).collect();
+    nodes.sort();
+    assert_eq!(nodes, BATCHED);
+    assert!(
+        settled.iter().all(|(_, settled)| *settled == Settled::Done),
+        "{settled:?}"
+    );
+    let reached = reached.lock().unwrap().clone();
+    let once = |cut: Cut| reached.iter().filter(|reached| **reached == cut).count();
+    for cut in [
+        Cut::BeforePlan,
+        Cut::AfterPlan,
+        Cut::Step(Step::Marked),
+        Cut::BeforeAck,
+        Cut::AfterAck,
+    ] {
+        assert_eq!(once(cut), 1, "{cut:?} in {reached:?}");
+    }
+    assert_eq!(running.engine.effects.cleared(), 5);
+    assert_eq!(running.step_batch(&server), None);
+    assert_all_done(&folder, &running, "uninterrupted");
+}
+
+#[test]
+fn a_crash_at_every_cut_of_a_batch_is_recovered_on_the_next_start() {
+    let reached = {
+        let folder = Folder::new();
+        let mut server = Server::default();
+        five_effects(&folder, &mut server);
+        let reached = Arc::new(Mutex::new(Vec::new()));
+        let record = reached.clone();
+        let mut running = folder
+            .start(Some(Box::new(move |cut| record.lock().unwrap().push(cut))))
+            .unwrap();
+        running.step_batch(&server).expect("a batch");
+        reached.lock().unwrap().clone()
+    };
+    assert!(reached.len() > 15, "{reached:?}");
+    for (at, cut) in reached.iter().enumerate() {
+        let context = format!("crashed at cut {at}, {cut:?}");
+        let folder = Folder::new();
+        let mut server = Server::default();
+        five_effects(&folder, &mut server);
+        let crashed = catch_unwind(AssertUnwindSafe(|| {
+            let mut count = 0;
+            let hook: Hook = Box::new(move |_| {
+                if count == at {
+                    resume_unwind(Box::new(Crash));
+                }
+                count += 1;
+            });
+            let mut running = folder.start(Some(hook)).unwrap();
+            running.step_batch(&server);
+        }));
+        assert!(
+            crashed.is_err_and(|payload| payload.is::<Crash>()),
+            "{context}: no crash"
+        );
+
+        let mut running = folder.start(no_hook()).unwrap();
+        assert_eq!(running.engine.effects.in_flight(), [], "{context}");
+        assert_eq!(
+            folder.marker(),
+            running.engine.effects.cleared(),
+            "{context}"
+        );
+        let planned = *cut != Cut::BeforePlan;
+        assert_eq!(
+            running.engine.effects.cleared(),
+            5 * u64::from(planned),
+            "{context}"
+        );
+        assert_eq!(
+            names(&folder, QUARANTINE_DIR),
+            Vec::<String>::new(),
+            "{context}"
+        );
+        assert_eq!(
+            names(&folder, STAGING_DIR),
+            Vec::<String>::new(),
+            "{context}"
+        );
+        for (name, bytes) in [("notes.txt", SYNCED), ("old.txt", REMOVED)] {
+            let at_name = fs::read(folder.root.join(name)).is_ok_and(|held| held == bytes);
+            assert!(
+                at_name || trashed(&folder, bytes),
+                "{context}: the bytes of {name} are neither at their name nor in the trash"
+            );
+        }
+        let mut batches = 0;
+        while let Some(settled) = running.step_batch(&server) {
+            assert!(
+                settled.iter().all(|(_, settled)| *settled == Settled::Done),
+                "{context}: {settled:?}"
+            );
+            batches += 1;
+            assert!(
+                batches <= 1,
+                "{context}: planned again after the effects were done"
+            );
+        }
+        assert_all_done(&folder, &running, &context);
+    }
+}
+
+#[test]
+fn a_batch_downloads_each_distinct_chunk_once_for_every_file_that_holds_it() {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    let shared = server.hold(REMOTE, ChunkerConfig::V0);
+    let twice = server.hold(NEWER_NOTES, ChunkerConfig::V0);
+    let alone = server.hold(MOVED, ChunkerConfig::V0);
+    let files = [
+        ("a.txt", &shared, REMOTE),
+        ("b.txt", &twice, NEWER_NOTES),
+        ("c.txt", &shared, REMOTE),
+        ("d.txt", &alone, MOVED),
+        ("e.txt", &twice, NEWER_NOTES),
+        ("f.txt", &shared, REMOTE),
+    ];
+    let nodes: Vec<NodeState> = (files.iter().enumerate())
+        .map(|(at, (name, content, _))| {
+            remote(
+                &format!("0190f0a0-0000-7000-8000-0000000000d{at}"),
+                name,
+                Some((*content).clone()),
+            )
+        })
+        .collect();
+    folder.seed(&nodes, &[], 0);
+    let mut running = folder.start(no_hook()).unwrap();
+
+    let settled = running.step_batch(&server).expect("a batch");
+
+    assert_eq!(settled.len(), files.len());
+    assert!(
+        settled.iter().all(|(_, settled)| *settled == Settled::Done),
+        "{settled:?}"
+    );
+    assert_eq!(*server.calls.lock().unwrap(), 1);
+    let mut handed = server.handed.lock().unwrap().clone();
+    handed.sort();
+    let mut distinct: Vec<Vec<u8>> = ([&shared, &twice, &alone].into_iter())
+        .flat_map(|content| content.chunks.iter().map(|chunk| chunk.hash.clone()))
+        .collect();
+    distinct.sort();
+    assert_eq!(handed, distinct);
+    for (name, _, bytes) in files {
+        assert_eq!(fs::read(folder.root.join(name)).unwrap(), bytes, "{name}");
+    }
+    assert_eq!(names(&folder, STAGING_DIR), Vec::<String>::new());
+    assert_eq!(running.step_batch(&server), None);
+}
+
+#[test]
+fn a_chunk_the_server_lost_fails_only_the_writes_of_the_batch_that_list_it() {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    let kept = server.hold(REMOTE, ChunkerConfig::V0);
+    let lost = server.hold(NEWER_NOTES, ChunkerConfig::V0);
+    let other = server.hold(MOVED, ChunkerConfig::V0);
+    for chunk in &lost.chunks {
+        server.chunks.remove(&chunk.hash);
+    }
+    let lost_node = "0190f0a0-0000-7000-8000-0000000000e1";
+    folder.seed(
+        &[
+            remote("0190f0a0-0000-7000-8000-0000000000e0", "a.txt", Some(kept)),
+            remote(lost_node, "b.txt", Some(lost)),
+            remote("0190f0a0-0000-7000-8000-0000000000e2", "c.txt", Some(other)),
+        ],
+        &[],
+        0,
+    );
+    let mut running = folder.start(no_hook()).unwrap();
+
+    let settled = running.step_batch(&server).expect("a batch");
+
+    assert_eq!(settled.len(), 3);
+    for (node, settled) in &settled {
+        match node == lost_node {
+            true => assert!(
+                matches!(settled, Settled::Failed(why) if why.starts_with("its content cannot be downloaded")),
+                "{settled:?}"
+            ),
+            false => assert_eq!(*settled, Settled::Done, "{node}"),
+        }
+    }
+    assert_eq!(fs::read(folder.root.join("a.txt")).unwrap(), REMOTE);
+    assert_eq!(fs::read(folder.root.join("c.txt")).unwrap(), MOVED);
+    assert!(!folder.root.join("b.txt").exists());
+    assert_eq!(names(&folder, STAGING_DIR), Vec::<String>::new());
+    assert!(running.engine.effects.blocked().contains_key(lost_node));
+}
+
+#[test]
+fn files_that_share_a_chunk_are_staged_within_a_small_descriptor_limit() {
+    const CHILD: &str = "KOIDRIVE_TEST_FEW_DESCRIPTORS";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "disk::tests::files_that_share_a_chunk_are_staged_within_a_small_descriptor_limit",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+    rustix::process::setrlimit(
+        rustix::process::Resource::Nofile,
+        rustix::process::Rlimit {
+            current: Some(128),
+            maximum: limit.maximum,
+        },
+    )
+    .unwrap();
+    let folder = Folder::new();
+    let mut server = Server::default();
+    let config = ChunkerConfig::new(64, 256, 1024, 0).unwrap();
+    let files: Vec<Vec<u8>> = (0..300)
+        .map(|index| {
+            let mut bytes = vec![b'x'; 2048];
+            bytes.extend(format!("the end of file {index}").as_bytes());
+            bytes
+        })
+        .collect();
+    let nodes: Vec<NodeState> = (files.iter().enumerate())
+        .map(|(index, bytes)| {
+            remote(
+                &format!("0190f0a0-0000-7000-8000-{:012x}", 0x10000 + index),
+                &format!("file-{index}.txt"),
+                Some(server.hold(bytes, config)),
+            )
+        })
+        .collect();
+    folder.seed(&nodes, &[], 0);
+    let mut running = folder.start(no_hook()).unwrap();
+
+    let settled = running.step_batch(&server).expect("a batch");
+
+    assert_eq!(settled.len(), files.len());
+    assert!(
+        settled.iter().all(|(_, settled)| *settled == Settled::Done),
+        "{settled:?}"
+    );
+    for (index, bytes) in files.iter().enumerate() {
+        assert_eq!(
+            fs::read(folder.root.join(format!("file-{index}.txt"))).unwrap(),
+            *bytes
+        );
+    }
+}
+
+#[test]
+fn a_chunk_the_server_reports_missing_fails_only_the_writes_of_the_batch_that_list_it() {
+    let folder = Folder::new();
+    let mut server = Server::default();
+    let kept = server.hold(REMOTE, ChunkerConfig::V0);
+    let missing = server.hold(NEWER_NOTES, ChunkerConfig::V0);
+    let other = server.hold(MOVED, ChunkerConfig::V0);
+    server.missing = missing
+        .chunks
+        .iter()
+        .map(|chunk| chunk.hash.clone())
+        .collect();
+    let missing_node = "0190f0a0-0000-7000-8000-0000000000f1";
+    folder.seed(
+        &[
+            remote("0190f0a0-0000-7000-8000-0000000000f0", "a.txt", Some(kept)),
+            remote(missing_node, "b.txt", Some(missing)),
+            remote("0190f0a0-0000-7000-8000-0000000000f2", "c.txt", Some(other)),
+        ],
+        &[],
+        0,
+    );
+    let mut running = folder.start(no_hook()).unwrap();
+
+    let settled = running.step_batch(&server).expect("a batch");
+
+    assert_eq!(settled.len(), 3);
+    for (node, settled) in &settled {
+        match node == missing_node {
+            true => assert!(
+                matches!(settled, Settled::Failed(why) if why.starts_with("its content cannot be downloaded")),
+                "{settled:?}"
+            ),
+            false => assert_eq!(*settled, Settled::Done, "{node}"),
+        }
+    }
+    assert_eq!(fs::read(folder.root.join("a.txt")).unwrap(), REMOTE);
+    assert_eq!(fs::read(folder.root.join("c.txt")).unwrap(), MOVED);
+    assert!(!folder.root.join("b.txt").exists());
+    assert_eq!(names(&folder, STAGING_DIR), Vec::<String>::new());
+    assert!(running.engine.effects.blocked().contains_key(missing_node));
 }

@@ -373,7 +373,7 @@ fn rewound_write_whose_delete_this_device_has_not_applied() {
             ],
         )
         .unwrap();
-    assert!(world.devices[0].engine.effects.in_flight().is_none());
+    assert!(world.devices[0].engine.effects.in_flight().is_empty());
     assert!(world.devices[0].disk.holds(1));
     world.run(1, &[(0, Step::Rewind)]).unwrap();
     world.phase(2, &[]).unwrap();
@@ -550,7 +550,7 @@ fn rewound_write_only_a_quarantine_holds() {
         assert!(world.devices[0].disk.holds(1) && !world.devices[0].disk.shows(1));
         assert!(!world.devices[1].disk.holds(1));
         if swept {
-            let record = (world.devices[0].engine.effects.in_flight())
+            let record = (world.devices[0].engine.effects.in_flight().first())
                 .unwrap()
                 .clone();
             world.devices[0].disk = Disk::default();

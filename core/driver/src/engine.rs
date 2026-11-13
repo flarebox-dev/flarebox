@@ -1451,7 +1451,7 @@ mod first_sync;
 #[cfg(test)]
 mod tests {
     use koidrive_engine::commit::InFlight;
-    use koidrive_engine::effects::{Base, Effect, EffectRecord, Location};
+    use koidrive_engine::effects::{Base, BatchLimit, Effect, EffectRecord, Location};
     use koidrive_engine::state::{CommitsState, EffectsState};
     use koidrive_proto::v1::{self as proto, op};
     use koidrive_proto::v1::{NodePurged, NodeStatus, SpaceUpdated};
@@ -1899,8 +1899,11 @@ mod tests {
         let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
         let mut plan = |trees: &mut Trees, effects: &mut Effects| {
             trees.settle();
-            (effects.plan(trees, None, &mut ids, 0).cloned())
-                .unwrap_or_else(|| panic!("{name}: no effect"))
+            (effects
+                .plan(trees, None, &mut ids, 0, BatchLimit::ONE)
+                .first()
+                .cloned())
+            .unwrap_or_else(|| panic!("{name}: no effect"))
         };
         for _ in 0..done {
             let record = plan(&mut trees, &mut effects);
@@ -2349,7 +2352,7 @@ mod tests {
         let mut replanned = Vec::new();
         for mut case in cases().into_iter().filter(|case| !case.takes) {
             let state = EffectsState {
-                in_flight: None,
+                in_flight: Vec::new(),
                 ..case.engine.effects.state()
             };
             case.engine.effects = Effects::from_state(state).unwrap();
@@ -2361,8 +2364,11 @@ mod tests {
                 ids,
                 ..
             } = &mut case.engine;
-            let planned = (effects.plan(trees, commits.in_flight(), ids, 0).cloned())
-                .filter(|planned| planned.node == case.record.node);
+            let planned = (effects
+                .plan(trees, commits.in_flight(), ids, 0, BatchLimit::ONE)
+                .first()
+                .cloned())
+            .filter(|planned| planned.node == case.record.node);
             let Some(planned) = planned else {
                 continue;
             };

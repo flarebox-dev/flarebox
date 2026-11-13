@@ -57,7 +57,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use koidrive_engine::classify::Trees;
 use koidrive_engine::commit::{self, Base, Reconnect};
-use koidrive_engine::effects::{Effect, EffectRecord, location_of};
+use koidrive_engine::effects::{BatchLimit, Effect, EffectRecord, location_of};
 use koidrive_engine::tree::{Content, NodeId, RemoteNode, same, same_content};
 use koidrive_proto::v1::{
     ChunkRef, Commit, Error, NodeKind, NodeStatus, PrepareUpload, Resume, UploadReceipt,
@@ -78,6 +78,7 @@ pub const NAMES: &[&str] = &["a", "A", "b", "c.txt", "C.TXT", "ß", "ss"];
 pub const TEXTS: u8 = 4;
 /// The rounds the devices get to become quiet once the faults stop.
 const ROUNDS: usize = 200;
+const BATCH: u64 = 4;
 
 /// A broken property, with what broke it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1027,7 +1028,8 @@ impl World {
         if device.recovering.is_some() {
             return Ok(false);
         }
-        let Some(record) = device.engine.effects.in_flight().cloned() else {
+        let batch = device.engine.effects.in_flight().to_vec();
+        if batch.is_empty() {
             let commits = &device.engine.commits;
             let listing = device.link.as_ref().is_some_and(|link| link.listing);
             if device.engine.behind
@@ -1044,90 +1046,128 @@ impl World {
                 ..
             } = &mut device.engine;
             trees.settle();
-            let planned = effects
-                .plan(trees, commits.in_flight(), ids, NOW as u64)
-                .is_some();
+            let size = match outcome {
+                Outcome::Run => 1 + self.clock % BATCH,
+                Outcome::Fail | Outcome::Crash(_) => BATCH,
+            };
+            let limit = BatchLimit {
+                effects: size as usize,
+                bytes: u64::MAX,
+            };
+            let planned =
+                !(effects.plan(trees, commits.in_flight(), ids, NOW as u64, limit)).is_empty();
             device.persist()?;
             return Ok(planned);
-        };
-        let applies = record.applies(&device.engine.trees, device.engine.commits.in_flight());
-        let until = match outcome {
-            Outcome::Run if applies => Some(Cut::Done),
-            Outcome::Crash(cut) if applies => Some(cut),
-            _ => None,
-        };
-        let applied = device.disk.apply(&record, until);
-        if let Some(applied) = applied.as_ref().filter(|applied| {
-            !resent_over_revert(&self.exposed, &self.rolled_back, &record, applied)
-        }) {
-            lost(&self.held, d, &record, applied)?;
         }
-        let applied = applied.map(|applied| applied.outcome);
-        if let Outcome::Crash(cut) = outcome {
+        let unlucky = match outcome {
+            Outcome::Crash(_) => batch.len() - 1,
+            _ => (self.clock.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize % batch.len(),
+        };
+        for (index, record) in batch.iter().enumerate() {
+            if index != unlucky || outcome != Outcome::Fail {
+                self.devices[d].disk.stage(record);
+            }
+        }
+        let mut ends = Vec::new();
+        for (index, record) in batch.iter().enumerate() {
+            let outcome = if index == unlucky {
+                outcome
+            } else {
+                Outcome::Run
+            };
+            let device = &mut self.devices[d];
+            let applies = record.applies(&device.engine.trees, device.engine.commits.in_flight());
+            let until = match outcome {
+                Outcome::Run if applies => Some(Cut::Done),
+                Outcome::Crash(cut) if applies => Some(cut),
+                _ => None,
+            };
+            let applied = device.disk.apply(record, until);
+            if let Some(applied) = applied.as_ref().filter(|applied| {
+                !resent_over_revert(&self.exposed, &self.rolled_back, record, applied)
+            }) {
+                lost(&self.held, d, record, applied)?;
+            }
+            let applied = applied.map(|applied| applied.outcome);
+            if let Outcome::Crash(cut) = outcome {
+                note(
+                    &mut self.seen,
+                    match applied {
+                        _ if !device.disk.quarantine.is_empty() => {
+                            "crash with a displaced entry in quarantine"
+                        }
+                        _ if !device.disk.staged.is_empty() => "crash with a download staged",
+                        Some(Err(_)) => "crash after the disk refused an effect",
+                        _ if applied.is_none() || cut == Cut::Quarantined => {
+                            "crash before an effect reached the disk"
+                        }
+                        _ => "crash after an effect reached the disk",
+                    },
+                );
+                if index > 0 {
+                    note(
+                        &mut self.seen,
+                        "crash after part of a batch reached the disk",
+                    );
+                }
+                device.down = true;
+                device.link = None;
+                return Ok(false);
+            }
+            ends.push((record, applied, applies, outcome));
+        }
+        if batch.len() > 1 {
+            note(&mut self.seen, "a batch of effects ends in one transaction");
+        }
+        let device = &mut self.devices[d];
+        for (record, applied, applies, outcome) in ends {
+            let Engine {
+                trees,
+                effects,
+                commits,
+                ids,
+                cursor,
+                ..
+            } = &mut device.engine;
+            let reported = match applied {
+                Some(Ok(identity)) => {
+                    (effects.done(trees, commits.in_flight(), &record.effect_id, identity)).map(
+                        |removal| {
+                            if let Some(removal) = removal {
+                                commits.count_remote(removal, trees, cursor.seq, ids, NOW as u64);
+                            }
+                        },
+                    )
+                }
+                Some(Err(Refused::Overtaken)) => effects.overtaken(trees, &record.effect_id),
+                _ => effects.failed(&record.effect_id).map(|()| {
+                    if !applies {
+                        effects.unblock(&record.node);
+                    }
+                }),
+            };
             note(
                 &mut self.seen,
-                match applied {
-                    _ if device.disk.quarantine.is_some() => {
-                        "crash with a displaced entry in quarantine"
+                match (applied, outcome) {
+                    (Some(Ok(_)), _) if record.after.is_none() => "effect removed an entry",
+                    (Some(Ok(_)), _)
+                        if trees
+                            .local()
+                            .get(&record.node)
+                            .is_some_and(|node| node.parked) =>
+                    {
+                        "effect parked a node"
                     }
-                    _ if device.disk.staged => "crash with a download staged",
-                    Some(Err(_)) => "crash after the disk refused an effect",
-                    _ if applied.is_none() || cut == Cut::Quarantined => {
-                        "crash before an effect reached the disk"
-                    }
-                    _ => "crash after an effect reached the disk",
+                    (Some(Ok(_)), _) => "effect done",
+                    (_, Outcome::Fail) => "effect failed before the disk",
+                    (None, _) => "effect not applied, L no longer takes it",
+                    _ => "effect refused by the disk",
                 },
             );
-            device.down = true;
-            device.link = None;
-            return Ok(false);
+            reported.map_err(|error| {
+                Failure::Broken(format!("the effect's outcome was refused: {error:?}"))
+            })?;
         }
-        let Engine {
-            trees,
-            effects,
-            commits,
-            ids,
-            cursor,
-            ..
-        } = &mut device.engine;
-        let reported = match applied {
-            Some(Ok(identity)) => {
-                (effects.done(trees, commits.in_flight(), &record.effect_id, identity)).map(
-                    |removal| {
-                        if let Some(removal) = removal {
-                            commits.count_remote(removal, trees, cursor.seq, ids, NOW as u64);
-                        }
-                    },
-                )
-            }
-            Some(Err(Refused::Overtaken)) => effects.overtaken(trees, &record.effect_id),
-            _ => effects.failed(&record.effect_id).map(|()| {
-                if !applies {
-                    effects.unblock(&record.node);
-                }
-            }),
-        };
-        note(
-            &mut self.seen,
-            match (applied, outcome) {
-                (Some(Ok(_)), _) if record.after.is_none() => "effect removed an entry",
-                (Some(Ok(_)), _)
-                    if trees
-                        .local()
-                        .get(&record.node)
-                        .is_some_and(|node| node.parked) =>
-                {
-                    "effect parked a node"
-                }
-                (Some(Ok(_)), _) => "effect done",
-                (_, Outcome::Fail) => "effect failed before the disk",
-                (None, _) => "effect not applied, L no longer takes it",
-                _ => "effect refused by the disk",
-            },
-        );
-        reported.map_err(|error| {
-            Failure::Broken(format!("the effect's outcome was refused: {error:?}"))
-        })?;
         device.persist()?;
         device.engine.scan(&device.disk);
         self.scanned[d] = self.clock;
@@ -1147,7 +1187,7 @@ impl World {
         device.engine = device.store.reload()?;
         let effects = &device.engine.effects;
         let (marker, cleared) = (device.disk.marker(), effects.cleared());
-        if marker > cleared + u64::from(effects.in_flight().is_some()) {
+        if marker > cleared + effects.in_flight().len() as u64 {
             return self.recover(
                 d,
                 format!("the root marker counts {marker} effects, more than the store"),
@@ -1159,12 +1199,22 @@ impl World {
             )));
         }
         let device = &mut self.devices[d];
-        if let Some(record) = device.engine.effects.in_flight().cloned() {
-            let quarantined = device.disk.quarantine.is_some();
-            let applied = device.disk.recover(&record);
-            if !resent_over_revert(&self.exposed, &self.rolled_back, &record, &applied) {
-                lost(&self.held, d, &record, &applied)?;
+        let batch = device.engine.effects.in_flight().to_vec();
+        let mut recovered = Vec::with_capacity(batch.len());
+        for record in &batch {
+            let quarantined = device.disk.quarantine.contains_key(&record.effect_id);
+            let applied = device.disk.recover(record);
+            if !resent_over_revert(&self.exposed, &self.rolled_back, record, &applied) {
+                lost(&self.held, d, record, &applied)?;
             }
+            let engine = &device.engine;
+            let refuted = matches!(
+                &applied.outcome,
+                Ok(identity) if !engine.effects.confirms(&engine.trees, &record.effect_id, identity.as_ref())
+            );
+            recovered.push((quarantined, applied, refuted));
+        }
+        for (record, (quarantined, applied, refuted)) in batch.iter().zip(recovered) {
             let Engine {
                 trees,
                 effects,
@@ -1178,10 +1228,6 @@ impl World {
                 _ => None,
             };
             let applies = record.applies(trees, commits.in_flight());
-            let refuted = matches!(
-                &applied.outcome,
-                Ok(identity) if !effects.confirms(trees, identity.as_ref())
-            );
             let reported = match applied.outcome {
                 Ok(identity) if applies && !refuted => {
                     // A file that the user made with the bytes of the download counts as the
@@ -1254,6 +1300,11 @@ impl World {
             reported.map_err(|error| {
                 Failure::Broken(format!("the effect's outcome was refused: {error:?}"))
             })?;
+        }
+        if batch.len() > 1 {
+            note(&mut self.seen, "restart ends a batch of effects");
+        }
+        if !batch.is_empty() {
             device.persist()?;
         }
         if device.engine.commits.in_flight().is_some() {
@@ -1945,7 +1996,7 @@ impl World {
             if self.devices[d].recovering.is_some() {
                 continue;
             }
-            if self.devices[d].engine.effects.in_flight().is_some() {
+            if !self.devices[d].engine.effects.in_flight().is_empty() {
                 self.effect(d, Outcome::Run)?;
             }
             self.devices[d].link = None;
@@ -2108,7 +2159,7 @@ impl World {
                 let r = shape(trees.remote().get(id).map(|node| &node.shape));
                 writeln!(out, "  node {} L[{l}] S[{s}] R[{r}]{flags}", short(id)).unwrap();
             }
-            if let Some(record) = engine.effects.in_flight() {
+            if let Some(record) = engine.effects.in_flight().first() {
                 writeln!(
                     out,
                     "  effect in flight for {}: {:?}",
@@ -2238,7 +2289,7 @@ impl World {
             if let Some(flight) = engine.commits.in_flight() {
                 return fail(format!("a commit is in flight: {flight:?}"));
             }
-            if let Some(record) = engine.effects.in_flight() {
+            if let Some(record) = engine.effects.in_flight().first() {
                 return fail(format!("an effect is in flight: {record:?}"));
             }
             if engine.behind {

@@ -205,7 +205,7 @@ fn a_file_edited_while_a_move_the_server_undid_was_in_flight_keeps_its_name() {
     a.run(&mut remote);
     b.pull(&remote);
     assert!(matches!(
-        b.folder.engine.effects.in_flight().unwrap().effect,
+        b.folder.engine.effects.in_flight().first().unwrap().effect,
         koidrive_engine::effects::Effect::Move { .. }
     ));
     fs::rename(site_a.root.join("remote.txt"), site_a.root.join("old.txt")).unwrap();

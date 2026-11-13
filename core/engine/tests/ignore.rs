@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use koidrive_engine::classify::{Origin, Trees, Waiting};
 use koidrive_engine::commit::Commits;
-use koidrive_engine::effects::{self, Base, Effect, Effects, Location, Stuck};
+use koidrive_engine::effects::{self, Base, BatchLimit, Effect, Effects, Location, Stuck};
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::ignore::{LocalRules, RuleFile};
 use koidrive_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
@@ -119,7 +119,11 @@ fn effects(trees: &mut Trees) -> Vec<(String, Effect)> {
     let (mut effects, mut ids, mut done) = (Effects::default(), IdGen::new(2), Vec::new());
     loop {
         trees.settle();
-        let Some(record) = effects.plan(trees, None, &mut ids, NOW).cloned() else {
+        let Some(record) = effects
+            .plan(trees, None, &mut ids, NOW, BatchLimit::ONE)
+            .first()
+            .cloned()
+        else {
             return done;
         };
         let made = identity(100 + done.len() as u128);
@@ -811,7 +815,11 @@ fn a_remote_rules_file_is_written_before_anything_else_below_its_folder() {
     let (mut effects, mut ids, mut order) = (Effects::default(), IdGen::new(2), Vec::new());
     loop {
         trees.settle();
-        let Some(record) = effects.plan(&trees, None, &mut ids, NOW).cloned() else {
+        let Some(record) = effects
+            .plan(&trees, None, &mut ids, NOW, BatchLimit::ONE)
+            .first()
+            .cloned()
+        else {
             break;
         };
         let made = identity(100 + order.len() as u128);

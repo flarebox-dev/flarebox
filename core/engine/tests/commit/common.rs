@@ -10,7 +10,7 @@ use koidrive_engine::commit::{
     Commits, Failure, Halt, Lift, LiftError, MAX_COMMIT_BYTES, MAX_OPS, Reconnect,
 };
 
-use koidrive_engine::effects::{Effect, EffectError, Effects, Location};
+use koidrive_engine::effects::{BatchLimit, Effect, EffectError, Effects, Location};
 
 use koidrive_engine::ids::IdGen;
 
@@ -217,7 +217,11 @@ fn swapped() -> Vec<Row> {
 /// Applies the effect that moves the reverted `node` back to its R position.
 fn moves_back(trees: &mut Trees, ids: &mut IdGen, node: &str) {
     let mut effects = Effects::default();
-    let record = effects.plan(trees, None, ids, NOW).unwrap().clone();
+    let record = effects
+        .plan(trees, None, ids, NOW, BatchLimit::ONE)
+        .first()
+        .unwrap()
+        .clone();
     assert_eq!(record.node, node);
     effects.done(trees, None, &record.effect_id, None).unwrap();
     trees.settle();
@@ -685,7 +689,11 @@ fn effects_for(trees: &mut Trees, ids: &mut IdGen, node: &str) -> Vec<Effect> {
     let mut effects = Effects::default();
     let mut planned = Vec::new();
     for _ in 0..8 {
-        let Some(record) = effects.plan(trees, None, ids, NOW).cloned() else {
+        let Some(record) = effects
+            .plan(trees, None, ids, NOW, BatchLimit::ONE)
+            .first()
+            .cloned()
+        else {
             break;
         };
         if record.node == node {

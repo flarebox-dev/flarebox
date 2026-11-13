@@ -6,7 +6,7 @@
 
 use koidrive_engine::classify::{Class, Trees};
 use koidrive_engine::commit::{Commits, Failure, Halt, MAX_OPS, Reconnect};
-use koidrive_engine::effects::{Effect, Effects};
+use koidrive_engine::effects::{BatchLimit, Effect, Effects};
 use koidrive_engine::ids::{IdGen, uuid_v7};
 use koidrive_engine::restore::{
     Malformed, Outcome, RESOLVED_KEPT, Rejection, Resolved, RestoreIntent,
@@ -300,7 +300,8 @@ fn a_trash_restore_is_one_op_and_its_result_is_downloaded() {
 
     let mut effects = Effects::default();
     let record = effects
-        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+        .first()
         .unwrap();
     assert_eq!((&record.node, &record.after), (&n, &Some(shape)));
     assert!(matches!(
@@ -336,7 +337,8 @@ fn a_version_restore_leaves_s_and_l_alone_and_the_file_is_replaced() {
 
     let mut effects = Effects::default();
     let record = effects
-        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+        .first()
         .unwrap();
     let Effect::WriteFile {
         content: written,
