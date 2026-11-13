@@ -38,7 +38,8 @@
 //!   in flight, blocked, parked or halted.
 //! - No commit moved a node to a name that the user of its device never gave to anything, other
 //!   than, until the devices are quiet again, a name that L or the server held for a node whose
-//!   shape a restore took from the server (section 4.4), and the pending name a swap goes through
+//!   shape a restore took from the server (section 4.4), a name the server gave that device's lost
+//!   placement of that node, and the pending name a swap goes through
 //!   to one of these names (design section 2.6), and no commit took a write out of the server's live tree that the user
 //!   of its device never overwrote or deleted.
 //! - No node keeps a pending name that no user gave.
@@ -392,7 +393,15 @@ struct Backup {
     held: Held,
     in_history: Held,
     spent: Vec<Spent>,
+    placements: Vec<BTreeSet<Placement>>,
     pending_authors: BTreeMap<NodeId, usize>,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Placement {
+    commit: String,
+    node: NodeId,
+    name: String,
 }
 
 fn unspend(spent: &mut Vec<Spent>, touches: &mut [BTreeMap<u128, BTreeSet<u64>>], backup: &Backup) {
@@ -452,12 +461,8 @@ pub struct World {
     /// The writes that a restore took from the server while a device still held them, each with
     /// the files the server may hold it in.
     exposed: BTreeMap<i64, Exposure>,
-    /// For each device, the names that L and the server held for the nodes whose shape a restore
-    /// took from the server, until the devices are quiet again. S forgets a node the restored
-    /// server holds with another shape, so the device sends the position it holds again, also one
-    /// that another device's lost commit gave it, or the name the server gave in place of the one
-    /// L holds.
     restored_names: Vec<BTreeMap<NodeId, BTreeSet<String>>>,
+    placements: Vec<BTreeSet<Placement>>,
     /// The files whose content a restore rolled back, each with the digest of the content the
     /// restored server holds, until the devices are quiet again.
     rolled_back: BTreeMap<NodeId, Vec<u8>>,
@@ -513,6 +518,7 @@ impl World {
             removed: vec![BTreeSet::new(); count],
             named: vec![BTreeSet::new(); devices.len()],
             restored_names: vec![BTreeMap::new(); devices.len()],
+            placements: vec![BTreeSet::new(); devices.len()],
             devices,
             seen: BTreeMap::new(),
             trace: false,
@@ -628,6 +634,7 @@ impl World {
                     held: self.held.clone(),
                     in_history: self.in_history.clone(),
                     spent: self.spent.clone(),
+                    placements: self.placements.clone(),
                     pending_authors: self.pending_authors.clone(),
                 });
             }
@@ -809,6 +816,7 @@ impl World {
             .collect();
         self.space.rewind(&backup.space, self.server_now());
         self.pending_authors = backup.pending_authors.clone();
+        self.placements.clone_from(&backup.placements);
         self.in_history = backup.in_history.clone();
         self.rewound
             .retain(|write, _| !stored(&backup.in_history, *write));
@@ -903,6 +911,15 @@ impl World {
         let changed: BTreeSet<&NodeId> = (before.keys().chain(after.keys()))
             .filter(|id| before.get(*id) != after.get(*id))
             .collect();
+        for (d, names) in self.restored_names.iter_mut().enumerate() {
+            for placement in self.placements[d].difference(&backup.placements[d]) {
+                names
+                    .entry(placement.node.clone())
+                    .or_default()
+                    .insert(placement.name.clone());
+            }
+        }
+        self.placements.clone_from(&backup.placements);
         for (device, names) in self.devices.iter_mut().zip(&mut self.restored_names) {
             device.link = None;
             for id in &changed {
@@ -1630,6 +1647,30 @@ impl World {
                 match self.space.commit(&session, now_ms, &sent) {
                     Ok(committed) => {
                         if let Some(record) = committed.record {
+                            let placed: BTreeSet<&str> = (sent.ops.iter())
+                                .zip(&committed.result.results)
+                                .filter(|(_, result)| {
+                                    matches!(
+                                        result.code(),
+                                        op_result::Code::Applied | op_result::Code::AppliedRenamed
+                                    )
+                                })
+                                .filter_map(|(op, _)| match &op.op {
+                                    Some(op::Op::Move(moved)) => Some(moved.node_id.as_str()),
+                                    Some(op::Op::CreateFile(made)) => Some(made.node_id.as_str()),
+                                    Some(op::Op::CreateDir(made)) => Some(made.node_id.as_str()),
+                                    _ => None,
+                                })
+                                .collect();
+                            self.placements[d].extend(
+                                crate::space::node_states(&record.changes)
+                                    .filter(|state| placed.contains(state.node_id.as_str()))
+                                    .map(|state| Placement {
+                                        commit: record.commit_id.clone(),
+                                        node: state.node_id.clone(),
+                                        name: state.name.clone(),
+                                    }),
+                            );
                             let built = self.built[d];
                             let nodes = self.space.nodes();
                             for node in &nodes {
@@ -2321,6 +2362,89 @@ mod tests {
     use koidrive_engine::tree::{Kind, Shape};
 
     use super::*;
+
+    #[test]
+    fn a_rejected_move_with_an_applied_edit_does_not_record_a_placement() {
+        let mut world = World::new(1);
+        let action = |kind, name| {
+            Step::User(Action {
+                kind,
+                target: 0,
+                parent: 0,
+                name,
+                text: 0,
+            })
+        };
+        world.phase(0, &[(0, action(1, 0))]).unwrap();
+        let placed = world.placements[0].clone();
+        world
+            .run(1, &[(0, action(2, 0)), (0, action(3, 2)), (0, Step::Scan)])
+            .unwrap();
+        world.commit(0, Reply::Served).unwrap();
+        let mut state = world.devices[0].engine.commits.state();
+        let flight = state.in_flight.as_mut().unwrap();
+        let moved = flight
+            .commit
+            .ops
+            .iter_mut()
+            .find_map(|op| match &mut op.op {
+                Some(op::Op::Move(moved)) => Some(moved),
+                _ => None,
+            })
+            .unwrap();
+        moved.new_parent_id = "00000000-0000-7000-8000-000000000001".into();
+        world.devices[0].engine.commits = commit::Commits::from_state(state).unwrap();
+        world.commit(0, Reply::Served).unwrap();
+        let node = world
+            .space
+            .nodes()
+            .into_iter()
+            .find(|node| node.name == "a")
+            .unwrap();
+        assert_eq!(node.current.unwrap().content.unwrap().mtime_ns, 2);
+        assert!(world.placements[0] == placed);
+    }
+
+    #[test]
+    fn a_restore_matches_placement_commits_even_when_their_sequence_is_reused() {
+        let mut world = World::new(2);
+        let action = |kind, name| {
+            Step::User(Action {
+                kind,
+                target: 0,
+                parent: 0,
+                name,
+                text: 0,
+            })
+        };
+        world.phase(0, &[(0, action(0, 0))]).unwrap();
+        world.step(0, &Step::Backup).unwrap();
+        world.phase(1, &[(0, action(3, 2))]).unwrap();
+        world.step(0, &Step::Backup).unwrap();
+        let head = world.space.head_seq();
+        let token = world.space.token_at(head).unwrap();
+        world.restore(true);
+        world.phase(2, &[]).unwrap();
+        assert_eq!(world.space.head_seq(), head);
+        assert_ne!(world.space.token_at(head).unwrap(), token);
+        let node = world
+            .space
+            .nodes()
+            .into_iter()
+            .find(|node| node.name == "b")
+            .unwrap()
+            .node_id;
+        world.restore(false);
+        assert_eq!(
+            world.restored_names[0],
+            BTreeMap::from([(node, BTreeSet::from(["b".into()]))])
+        );
+        assert!(world.restored_names[1].is_empty());
+        world.phase(3, &[]).unwrap();
+        assert!(world.restored_names.iter().all(BTreeMap::is_empty));
+        world.restore(false);
+        assert!(world.restored_names.iter().all(BTreeMap::is_empty));
+    }
 
     #[test]
     fn a_completed_phase_retires_only_live_devices_rollback_evidence() {

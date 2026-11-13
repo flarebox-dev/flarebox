@@ -3748,6 +3748,38 @@ fn a_lost_create_sent_again_under_a_new_name_is_taken_by_a_device_that_downloade
 }
 
 #[test]
+fn a_lost_rename_can_resend_the_conflict_name_its_own_commit_received() {
+    converge(
+        3,
+        &[
+            vec![(0, file("b")), (0, BACKUP)],
+            vec![
+                (2, BACKUP),
+                (2, rename(0, 0, "a")),
+                (2, SCAN),
+                (2, COMMIT),
+                (2, COMMIT),
+                (2, rename(0, 0, "a")),
+                (0, folder("a")),
+                (2, RESTORE),
+            ],
+            vec![
+                (0, rename(0, 0, "a")),
+                (0, SCAN),
+                (0, COMMIT),
+                (0, COMMIT),
+                (0, rename(0, 0, "b")),
+                (0, SCAN),
+                (0, COMMIT),
+                (0, COMMIT),
+                (0, RESTORE),
+            ],
+        ],
+    )
+    .unwrap();
+}
+
+#[test]
 fn a_lost_create_sent_again_under_a_new_name_is_taken_by_a_device_whose_download_a_crash_cut() {
     a_lost_create_its_author_sends_again_under_a_new_name(Step::Effect(Outcome::Crash(
         Cut::Placed,
