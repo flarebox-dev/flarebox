@@ -7850,3 +7850,65 @@ fn a_held_folder_another_devices_rules_leave_out_stays_held_when_renamed_while_s
     b.rest(&mut remote);
     assert_eq!(remote.names(), [".koiignore", "notes.txt"]);
 }
+
+#[test]
+fn a_link_moved_into_an_ignored_folder_beside_an_included_link_keeps_its_node() {
+    for (made, link) in [("source/file", "also"), ("also", "source/file")] {
+        let mut remote = Remote::new();
+        let (site, mut a) = linked(&mut remote, "a");
+        let settled = |a: &mut Device, remote: &mut Remote| {
+            for _ in 0..3 {
+                a.settle();
+                a.run(remote);
+            }
+        };
+        a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
+        fs::create_dir(site.root.join("source")).unwrap();
+        a.create(&mut remote, &site.root.join(made), b"kept");
+        fs::hard_link(site.root.join(made), site.root.join(link)).unwrap();
+        settled(&mut a, &mut remote);
+        let before = server_nodes(&remote);
+        let (file, also) = (live_id(&before, "file"), live_id(&before, "also"));
+        let live =
+            |nodes: &Nodes, id: &str| nodes.iter().any(|(_, node, live)| node == id && *live);
+
+        fs::create_dir(site.root.join("ignored")).unwrap();
+        fs::rename(
+            site.root.join("source/file"),
+            site.root.join("ignored/file"),
+        )
+        .unwrap();
+        settled(&mut a, &mut remote);
+        let moved = server_nodes(&remote);
+        assert!(
+            live(&moved, &file) && live(&moved, &also),
+            "{made}: {moved:?}"
+        );
+        assert_eq!(a.folder.engine.trees.check(), Ok(()));
+
+        fs::hard_link(site.root.join("also"), site.root.join("third")).unwrap();
+        settled(&mut a, &mut remote);
+        fs::remove_file(site.root.join("third")).unwrap();
+        settled(&mut a, &mut remote);
+        let linked = server_nodes(&remote);
+        assert!(
+            live(&linked, &file) && live(&linked, &also),
+            "{made}: {linked:?}"
+        );
+        assert_eq!(a.folder.engine.trees.check(), Ok(()));
+
+        fs::remove_file(site.root.join("also")).unwrap();
+        settled(&mut a, &mut remote);
+        let after = server_nodes(&remote);
+        assert!(live(&after, &file), "{made}: {after:?}");
+        assert_eq!(fs::read(site.root.join("ignored/file")).unwrap(), b"kept");
+        assert_eq!(a.folder.engine.trees.check(), Ok(()));
+
+        drop(a);
+        let mut a = site.start();
+        a.connect(&remote);
+        a.scan_until(|a| a.folder.scanned);
+        settled(&mut a, &mut remote);
+        assert_eq!(server_nodes(&remote), after, "{made}");
+    }
+}
