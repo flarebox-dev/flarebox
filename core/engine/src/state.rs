@@ -75,6 +75,10 @@ pub struct TreesState {
     /// The nodes whose local copy is in an ignored folder and whose name in L another entry took, each with the
     /// identity L held for it. L holds none of them, and R holds each live.
     pub displaced: BTreeMap<NodeId, FileIdentity>,
+    /// The files that wait for the other half of a move, each with when the wait began (section 5.10): one a scan of
+    /// part of the tree found gone, which `displaced` keeps meanwhile, and one L holds as a new link of a file at
+    /// another path.
+    pub halves: BTreeMap<NodeId, u64>,
     /// The files whose content an edit of this device set, each with the seq of its commit, while
     /// R holds that content.
     pub edited_here: BTreeMap<NodeId, u64>,
@@ -206,6 +210,7 @@ pub struct TreesChanges {
     pub outside: SetChanges<NodeId>,
     pub lost: SetChanges<NodeId>,
     pub displaced: MapChanges<NodeId, FileIdentity>,
+    pub halves: MapChanges<NodeId, u64>,
     pub edited_here: MapChanges<NodeId, u64>,
     pub moved_here: MapChanges<NodeId, MovedHere>,
     pub past_positions: MapChanges<NodeId, Vec<Agreed>>,
@@ -234,6 +239,7 @@ impl TreesChanges {
             outside,
             lost,
             displaced,
+            halves,
             edited_here,
             moved_here,
             past_positions,
@@ -258,6 +264,7 @@ impl TreesChanges {
             outside: set_changes(&before.outside, outside),
             lost: set_changes(&before.lost, lost),
             displaced: map_changes(&before.displaced, displaced),
+            halves: map_changes(&before.halves, halves),
             edited_here: map_changes(&before.edited_here, edited_here),
             moved_here: map_changes(&before.moved_here, moved_here),
             past_positions: map_changes(&before.past_positions, past_positions),
@@ -430,6 +437,8 @@ pub enum StateError {
     NotIgnoredLocal(NodeId),
     /// A node is recorded as displaced, but L holds it or R does not hold it live.
     NotDisplaced(NodeId),
+    /// A file waits for the other half of a move, but neither L holds it nor is it displaced.
+    NotHalf(NodeId),
     /// A file is recorded as edited by this device, but R does not hold the content of that
     /// commit.
     NotEditedHere(NodeId),

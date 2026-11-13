@@ -45,6 +45,7 @@ pub(crate) struct Engine {
     pub asked: bool,
     pub recovery_cause: Option<RecoveryCause>,
     unscanned: Option<BTreeSet<NodeId>>,
+    vanishing: Option<u64>,
 }
 
 /// What applying a batch of the log did.
@@ -113,6 +114,7 @@ impl Engine {
             asked: false,
             recovery_cause: None,
             unscanned: None,
+            vanishing: None,
         })
     }
 
@@ -711,8 +713,13 @@ impl Engine {
         &mut self,
         changes: &[Observed],
         now_ms: u64,
-        _whole: bool,
+        whole: bool,
     ) -> BTreeSet<NodeId> {
+        self.trees.release_halves(now_ms);
+        let mut touched = BTreeSet::new();
+        let mut gone = Gone::new();
+        self.take_links(changes, now_ms, &mut touched, &mut gone);
+        self.vanishing = (!whole).then_some(now_ms);
         let unscanned = self.unscanned.take();
         let mut before: Vec<Option<NodeId>> = changes
             .iter()
@@ -720,7 +727,9 @@ impl Engine {
                 Observed::Removed { path, .. } => local_at(&self.trees, path),
                 Observed::Renamed {
                     from, id, linked, ..
-                } => resolve(&self.trees, from, &file_identity(*id), *linked),
+                } => resolve(&self.trees, from, &file_identity(*id), *linked).filter(|node| {
+                    !touched.contains(node) || self.path_of(node).as_deref() == Some(from.as_path())
+                }),
                 Observed::Created { .. } | Observed::Modified { .. } => None,
             })
             .collect();
@@ -827,8 +836,6 @@ impl Engine {
                 self.trees.ignore_local(node);
             }
         }
-        let mut touched = BTreeSet::new();
-        let mut gone = Gone::new();
         let mut parked = Vec::new();
         for at in order {
             let (change, before) = (&changes[at], before[at].take());
@@ -854,13 +861,20 @@ impl Engine {
                         self.remove(&id, &moving, true, &mut touched, &mut gone);
                     }
                 }
-                Observed::Renamed { to, kind, id, .. } => {
+                Observed::Renamed {
+                    from, to, kind, id, ..
+                } => {
                     let node_kind = match kind {
                         EntryKind::File => Kind::File,
                         EntryKind::Dir => Kind::Dir,
                     };
                     if names(to).is_some_and(|to| self.trees.ignores(&to, node_kind)) {
                         let Some(node) = &before else { continue };
+                        if touched.contains(node)
+                            && self.path_of(node).as_deref() != Some(from.as_path())
+                        {
+                            continue;
+                        }
                         if to
                             .parent()
                             .and_then(|dir| local_at(&self.trees, dir))
@@ -914,7 +928,22 @@ impl Engine {
                                     *held == identity && self.trees.local().get(node).is_none()
                                 })
                                 .map(|(node, _)| node.clone())
+                        })
+                        .or_else(|| {
+                            (gone.values())
+                                .filter(|_| !linked)
+                                .find(|(node, held)| {
+                                    *held == identity && self.trees.local().get(node).is_none()
+                                })
+                                .map(|(node, _)| node.clone())
                         });
+                    let link = node.is_none()
+                        && *linked
+                        && *kind == EntryKind::File
+                        && !whole
+                        && identity.birth_ns.is_some()
+                        && (self.trees.locals_with_identity(&identity))
+                            .any(|other| !self.trees.recorded_local(other));
                     self.place(
                         node,
                         path,
@@ -926,6 +955,9 @@ impl Engine {
                         &mut touched,
                         &mut gone,
                     );
+                    if link && let Some(new) = local_at(&self.trees, path) {
+                        self.trees.hold_link(&new, now_ms);
+                    }
                 }
                 Observed::Modified {
                     path,
@@ -964,7 +996,73 @@ impl Engine {
                 self.remove(id, &BTreeSet::new(), false, &mut touched, &mut gone);
             }
         }
+        self.vanishing = None;
+        if whole {
+            self.trees.release_halves(u64::MAX);
+        }
         touched
+    }
+
+    fn take_links(
+        &mut self,
+        changes: &[Observed],
+        now_ms: u64,
+        touched: &mut BTreeSet<NodeId>,
+        gone: &mut Gone,
+    ) {
+        for change in changes {
+            let left = match change {
+                Observed::Removed { path, .. } => path,
+                Observed::Renamed {
+                    from,
+                    to,
+                    kind: EntryKind::File,
+                    ..
+                } if names(to).is_some_and(|to| self.trees.ignores(&to, Kind::File)) => from,
+                _ => continue,
+            };
+            let Some(top) = local_at(&self.trees, left) else {
+                continue;
+            };
+            let mut below = vec![top];
+            let mut next = 0;
+            while let Some(current) = below.get(next).cloned() {
+                below.extend(self.trees.local_children(&current).cloned());
+                next += 1;
+            }
+            for file in below {
+                let Some(identity) = (self.trees.local().get(&file))
+                    .filter(|node| node.shape.kind == Kind::File)
+                    .map(|node| node.identity)
+                else {
+                    continue;
+                };
+                let Some(link) = (self.trees.link_with_identity(&identity))
+                    .filter(|link| **link != file)
+                    .cloned()
+                else {
+                    continue;
+                };
+                let Some(path) = self.path_of(&link) else {
+                    continue;
+                };
+                let content =
+                    (self.trees.local().get(&link)).and_then(|node| node.shape.content.clone());
+                self.trees.remove_local(&link);
+                touched.insert(link);
+                self.place(
+                    Some(file),
+                    &path,
+                    EntryKind::File,
+                    identity,
+                    content,
+                    now_ms,
+                    &BTreeSet::new(),
+                    touched,
+                    gone,
+                );
+            }
+        }
     }
 
     fn scanned(&self, id: &str) -> bool {
@@ -1191,6 +1289,11 @@ impl Engine {
         for id in doomed {
             match displaced.contains(&id) {
                 true => self.trees.displace_local(&id),
+                false
+                    if outside
+                        && self
+                            .vanishing
+                            .is_some_and(|at| self.trees.vanish_local(&id, at)) => {}
                 false => self.trees.remove_local(&id),
             }
             touched.insert(id);
@@ -1954,6 +2057,7 @@ mod tests {
             asked: false,
             recovery_cause: None,
             unscanned: None,
+            vanishing: None,
         };
         Case {
             name,

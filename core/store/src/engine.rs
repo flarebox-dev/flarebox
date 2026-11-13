@@ -219,6 +219,13 @@ impl Tx<'_> {
         }
         let mut stmt = self
             .0
+            .prepare_cached("SELECT node_id, at_ms FROM move_halves")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            state.trees.halves.insert(row.get(0)?, row.get(1)?);
+        }
+        let mut stmt = self
+            .0
             .prepare_cached("SELECT node_id, seq FROM edited_here")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
@@ -379,6 +386,7 @@ impl Tx<'_> {
             "published_nodes",
             "pending_names",
             "recorded_nodes",
+            "move_halves",
             "edited_here",
             "moved_here",
             "past_positions",
@@ -438,6 +446,7 @@ impl Tx<'_> {
             outside,
             lost,
             displaced,
+            halves,
             edited_here,
             moved_here,
             past_positions,
@@ -576,6 +585,12 @@ impl Tx<'_> {
             },
         )?;
         self.write_recorded(outside, lost, displaced)?;
+        self.write_map(
+            halves,
+            "DELETE FROM move_halves WHERE node_id = ?1",
+            "INSERT OR REPLACE INTO move_halves (node_id, at_ms) VALUES (?1, ?2)",
+            |put, node, at| put.execute(params![node, at]),
+        )?;
         self.write_map(
             edited_here,
             "DELETE FROM edited_here WHERE node_id = ?1",

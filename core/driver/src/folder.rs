@@ -130,6 +130,7 @@ pub(crate) struct Folder {
     asked: BTreeSet<String>,
     /// When the [`Work::RetryAfter`] that is out ends.
     retry_at: Option<Instant>,
+    halves_at: Option<u64>,
     /// Tests stop the task after this many more store transactions, as a crash right after one would.
     #[cfg(test)]
     crash_after: Option<usize>,
@@ -182,7 +183,9 @@ pub(crate) enum Work {
     Subscribe(Resume),
     /// Read every page of the tree, then every page of the trash when `trash` is set. Answered with
     /// [`Folder::listed`].
-    List { trash: bool },
+    List {
+        trash: bool,
+    },
     /// Read on from `Listing` after a wait.
     ListAfter(Duration, Listing),
     /// [`Pending::stage`]. Answered with [`Folder::staged`].
@@ -197,6 +200,7 @@ pub(crate) enum Work {
     ResendAfter(Duration),
     /// Answered with [`Folder::retry`] after the wait. A later one replaces it, and always ends earlier.
     RetryAfter(Duration),
+    HalvesAfter(Duration),
 }
 
 /// The pages of the tree read so far, the cursor of the next page and how many times in a row a page failed. When
@@ -321,6 +325,7 @@ impl Folder {
             refused_nodes: BTreeMap::new(),
             asked,
             retry_at: None,
+            halves_at: None,
             #[cfg(test)]
             crash_after: None,
         })
@@ -473,8 +478,37 @@ impl Folder {
         self.disk
             .observed(batch, &mut self.engine, &mut self.store)?;
         let mut work = Vec::new();
+        self.wait_for_halves(&mut work);
         self.drive(&mut work)?;
         Ok(work)
+    }
+
+    pub fn halves_ended(&mut self) -> Result<Vec<Work>, Stop> {
+        if let Some(due) = self.halves_at.take() {
+            self.step(|engine, _| {
+                engine.trees.release_halves(due);
+                Ok(())
+            })?;
+        }
+        let mut work = Vec::new();
+        self.wait_for_halves(&mut work);
+        self.drive(&mut work)?;
+        Ok(work)
+    }
+
+    fn wait_for_halves(&mut self, work: &mut Vec<Work>) {
+        let due = self.engine.trees.halves_due();
+        if due == self.halves_at {
+            return;
+        }
+        self.halves_at = due;
+        if let Some(due) = due {
+            let now_ms = (SystemTime::now().duration_since(UNIX_EPOCH))
+                .map_or(0, |since| since.as_millis() as u64);
+            work.push(Work::HalvesAfter(Duration::from_millis(
+                due.saturating_sub(now_ms),
+            )));
+        }
     }
 
     /// The observer has scanned the folder once. Design §2.7 leaves a node the server refused an op for out of
@@ -1807,6 +1841,7 @@ impl FolderTask {
             let mut send: Slot<'_, Result<CommitResult, CallError>> = None;
             let mut wait: Slot<'_, ()> = None;
             let mut retry: Slot<'_, ()> = None;
+            let mut halves: Slot<'_, ()> = None;
             let mut recheck = tokio::time::interval(CLAIM_RECHECK);
             let mut reclaim = tokio::time::interval(RECLAIM_TRASH);
             reclaim.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1839,6 +1874,7 @@ impl FolderTask {
                     }
                     () = finished(&mut wait) => folder.resend(),
                     () = finished(&mut retry) => folder.retry(),
+                    () = finished(&mut halves) => folder.halves_ended(),
                     () = self.requests.notified() => folder.requested(),
                     _ = reclaim.tick() => {
                         folder.reclaim_trash(self.trash_cap);
@@ -1898,6 +1934,9 @@ impl FolderTask {
                         }
                         Work::RetryAfter(after) => {
                             retry = Some(Box::pin(tokio::time::sleep(after)))
+                        }
+                        Work::HalvesAfter(after) => {
+                            halves = Some(Box::pin(tokio::time::sleep(after)))
                         }
                     }
                 }

@@ -343,11 +343,21 @@ impl Device {
         Ok(unreadable)
     }
 
+    fn end_halves(&mut self) {
+        let Some(at) = (self.work.iter()).position(|work| matches!(work, Work::HalvesAfter(_))) else {
+            return;
+        };
+        self.work.remove(at);
+        let step = self.folder.halves_ended();
+        self.take(step).unwrap();
+    }
+
     /// Observes until `done`.
     fn scan_until(&mut self, done: impl Fn(&Device) -> bool) {
         eventually("the observer brings the awaited state", || {
             done(self) || {
                 self.scan(Duration::from_millis(100));
+                self.end_halves();
                 false
             }
         });
@@ -460,6 +470,7 @@ impl Device {
             }
             Work::ResendAfter(_) => self.folder.resend(),
             Work::RetryAfter(_) => self.folder.retry(),
+            Work::HalvesAfter(_) => self.folder.halves_ended(),
         };
         self.take(step)
     }
@@ -483,6 +494,7 @@ impl Device {
                 Work::Send(_) => "send",
                 Work::ResendAfter(_) => "wait",
                 Work::RetryAfter(_) => "retry",
+                Work::HalvesAfter(_) => "wait for halves",
             });
             self.perform(work, remote)?;
         }

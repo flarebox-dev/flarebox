@@ -31,6 +31,10 @@ pub const REPLACED_VERSIONS_KEPT: usize = 64;
 /// [`TreesState::past_positions`]: crate::state::TreesState::past_positions
 pub const PAST_POSITIONS_KEPT: usize = 64;
 
+/// How long a file that left L in a scan of part of the tree, or a file a link made at another path, waits for the
+/// other half of a move to arrive in a later scan before it counts as deleted or as created (section 5.10).
+pub const HALF_WAIT_MS: u64 = 2_000;
+
 /// An S update of an acknowledged op that waits until S stays a valid tree with it
 /// ([`Trees::waiting`]).
 #[derive(Clone, Debug, PartialEq)]
@@ -234,6 +238,7 @@ pub struct Trees {
     /// The nodes of `outside`, and those L held under them, that left L because another entry took their name
     /// ([`Trees::displace_local`]), each with the identity L held for it.
     displaced: TrackedMap<NodeId, FileIdentity>,
+    halves: TrackedMap<NodeId, u64>,
     /// False from a restore until the rules of a full scan are in force.
     rules_known: bool,
     /// The folders whose rules the last scan of each could not read, by node: a folder renamed is the same folder,
@@ -308,6 +313,7 @@ impl Trees {
             outside: TrackedSet::default(),
             lost: TrackedSet::default(),
             displaced: TrackedMap::default(),
+            halves: TrackedMap::default(),
             rules_known: true,
             unknown_rules: BTreeSet::new(),
             asked: BTreeSet::new(),
@@ -606,6 +612,9 @@ impl Trees {
         }
         if node.trashed {
             self.displaced.remove(&id);
+            if self.l.get(&id).is_none() {
+                self.halves.remove(&id);
+            }
         }
         if (self.edited_here.get(&id)).is_some_and(|&seq| node.trashed || node.edit_rev != seq) {
             self.edited_here.remove(&id);
@@ -769,6 +778,9 @@ impl Trees {
         self.count_held_trash(id, false);
         self.count_trashed(id, false);
         self.displaced.remove(id);
+        if self.l.get(id).is_none() {
+            self.halves.remove(id);
+        }
         self.edited_here.remove(id);
         self.replaced_versions.remove(id);
         self.resends.remove(id);
@@ -787,6 +799,9 @@ impl Trees {
     /// Sets L. A reverted node that L now holds at a position other than its old one and R's was
     /// moved by the user, and is no longer reverted: that move is committed instead.
     pub fn set_local(&mut self, id: NodeId, node: LocalNode) {
+        if self.l.get(&id).is_none() && self.halves.remove(&id).is_some() {
+            self.mark(&id);
+        }
         if let Some(old) = self.l.get(&id) {
             if !old.shape.same(&node.shape) && self.resends.remove(&id) {
                 let restored = (self
@@ -853,6 +868,7 @@ impl Trees {
     }
 
     pub fn remove_local(&mut self, id: &str) {
+        self.halves.remove(id);
         self.parked_as.remove(id);
         self.unknown_rules.remove(id);
         self.outside.remove(id);
@@ -1109,6 +1125,70 @@ impl Trees {
         }
     }
 
+    /// Takes a file out of L as [`Trees::remove_local`] does, after a scan of part of the tree found it gone, and keeps
+    /// it as [`Trees::displace_local`] does until [`HALF_WAIT_MS`] after `at_ms`: an entry with its identity that a
+    /// later scan finds is the file moved, and the file counts as deleted only once the wait ends
+    /// ([`Trees::release_halves`]). A file R does not hold live, or whose identity has no birth time, has nothing to
+    /// wait for, and returns false without a change.
+    pub fn vanish_local(&mut self, id: &str, at_ms: u64) -> bool {
+        let Some(node) = self.l.get(id) else {
+            return false;
+        };
+        let identity = node.identity;
+        if node.parked
+            || node.shape.kind != Kind::File
+            || identity.birth_ns.is_none()
+            || self.r.live(id).is_none()
+            || self.recorded_local(id)
+        {
+            return false;
+        }
+        self.remove_local(id);
+        self.displaced.insert(id.to_owned(), identity);
+        self.halves.insert(id.to_owned(), at_ms);
+        true
+    }
+
+    /// Holds a file L just took from a scan of part of the tree as a new link of a file L holds at another path, until
+    /// [`HALF_WAIT_MS`] after `at_ms`: the other link may be the old path of a move that a later scan reports. Nothing
+    /// is planned for the file meanwhile ([`Trees::excluded`]).
+    pub fn hold_link(&mut self, id: &str, at_ms: u64) {
+        if self.l.get(id).is_some() {
+            self.halves.insert(id.to_owned(), at_ms);
+        }
+    }
+
+    /// The file [`Trees::hold_link`] holds with `identity`: the greatest ID when several have it.
+    pub fn link_with_identity(&self, identity: &FileIdentity) -> Option<&NodeId> {
+        (self.halves.keys().rev()).find(|id| {
+            (self.l.get(id)).is_some_and(|node| node.identity == *identity && !node.parked)
+        })
+    }
+
+    /// Ends every wait of [`Trees::vanish_local`] and [`Trees::hold_link`] that began at least [`HALF_WAIT_MS`]
+    /// before `now_ms`. A wait that began after `now_ms` counts as begun at `now_ms`.
+    pub fn release_halves(&mut self, now_ms: u64) {
+        let due: Vec<NodeId> = (self.halves.iter())
+            .filter(|(_, at)| (**at).min(now_ms).saturating_add(HALF_WAIT_MS) <= now_ms)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            self.halves.remove(&id);
+            if self.l.get(&id).is_none() {
+                self.displaced.remove(&id);
+            }
+            self.mark(&id);
+        }
+    }
+
+    /// When the earliest wait of [`Trees::release_halves`] ends, if any is left.
+    pub fn halves_due(&self) -> Option<u64> {
+        self.halves
+            .values()
+            .min()
+            .map(|at| at.saturating_add(HALF_WAIT_MS))
+    }
+
     /// The nodes [`Trees::displace_local`] took out of L, each with the identity L held for it.
     pub fn displaced_local(&self) -> &BTreeMap<NodeId, FileIdentity> {
         &self.displaced
@@ -1306,7 +1386,10 @@ impl Trees {
     }
 
     fn ignored_by_paths(&self, id: &str) -> Option<bool> {
-        if self.recorded_local(id) || self.displaced.contains_key(id) {
+        if self.recorded_local(id)
+            || self.displaced.contains_key(id)
+            || self.halves.contains_key(id)
+        {
             return Some(true);
         }
         let ignored =
@@ -2749,6 +2832,7 @@ impl Trees {
             outside: (*self.outside).clone(),
             lost: (*self.lost).clone(),
             displaced: (*self.displaced).clone(),
+            halves: (*self.halves).clone(),
             edited_here: (*self.edited_here).clone(),
             moved_here: (*self.moved_here).clone(),
             past_positions: (*self.past_positions).clone(),
@@ -2793,6 +2877,7 @@ impl Trees {
             outside,
             lost,
             displaced,
+            halves,
             rules_known: _,
             unknown_rules: _,
             asked: _,
@@ -2819,6 +2904,7 @@ impl Trees {
             outside: outside.take_changes(),
             lost: lost.take_changes(),
             displaced: displaced.take_changes(),
+            halves: halves.take_changes(),
             edited_here: edited_here.take_changes(),
             moved_here: moved_here.take_changes(),
             past_positions: past_positions.take_changes(),
@@ -2880,6 +2966,10 @@ impl Trees {
         if let Some(id) = state.displaced.keys().find(|id| !kept(id)) {
             return Err(StateError::NotDisplaced(id.clone()));
         }
+        let waits = |id: &&NodeId| self.l.get(id).is_some() || state.displaced.contains_key(*id);
+        if let Some(id) = state.halves.keys().find(|id| !waits(id)) {
+            return Err(StateError::NotHalf(id.clone()));
+        }
         let edited = |(id, seq): &(&NodeId, &u64)| {
             (self.r.get(id)).is_some_and(|remote| !remote.trashed && remote.edit_rev == **seq)
         };
@@ -2929,6 +3019,7 @@ impl Trees {
             outside,
             lost,
             displaced,
+            halves,
             edited_here,
             moved_here,
             past_positions,
@@ -2955,6 +3046,7 @@ impl Trees {
         self.outside = outside.into();
         self.lost = lost.into();
         self.displaced = displaced.into();
+        self.halves = halves.into();
         self.edited_here = edited_here.into();
         self.moved_here = moved_here.into();
         self.past_positions = past_positions.into();
