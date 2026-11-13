@@ -512,6 +512,7 @@ impl Engine {
             }
         }
         if behind {
+            (self.trees).keep_unsent_edits(self.commits.edited_in_flight());
             (self.trees).forget_lost(
                 trashed,
                 edited,

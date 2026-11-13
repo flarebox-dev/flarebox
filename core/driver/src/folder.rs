@@ -1066,8 +1066,10 @@ impl Folder {
             if adopt {
                 engine.commits.adopt(welcome.device_seq);
             }
+            let in_flight = engine.commits.edited_in_flight();
             let reconnect = engine.commits.connected(welcome);
             if reconnect == Reconnect::AheadOfServer {
+                engine.trees.keep_unsent_edits(in_flight);
                 engine.server_behind(tx)?;
             }
             Ok(reconnect)
@@ -1306,9 +1308,11 @@ impl Folder {
         };
         let before = self.engine.commits.problems().clone();
         let failure = self.step(|engine, tx| {
+            let in_flight = engine.commits.edited_in_flight();
             let failure = (engine.commits.failed(&refusal.0))
                 .map_err(|error| Stop::Protocol(format!("a refused commit: {error:?}")))?;
             if matches!(failure, Failure::Resync) {
+                engine.trees.keep_unsent_edits(in_flight);
                 engine.server_behind(tx)?;
             }
             Ok(failure)

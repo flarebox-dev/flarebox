@@ -216,3 +216,34 @@ fn a_lost_own_move_the_server_holds_again_as_l_and_s_do_is_no_change() {
     assert_eq!(trees.class("n"), Class::InSync);
     assert!(trees.state().local_changes.is_empty());
 }
+
+#[test]
+fn an_edit_in_flight_that_a_reconnect_drops_after_a_loss_is_sent_again_where_another_device_moved_the_file() {
+    let (mut commits, mut trees, mut ids) = an_edit_in_flight_of_a_file_another_device_moved();
+    let in_flight = commits.edited_in_flight();
+    assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
+    assert!(commits.in_flight().is_none());
+    trees.keep_unsent_edits(in_flight);
+    list_a_at_its_old_place_after_a_loss(&mut trees, &commits);
+    let ops = ops(&build(&mut commits, &mut trees, &mut ids).unwrap());
+    assert!(ops.contains(&update("a", 3)), "{ops:?}");
+    assert!(
+        !ops.iter().any(|op| matches!(op, op::Op::CreateFile(create) if create.content == Some(content(3)))),
+        "{ops:?}"
+    );
+}
+
+#[test]
+fn an_edit_still_in_flight_when_the_listing_after_a_loss_arrives_is_sent_again_where_another_device_moved_the_file() {
+    let (mut commits, mut trees, mut ids) = an_edit_in_flight_of_a_file_another_device_moved();
+    trees.keep_unsent_edits(commits.edited_in_flight());
+    list_a_at_its_old_place_after_a_loss(&mut trees, &commits);
+    let refused = commits.failed(&refusal(error::Code::AheadOfServer, 0)).unwrap();
+    assert_eq!(refused, Failure::Resync);
+    let ops = ops(&build(&mut commits, &mut trees, &mut ids).unwrap());
+    assert!(ops.contains(&update("a", 3)), "{ops:?}");
+    assert!(
+        !ops.iter().any(|op| matches!(op, op::Op::CreateFile(create) if create.content == Some(content(3)))),
+        "{ops:?}"
+    );
+}

@@ -1399,6 +1399,7 @@ impl World {
         if self.devices[d].engine.history != welcome.history_id {
             return self.recover(d, "the server's history changed".into());
         }
+        let in_flight = self.devices[d].engine.commits.edited_in_flight();
         match self.devices[d].engine.commits.connected(&welcome) {
             Reconnect::Recovery => {
                 return self.recover(
@@ -1411,6 +1412,7 @@ impl World {
             }
             Reconnect::AheadOfServer => {
                 note(&mut self.seen, "reconnect finds the server lost commits");
+                self.devices[d].engine.trees.keep_unsent_edits(in_flight);
                 self.devices[d].engine.behind = true;
             }
             Reconnect::Resend if welcome.device_seq > self.devices[d].engine.commits.accepted() => {
@@ -1494,6 +1496,7 @@ impl World {
                     }
                 }
                 if *behind {
+                    trees.keep_unsent_edits(commits.edited_in_flight());
                     trees.forget_lost(
                         trashed,
                         edited,
@@ -1553,6 +1556,7 @@ impl World {
                 let device = &mut self.devices[d];
                 let refused = |error| Failure::Broken(format!("the answer was refused: {error:?}"));
                 let problems = device.engine.commits.problems().len();
+                let in_flight = device.engine.commits.edited_in_flight();
                 match result {
                     Ok(result) => {
                         note(
@@ -1598,6 +1602,7 @@ impl World {
                         ),
                         commit::Failure::Resync => {
                             note(&mut self.seen, "commit ahead of the server, R listed again");
+                            device.engine.trees.keep_unsent_edits(in_flight);
                             device.engine.behind = true;
                             let listed = listing(&self.space);
                             (device.link.as_mut()).expect("answered").inbox.push(listed);

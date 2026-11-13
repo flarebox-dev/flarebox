@@ -1211,3 +1211,50 @@ fn owed_mv(node: &str, parent: &str, name: &str, from: &str) -> op::Op {
         }),
     })
 }
+
+fn an_edit_in_flight_of_a_file_another_device_moved() -> (Commits, Trees, IdGen) {
+    let mut trees = trees(&[synced("a", file(ROOT, "a", 1))]);
+    trees.set_remote("a".into(), version(remote(file(ROOT, "a", 1)), "v1"));
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    commit_file(&mut trees, &mut commits, &mut ids, "pad", 2);
+    let moved = RemoteNode {
+        content_rev: 3,
+        edit_rev: 3,
+        meta_rev: 3,
+        ..version(remote(file(ROOT, "b", 2)), "v2")
+    };
+    trees.set_remote("a".into(), moved);
+    trees.set_local("a".into(), local(file(ROOT, "b", 2), 1));
+    trees.settle();
+    assert_eq!(trees.class("a"), Class::InSync);
+    trees.set_local("a".into(), local(file(ROOT, "b", 3), 1));
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("a", 3)]);
+    (commits, trees, ids)
+}
+
+fn list_a_at_its_old_place_after_a_loss(trees: &mut Trees, commits: &Commits) {
+    let (trashed, edited, moved) = (
+        trees.trashed_here(),
+        trees.edited_here(),
+        trees.moved_here(),
+    );
+    let synced = trees.taken_from_others(|seq| commits.lost_here(seq));
+    let untaken = trees.untaken_changes(|seq| commits.lost_here(seq));
+    let records = trees.remote_records();
+    trees.set_listed_remote("a".into(), version(remote(file(ROOT, "a", 1)), "v1"));
+    trees.remove_remote("pad");
+    trees.forget_lost(
+        trashed,
+        edited,
+        synced,
+        moved,
+        untaken,
+        records,
+        commits.held_through(),
+        commits.accepted(),
+    );
+    trees.settle();
+    assert_eq!(trees.synced().live("a"), Some(&file(ROOT, "b", 1)));
+}

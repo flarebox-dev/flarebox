@@ -1614,9 +1614,10 @@ impl Trees {
     /// below `held_through`, or with a record R held earlier, or when the store upgrade
     /// recorded the move without those records. So the position this device set is sent again,
     /// unless another device moved the node after the loss. S takes R's position for these nodes
-    /// before `edited` and `synced` compare positions, so a file whose move and edit were both
-    /// lost is sent again as both. Where S cannot take that position yet, it waits, and `edited`
-    /// compares R's position with the one that waits, so the lost edit waits with it.
+    /// before `edited` and `synced` take R's content at the position S holds, so a file whose
+    /// move and edit were both lost is sent again as both. Where S cannot take that position yet,
+    /// it waits, and `edited` takes R's content at the position that waits, so the lost edit waits
+    /// with it.
     ///
     /// `trashed` lists what deletes of this device had trashed before the bootstrap
     /// ([`Trees::trashed_here`]), and `held_through` the seq of the newest commit of this device the
@@ -1630,16 +1631,16 @@ impl Trees {
     /// commits had.
     ///
     /// `edited` lists the files whose content an edit of this device set before the bootstrap
-    /// ([`Trees::edited_here`]), each with the seq of that edit's commit. A file of it that R now
-    /// holds, live or in the trash, at the position S holds, with content of no revision above
-    /// `held_through` or at a version the log replaced for it before
-    /// ([`TreesState::replaced_versions`]), lost the edit. S takes
-    /// R's shape for it, so the content L holds is sent again as an edit instead of being kept
-    /// beside R's as a conflict copy. A delete R holds trashed the content from before the edit, so
-    /// the edit beats it (R8): the server revives the file instead of this device moving the edit
-    /// to the local trash. That also undoes a delete by a device that saw the edit before the loss,
-    /// which the engine cannot tell apart: the revived file can be deleted again, while an edit in
-    /// the local trash would be missing from the server.
+    /// ([`Trees::edited_here`]), each with the seq of that edit's commit, and the files of
+    /// [`Trees::unsent_edits`] whose content in L differs from S's. A file of it that R now holds,
+    /// live or in the trash, with content of no revision above `held_through` or at a version the
+    /// log replaced for it before ([`TreesState::replaced_versions`]), lost the edit. S takes R's
+    /// content for it at the position S holds, so the content L holds is sent again as an edit
+    /// instead of being kept beside R's as a conflict copy. A delete R holds trashed the content
+    /// from before the edit, so the edit beats it (R8): the server revives the file instead of this
+    /// device moving the edit to the local trash. That also undoes a delete by a device that saw the
+    /// edit before the loss, which the engine cannot tell apart: the revived file can be deleted
+    /// again, while an edit in the local trash would be missing from the server.
     ///
     /// A file S forgets that L and R hold may hold, or later get, an edit of this device to the
     /// bytes R now holds, such as the content the server went back to (GUN-438). So may a file of
@@ -1743,6 +1744,13 @@ impl Trees {
                         || seen(id, remote)
                 })
         };
+        let edited: Vec<(NodeId, u64)> = (edited.into_iter())
+            .chain(
+                (self.unsent_edits.iter())
+                    .filter(|id| self.local_content_differs(id))
+                    .map(|id| (id.clone(), u64::MAX)),
+            )
+            .collect();
         let lost_here = (moved.iter().map(|(id, moved)| (id, moved.seq)))
             .chain(edited.iter().map(|(id, seq)| (id, *seq)))
             .filter(|(id, seq)| *seq > held_through && self.l.get(id).is_some())
@@ -1817,10 +1825,14 @@ impl Trees {
                     remote.content_rev <= held_through
                         || replaced.is_some_and(|versions| versions.contains(&remote.version_id))
                 })
-                .filter(|remote| {
-                    (waits_at.or(self.s.live(&id))).is_some_and(|s| s.same_position(&remote.shape))
+                .and_then(|remote| {
+                    let s = waits_at.or(self.s.live(&id))?;
+                    Some(Shape {
+                        parent: s.parent.clone(),
+                        name: s.name.clone(),
+                        ..remote.shape.clone()
+                    })
                 })
-                .map(|remote| remote.shape.clone())
             else {
                 continue;
             };
@@ -2084,6 +2096,26 @@ impl Trees {
         &self.unsent_edits
     }
 
+    /// Records each file of `ids` whose content in L differs from S's as an unsent edit
+    /// ([`Trees::unsent_edits`]).
+    pub fn keep_unsent_edits(&mut self, ids: impl IntoIterator<Item = NodeId>) {
+        for id in ids {
+            if self.local_content_differs(&id) {
+                self.unsent_edits.insert(id.clone());
+                self.mark(&id);
+            }
+        }
+    }
+
+    fn local_content_differs(&self, id: &str) -> bool {
+        let local = self.l.live(id).and_then(|shape| shape.content.as_ref());
+        let synced = self.s.live(id).and_then(|shape| shape.content.as_ref());
+        match (local, synced) {
+            (Some(local), Some(synced)) => !same_content(local, synced),
+            (local, _) => local.is_some(),
+        }
+    }
+
     /// Records that the server acknowledged an edit of `id` to `sent`, so L's content is no longer
     /// an edit it lacks ([`Trees::unsent_edits`]), unless L has since taken other content.
     pub fn sent_edit(&mut self, id: &str, sent: Option<&Content>) {
@@ -2097,12 +2129,7 @@ impl Trees {
     }
 
     fn record_edit_in_trash(&mut self, id: &str) {
-        let local = self.l.live(id).and_then(|shape| shape.content.as_ref());
-        let synced = self.s.live(id).and_then(|shape| shape.content.as_ref());
-        let edited = match (local, synced) {
-            (Some(local), Some(synced)) => !same_content(local, synced),
-            (local, _) => local.is_some(),
-        };
+        let edited = self.local_content_differs(id);
         let trashed = self.r.get(id).is_some_and(|remote| remote.trashed);
         if edited && trashed && !self.waiting.contains_key(id) {
             self.unsent_edits.insert(id.to_owned());
