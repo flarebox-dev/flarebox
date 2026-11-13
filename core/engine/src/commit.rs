@@ -2319,6 +2319,7 @@ fn plan(
             Want::Create { id, shape } => {
                 if shape.kind == Kind::Dir {
                     let targets = scratch.merge_targets(&shape.parent);
+                    scratch.protected.extend(targets.iter().cloned());
                     scratch.merges.insert(id.clone(), targets);
                 }
                 scratch.place(&id, &shape.parent, &shape.name, shape.kind);
@@ -2635,6 +2636,7 @@ struct Scratch {
     /// device may have renamed one of them since R. Deleting one in the same commit would trash
     /// what the create brings, so their deletes wait for the next commit.
     merges: BTreeMap<NodeId, Vec<NodeId>>,
+    protected: BTreeSet<NodeId>,
     /// For each node a queued restore names, how many wants that change it are not emitted yet,
     /// and one more while the node is not settled: this build leaves it out, so its changes are
     /// not among the wants, or S has not taken what L and R agree on. The restore waits for all
@@ -2650,6 +2652,7 @@ impl Scratch {
             nodes: BTreeMap::new(),
             children: BTreeMap::new(),
             merges: BTreeMap::new(),
+            protected: BTreeSet::new(),
             unsent: BTreeMap::new(),
         };
         for (id, node) in trees.remote().iter() {
@@ -2700,11 +2703,11 @@ impl Scratch {
             Want::Content { .. } => Fit::Valid,
             Want::Delete { id, members } => {
                 let subtree = self.subtree(id);
-                let merged =
-                    |node: &NodeId| self.merges.values().flatten().any(|into| into == node);
                 if !subtree.iter().all(|node| members.contains(node)) {
                     Fit::Wait
-                } else if merged(id) || subtree.iter().any(merged) {
+                } else if self.protected.contains(id)
+                    || subtree.iter().any(|node| self.protected.contains(node))
+                {
                     Fit::Merged
                 } else {
                     Fit::Valid
