@@ -1201,17 +1201,18 @@ fn run_ignoring(
         );
         let open = |question: &Question| commits.questions().iter().any(|o| o.id == question.id);
         if let Some(question) = pending.take_if(|question| !open(question)) {
-            let asked_again = (commits.questions().iter().flat_map(Question::holds))
-                .any(|id| question.shown.contains_key(id));
-            if !asked_again {
-                let contents = (question.shown.values()).map(|shape| shape.content.clone());
-                let contents = written(contents, 1);
-                local_writes.retain(|write| !contents.contains(write));
-                for id in question.shown.keys() {
-                    device.touched.remove(id);
-                }
-                discarded.extend(question.shown);
+            let asked_again: BTreeSet<&String> =
+                (commits.questions().iter().flat_map(Question::holds)).collect();
+            let shown: BTreeMap<String, koidrive_engine::tree::Shape> = (question.shown)
+                .into_iter()
+                .filter(|(id, _)| !asked_again.contains(id))
+                .collect();
+            let contents = written(shown.values().map(|shape| shape.content.clone()), 1);
+            local_writes.retain(|write| !contents.contains(write));
+            for id in shown.keys() {
+                device.touched.remove(id);
             }
+            discarded.extend(shown);
         }
         // A discarded entry the user changed, or a discarded folder that holds an entry the answer
         // did not discard there, is the user's, and so is every discarded folder above it.
