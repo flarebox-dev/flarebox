@@ -1279,6 +1279,7 @@ impl Commits {
                         synced.set(&outcome.node_id, edited);
                         synced.set(id, None);
                         rekey(trees, id, &outcome.node_id);
+                        trees.sent_edit(&outcome.node_id, update.content.as_ref());
                     }
                     if applied && !update.resend {
                         trees.record_edited(id, update.content.as_ref());

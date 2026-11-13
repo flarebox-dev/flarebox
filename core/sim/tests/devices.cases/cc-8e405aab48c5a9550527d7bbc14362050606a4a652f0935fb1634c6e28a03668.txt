@@ -1,0 +1,1 @@
+cc 8e405aab48c5a9550527d7bbc14362050606a4a652f0935fb1634c6e28a03668 # shrinks to devices = 2, an edit the server forks into a copy that another device deletes before the answer arrives is sent again over the delete
