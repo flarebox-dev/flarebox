@@ -2908,6 +2908,22 @@ fn a_device_that_deleted_the_file_keeps_the_authors_resent_edit_it_pulled() {
 }
 
 #[test]
+fn a_device_that_deleted_the_file_keeps_the_authors_edit_sent_after_the_resend_reached_the_author()
+{
+    let mut world = a_lost_edit_three_devices_held(overwrite(0));
+    let mut steps = connect(&[1, 0, 2]);
+    steps.extend([(2, delete(0)), (2, SCAN)]);
+    steps.extend([(1, COMMIT), (1, COMMIT)]);
+    steps.extend([(0, DELIVER); 8]);
+    steps.extend([(2, DELIVER); 8]);
+    steps.extend([(0, SCAN), (0, COMMIT), (0, COMMIT)]);
+    steps.extend([(2, DELIVER); 8]);
+    steps.extend(commit(2));
+    world.phase(2, &steps).unwrap();
+    assert!(every_device_holds_a_file(&world));
+}
+
+#[test]
 fn a_delete_planned_against_a_resend_it_pulled_trashes_the_file() {
     let mut world = converge(
         2,

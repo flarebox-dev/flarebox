@@ -449,7 +449,8 @@ impl Trees {
         let edited_over_delete = local_gone
             && self.acknowledged(&id).is_some()
             && (self.r.get(&id)).is_some_and(|old| {
-                old.content_rev == node.content_rev && old.edit_rev != node.edit_rev
+                old.edit_rev != node.edit_rev
+                    && (old.content_rev == node.content_rev || old.edit_rev < old.content_rev)
             });
         if let Some(replaced) = (self.r.get(&id))
             .map(|old| &old.version_id)
