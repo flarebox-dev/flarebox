@@ -422,11 +422,12 @@ fn main() -> ExitCode {
                     false => Vec::new(),
                 };
                 let succeeded = outcome.is_ok();
+                let prompt_eligible = outcome.as_ref().is_ok_and(|done| done.exit == 0);
                 if json && daemon_run && succeeded {
                     return ExitCode::SUCCESS;
                 }
                 let exit = finish(command_name, json, outcome, pending);
-                if ask && succeeded
+                if ask && prompt_eligible
                     && let Err(error) = telemetry::ask(&telemetry_paths, &work_terminal).await
                 {
                     return finish(command_name, json, Err(error), Vec::new());

@@ -73,7 +73,7 @@ fn session(
     });
     let mut arguments = vec!["setup", "--interactive", "--no-browser"];
     arguments.extend(args);
-    let output = terminal_run(home.path(), input, &arguments, vars, rich, interrupt);
+    let output = terminal_run(home.path(), input, &arguments, vars, rich, interrupt, false);
     stop.send(()).unwrap();
     server.join().unwrap();
     (home, output)
@@ -86,6 +86,7 @@ fn terminal_run(
     vars: &[(&str, &str)],
     rich: bool,
     interrupt: Option<(usize, rustix::process::Signal)>,
+    queued_enter: bool,
 ) -> Output {
     let master = rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR).unwrap();
     rustix::pty::grantpt(&master).unwrap();
@@ -131,8 +132,11 @@ fn terminal_run(
     for (key, value) in vars {
         command.env(key, value);
     }
-    let mut child = command.spawn().unwrap();
     let mut terminal = File::from(master);
+    if queued_enter {
+        terminal.write_all(b"\r").unwrap();
+    }
+    let mut child = command.spawn().unwrap();
     let mut text = String::new();
     let answers: Vec<&str> = input.lines().collect();
     let prompts = if args.first() == Some(&"status") {
@@ -162,6 +166,12 @@ fn terminal_run(
                 text.push_str(&String::from_utf8_lossy(&bytes[..count]));
                 let visible = console::strip_ansi_codes(&text);
                 if !signalled && answered < prompts.len() && visible.contains(prompts[answered]) {
+                    if queued_enter {
+                        std::thread::sleep(Duration::from_millis(250));
+                        let state = home.join("state/koidrive/telemetry");
+                        assert!(!state.join("settings.json").exists(), "{text}");
+                        assert!(state.join("prompt.json").exists());
+                    }
                     if let Some((stage, signal)) = interrupt.filter(|(stage, _)| *stage == answered)
                     {
                         let children = Command::new("pgrep")
@@ -296,6 +306,31 @@ fn raw_ctrl_c_cancels_rich_selection() {
 }
 
 #[test]
+fn eof_closes_each_plain_and_rich_prompt_without_granting_consent() {
+    for rich in [false, true] {
+        for stage in 0..3 {
+            let route = if rich { "\u{1b}[B" } else { "2" };
+            let input = match stage {
+                0 => "\u{4}".to_string(),
+                1 => format!("{route}\n\u{4}"),
+                _ => format!("{route}\nCODE@files.example.com\n\u{4}"),
+            };
+            let (home, output) = session(&input, &[], &[], true, rich, None);
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(if stage == 2 { 0 } else { 1 }),
+                "{text}"
+            );
+            assert_eq!(text.contains("This device is set up"), stage == 2, "{text}");
+            let state = home.path().join("state/koidrive/telemetry");
+            assert!(!state.join("settings.json").exists());
+            assert_eq!(state.join("prompt.json").exists(), stage == 2);
+        }
+    }
+}
+
+#[test]
 fn eof_at_the_final_question_keeps_setup_successful() {
     let (home, output) = setup("2\nCODE@files.example.com\n\u{4}", &[], &[], true);
     assert!(
@@ -385,7 +420,7 @@ fn cancelled_reporting_returns_after_the_next_successful_interactive_command() {
             assert!(!String::from_utf8_lossy(&output.stderr).contains("Send reports?"));
             assert!(state.join("prompt.json").exists());
         }
-        let output = terminal_run(home.path(), "n", &["status"], &[], rich, None);
+        let output = terminal_run(home.path(), "n", &["status"], &[], rich, None, false);
         let text = String::from_utf8(output.stdout).unwrap();
         assert!(output.status.success(), "{text}");
         assert!(text.contains("Send reports?"), "{text}");
@@ -394,7 +429,7 @@ fn cancelled_reporting_returns_after_the_next_successful_interactive_command() {
         assert_eq!(settings["enabled"], false);
         assert!(settings["install_id"].is_null());
         assert!(!state.join("prompt.json").exists());
-        let output = terminal_run(home.path(), "", &["status"], &[], rich, None);
+        let output = terminal_run(home.path(), "", &["status"], &[], rich, None, false);
         assert!(output.status.success());
         assert!(!String::from_utf8_lossy(&output.stdout).contains("Send reports?"));
     }
@@ -420,6 +455,41 @@ fn rich_questions_use_the_terminal_color_policy_with_a_private_answer_pipe() {
 }
 
 #[test]
+fn failed_status_check_preserves_its_exit_and_defers_consent() {
+    for rich in [true, false] {
+        let (home, _) = setup("2\nCODE@files.example.com\n\u{4}", &[], &[], true);
+        let output = terminal_run(
+            home.path(),
+            if rich { "\u{3}" } else { "n" },
+            &["status", "--check"],
+            &[],
+            rich,
+            None,
+            false,
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(4), "{text}");
+        assert!(!text.contains("Send reports?"), "{text}");
+        let state = home.path().join("state/koidrive/telemetry");
+        assert!(state.join("prompt.json").exists());
+        assert!(!state.join("settings.json").exists());
+    }
+}
+
+#[test]
+fn queued_enter_cannot_answer_deferred_consent() {
+    for rich in [true, false] {
+        let (home, _) = setup("2\nCODE@files.example.com\n\u{4}", &[], &[], true);
+        let output = terminal_run(home.path(), "\u{4}", &["status"], &[], rich, None, true);
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success(), "{text}");
+        let state = home.path().join("state/koidrive/telemetry");
+        assert!(state.join("prompt.json").exists());
+        assert!(!state.join("settings.json").exists());
+    }
+}
+
+#[test]
 fn no_color_applies_to_warnings_after_a_cancelled_question() {
     let (home, _) = setup("2\nCODE@files.example.com\n\u{4}", &[], &[], true);
     fs::write(
@@ -434,6 +504,7 @@ fn no_color_applies_to_warnings_after_a_cancelled_question() {
         &[("NO_COLOR", "1"), ("CLICOLOR_FORCE", "1")],
         true,
         None,
+        false,
     );
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(output.status.success(), "{text}");

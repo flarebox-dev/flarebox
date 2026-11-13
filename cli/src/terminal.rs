@@ -3,13 +3,15 @@
 use std::ffi::OsString;
 use std::future::Future;
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::process::{ExitCode, Stdio};
 
 use koidrive_ipc::Code;
 use rustix::termios::{LocalModes, OptionalActions, Termios, tcgetattr, tcsetattr};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 use tokio::process::Child;
 use tokio::sync::Mutex;
 
@@ -77,6 +79,79 @@ impl From<PromptFailure> for CliError {
 struct ActivePrompt {
     child: Child,
     saved: SavedTerminal,
+}
+
+struct InputBridge {
+    terminal: AsyncFd<OwnedFd>,
+    helper: AsyncFd<OwnedFd>,
+}
+
+impl InputBridge {
+    fn new(input: &OwnedFd) -> io::Result<(Self, Stdio)> {
+        use rustix::fs::{Mode, OFlags, fcntl_getfl, fcntl_setfl, open};
+        use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+
+        fn register(fd: OwnedFd) -> io::Result<AsyncFd<OwnedFd>> {
+            unsafe { AsyncFd::register(fd) }.map_err(|error| error.into_parts().1)
+        }
+
+        let name = rustix::termios::ttyname(input, Vec::new())?;
+        let terminal = open(
+            name.as_c_str(),
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let helper = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
+        rustix::io::fcntl_setfd(&helper, rustix::io::FdFlags::CLOEXEC)?;
+        fcntl_setfl(&helper, fcntl_getfl(&helper)? | OFlags::NONBLOCK)?;
+        grantpt(&helper)?;
+        unlockpt(&helper)?;
+        let name = ptsname(&helper, Vec::new())?;
+        let slave = open(
+            name.as_c_str(),
+            OFlags::RDONLY | OFlags::NOCTTY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let mut raw = tcgetattr(&slave)?;
+        raw.make_raw();
+        tcsetattr(&slave, OptionalActions::Now, &raw)?;
+        Ok((
+            Self {
+                terminal: register(terminal)?,
+                helper: register(helper)?,
+            },
+            Stdio::from(std::fs::File::from(slave)),
+        ))
+    }
+
+    async fn forward(&self) -> Result<(), PromptFailure> {
+        let mut buffer = [0; 4096];
+        loop {
+            let count = self
+                .terminal
+                .async_io(Interest::READABLE, |fd| {
+                    rustix::io::read(fd, &mut buffer).map_err(io::Error::from)
+                })
+                .await?;
+            if count == 0 || buffer[..count].contains(&4) {
+                return Err(PromptFailure::Closed);
+            }
+            let mut bytes = &buffer[..count];
+            while !bytes.is_empty() {
+                let count = self
+                    .helper
+                    .async_io(Interest::WRITABLE, |fd| {
+                        rustix::io::write(fd, bytes).map_err(io::Error::from)
+                    })
+                    .await;
+                let count = match count {
+                    Ok(count) if count > 0 => count,
+                    _ => return Ok(()),
+                };
+                bytes = &bytes[count..];
+            }
+        }
+    }
 }
 
 struct SavedTerminal {
@@ -226,20 +301,26 @@ impl Terminal {
             ));
         }
         let mut active = self.active.lock().await;
-        let input = rustix::io::dup(io::stdin()).map_err(io::Error::from)?;
+        let input = io::stdin().as_fd().try_clone_to_owned()?;
         let original = tcgetattr(&input).map_err(io::Error::from)?;
         let saved = SavedTerminal { input, original };
+        let mut hidden = saved.original.clone();
+        if self.interaction == Interaction::Rich {
+            hidden.make_raw();
+            hidden.output_modes = saved.original.output_modes;
+        }
         if self.interaction == Interaction::Rich
             || matches!(&request, Prompt::Input { secret: true, .. })
         {
-            let mut hidden = saved.original.clone();
-            if self.interaction == Interaction::Rich {
-                hidden.make_raw();
-                hidden.output_modes = saved.original.output_modes;
-            }
             hidden.local_modes.remove(LocalModes::ECHO);
-            tcsetattr(&saved.input, OptionalActions::Now, &hidden).map_err(io::Error::from)?;
         }
+        tcsetattr(&saved.input, OptionalActions::Flush, &hidden).map_err(io::Error::from)?;
+        let (bridge, input) = if self.interaction == Interaction::Rich {
+            let (bridge, input) = InputBridge::new(&saved.input)?;
+            (Some(bridge), input)
+        } else {
+            (None, Stdio::inherit())
+        };
         let child = tokio::process::Command::new(std::env::current_exe()?)
             .arg("_prompt")
             .arg(if self.interaction == Interaction::Rich {
@@ -248,38 +329,51 @@ impl Terminal {
                 "plain"
             })
             .arg(serde_json::to_string(&request).expect("prompt requests serialize"))
-            .stdin(Stdio::inherit())
+            .stdin(input)
             .stderr(Stdio::inherit())
             .stdout(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
         *active = Some(ActivePrompt { child, saved });
-        let result = async {
-            let running = active.as_mut().expect("the helper was just started");
-            let mut output = Vec::new();
-            let stdout = running
-                .child
-                .stdout
-                .take()
-                .expect("the helper has a stdout pipe")
-                .take(64 * 1024 + 1);
-            let mut stdout = stdout;
-            stdout.read_to_end(&mut output).await?;
-            drop(stdout);
-            if output.len() > 64 * 1024 {
-                return Err(PromptFailure::Io("the terminal answer is too long".into()));
+        let result = {
+            let answer = async {
+                let running = active.as_mut().expect("the helper was just started");
+                let mut output = Vec::new();
+                let stdout = running
+                    .child
+                    .stdout
+                    .take()
+                    .expect("the helper has a stdout pipe")
+                    .take(64 * 1024 + 1);
+                let mut stdout = stdout;
+                stdout.read_to_end(&mut output).await?;
+                drop(stdout);
+                if output.len() > 64 * 1024 {
+                    return Err(PromptFailure::Io("the terminal answer is too long".into()));
+                }
+                let status = running.child.wait().await?;
+                if !status.success() {
+                    return Err(PromptFailure::Io(
+                        "the terminal helper stopped before returning an answer".into(),
+                    ));
+                }
+                serde_json::from_slice::<Result<Answer, PromptFailure>>(&output).map_err(|_| {
+                    PromptFailure::Io("the terminal helper returned an invalid answer".into())
+                })?
+            };
+            tokio::pin!(answer);
+            match bridge.as_ref() {
+                Some(bridge) => tokio::select! {
+                    biased;
+                    result = &mut answer => result,
+                    result = bridge.forward() => match result {
+                        Ok(()) => answer.await,
+                        Err(error) => Err(error),
+                    },
+                },
+                None => answer.await,
             }
-            let status = running.child.wait().await?;
-            if !status.success() {
-                return Err(PromptFailure::Io(
-                    "the terminal helper stopped before returning an answer".into(),
-                ));
-            }
-            serde_json::from_slice::<Result<Answer, PromptFailure>>(&output).map_err(|_| {
-                PromptFailure::Io("the terminal helper returned an invalid answer".into())
-            })?
-        }
-        .await;
+        };
         self.cleanup(&mut active).await;
         result
     }
