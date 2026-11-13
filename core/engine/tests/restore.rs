@@ -1018,3 +1018,19 @@ fn a_thousand_restores_fill_a_commit_and_the_last_outcomes_are_kept() {
     assert_eq!(resolved[RESOLVED_KEPT - 1].outcome, Outcome::Restored);
     reload(&commits);
 }
+
+#[test]
+fn an_edit_sent_with_a_restore_from_the_trash_is_an_edit_of_this_device() {
+    let n = id(1);
+    let edited = (
+        n.clone(),
+        Some(file(&root(), "f", 3)),
+        Some(file(&root(), "f", 2)),
+        Some(trashed(file(&root(), "f", 2))),
+    );
+    let mut trees = trees(&[edited]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    commits.restore(id(100), from_trash(&n));
+    let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(commits.edits_in_flight(&sent.commit_id, &n));
+}

@@ -364,7 +364,11 @@ impl Commits {
                     Some(op::Op::UpdateContent(update)) if update.node_id == id => {
                         Some(!update.resend)
                     }
-                    Some(op::Op::Restore(restore)) if restore.node_id == id => Some(false),
+                    Some(op::Op::Restore(restore))
+                        if restore.node_id == id && !restore.version_id.is_empty() =>
+                    {
+                        Some(false)
+                    }
                     _ => None,
                 }) == Some(true)
         })
