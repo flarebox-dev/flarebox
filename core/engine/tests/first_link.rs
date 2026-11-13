@@ -778,6 +778,47 @@ fn a_discarded_folder_that_already_holds_a_synced_entry_is_kept_and_sent() {
 }
 
 #[test]
+fn a_discarded_folder_the_user_moves_a_synced_entry_into_through_a_new_folder_is_kept_and_sent() {
+    let mut trees = trees(
+        &[
+            ("l-new", dir(ROOT, "new")),
+            ("l-notes", file(ROOT, "notes", 9)),
+        ],
+        &[("r-notes", file(ROOT, "notes", 9))],
+    );
+    let mut commits = Commits::default();
+    let mut ids = IdGen::new(7);
+    commits.first_link(&mut trees, &mut ids, NOW);
+    trees.settle();
+    let asked = question(&commits);
+    assert!(commits.decide(&asked.id, Answer::Discard));
+    assert_eq!(ops(&mut commits, &mut trees, &mut ids), []);
+    let sub = LocalNode {
+        shape: dir("l-new", "sub"),
+        identity: FileIdentity {
+            dev: 1,
+            ino: 99,
+            birth_ns: Some(0),
+        },
+        parked: false,
+    };
+    trees.set_local("l-sub".into(), sub);
+    let mut moved = trees.local().get("r-notes").unwrap().clone();
+    moved.shape.parent = "l-sub".into();
+    trees.set_local("r-notes".into(), moved);
+    trees.settle();
+    assert_eq!(
+        ops(&mut commits, &mut trees, &mut ids),
+        [
+            ("create dir", "l-new".to_owned()),
+            ("create dir", "l-sub".to_owned()),
+            ("move", "r-notes".to_owned())
+        ]
+    );
+    assert!(commits.questions().is_empty(), "{:?}", commits.questions());
+}
+
+#[test]
 fn a_discarded_folder_whose_subfolder_the_user_puts_an_entry_in_is_asked_about_again() {
     let mut trees = trees(
         &[
