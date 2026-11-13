@@ -98,6 +98,31 @@ fn envelope(output: &Output) -> Value {
     envelope
 }
 
+fn development_version() -> bool {
+    koidrive_driver::update::is_development_version(env!("CARGO_PKG_VERSION"))
+}
+
+fn development_update(output: &Output, home: &Path, github: &GitHub) -> bool {
+    if !development_version() {
+        return false;
+    }
+    let envelope = envelope(output);
+    assert!(output.status.success(), "{envelope:#}");
+    assert_eq!(envelope["outcome"], "unchanged");
+    assert_eq!(
+        envelope["data"],
+        serde_json::json!({
+            "from": env!("CARGO_PKG_VERSION"),
+            "to": env!("CARGO_PKG_VERSION"),
+            "result": "unchanged",
+        })
+    );
+    assert!(github.requests.lock().unwrap().is_empty());
+    assert!(!home.join("brew/bin/brew.calls").exists());
+    assert!(!home.join("brew/opt/koidrive/bin/koi.calls").exists());
+    true
+}
+
 const REPORT: &str = r#"{"schema_version":1,"command":"_reconcile","outcome":"ok","data":{"service":{"manager":"launchd","name":"dev.koidrive.koi","state":"running"}}}"#;
 
 fn homebrew(home: &Path, version: &str) -> PathBuf {
@@ -120,6 +145,45 @@ fn homebrew(home: &Path, version: &str) -> PathBuf {
 }
 
 #[test]
+fn development_update_never_contacts_github_or_runs_an_installer() {
+    if !development_version() {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let github = github("v99.0.0");
+    homebrew(home.path(), "0.0.1");
+    let script = home.path().join(".local/bin/koi");
+    let app = home
+        .path()
+        .join("Applications/Koidrive.app/Contents/Helpers/koi");
+    for path in [&script, &app] {
+        executable(
+            path,
+            "#!/bin/sh\necho called >> \"$0.calls\"\necho 'koi 0.0.1'\n",
+        );
+    }
+    for switch in ["on", "off"] {
+        let output = koi(home.path(), &github, &["update", "--json"])
+            .env("KOIDRIVE_UPDATE_CHECK", switch)
+            .output()
+            .unwrap();
+        assert!(development_update(&output, home.path(), &github));
+        assert!(!script.with_extension("calls").exists());
+        assert!(!app.with_extension("calls").exists());
+    }
+    let output = koi(home.path(), &github, &["update"])
+        .env("KOIDRIVE_UPDATE_CHECK_URL", "not a URL")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "Development builds do not update to releases.\n"
+    );
+    assert!(github.requests.lock().unwrap().is_empty());
+}
+
+#[test]
 fn koi_update_upgrades_the_homebrew_formula_and_hands_the_service_to_the_new_koi() {
     let home = tempfile::tempdir().unwrap();
     let github = github("v99.0.0");
@@ -127,6 +191,9 @@ fn koi_update_upgrades_the_homebrew_formula_and_hands_the_service_to_the_new_koi
     let output = koi(home.path(), &github, &["update", "--json"])
         .output()
         .unwrap();
+    if development_update(&output, home.path(), &github) {
+        return;
+    }
     let envelope = envelope(&output);
     assert!(output.status.success(), "{envelope:#}");
     assert_eq!(
@@ -158,6 +225,9 @@ fn koi_update_on_the_newest_release_changes_nothing() {
     let output = koi(home.path(), &github, &["update", "--json"])
         .output()
         .unwrap();
+    if development_update(&output, home.path(), &github) {
+        return;
+    }
     let envelope = envelope(&output);
     assert!(output.status.success(), "{envelope:#}");
     assert_eq!(envelope["outcome"], "unchanged");
@@ -192,6 +262,15 @@ fn koi_update_rechecks_foreign_and_legacy_caches_but_keeps_same_target_condition
             cached["asset"] = asset.clone().into();
         }
         std::fs::write(state.join("update-check.json"), cached.to_string()).unwrap();
+        if development_version() {
+            let github = github("v99.0.0");
+            homebrew(home.path(), "99.0.0");
+            let output = koi(home.path(), &github, &["update", "--json"])
+                .output()
+                .unwrap();
+            assert!(development_update(&output, home.path(), &github));
+            continue;
+        }
         let same_target = cached_asset.as_deref() == Some(asset().as_str());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let github = GitHub {
@@ -273,6 +352,9 @@ fn koi_update_preserves_disabled_login_items_and_only_fails_for_a_real_problem()
         let output = koi(home.path(), &github, &["update", "--json"])
             .output()
             .unwrap();
+        if development_update(&output, home.path(), &github) {
+            continue;
+        }
         let envelope = envelope(&output);
         assert_eq!(output.status.success(), problem.is_none(), "{envelope:#}");
         assert_eq!(envelope["data"]["result"], "updated");
@@ -313,6 +395,13 @@ fn koi_update_text_hides_the_reconcile_envelope_but_keeps_it_in_the_log() {
     let output = koi(home.path(), &github, &["update"]).output().unwrap();
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(output.status.success(), "{text}");
+    if development_version() {
+        assert_eq!(text, "Development builds do not update to releases.\n");
+        assert!(github.requests.lock().unwrap().is_empty());
+        assert!(!home.path().join("brew/bin/brew.calls").exists());
+        assert!(!home.path().join("brew/opt/koidrive/bin/koi.calls").exists());
+        return;
+    }
     assert!(
         text.contains("Koidrive 99.0.0 is the newest release."),
         "{text}"
@@ -337,6 +426,9 @@ fn koi_update_rejects_a_successful_brew_that_leaves_the_old_binary_installed() {
         .output()
         .unwrap();
     assert!(started.elapsed() < Duration::from_secs(10));
+    if development_update(&output, home.path(), &github) {
+        return;
+    }
     let envelope = envelope(&output);
     assert!(!output.status.success(), "{envelope:#}");
     assert_eq!(envelope["outcome"], "error");
@@ -363,6 +455,9 @@ fn koi_update_reports_the_version_actually_installed_when_it_is_above_the_target
     let output = koi(home.path(), &github, &["update", "--json"])
         .output()
         .unwrap();
+    if development_update(&output, home.path(), &github) {
+        return;
+    }
     let envelope = envelope(&output);
     assert!(output.status.success(), "{envelope:#}");
     assert_eq!(envelope["data"]["to"], "100.0.0");
@@ -386,6 +481,10 @@ fn koi_update_uses_the_custom_homebrew_of_the_running_koi_without_a_prefix_varia
         .env_remove("HOMEBREW_PREFIX")
         .output()
         .unwrap();
+    if development_update(&output, home.path(), &github) {
+        assert!(!brew.with_extension("calls").exists());
+        return;
+    }
     let envelope = envelope(&output);
     assert!(!output.status.success());
     assert!(
@@ -415,7 +514,12 @@ fn the_daemon_checks_for_a_release_and_koi_status_names_it() {
             .output()
             .unwrap();
         let envelope = envelope(&output);
-        if envelope["data"]["update"]["state"] == "available" || Instant::now() > deadline {
+        let expected = if development_version() {
+            "off"
+        } else {
+            "available"
+        };
+        if envelope["data"]["update"]["state"] == expected || Instant::now() > deadline {
             break envelope;
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -424,6 +528,15 @@ fn the_daemon_checks_for_a_release_and_koi_status_names_it() {
     daemon.kill().unwrap();
     daemon.wait().unwrap();
     let update = &status["data"]["update"];
+    if development_version() {
+        assert_eq!(
+            update,
+            &serde_json::json!({ "state": "off", "version": env!("CARGO_PKG_VERSION") })
+        );
+        assert!(!String::from_utf8(text.stdout).unwrap().contains("Update:"));
+        assert!(github.requests.lock().unwrap().is_empty());
+        return;
+    }
     assert_eq!(update["state"], "available", "{status:#}");
     assert_eq!(update["latest"], "99.0.0");
     assert_eq!(update["version"], env!("CARGO_PKG_VERSION"));
@@ -477,8 +590,15 @@ fn without_a_daemon_status_reads_the_last_check_and_the_switch_turns_it_off() {
         .output()
         .unwrap();
     let update = envelope(&output)["data"]["update"].clone();
-    assert_eq!(update["state"], "available");
-    assert_eq!(update["checked_at"], "2025-11-13T04:00:00Z");
+    if development_version() {
+        assert_eq!(
+            update,
+            serde_json::json!({ "state": "off", "version": env!("CARGO_PKG_VERSION") })
+        );
+    } else {
+        assert_eq!(update["state"], "available");
+        assert_eq!(update["checked_at"], "2025-11-13T04:00:00Z");
+    }
 
     let output = koi(home.path(), &github, &["status", "--json"])
         .env("KOIDRIVE_UPDATE_CHECK", "off")

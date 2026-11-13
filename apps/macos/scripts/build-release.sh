@@ -12,7 +12,7 @@ scripts/generate-project.sh
 koi_version="$(build/koi --version)"
 koi_version="${koi_version#koi }"
 if [ -n "${VERSION:-}" ] && [ "$VERSION" != "$koi_version" ]; then
-  echo "error: koi --version reports $koi_version, but VERSION is $VERSION. Set version in [workspace.package] of Cargo.toml." >&2
+  echo "error: koi --version reports $koi_version, but VERSION is $VERSION. Stamp the release version before building." >&2
   exit 1
 fi
 version="${VERSION:-$koi_version}"

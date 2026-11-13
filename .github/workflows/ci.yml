@@ -349,6 +349,10 @@ jobs:
           nice -n 10 cargo clippy --manifest-path scripts/test-split/Cargo.toml --all-targets --locked -- -D warnings
           python3 scripts/test-split/test_split.py -v
       - run: cargo test --workspace --locked --features koidrive-cli/test-install-inventory
+      - name: Test release updates with a tag-derived version
+        run: |
+          python3 scripts/stamp-release-version.py v0.1.0-alpha.1
+          nice -n 10 cargo test --locked -p koidrive-cli --test update --features koidrive-cli/test-install-inventory
 
   server:
     name: server (${{ matrix.os }})

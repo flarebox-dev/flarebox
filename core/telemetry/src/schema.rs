@@ -764,6 +764,11 @@ impl From<EventUuid> for String {
 pub struct Version(String);
 
 impl Version {
+    /// Whether this is the fixed local development version, with optional build metadata.
+    pub fn is_development(&self) -> bool {
+        self.0.split('+').next() == Some("0.0.0-dev")
+    }
+
     pub fn parse(value: &str) -> Result<Self, Invalid> {
         let valid = value.len() <= 64
             && value.starts_with(|c: char| c.is_ascii_digit())

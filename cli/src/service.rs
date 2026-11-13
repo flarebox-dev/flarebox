@@ -1903,7 +1903,7 @@ mod tests {
         let not_executable = dir.path().join("not-executable");
         fs::write(&not_executable, "#!/bin/sh\necho 'koi 99.0.0'\n").unwrap();
         for moved in [
-            koi_printing(dir.path(), "older", "koi 0.0.1\n", 0),
+            koi_printing(dir.path(), "older", "koi 0.0.0-0\n", 0),
             koi_printing(dir.path(), "failing", "koi 99.0.0\n", 1),
             koi_printing(dir.path(), "other", "something 99.0.0\n", 0),
             koi_printing(dir.path(), "unparsable", "koi 99\n", 0),
@@ -1930,7 +1930,7 @@ mod tests {
         let caller = service(&[]);
         let this = this_version();
         converge(&fake, &caller, 1, false, false, &Daemon::Absent);
-        let older = Daemon::Running(Some(version("0.0.1")));
+        let older = Daemon::Running(Some(version("0.0.0-0")));
         converge(&fake, &caller, 1, false, false, &older);
         assert_eq!(fake.restarts.get(), 1);
         converge(&fake, &caller, 1, false, false, &Daemon::Running(None));
@@ -2232,7 +2232,7 @@ mod tests {
                 let _ = koidrive_ipc::write_line(&mut writer, &response).await;
             }
         });
-        let older = koi_printing(dir.path(), "older-koi", "koi 0.0.1\n", 0);
+        let older = koi_printing(dir.path(), "older-koi", "koi 0.0.0-0\n", 0);
         let fake = Fake {
             service_lock: Some(paths.service_lock()),
             ..Fake::default()
