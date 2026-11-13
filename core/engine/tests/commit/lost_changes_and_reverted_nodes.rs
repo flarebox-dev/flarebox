@@ -1736,3 +1736,69 @@ fn content_this_devices_restore_set_is_not_kept_beside_it_after_a_loss() {
     });
     assert!(!kept, "{sent:?}");
 }
+
+#[test]
+fn a_lost_move_and_edit_are_sent_again_when_another_file_held_the_old_name() {
+    for occupied in [false, true] {
+        let mut trees = trees(&[
+            synced("n", file(ROOT, "x", 1)),
+            synced("q", file(ROOT, "z", 2)),
+        ]);
+        trees.set_remote("n".into(), version(remote(file(ROOT, "x", 1)), "v1"));
+        trees.set_remote("q".into(), version(remote(file(ROOT, "z", 2)), "vq"));
+        let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+        trees.set_local("n".into(), local(file(ROOT, "y", 3), 1));
+        trees.settle();
+        let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+        let changed = RemoteNode {
+            meta_rev: 2,
+            content_rev: 2,
+            edit_rev: 2,
+            version_id: "v2".into(),
+            ..remote(file(ROOT, "y", 3))
+        };
+        trees.set_remote("n".into(), changed);
+        let applied = commit.ops.iter().map(|_| outcome(op_result::Code::Applied));
+        commits.received(result(2, applied.collect())).unwrap();
+        assert!(commits.acknowledge(&mut trees, 2));
+        trees.settle();
+        if occupied {
+            let moved = version(remote_at(file(ROOT, "x", 2), 3), "vq");
+            trees.set_remote("q".into(), moved);
+            trees.set_local("q".into(), local(file(ROOT, "x", 2), 2));
+            trees.settle();
+        }
+        assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
+        let trashed = trees.trashed_here();
+        let edited = trees.edited_here();
+        let synced = trees.taken_from_others(|seq| commits.lost_here(seq));
+        let moved = trees.moved_here();
+        let untaken = trees.untaken_edits(|seq| commits.lost_here(seq));
+        let versions = trees.remote_versions();
+        trees.set_listed_remote("n".into(), version(remote(file(ROOT, "x", 1)), "v1"));
+        trees.set_listed_remote("q".into(), version(remote(file(ROOT, "z", 2)), "vq"));
+        trees.forget_lost(
+            trashed,
+            edited,
+            synced,
+            moved,
+            untaken,
+            versions,
+            commits.held_through(),
+            commits.accepted(),
+        );
+        trees.settle();
+        let sent = build(&mut commits, &mut trees, &mut ids).map(|commit| ops(&commit));
+        let edits_n = |op: &op::Op| {
+            matches!(op, op::Op::UpdateContent(update) if update.node_id == "n" && update.content == Some(content(3)))
+        };
+        assert!(
+            sent.as_ref().is_some_and(|ops| ops.iter().any(edits_n)),
+            "occupied {occupied}: {sent:?}"
+        );
+        assert!(
+            sent.iter().flatten().all(|op| !matches!(op, op::Op::CreateFile(_))),
+            "occupied {occupied}: {sent:?}"
+        );
+    }
+}

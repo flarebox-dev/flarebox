@@ -3873,3 +3873,29 @@ fn a_folder_another_device_made_stays_deleted_when_a_restore_takes_its_delete() 
         assert_eq!(device.disk.entries().len(), 0);
     }
 }
+
+#[test]
+fn a_file_moved_and_edited_in_a_lost_commit_stays_one_file_when_another_file_takes_its_old_name() {
+    let mut world = world(2);
+    world.phase(0, &[(0, file("a")), (0, file("b"))]).unwrap();
+    let lost = [(0, BACKUP), (0, rename(0, 0, "c.txt")), (0, overwrite(0))];
+    world.phase(1, &lost).unwrap();
+    let disk = &world.devices[1].disk;
+    let b = (disk.visible().iter())
+        .position(|ino| disk.entries()[ino].name == "b")
+        .unwrap();
+    world.phase(2, &[(1, rename(b, 0, "a"))]).unwrap();
+    let mut steps = vec![(0, RESTORE), (0, Step::Connect)];
+    steps.extend([(0, DELIVER); 8]);
+    steps.extend(commit(0));
+    steps.extend([(0, DELIVER); 4]);
+    world.phase(3, &steps).unwrap();
+    for device in &world.devices {
+        assert_eq!(
+            device.disk.entries().len(),
+            2,
+            "{:?}",
+            device.disk.entries()
+        );
+    }
+}

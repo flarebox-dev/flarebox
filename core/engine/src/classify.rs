@@ -1505,14 +1505,16 @@ impl Trees {
     /// recorded the move without those records. So the position this device set is sent again,
     /// unless another device moved the node after the loss. S takes R's position for these nodes
     /// before `edited` and `synced` compare positions, so a file whose move and edit were both
-    /// lost is sent again as both.
+    /// lost is sent again as both. Where S cannot take that position yet, it waits, and `edited`
+    /// compares R's position with the one that waits, so the lost edit waits with it.
     ///
     /// `trashed` lists what deletes of this device had trashed before the bootstrap
     /// ([`Trees::trashed_here`]), and `held_through` the seq of the newest commit of this device the
     /// server still counts ([`Commits::held_through`]), at or below which every seq is from before
-    /// the loss. A node of `trashed` that R now holds live, as it was deleted and with no revision
-    /// above `held_through` or, for a file, at the version the delete trashed, lost its delete:
-    /// nothing changed it after the loss, since a server never gives a version ID twice (RFC 0016).
+    /// the loss. A node of `trashed` that R now holds live as it was deleted, with no revision
+    /// above `held_through` or at a position this device saw with the revisions and version the
+    /// delete trashed, lost its delete: nothing changed it after the loss, since a server never
+    /// gives a version ID twice (RFC 0016).
     /// S takes R's shape for it, parents first, so the delete is sent again. Any other node of it is
     /// downloaded again, since a restore or another change after the loss can take a seq the lost
     /// commits had.
@@ -1663,6 +1665,7 @@ impl Trees {
             }
             self.set_synced(id, Some(shape));
         }
+        let mut queued = BTreeSet::new();
         for id in &lost_moves {
             let (Some(remote), Some(synced)) = (self.r.live(id), self.s.live(id)) else {
                 continue;
@@ -1673,22 +1676,31 @@ impl Trees {
                 ..synced.clone()
             };
             if !self.set_synced_if_valid(id.clone(), Some(before.clone())) {
+                queued.insert(id.clone());
                 self.wait(id.clone(), Some(before), Origin::Other);
             }
         }
         for (id, _) in edited {
             let replaced = self.replaced_versions.get(&id);
+            let waits_at = (self.waiting.get(&id))
+                .filter(|_| queued.contains(&id))
+                .and_then(|waiting| waiting.shape.as_ref());
             let Some(remote) = (self.r.get(&id))
                 .filter(|remote| {
                     remote.content_rev <= held_through
                         || replaced.is_some_and(|versions| versions.contains(&remote.version_id))
                 })
-                .filter(|remote| (self.s.live(&id)).is_some_and(|s| s.same_position(&remote.shape)))
+                .filter(|remote| {
+                    (waits_at.or(self.s.live(&id))).is_some_and(|s| s.same_position(&remote.shape))
+                })
                 .map(|remote| remote.shape.clone())
             else {
                 continue;
             };
-            self.set_synced_if_valid(id, Some(remote));
+            if !self.set_synced_if_valid(id.clone(), Some(remote.clone())) {
+                queued.insert(id.clone());
+                self.wait(id, Some(remote), Origin::Other);
+            }
         }
         let synced: BTreeSet<NodeId> = synced.into_iter().collect();
         for id in synced.iter().cloned() {
@@ -1744,6 +1756,10 @@ impl Trees {
             .collect();
         let mut lost: BTreeSet<&str> = (self.s.iter())
             .filter(|(id, synced)| {
+                let synced = (self.waiting.get(*id))
+                    .filter(|_| queued.contains(*id))
+                    .and_then(|waiting| waiting.shape.as_ref())
+                    .unwrap_or(*synced);
                 let moved = |remote: &Shape| {
                     let at = Shape {
                         parent: remote.parent.clone(),
