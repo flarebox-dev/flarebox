@@ -22,6 +22,7 @@ const SPACE_SCHEMA_DIGESTS = [
   "bace53ef766c53ef40805288c138d854ac27628cd5674daf517d2abe81547c56",
   "857a54a49b2c3ee1fa6b96cd0aca389f4eb674174ccd90dd9de9bf1ee16c7ac2",
   "f3fd30e63a5e7d34587553333ac4d0e9f72403d7a6b2f7bb6030286b84facefc",
+  "ebd4aca495e8c70c997dde3afad3cdb3e934b87353f9b176433266161c828873",
 ];
 const ACCOUNT_SCHEMA_DIGESTS = [
   "cdd5988fc835119f5b6ad96ebde0be7f38aac621215c10844fdb4fb99f4a7fcf",
@@ -215,7 +216,7 @@ describe("upgraded objects keep working", () => {
     await inObject(stub, (sql) => {
       sql.exec("ALTER TABLE nodes DROP COLUMN parent_rev");
       sql.exec("ALTER TABLE nodes DROP COLUMN parent_dev");
-      sql.exec("UPDATE meta SET value = ? WHERE key = 'schema_version'", SPACE_MIGRATIONS.length - 1);
+      sql.exec("UPDATE meta SET value = ? WHERE key = 'schema_version'", SPACE_MIGRATIONS.length - 2);
     });
     await evictDurableObject(stub);
     const deleted = await desk.commit([op.delete(target)]);

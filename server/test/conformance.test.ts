@@ -486,7 +486,7 @@ class Run {
         create_dir: ["node", "parent", "name"],
         move: ["node", "parent", "name"],
         create_file: ["node", "parent", "name", "content"],
-        update_content: ["node", "content"],
+        update_content: ["node", "content", "resend"],
         delete: ["node", "requires"],
         restore: ["node", "version", "parent", "name"],
         empty: [],
@@ -509,7 +509,7 @@ class Run {
       let op: Op;
       if (kind === "create_dir") op = create(OpSchema, { op: { case: "createDir", value: { nodeId, parentId, name } } });
       else if (kind === "create_file") op = create(OpSchema, { op: { case: "createFile", value: { nodeId, parentId, name, content: content() } } });
-      else if (kind === "update_content") op = create(OpSchema, { op: { case: "updateContent", value: { nodeId, content: content() } } });
+      else if (kind === "update_content") op = create(OpSchema, { op: { case: "updateContent", value: { nodeId, content: content(), resend: optBool(body, "resend") ?? false } } });
       else if (kind === "move") op = create(OpSchema, { op: { case: "move", value: { nodeId, newParentId: parentId, newName: name } } });
       else if (kind === "delete") {
         const found = "requires" in body ? keys(body.requires, "requires", ["node", "content_rev", "meta_rev"]) : undefined;
@@ -847,9 +847,9 @@ class Run {
   }
 
   private checkNodeState(space: string, wanted: Json, got: NodeState, complete: boolean): void {
-    const want = keys(wanted, "a node", complete ? NODE_FIELDS : [...NODE_FIELDS, "absent", "content"]);
+    const want = keys(wanted, "a node", complete ? [...NODE_FIELDS, "edit_rev"] : [...NODE_FIELDS, "absent", "content", "edit_rev"]);
     if (complete) every(want, NODE_FIELDS);
-    covered(NodeStateSchema, ["nodeId", "parentId", "name", "kind", "status", "contentRev", "metaRev", "trashGroup", "current"]);
+    covered(NodeStateSchema, ["nodeId", "parentId", "name", "kind", "status", "contentRev", "metaRev", "trashGroup", "current", "editRev"]);
     const symbol = req(optStr(want, "node"), "node");
     within("node", () => this.expectId(space, symbol, got.nodeId));
     const differs = (field: string, value: unknown) => fail(`${symbol}.${field} is ${String(value)}, expected ${show(want[field])}`);
@@ -872,6 +872,8 @@ class Run {
     if (contentRev !== undefined && got.contentRev !== BigInt(contentRev)) differs("content_rev", got.contentRev);
     const metaRev = optUint(want, "meta_rev");
     if (metaRev !== undefined && got.metaRev !== BigInt(metaRev)) differs("meta_rev", got.metaRev);
+    const editRev = optUint(want, "edit_rev");
+    if (editRev !== undefined && got.editRev !== BigInt(editRev)) differs("edit_rev", got.editRev);
     if ("trash_group" in want) {
       const group = want.trash_group;
       if (group === null) {

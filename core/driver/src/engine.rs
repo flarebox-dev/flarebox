@@ -377,13 +377,18 @@ impl Engine {
                 "a commit arrived before the space's tree was read".into(),
             ));
         };
+        let made_here = self.commits.made_record(at.seq, &at.commit_id);
         for change in changes {
             match &change.change {
                 Some(change_record::Change::Node(state)) => {
                     tx.put_remote_node(state)?;
                     if state.node_id != self.trees.remote().root {
                         let (id, node) = remote_node(state)?;
-                        self.trees.set_remote(id, node);
+                        if made_here {
+                            self.trees.set_remote_made_here(id, node);
+                        } else {
+                            self.trees.set_remote(id, node);
+                        }
                     }
                 }
                 Some(change_record::Change::Purged(purged)) => {
@@ -1289,7 +1294,9 @@ impl Staging {
     /// Holds `state` unless the node it holds is as new.
     fn take(&mut self, state: NodeState) {
         let newer = self.nodes.get(&state.node_id).is_none_or(|held| {
-            state.content_rev > held.content_rev || state.meta_rev > held.meta_rev
+            state.content_rev > held.content_rev
+                || state.meta_rev > held.meta_rev
+                || state.edit_rev > held.edit_rev
         });
         if newer {
             self.nodes.insert(state.node_id.clone(), state);
@@ -1775,6 +1782,7 @@ mod tests {
                     meta_rev: 1,
                     trash_group: String::new(),
                     version_id: String::new(),
+                    edit_rev: 1,
                 };
                 trees.set_remote((*id).into(), node);
             }
@@ -2061,6 +2069,7 @@ mod tests {
                         meta_rev: 2,
                         trash_group: String::new(),
                         version_id: String::new(),
+                        edit_rev: 1,
                     };
                     trees.set_remote("d".into(), node);
                 },
@@ -3263,5 +3272,103 @@ mod tests {
             &["mkdir ß", "mkdir ß/a", "write ß/b"],
             &["mv ß a", "mv a/b a/a/b", "mv a/a ß"],
         ]);
+    }
+
+    #[test]
+    fn a_store_from_before_edit_revisions_keeps_the_edits_this_device_made() {
+        let (dir, mut store) = store();
+        let edited = NodeState {
+            node_id: "e".into(),
+            parent_id: ROOT.into(),
+            name: "e.txt".into(),
+            kind: NodeKind::File as i32,
+            status: NodeStatus::Live as i32,
+            content_rev: 6,
+            meta_rev: 2,
+            current: Some(proto::VersionInfo {
+                content: Some(proto::Content::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let shape = koidrive_store::Shape {
+            parent_id: ROOT.into(),
+            name: "e.txt".into(),
+            kind: NodeKind::File as i32,
+            content: Some(proto::Content::default()),
+        };
+        let mut state = EngineState::default();
+        state.trees.edited_here.insert("e".into(), 6);
+        store
+            .transaction(|tx| {
+                tx.put_remote_node(&edited)?;
+                tx.put_synced_node(&SyncedNode {
+                    node_id: "e".into(),
+                    shape: shape.clone(),
+                })?;
+                tx.put_local_node(&koidrive_store::LocalNode {
+                    node_id: "e".into(),
+                    shape,
+                    identity: ino(1),
+                    parked: false,
+                })?;
+                tx.set_engine_state(&state)
+            })
+            .unwrap();
+        drop(store);
+        let path = dir.path().join("store.sqlite");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE remote_nodes DROP COLUMN edit_rev;
+             DELETE FROM migrations WHERE name = 'remote_nodes_edit_rev';",
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut store = Store::open(&path).unwrap();
+        let engine = store.transaction(|tx| Engine::load(tx, ROOT)).unwrap();
+        assert_eq!(
+            engine.trees.state().edited_here,
+            BTreeMap::from([("e".into(), 6)])
+        );
+    }
+
+    #[test]
+    fn a_replayed_claim_of_an_edit_replaces_the_listed_node() {
+        let listed_at = |edit_rev| NodeState {
+            node_id: "f".into(),
+            parent_id: ROOT.into(),
+            name: "f.txt".into(),
+            kind: NodeKind::File as i32,
+            status: NodeStatus::Live as i32,
+            content_rev: 3,
+            meta_rev: 1,
+            edit_rev,
+            current: Some(proto::VersionInfo {
+                content: Some(proto::Content::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (_dir, mut store) = store();
+        store
+            .transaction(|tx| {
+                let mut engine = Engine::load(tx, ROOT)?;
+                let mut staging = listed(4, vec![listed_at(2)]);
+                let claim = change_record::Change::Node(listed_at(5));
+                assert_eq!(staging.replay(&[record(5, vec![claim])])?, Applied::Through);
+                staging.caught_up(5);
+                engine.replace_remote(tx, staging)?;
+                assert_eq!(engine.trees.remote().get("f").map(|f| f.edit_rev), Some(5));
+                assert_eq!(
+                    tx.remote_nodes()?
+                        .iter()
+                        .map(|f| f.edit_rev)
+                        .collect::<Vec<_>>(),
+                    [5]
+                );
+                Ok::<_, Stop>(())
+            })
+            .unwrap();
     }
 }

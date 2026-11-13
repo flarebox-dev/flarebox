@@ -403,6 +403,14 @@ impl Trees {
     }
 
     pub fn set_remote(&mut self, id: NodeId, node: RemoteNode) {
+        self.apply_remote(id, node, false);
+    }
+
+    pub fn set_remote_made_here(&mut self, id: NodeId, node: RemoteNode) {
+        self.apply_remote(id, node, true);
+    }
+
+    fn apply_remote(&mut self, id: NodeId, node: RemoteNode, made_here: bool) {
         let hidden = (self.r.get(&id)).is_some_and(|old| old.content_rev != node.content_rev)
             && !node.trashed
             && self.edited(&id)
@@ -411,6 +419,22 @@ impl Trees {
                 .and_then(|shape| shape.content.as_ref()))
             .zip(node.shape.content.as_ref())
             .is_some_and(|(synced, remote)| same_content(synced, remote));
+        let local_gone = !made_here && self.l.get(&id).is_none();
+        let resent_over_delete = local_gone
+            && (self.r.get(&id)).is_some_and(|old| {
+                !old.trashed
+                    && !node.trashed
+                    && old.content_rev != node.content_rev
+                    && old.edit_rev == node.edit_rev
+                    && old.meta_rev == node.meta_rev
+                    && old.shape.same_position(&node.shape)
+                    && (self.acknowledged(&id)).is_some_and(|synced| synced.same(&old.shape))
+            });
+        let edited_over_delete = local_gone
+            && self.acknowledged(&id).is_some()
+            && (self.r.get(&id)).is_some_and(|old| {
+                old.content_rev == node.content_rev && old.edit_rev != node.edit_rev
+            });
         if let Some(replaced) = (self.r.get(&id))
             .map(|old| &old.version_id)
             .filter(|old| !old.is_empty() && **old != node.version_id)
@@ -423,8 +447,15 @@ impl Trees {
                 versions.remove(0);
             }
         }
+        let shape = node.shape.clone();
         self.place_remote(id.clone(), node);
         if hidden && !self.set_synced_if_valid(id.clone(), None) {
+            self.wait(id.clone(), None, Origin::Other);
+        }
+        if resent_over_delete && !self.set_synced_if_valid(id.clone(), Some(shape.clone())) {
+            self.wait(id.clone(), Some(shape), Origin::Other);
+        }
+        if edited_over_delete && !self.set_synced_if_valid(id.clone(), None) {
             self.wait(id, None, Origin::Other);
         }
     }
@@ -462,7 +493,7 @@ impl Trees {
         if node.trashed {
             self.displaced.remove(&id);
         }
-        if (self.edited_here.get(&id)).is_some_and(|&seq| node.trashed || node.content_rev != seq) {
+        if (self.edited_here.get(&id)).is_some_and(|&seq| node.trashed || node.edit_rev != seq) {
             self.edited_here.remove(&id);
         }
         if node.is_live() && node.shape.kind == Kind::File && is_rules_file(&node.shape.name) {
@@ -1146,11 +1177,16 @@ impl Trees {
         })
     }
 
-    /// Records that an edit of this device, in the commit at `seq`, set the content of `id`, if R
-    /// holds the content of that commit.
-    pub fn record_edited(&mut self, id: &str, seq: u64) {
-        if (self.r.get(id)).is_some_and(|remote| !remote.trashed && remote.content_rev == seq) {
-            self.edited_here.insert(id.to_owned(), seq);
+    /// Records that an edit of this device set the content of `id` to `sent`, at R's edit
+    /// revision, if R holds that content live.
+    pub fn record_edited(&mut self, id: &str, sent: Option<&Content>) {
+        let Some(remote) = (self.r.get(id)).filter(|remote| !remote.trashed) else {
+            return;
+        };
+        if (remote.shape.content.as_ref().zip(sent))
+            .is_some_and(|(held, sent)| same_content(held, sent))
+        {
+            self.edited_here.insert(id.to_owned(), remote.edit_rev);
         }
     }
 
@@ -1185,7 +1221,9 @@ impl Trees {
                 };
                 let remote = (self.r.get(id))
                     .filter(|remote| !remote.trashed)
-                    .filter(|remote| !made_here(remote.content_rev.max(remote.meta_rev)));
+                    .filter(|remote| {
+                        !made_here(remote.content_rev.max(remote.meta_rev).max(remote.edit_rev))
+                    });
                 holds(remote.map(|remote| &remote.shape)) && holds(self.l.live(id))
             })
             .map(|(id, _)| id.clone())
@@ -2095,7 +2133,7 @@ impl Trees {
             return Err(StateError::NotDisplaced(id.clone()));
         }
         let edited = |(id, seq): &(&NodeId, &u64)| {
-            (self.r.get(id)).is_some_and(|remote| !remote.trashed && remote.content_rev == **seq)
+            (self.r.get(id)).is_some_and(|remote| !remote.trashed && remote.edit_rev == **seq)
         };
         if let Some((id, _)) = state.edited_here.iter().find(|entry| !edited(entry)) {
             return Err(StateError::NotEditedHere(id.clone()));

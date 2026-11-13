@@ -77,6 +77,8 @@ pub(crate) struct Node {
     status: NodeStatus,
     content_rev: u64,
     content_dev: String,
+    edit_rev: u64,
+    edit_dev: String,
     meta_rev: u64,
     meta_dev: String,
     /// The seq and device of the commit that last gave the node a new parent or brought it back from
@@ -147,6 +149,7 @@ impl State {
             kind: node.kind as i32,
             status: node.status as i32,
             content_rev: node.content_rev,
+            edit_rev: node.edit_rev,
             meta_rev: node.meta_rev,
             trash_group: node.trash_group.clone().unwrap_or_default(),
             current: node
@@ -351,8 +354,6 @@ pub struct Committed {
     pub record: Option<CommitRecord>,
 }
 
-/// A commit's stored result, with the principal that made the commit and its request as digest v1
-/// covers it (RFC 0006 section 8). Comparing the covered request stands in for comparing digests.
 #[derive(Clone, Debug)]
 struct StoredResult {
     device_id: String,
@@ -360,8 +361,6 @@ struct StoredResult {
     result: CommitResult,
 }
 
-/// The part of a commit request that digest v1 covers: `base_seq`, `ops`, `device_seq` and
-/// `require_head`. Fields added later, such as the base token of RFC 0013, stay out of it.
 fn covered(commit: &Commit) -> Commit {
     Commit {
         base_seq: commit.base_seq,
@@ -411,6 +410,8 @@ impl SpaceDo {
             status: NodeStatus::Live,
             content_rev: 0,
             content_dev: String::new(),
+            edit_rev: 0,
+            edit_dev: String::new(),
             meta_rev: 0,
             meta_dev: String::new(),
             parent_rev: 0,

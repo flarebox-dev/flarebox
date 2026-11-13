@@ -85,7 +85,7 @@ function replay(nodes: Map<string, RestoredNode>, record: CommitRecord): void {
     if (change.case !== "node") throw new Error(`unexpected change ${change.case}`);
     const incoming = change.value;
     const known = nodes.get(incoming.nodeId);
-    const rev = (state: NodeState) => (state.contentRev > state.metaRev ? state.contentRev : state.metaRev);
+    const rev = (state: NodeState) => [state.contentRev, state.metaRev, state.editRev].reduce((a, b) => (a > b ? a : b));
     if (known && rev(incoming) <= rev(known.state)) continue;
     const previous = new Map(known?.previous);
     let current = incoming.current;

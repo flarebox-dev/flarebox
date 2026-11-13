@@ -1389,6 +1389,7 @@ dependencies = [
  "proptest",
  "prost",
  "reqwest",
+ "rusqlite",
  "rustix",
  "semver",
  "serde",

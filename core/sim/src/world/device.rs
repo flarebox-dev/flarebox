@@ -83,7 +83,7 @@ impl Engine {
     }
 
     /// Applies change records to R, as the receiving side does for records in seq order.
-    pub fn apply(&mut self, changes: &[ChangeRecord]) -> Result<(), Failure> {
+    pub fn apply(&mut self, changes: &[ChangeRecord], made_here: bool) -> Result<(), Failure> {
         for change in changes {
             match &change.change {
                 Some(change_record::Change::Node(state))
@@ -92,7 +92,11 @@ impl Engine {
                     let (id, node) = RemoteNode::from_state(state).map_err(|error| {
                         Failure::Broken(format!("unreadable node state: {error:?}"))
                     })?;
-                    self.trees.set_remote(id, node);
+                    if made_here {
+                        self.trees.set_remote_made_here(id, node);
+                    } else {
+                        self.trees.set_remote(id, node);
+                    }
                 }
                 Some(change_record::Change::Purged(purged)) => {
                     self.trees.remove_remote(&purged.node_id)

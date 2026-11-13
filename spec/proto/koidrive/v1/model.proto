@@ -61,6 +61,9 @@ message NodeState {
   // (RFC 0012). Clients compare groups only for equality.
   string trash_group = 8;
   VersionInfo current = 9;
+  // The seq of the newest commit that created the node, changed its content other than by a resend, or carried a user's
+  // edit of content a resend brought (RFC 0018). 0 from a server before RFC 0018, read as content_rev.
+  uint64 edit_rev = 12;
 }
 
 message ChangeRecord {

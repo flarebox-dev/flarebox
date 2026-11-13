@@ -206,6 +206,7 @@ fn update(id: &str, content: Content) -> Op {
     wrap(op::Op::UpdateContent(UpdateContent {
         node_id: id.into(),
         content: Some(content),
+        resend: false,
     }))
 }
 

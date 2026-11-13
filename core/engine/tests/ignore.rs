@@ -53,6 +53,7 @@ fn remote(shape: Shape) -> RemoteNode {
         meta_rev: 1,
         trash_group: String::new(),
         version_id: String::new(),
+        edit_rev: 1,
     }
 }
 
@@ -251,6 +252,7 @@ fn a_node_is_synced_again_once_its_rule_is_removed() {
     let update = op::Op::UpdateContent(proto::UpdateContent {
         node_id: "b".into(),
         content: Some(content(9)),
+        resend: false,
     });
     assert_eq!(
         ops(&mut trees),

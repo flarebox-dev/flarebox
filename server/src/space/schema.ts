@@ -81,6 +81,18 @@ export const MIGRATIONS: readonly Migration[] = [
     sql.exec("ALTER TABLE nodes ADD COLUMN parent_dev TEXT NOT NULL DEFAULT ''");
     sql.exec("UPDATE nodes SET parent_rev = meta_rev");
   },
+  (sql) => {
+    const columns = sql.exec("SELECT name FROM pragma_table_info('nodes')").toArray().map((row) => row.name);
+    if (!columns.includes("edit_rev")) {
+      sql.exec("ALTER TABLE nodes ADD COLUMN edit_rev INTEGER NOT NULL DEFAULT 0");
+      sql.exec("ALTER TABLE nodes ADD COLUMN edit_dev TEXT NOT NULL DEFAULT ''");
+      sql.exec("UPDATE nodes SET edit_rev = content_rev, edit_dev = content_dev");
+    }
+    for (const table of ["commits", "device_commits"]) {
+      const held = sql.exec(`SELECT name FROM pragma_table_info('${table}')`).toArray().map((row) => row.name);
+      if (!held.includes("digest_version")) sql.exec(`ALTER TABLE ${table} ADD COLUMN digest_version INTEGER NOT NULL DEFAULT 1`);
+    }
+  },
 ];
 
 export function migrate(sql: Sql): void {

@@ -318,7 +318,7 @@ fn acknowledge(engine: &mut Engine) -> Result<(), Failure> {
     if let Some((commit_id, result)) =
         next.filter(|(_, result)| result.seq == engine.cursor.seq + 1)
     {
-        engine.apply(&result.changes)?;
+        engine.apply(&result.changes, true)?;
         engine.cursor = match result.committed_at_ms {
             0 => Base::from(result.seq),
             committed_at_ms => Base {
@@ -1400,7 +1400,8 @@ impl World {
                         break;
                     }
                     if record.seq == engine.cursor.seq + 1 {
-                        engine.apply(&record.changes)?;
+                        let made_here = engine.commits.made_record(record.seq, &record.commit_id);
+                        engine.apply(&record.changes, made_here)?;
                         engine.cursor = Base {
                             seq: record.seq,
                             commit_id: record.commit_id.clone(),
@@ -1602,6 +1603,11 @@ impl World {
                     .filter(|node| node.status == NodeStatus::Trashed as i32)
                     .map(|node| node.node_id)
                     .collect();
+                let resends: BTreeSet<NodeId> = (self.space.nodes().into_iter())
+                    .filter(|node| node.status == NodeStatus::Live as i32)
+                    .filter(|node| node.edit_rev < node.content_rev)
+                    .map(|node| node.node_id)
+                    .collect();
                 match self.space.commit(&session, now_ms, &sent) {
                     Ok(committed) => {
                         if let Some(record) = committed.record {
@@ -1746,6 +1752,16 @@ impl World {
                                 });
                                 if asked(&self.removed[d])
                                     || resent && self.removed.iter().any(asked)
+                                    || resends.contains(node)
+                                        && (nodes.iter()).any(|trashed| {
+                                            trashed.node_id == *node
+                                                && trashed.status != NodeStatus::Live as i32
+                                        })
+                                        && (chain(&parents, node).iter())
+                                            .any(|id| folders.contains(id))
+                                        && (self.removed[d].iter()).any(|write| {
+                                            held.is_some_and(|held| held.contains_key(write))
+                                        })
                                 {
                                     continue;
                                 }

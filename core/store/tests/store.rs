@@ -937,6 +937,7 @@ fn three_trees_round_trip() {
             user_id: "u1".into(),
             created_at_ms: 1_700_000_000_000,
         }),
+        edit_rev: 0,
     };
     let synced = [
         SyncedNode {
@@ -2587,6 +2588,7 @@ fn a_discarded_file_that_s_no_longer_holds_is_asked_about_again(edited: bool) {
             content_rev: 1,
             trash_group: String::new(),
             version_id: String::new(),
+            edit_rev: 1,
         },
     );
     trees.settle();
@@ -3079,6 +3081,7 @@ fn a_discarded_folder_is_not_sent_while_a_question_asks_again_about_what_it_hold
                 content_rev: 1,
                 trash_group: String::new(),
                 version_id: String::new(),
+                edit_rev: 1,
             },
         );
         trees.settle();
@@ -3191,4 +3194,37 @@ fn a_store_from_before_kept_originals_were_recorded_opens_with_none_recorded() {
     drop(store);
     let mut store = Store::open(&path).unwrap();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), after);
+}
+
+#[test]
+fn a_store_from_before_edit_revisions_were_stored_reads_each_as_its_content_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let node = NodeState {
+        node_id: "f".into(),
+        parent_id: "root".into(),
+        name: "b.txt".into(),
+        kind: NodeKind::File as i32,
+        status: NodeStatus::Live as i32,
+        content_rev: 4,
+        meta_rev: 3,
+        edit_rev: 2,
+        ..Default::default()
+    };
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| tx.put_remote_node(&node))
+        .unwrap();
+    store_before(&path, "remote_nodes_edit_rev");
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(applied(&path), all_migrations());
+    let nodes = store.transaction(|tx| tx.remote_nodes()).unwrap();
+    assert_eq!(
+        nodes,
+        [NodeState {
+            edit_rev: 4,
+            ..node
+        }]
+    );
 }

@@ -50,6 +50,7 @@ fn space(loose: usize, inside: usize) -> Trees {
                 meta_rev: 1,
                 trash_group: String::new(),
                 version_id: String::new(),
+                edit_rev: 1,
             },
         );
     }
@@ -493,6 +494,7 @@ fn a_held_file_changed_on_the_server_leaves_the_question_and_is_downloaded() {
             meta_rev: 1,
             trash_group: String::new(),
             version_id: String::new(),
+            edit_rev: 2,
         },
     );
     trees.settle();
@@ -751,6 +753,7 @@ fn a_restore_answer_holds_a_node_deleted_under_its_folder_since() {
             meta_rev: 1,
             trash_group: String::new(),
             version_id: String::new(),
+            edit_rev: 1,
         },
     );
     trees.settle();
@@ -823,6 +826,7 @@ fn trash_remotely(trees: &mut Trees, ids: &[&str]) {
             meta_rev: 2,
             trash_group: top.into(),
             version_id: String::new(),
+            edit_rev: 2,
         };
         trees.set_remote(id, node);
     }
@@ -1007,6 +1011,7 @@ fn a_folder_restored_after_its_notice_was_dismissed_is_noticed_when_deleted_agai
                 } else {
                     String::new()
                 },
+                edit_rev: rev,
             };
             trees.set_remote(id.clone(), node);
         }
@@ -1246,6 +1251,7 @@ fn a_folder_restored_after_a_dismissal_without_its_record_is_noticed_when_delete
                 } else {
                     String::new()
                 },
+                edit_rev: rev,
             };
             trees.set_remote(id.clone(), node);
         }
@@ -1319,6 +1325,7 @@ fn nested() -> Trees {
             meta_rev: 1,
             trash_group: String::new(),
             version_id: String::new(),
+            edit_rev: 1,
         };
         trees.set_remote(id, node);
     }

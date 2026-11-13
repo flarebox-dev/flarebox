@@ -142,6 +142,7 @@ fn run(actions: &[Action]) -> Vec<NodeState> {
             Kind::Update => op::Op::UpdateContent(UpdateContent {
                 node_id: pick(a.target),
                 content: Some(content(a.text)),
+                resend: false,
             }),
             Kind::Move => op::Op::Move(Move {
                 node_id: pick(a.target),

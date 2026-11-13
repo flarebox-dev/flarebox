@@ -28,6 +28,8 @@ export interface NodeRow {
   status: number;
   content_rev: number;
   content_dev: string;
+  edit_rev: number;
+  edit_dev: string;
   meta_rev: number;
   meta_dev: string;
   parent_rev: number;
@@ -156,6 +158,7 @@ export function nodeState(sql: Sql, node: NodeRow, complete = false): NodeState 
     kind: node.kind === 1 ? NodeKind.DIR : NodeKind.FILE,
     status: node.status === 1 ? NodeStatus.LIVE : NodeStatus.TRASHED,
     contentRev: BigInt(node.content_rev),
+    editRev: BigInt(node.edit_rev),
     metaRev: BigInt(node.meta_rev),
     trashGroup: node.trash_group ?? "",
     current: version ? versionInfo(sql, version, complete) : undefined,

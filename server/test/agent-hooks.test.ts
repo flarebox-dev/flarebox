@@ -75,6 +75,16 @@ describe("RFC 0006 section 8: digest v1", () => {
     expect(toHex(await commitDigest(empty))).toBe(toHex(await sha256(new Uint8Array([0x1a, 0x02, 0x2a, 0x00, 0x38, 0x01]))));
   });
 
+  it("covers resend from digest v2 and leaves digest v1 as it was", async () => {
+    const parts = await content("one");
+    const update = (resend: boolean) =>
+      create(CommitSchema, { baseSeq: 1n, deviceSeq: 2n, ops: [create(OpSchema, { op: { case: "updateContent", value: { nodeId: "n", content: parts.content, resend } } })] });
+    const [plain, resent] = [update(false), update(true)];
+    expect(toHex(await commitDigest(plain, 1))).toBe(toHex(await commitDigest(plain, 2)));
+    expect(toHex(await commitDigest(resent, 1))).toBe(toHex(await commitDigest(plain, 1)));
+    expect(toHex(await commitDigest(resent, 2))).not.toBe(toHex(await commitDigest(plain, 2)));
+  });
+
   it("changes with every covered field and keeps the request's order", async () => {
     const parts = await content("one", "two");
     const file = (init: Partial<typeof parts.content>) => op.create("f", "d", "f.txt", create(ContentSchema, { ...parts.content, ...init }));
