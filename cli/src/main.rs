@@ -560,7 +560,8 @@ async fn run(
             text if text.is_empty() && shows_state => report.status_line(),
             text => text,
         };
-        let failed = asked && report.failed();
+        let failed =
+            asked && report.failed() || shows_state && report.state == service::State::Unavailable;
         let failure = failed.then(|| report.failure_message());
         let data = match done.data.take() {
             Value::Null => Value::Object(serde_json::Map::new()),

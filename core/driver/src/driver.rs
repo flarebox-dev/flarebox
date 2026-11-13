@@ -1618,7 +1618,9 @@ impl Driver {
             if folder.run.as_ref().is_none_or(Running::ended) {
                 folder.run = None;
                 let mut status = folder.status.lock().unwrap();
-                status.state = FolderState::Stopped;
+                if status.state != FolderState::Halted {
+                    status.state = FolderState::Stopped;
+                }
                 status.wait = None;
             }
         }
@@ -2412,7 +2414,36 @@ mod tests {
             "{folder:?}"
         );
         driver.stop().await;
-        assert_eq!(driver.status().folders[0].state, FolderState::Stopped);
+        assert_eq!(driver.status().folders[0].state, FolderState::Halted);
+    }
+
+    #[tokio::test]
+    async fn pausing_a_halted_folder_keeps_its_problem_and_resuming_rechecks_it() {
+        let (_dir, paths, _root) = profile(&[]);
+        credential("d2").save_new(&paths.credential()).unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+        driver.start();
+        let halted = driver.status().folders[0].clone();
+        assert_eq!(halted.state, FolderState::Halted);
+        assert!(halted.problem.as_ref().unwrap().contains("device d1"));
+        driver.pause().await.unwrap();
+        let paused = driver.status();
+        assert!(paused.paused);
+        assert_eq!(paused.folders[0].state, FolderState::Halted);
+        assert_eq!(paused.folders[0].problem, halted.problem);
+        driver.resume().await.unwrap();
+        assert_eq!(driver.status().folders[0].state, FolderState::Halted);
+        assert_eq!(driver.status().folders[0].problem, halted.problem);
+        driver.pause().await.unwrap();
+        drop(driver);
+
+        let driver = Driver::open(paths).unwrap();
+        driver.start();
+        assert!(driver.status().paused);
+        driver.resume().await.unwrap();
+        assert_eq!(driver.status().folders[0].state, FolderState::Halted);
+        assert_eq!(driver.status().folders[0].problem, halted.problem);
+        driver.stop().await;
     }
 
     #[tokio::test]

@@ -264,19 +264,6 @@
           "type": "object"
         },
         {
-          "description": "Sync is paused until `koi resume`. `status --check` exits 0 for it, and the folders the pause stops add no\n`stopped` condition.",
-          "properties": {
-            "condition": {
-              "const": "paused",
-              "type": "string"
-            }
-          },
-          "required": [
-            "condition"
-          ],
-          "type": "object"
-        },
-        {
           "properties": {
             "condition": {
               "const": "halted",
