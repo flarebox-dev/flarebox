@@ -479,6 +479,10 @@ impl Engine {
     /// of this device it lost, so that they are sent again. A tree that is not valid stops the task before anything is
     /// replaced.
     pub fn replace_remote(&mut self, tx: &Tx<'_>, staging: Staging) -> Result<(), Stop> {
+        let replayed_own_record = (self.commits.in_flight()).and_then(|flight| {
+            let commit_id = &flight.commit.commit_id;
+            Some((staging.replayed.get(commit_id).copied()?, commit_id.clone()))
+        });
         let behind = (self.cursor.as_ref()).is_some_and(|cursor| cursor.ahead_of_server);
         let trashed = self.trees.trashed_here();
         let edited = self.trees.edited_here();
@@ -521,6 +525,9 @@ impl Engine {
                 self.commits.accepted(),
             );
             self.commits.forget_lost_slots();
+        }
+        if let Some((seq, commit_id)) = replayed_own_record {
+            self.commits.own_record(seq, &commit_id);
         }
         tx.clear_remote_nodes()?;
         for state in staging.nodes.values() {
@@ -1301,6 +1308,7 @@ pub(crate) struct Staging {
     /// The head of the last `CaughtUp`.
     caught_up: Option<u64>,
     nodes: BTreeMap<String, NodeState>,
+    replayed: BTreeMap<String, u64>,
 }
 
 impl Staging {
@@ -1323,6 +1331,7 @@ impl Staging {
                 .flat_map(|page| page.nodes)
                 .map(|node| (node.node_id.clone(), node))
                 .collect(),
+            replayed: BTreeMap::new(),
         };
         for state in trash.into_iter().flat_map(|page| page.nodes) {
             staging.take(state);
@@ -1388,6 +1397,7 @@ impl Staging {
                 }
             }
         }
+        self.replayed.insert(at.commit_id.clone(), at.seq);
         self.last = at;
         Ok(())
     }
@@ -3526,5 +3536,79 @@ mod tests {
                 Ok::<_, Stop>(())
             })
             .unwrap();
+    }
+
+    fn created_in_a_folder_and_lost(replayed: bool) -> Vec<op::Op> {
+        let (_dir, mut store) = store();
+        store
+            .transaction(|tx| {
+                let mut engine = Engine::load(tx, ROOT)?;
+                engine.replace_remote(tx, listed(4, vec![node("f", "f")]))?;
+                engine.trees.set_local("f".into(), held(dir(ROOT, "f"), 1));
+                engine.trees.set_local("n".into(), held(dir("f", "n"), 2));
+                engine.trees.rules_scanned();
+                engine.trees.settle();
+                let state = CommitsState {
+                    accepted: 2,
+                    slots: BTreeMap::from([(1, 2), (2, 3)]),
+                    ..Default::default()
+                };
+                engine.commits = Commits::from_state(state).unwrap();
+                let commit = (engine.commits)
+                    .build(&mut engine.trees, &mut engine.ids, 0, "h", 4)
+                    .cloned()
+                    .unwrap();
+                let created = NodeState {
+                    parent_id: "f".into(),
+                    meta_rev: 5,
+                    ..node("n", "n")
+                };
+                let created = CommitRecord {
+                    commit_id: commit.commit_id.clone(),
+                    ..record(5, vec![change_record::Change::Node(created)])
+                };
+                if replayed {
+                    let mut staging = listed(4, vec![node("f", "f")]);
+                    staging.replay(&[created])?;
+                    staging.caught_up(5);
+                    engine.replace_remote(tx, staging)?;
+                } else {
+                    engine.apply_records(tx, &[created])?;
+                }
+                engine.trees.settle();
+                let restored = proto::Welcome {
+                    history_id: "h".into(),
+                    device_seq: 1,
+                    ..Default::default()
+                };
+                let reconnect = engine.commits.connected(&restored);
+                assert_eq!(reconnect, koidrive_engine::commit::Reconnect::AheadOfServer);
+                engine.server_behind(tx)?;
+                let deleted = NodeState {
+                    status: NodeStatus::Trashed as i32,
+                    meta_rev: 3,
+                    trash_group: "3:0".into(),
+                    ..node("f", "f")
+                };
+                engine.replace_remote(tx, listed(3, vec![deleted]))?;
+                engine.trees.settle();
+                let sent = (engine.commits).build(&mut engine.trees, &mut engine.ids, 0, "h", 3);
+                Ok::<_, Stop>(sent.map_or_else(Vec::new, |commit| {
+                    commit.ops.iter().filter_map(|op| op.op.clone()).collect()
+                }))
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn a_lost_create_whose_record_a_listing_replayed_is_sent_again_as_when_the_log_brought_it() {
+        let streamed = created_in_a_folder_and_lost(false);
+        assert!(
+            streamed
+                .iter()
+                .any(|op| matches!(op, op::Op::CreateDir(create) if create.node_id == "n")),
+            "{streamed:?}"
+        );
+        assert_eq!(created_in_a_folder_and_lost(true), streamed);
     }
 }
