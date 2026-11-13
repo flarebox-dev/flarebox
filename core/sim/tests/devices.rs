@@ -2594,3 +2594,31 @@ fn the_authors_edit_survives_a_second_loss_and_a_delete() {
         &the_authors_edit_after_two_losses(false)
     ));
 }
+
+#[test]
+fn an_idle_device_sends_nothing_over_a_resend_it_pulled() {
+    let user = |kind| {
+        Step::User(Action {
+            kind,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text: 0,
+        })
+    };
+    let mut world = World::new(3);
+    world.phase(0, &[(0, user(1))]).unwrap();
+    let steps = [
+        (2, user(2)),
+        (0, user(0)),
+        (0, BACKUP),
+        (2, Step::Work(0)),
+        (0, Step::Work(0)),
+        (2, Step::Work(0)),
+        (2, COMMIT),
+        (0, Step::Work(0)),
+        (0, Step::Effect(Outcome::Crash(Cut::Quarantined))),
+        (0, RESTORE),
+    ];
+    world.phase(1, &steps).unwrap();
+}

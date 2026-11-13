@@ -1603,6 +1603,11 @@ impl World {
                     .filter(|node| node.status == NodeStatus::Trashed as i32)
                     .map(|node| node.node_id)
                     .collect();
+                let resends: BTreeSet<NodeId> = (self.space.nodes().into_iter())
+                    .filter(|node| node.status == NodeStatus::Live as i32)
+                    .filter(|node| node.edit_rev < node.content_rev)
+                    .map(|node| node.node_id)
+                    .collect();
                 match self.space.commit(&session, now_ms, &sent) {
                     Ok(committed) => {
                         if let Some(record) = committed.record {
@@ -1747,6 +1752,10 @@ impl World {
                                 });
                                 if asked(&self.removed[d])
                                     || resent && self.removed.iter().any(asked)
+                                    || resends.contains(node)
+                                        && (self.removed[d].iter()).any(|write| {
+                                            held.is_some_and(|held| held.contains_key(write))
+                                        })
                                 {
                                     continue;
                                 }

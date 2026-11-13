@@ -20,3 +20,4 @@ cc e1d24e940ffb2ce05bf036ed3828379f9181643626496be42ce5eba31b69ec91 # shrinks to
 cc f2098253217140721824a954e37edd294b34ced8e1c4f1e806988bf13b4c0b7b # shrinks to devices = 3, phases = [[(1, User(Action { kind: 1, target: 0, parent: 0, name: 0, text: 1 }))], [(0, User(Action { kind: 2, target: 0, parent: 0, name: 0, text: 0 })), (0, Backup)], [(0, Restore), (1, Connect), (1, Work(0)), (1, User(Action { kind: 2, target: 0, parent: 0, name: 0, text: 1 }))]]
 cc 4da93369d9a1d2d4c2614b29b46995a1b22f2b5f786b7e71a0061e65fea6be92
 cc 6738d936980638b431ef9488520fbef10ada8585333b827d5fa44480e7bdbb2a
+cc 67e7d4cee5fe483f5ce25dd05944c6a5fae035595279e174de613c490e1e8793 # shrinks to devices = 3, a delete that passes over a resend before the author sends its edit again (GUN-594)
