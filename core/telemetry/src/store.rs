@@ -162,6 +162,19 @@ impl Store {
         read(&self.dir.join("settings.json"))
     }
 
+    pub fn prompt_pending(&self) -> io::Result<bool> {
+        read(&self.dir.join("prompt.json"))
+    }
+
+    pub fn begin_prompt(&self) -> io::Result<bool> {
+        let _lock = self.lock(true)?;
+        if self.settings()?.enabled.is_some() {
+            return Ok(false);
+        }
+        write(&self.dir.join("prompt.json"), &true)?;
+        Ok(true)
+    }
+
     /// The mode with this profile's stored choice and the process's environment.
     pub fn status(&self, var: impl Fn(&str) -> Option<std::ffi::OsString>) -> io::Result<Status> {
         Ok(consent::resolve(var, self.settings()?.enabled))
@@ -185,6 +198,7 @@ impl Store {
             settings.install_id.get_or_insert_with(InstallId::generate);
         }
         write(&self.dir.join("settings.json"), &settings)?;
+        remove(&self.dir.join("prompt.json"))?;
         Ok(settings)
     }
 
@@ -397,6 +411,27 @@ mod tests {
     use super::*;
     use crate::Recorder;
     use crate::schema::{Command, Counter, SourceFile};
+
+    #[test]
+    fn unanswered_prompts_persist_without_consent_or_an_identity() {
+        for on in [false, true] {
+            let (dir, store) = store();
+            assert!(!store.prompt_pending().unwrap());
+            assert!(store.begin_prompt().unwrap());
+            assert!(store.prompt_pending().unwrap());
+            assert_eq!(store.settings().unwrap(), Settings::default());
+            assert!(matches!(
+                store.status(|_| None).unwrap().mode,
+                crate::Mode::Off
+            ));
+            assert!(!dir.path().join("telemetry/settings.json").exists());
+            assert!(!dir.path().join("telemetry/queue.json").exists());
+            store.set(on).unwrap();
+            assert!(!store.prompt_pending().unwrap());
+            assert!(!store.begin_prompt().unwrap());
+            assert_eq!(store.settings().unwrap().enabled, Some(on));
+        }
+    }
 
     fn store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();

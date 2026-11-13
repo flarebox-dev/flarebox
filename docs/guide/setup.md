@@ -18,6 +18,8 @@ koi setup
 
 On a terminal, `koi setup` asks how to set up this machine:
 
+Use the arrow keys and Enter to choose. Pairing codes and pasted login callback addresses are hidden while you type. For numbered, line-oriented questions without color or animation, run `koi setup --plain` or set `KOI_PLAIN=1`. Narrow terminals and `TERM=dumb` use that mode too. A nonempty `NO_COLOR` disables color without changing the questions.
+
 1. Log in with Cloudflare. Your browser opens Cloudflare's login page. Pick the account and select Authorize. Then Koidrive looks for its servers in that account:
    - With no server, it deploys one. It creates an R2 bucket, uploads the server as a Worker, turns on its `workers.dev` address, and claims the server with this device.
    - With one server, it adds this device to it.

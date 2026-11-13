@@ -21,6 +21,7 @@ use serde::Serialize;
 
 use crate::error::CliError;
 use crate::report::Done;
+use crate::terminal::{PromptFailure, Terminal};
 
 /// How often the daemon moves its sums to disk and sends what is due.
 const TICK: Duration = Duration::from_secs(10 * 60);
@@ -101,11 +102,19 @@ pub async fn start(
     });
 }
 
-pub async fn ask(paths: &Paths) {
+pub async fn ask(paths: &Paths, terminal: &Terminal) -> Result<(), CliError> {
     let store = Store::new(&paths.state_dir);
     match store.settings() {
         Ok(settings) if should_ask(var, settings.enabled) => {
-            if let Some(on) = question().await
+            match store.begin_prompt() {
+                Ok(true) => {}
+                Ok(false) => return Ok(()),
+                Err(error) => {
+                    tracing::warn!(%error, "the unanswered telemetry question could not be stored");
+                    return Ok(());
+                }
+            }
+            if let Some(on) = question(terminal).await?
                 && let Err(error) = store.set(on)
             {
                 tracing::warn!(%error, "the telemetry choice could not be stored");
@@ -113,6 +122,17 @@ pub async fn ask(paths: &Paths) {
         }
         Ok(_) => {}
         Err(error) => tracing::warn!(%error, "the telemetry settings cannot be read"),
+    }
+    Ok(())
+}
+
+pub fn prompt_pending(paths: &Paths) -> bool {
+    match Store::new(&paths.state_dir).prompt_pending() {
+        Ok(pending) => pending,
+        Err(error) => {
+            tracing::warn!(%error, "the unanswered telemetry question cannot be read");
+            false
+        }
     }
 }
 
@@ -130,21 +150,15 @@ fn flow() -> Option<SetupFlow> {
         .and_then(|run| run.flow.lock().ok().and_then(|flow| *flow))
 }
 
-/// The question, until it gets an answer: Enter or y is yes, n is no. None when stdin closes.
-async fn question() -> Option<bool> {
-    println!("Send anonymous usage reports to the Koidrive project?");
-    println!("Reports hold which commands ran, where setup failed, crash locations, daily sync");
-    println!("totals, daily counts of each kind of error, and your OS and Koidrive version.");
-    println!("They never hold file names, paths, contents, error messages, your server address");
-    println!("or your account.");
-    println!("See a report: koi telemetry preview. Turn off: koi telemetry off.");
-    loop {
-        let answer = crate::setup::prompt("Send reports? [Y/n] ").await.ok()?;
-        match answer.to_ascii_lowercase().as_str() {
-            "" | "y" | "yes" => return Some(true),
-            "n" | "no" => return Some(false),
-            _ => {}
-        }
+async fn question(terminal: &Terminal) -> Result<Option<bool>, CliError> {
+    terminal.message("Send anonymous usage reports to the Koidrive project?");
+    terminal.message("Reports hold command and error counts, crash locations, daily sync totals, and your OS and Koidrive version.");
+    terminal.message("They never hold file names, paths, contents, error messages, your server address or your account.");
+    terminal.message("Preview: koi telemetry preview. Turn off: koi telemetry off.");
+    match terminal.confirm("Send reports?", true).await {
+        Ok(answer) => Ok(Some(answer)),
+        Err(PromptFailure::Cancelled) => Err(PromptFailure::Cancelled.into()),
+        Err(_) => Ok(None),
     }
 }
 
