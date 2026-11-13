@@ -10,7 +10,7 @@ koi share create ~/Koidrive/Plans/Q3.pptx
 
 The command prints the link, and only the link, on stdout, so `link=$(koi share create ...)` works. On stderr it says what the link shares, how long it works and how to end it. Copy the link then: no other command shows it again. To give someone a link you lost, revoke it and make a new one.
 
-The file or folder must be on the server. A file this device hasn't uploaded yet, or one your [`.koiignore` rules](folders.md) leave out, can't be shared.
+The file or folder must match what is on the server. Before sharing, Koidrive checks the local file identities and contents, including every file in a shared folder. Wait for edits, moves and replacements to sync before making a link. A file your [`.koiignore` rules](folders.md) leave out can't be shared.
 
 A folder's link shows the folder as it is each time someone opens it. Files added to it later show up, and files moved out of it or deleted don't. Moving or renaming the shared folder or file keeps the link working. If it goes to the trash, the link opens nothing until you [restore it](history.md).
 

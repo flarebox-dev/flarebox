@@ -2021,4 +2021,138 @@ async fn a_share_link_opens_what_it_shares_until_it_is_revoked() {
             "the daemon's log holds a link's secret"
         );
     }
+    refuses_local_replacements_and_edits_that_have_not_synced().await;
+}
+
+async fn refuses_local_replacements_and_edits_that_have_not_synced() {
+    let owner = Arc::new(Auth::new(api(), owner().await));
+    let space_name = format!("share local {}", uuidv7());
+    let space = owner
+        .api()
+        .create_space(
+            &owner,
+            &CreateSpaceRequest {
+                name: space_name.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let pairing = owner.api().pair_start(&owner).await.unwrap();
+    let machine = Machine::new();
+    let server = server_url().to_string();
+    machine.run(&["join", &pairing.code, "--server", &server, "--name", "desk"]);
+    let folder = machine.path("Sync");
+    fs::create_dir_all(&folder).unwrap();
+    let folder = folder.canonicalize().unwrap();
+    machine.run(&[
+        "folder",
+        "link",
+        folder.to_str().unwrap(),
+        "--space",
+        &space_name,
+    ]);
+    let daemon = machine
+        .command(&["_daemon"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    eventually("the daemon's socket", || machine.socket().exists()).await;
+    machine
+        .status_until("the first sync", |status| {
+            status["folders"][0]["state"] == "up_to_date"
+        })
+        .await;
+    let docs = uuidv7();
+    let original = uuidv7();
+    commit_as_owner(
+        &owner,
+        &space.space_id,
+        &[b"private original"],
+        vec![
+            op::Op::CreateDir(CreateDir {
+                node_id: docs.clone(),
+                parent_id: space.space_id.clone(),
+                name: "Docs".into(),
+            }),
+            op::Op::CreateFile(CreateFile {
+                node_id: original.clone(),
+                parent_id: docs,
+                name: "contract.txt".into(),
+                content: Some(file_content(b"private original")),
+            }),
+        ],
+    )
+    .await;
+    let file = folder.join("Docs/contract.txt");
+    eventually("the original on disk", || {
+        fs::read(&file).ok().as_deref() == Some(b"private original")
+    })
+    .await;
+    assert!(stop(daemon).success());
+
+    let share = |path: &Path| machine.data(&["share", "create", path.to_str().unwrap()]);
+    let synced = share(&file);
+    assert_eq!(synced["node_id"], original);
+    machine.data(&["share", "revoke", synced["id"].as_str().unwrap()]);
+    let private = folder.join("Docs/contract-private.txt");
+    fs::rename(&file, &private).unwrap();
+    fs::write(&file, b"public replacement").unwrap();
+    for path in [&file, &folder.join("Docs"), &folder] {
+        let error = machine.fails(&["share", "create", path.to_str().unwrap()]);
+        assert!(error.contains("has not synced yet"), "{error}");
+    }
+    fs::remove_file(&file).unwrap();
+    fs::rename(&private, &file).unwrap();
+    fs::write(&file, b"public edited in place").unwrap();
+    for path in [&file, &folder.join("Docs"), &folder] {
+        let error = machine.fails(&["share", "create", path.to_str().unwrap()]);
+        assert!(error.contains("has not synced yet"), "{error}");
+    }
+    fs::write(&file, b"private original").unwrap();
+    let restored = share(&file);
+    assert_eq!(restored["node_id"], original);
+    machine.data(&["share", "revoke", restored["id"].as_str().unwrap()]);
+
+    fs::rename(&file, &private).unwrap();
+    fs::write(&file, b"public replacement").unwrap();
+    let daemon = machine
+        .command(&["_daemon"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    eventually("the restarted daemon's socket", || {
+        machine.socket().exists()
+    })
+    .await;
+    let started = Instant::now();
+    let created = loop {
+        let output = machine.output(&["share", "create", file.to_str().unwrap(), "--json"]);
+        let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+        schema::check(&envelope);
+        if output.status.success() {
+            break envelope["data"].clone();
+        }
+        assert!(
+            started.elapsed() < WAIT,
+            "replacement did not finish syncing"
+        );
+        assert_eq!(envelope["error"]["code"], "usage");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_ne!(created["node_id"], original);
+    let id = link_id(created["url"].as_str().unwrap());
+    let node = created["node_id"].as_str().unwrap();
+    let reply = reqwest::get(
+        server_url()
+            .join(&format!("v1/share/{id}/file/{node}"))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply.status().as_u16(), 200);
+    assert_eq!(reply.bytes().await.unwrap().as_ref(), b"public replacement");
+    machine.data(&["share", "revoke", created["id"].as_str().unwrap()]);
+    assert!(stop(daemon).success());
 }

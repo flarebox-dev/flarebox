@@ -162,6 +162,8 @@ pub enum DriverError {
     ShareLinkNotFound,
     #[error("several share links have the ID {0}; name the one to revoke by its URL")]
     ShareLinkAmbiguous(String),
+    #[error("the folder changed while its server tree was being read; try again")]
+    ShareTreeChanged,
     #[error("the server refused: {}", .0.message())]
     Refused(ServerError),
     #[error(

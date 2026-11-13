@@ -169,6 +169,7 @@ impl From<DriverError> for CliError {
                 CliError::new(Code::AuthRequired, message).then(&["koi", "setup"])
             }
             DriverError::NeedsConfirmation => CliError::new(Code::AuthRequired, message),
+            DriverError::ShareTreeChanged => CliError::new(Code::Unavailable, message),
             DriverError::QuestionNotFound(_) | DriverError::AnsweredOtherwise { .. } => {
                 CliError::new(
                     Code::StaleDecision,

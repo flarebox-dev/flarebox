@@ -335,6 +335,10 @@ impl Api {
             MAX_SHARE_LINK_PAGE,
         )
         .await
+        .map_err(|error| match error {
+            ApiError::Transport(error) => ApiError::Transport(error.without_url()),
+            other => other,
+        })
     }
 
     /// `DELETE /v1/spaces/{space_id}/links/{link_id}`, owner only (RFC 0005 section 2). Revoking a revoked link succeeds.
@@ -952,6 +956,29 @@ mod tests {
         }
         let sent = tokio::time::timeout(Duration::from_millis(100), listener.accept()).await;
         assert!(sent.is_err(), "nothing was sent");
+    }
+
+    #[tokio::test]
+    async fn a_failed_share_listing_keeps_the_cursor_out_of_its_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base: Url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        drop(listener);
+        let auth = signed_in(base);
+        let link_id = "AAAAAAAAAAAAAAAAAAAAAA";
+        let cursor = format!("1000.{link_id}");
+        let outcome = auth.api().list_share_links(&auth, "s1", &cursor).await;
+        let Err(error @ ApiError::Transport(_)) = outcome else {
+            panic!("{outcome:?}");
+        };
+        let mut shown = format!("{error} {error:?}");
+        let mut source = std::error::Error::source(&error);
+        while let Some(cause) = source {
+            shown.push_str(&format!(" {cause} {cause:?}"));
+            source = cause.source();
+        }
+        assert!(!shown.contains(link_id), "{shown}");
     }
 
     #[tokio::test]

@@ -2,9 +2,12 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use koidrive_engine::names::name_key;
+use koidrive_engine::tree::{RemoteNode, same_content};
+use koidrive_fs::{EntryKind, Snapshot, check_root};
 use koidrive_net::{ApiError, Auth, ServerError};
 use koidrive_proto::v1::{
     CreateShareLinkRequest, ListTree, NodeKind, NodeState, NodeStatus, ShareLink, SpaceInfo,
@@ -15,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::driver::{now_ms, store_error};
+use crate::engine::{Engine, file_id};
+use crate::observe::{open_beneath, read_content};
 use crate::{Driver, DriverError, FolderState, FolderStatus};
 
 const TREE_PAGE: u32 = 1000;
@@ -113,7 +118,7 @@ impl Driver {
         let auth = self.signed_in()?;
         let folders = self.status().folders;
         let (folder, names) = locate(&folders, path)?;
-        let nodes = self.remote_nodes(&folder.space_id)?;
+        let nodes = server_tree(&auth, &folder.space_id).await?;
         let tree = Tree::new(&folder.space_id, &nodes);
         let Some(node_id) = tree.find(&names) else {
             return Err(match std::fs::symlink_metadata(path) {
@@ -121,9 +126,37 @@ impl Driver {
                 Err(_) => DriverError::PathNotFound(path.to_owned()),
             });
         };
+        let node_id = node_id.to_owned();
+        let store = self.paths().store(&folder.space_id)?;
+        let root = PathBuf::from(&folder.path);
+        let requested = path.to_owned();
+        let space_id = folder.space_id.clone();
+        let selected = node_id.clone();
+        let nodes = tokio::task::spawn_blocking(move || {
+            let (engine, link) = Store::open(&store)
+                .and_then(|mut store| {
+                    store.transaction(|tx| Ok((Engine::load(tx, &space_id)?, tx.link()?)))
+                })
+                .map_err(store_error(&store))?;
+            let unsynced = || DriverError::NotOnServer(requested.clone());
+            let link = link.ok_or_else(unsynced)?;
+            let tree = Tree::new(&space_id, &nodes);
+            if !verified(&root, link.root_dev, &names, &selected, &tree, &engine)
+                .map_err(|_| unsynced())?
+            {
+                return Err(unsynced());
+            }
+            Ok(nodes)
+        })
+        .await
+        .map_err(|error| DriverError::Io {
+            path: path.to_owned(),
+            error: std::io::Error::other(error),
+        })??;
+        let tree = Tree::new(&folder.space_id, &nodes);
         let now = now_ms();
         let request = CreateShareLinkRequest {
-            node_id: node_id.to_owned(),
+            node_id,
             expires_at_ms: match expiry {
                 Expiry::After { ms } => now.saturating_add_unsigned(ms),
                 Expiry::Default | Expiry::Never => 0,
@@ -239,6 +272,108 @@ impl Driver {
             .and_then(|mut store| store.transaction(|tx| tx.remote_nodes()))
             .map_err(store_error(&path))
     }
+}
+
+fn verified(
+    root: &Path,
+    root_dev: u64,
+    names: &[String],
+    node_id: &str,
+    tree: &Tree<'_>,
+    engine: &Engine,
+) -> std::io::Result<bool> {
+    let flags = rustix::fs::OFlags::RDONLY
+        | rustix::fs::OFlags::DIRECTORY
+        | rustix::fs::OFlags::NOFOLLOW
+        | rustix::fs::OFlags::CLOEXEC;
+    let held = std::fs::File::from(rustix::fs::open(root, flags, rustix::fs::Mode::empty())?);
+    let identity = held.metadata()?;
+    if check_root(root, tree.root, root_dev).is_err() {
+        return Ok(false);
+    }
+    let Some(target) = tree.target(node_id) else {
+        return Ok(false);
+    };
+    let scope = Path::new(&target.path);
+    let mut disk = Snapshot::default();
+    let scanned = disk
+        .rescan(root, [PathBuf::new()])
+        .map_err(std::io::Error::other)?;
+    if scanned.root.dev != identity.dev() || scanned.root.ino != u128::from(identity.ino()) {
+        return Ok(false);
+    }
+    let mut selected = None;
+    for (&id, remote) in &tree.by_id {
+        let Some(target) = tree.target(id) else {
+            return Ok(false);
+        };
+        let remote_path = Path::new(&target.path);
+        if !remote_path.starts_with(scope) && !scope.starts_with(remote_path) {
+            continue;
+        }
+        let Some(local) = engine.trees.local().get(id) else {
+            return Ok(false);
+        };
+        let Ok((_, remote_shape)) = RemoteNode::from_state(remote) else {
+            return Ok(false);
+        };
+        if local.parked
+            || engine.trees.ignored_local().contains(id)
+            || !local.shape.same_position(&remote_shape.shape)
+            || local.shape.kind != remote_shape.shape.kind
+        {
+            return Ok(false);
+        }
+        let Some(path) = engine.path_of(id) else {
+            return Ok(false);
+        };
+        if scanned
+            .unreadable
+            .iter()
+            .chain(&scanned.unsettled)
+            .any(|blocked| path.starts_with(blocked) || blocked.starts_with(&path))
+        {
+            return Ok(false);
+        }
+        let Some(entry) = disk.entries.get(&path) else {
+            return Ok(false);
+        };
+        if entry.id != file_id(local.identity) {
+            return Ok(false);
+        }
+        match (entry.kind, remote_shape.shape.content.as_ref()) {
+            (EntryKind::Dir, None) => {}
+            (EntryKind::File, Some(expected)) => {
+                let Some(content) = read_content(root, &path, entry, &|| false)? else {
+                    return Ok(false);
+                };
+                if !same_content(&content, expected) {
+                    return Ok(false);
+                }
+            }
+            _ => return Ok(false),
+        }
+        if id == node_id {
+            selected = Some(entry.id);
+        }
+    }
+    let after = std::fs::symlink_metadata(root)?;
+    if after.dev() != identity.dev()
+        || after.ino() != identity.ino()
+        || !after.is_dir()
+        || check_root(root, tree.root, root_dev).is_err()
+    {
+        return Ok(false);
+    }
+    if node_id == tree.root {
+        return Ok(scanned.unreadable.is_empty() && scanned.unsettled.is_empty());
+    }
+    let Some(expected) = selected else {
+        return Ok(false);
+    };
+    let typed: PathBuf = names.iter().collect();
+    let actual = open_beneath(root, &typed)?.metadata()?;
+    Ok(actual.dev() == expected.dev && u128::from(actual.ino()) == expected.ino)
 }
 
 enum LinkRef {
@@ -421,6 +556,8 @@ fn locate<'a>(
                     }
                 } else if !metadata.is_dir() {
                     return Err(outside());
+                } else {
+                    prefix = std::fs::canonicalize(&prefix).map_err(|_| outside())?;
                 }
             }
             other => prefix.push(other),
@@ -477,6 +614,7 @@ async fn server_tree(auth: &Auth, space_id: &str) -> Result<Vec<NodeState>, Driv
     let mut nodes = Vec::new();
     let mut cursor = String::new();
     let mut seen = HashSet::new();
+    let mut head = None;
     loop {
         let call = Call::ListTree(ListTree {
             cursor,
@@ -489,6 +627,11 @@ async fn server_tree(auth: &Auth, space_id: &str) -> Result<Vec<NodeState>, Driv
             }
             _ => return Err(ApiError::Decode("TreePage").into()),
         };
+        let at = (page.head_seq, page.head_commit_id.clone());
+        if head.as_ref().is_some_and(|head| head != &at) {
+            return Err(DriverError::ShareTreeChanged);
+        }
+        head = Some(at);
         nodes.extend(page.nodes);
         if page.next_cursor.is_empty() {
             return Ok(nodes);
@@ -791,6 +934,214 @@ mod tests {
             located(Path::new("Sync/x.txt")),
             Err(DriverError::RelativePath(_))
         ));
+    }
+
+    #[test]
+    fn sharing_verifies_local_identity_and_content_for_files_and_subtrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Sync");
+        std::fs::create_dir_all(root.join("Docs")).unwrap();
+        koidrive_fs::write_marker(
+            &root,
+            &koidrive_fs::Marker {
+                space_id: SPACE.into(),
+                effects: 0,
+            },
+        )
+        .unwrap();
+        let file = root.join("Docs/contract.txt");
+        std::fs::write(&file, b"private").unwrap();
+        let snapshot = Snapshot::scan(&root).unwrap();
+        let content = read_content(
+            &root,
+            Path::new("Docs/contract.txt"),
+            &snapshot.entries[Path::new("Docs/contract.txt")],
+            &|| false,
+        )
+        .unwrap()
+        .unwrap();
+        let nodes = vec![
+            node("docs", SPACE, "Docs", NodeKind::Dir, NodeStatus::Live),
+            NodeState {
+                current: Some(koidrive_proto::v1::VersionInfo {
+                    content: Some(content),
+                    ..Default::default()
+                }),
+                ..node(
+                    "file",
+                    "docs",
+                    "contract.txt",
+                    NodeKind::File,
+                    NodeStatus::Live,
+                )
+            },
+        ];
+        let mut store = Store::open(dir.path().join("store.sqlite")).unwrap();
+        let engine = store
+            .transaction(|tx| {
+                for (node, path) in nodes.iter().zip(["Docs", "Docs/contract.txt"]) {
+                    let (_, remote) = RemoteNode::from_state(node).unwrap();
+                    tx.put_remote_node(node)?;
+                    let shape = koidrive_store::Shape {
+                        parent_id: remote.shape.parent,
+                        name: remote.shape.name,
+                        kind: node.kind,
+                        content: remote.shape.content,
+                    };
+                    tx.put_synced_node(&koidrive_store::SyncedNode {
+                        node_id: node.node_id.clone(),
+                        shape: shape.clone(),
+                    })?;
+                    tx.put_local_node(&koidrive_store::LocalNode {
+                        node_id: node.node_id.clone(),
+                        shape,
+                        identity: snapshot.entries[Path::new(path)].id,
+                        parked: false,
+                    })?;
+                }
+                Engine::load(tx, SPACE)
+            })
+            .unwrap();
+        let tree = Tree::new(SPACE, &nodes);
+        let dev = std::fs::metadata(&root).unwrap().dev();
+        let valid = || {
+            [
+                verified(
+                    &root,
+                    dev,
+                    &names("Docs/contract.txt"),
+                    "file",
+                    &tree,
+                    &engine,
+                )
+                .unwrap(),
+                verified(&root, dev, &names("Docs"), "docs", &tree, &engine).unwrap(),
+                verified(&root, dev, &[], SPACE, &tree, &engine).unwrap(),
+            ]
+        };
+        assert_eq!(valid(), [true; 3]);
+        std::fs::write(root.join("not-synced-yet.txt"), b"a future folder addition").unwrap();
+        assert_eq!(valid(), [true; 3]);
+
+        let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+        std::fs::write(&file, b"public!").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        assert_eq!(valid(), [false; 3]);
+        std::fs::write(&file, b"private").unwrap();
+        assert_eq!(valid(), [true; 3]);
+
+        let saved = root.join("Docs/contract-private.txt");
+        std::fs::rename(&file, &saved).unwrap();
+        std::fs::write(&file, b"private").unwrap();
+        assert_eq!(valid(), [false; 3]);
+        std::fs::remove_file(&file).unwrap();
+        std::fs::rename(&saved, &file).unwrap();
+        assert_eq!(valid(), [true; 3]);
+        if !root.join("DOCS").exists() {
+            std::fs::create_dir(root.join("DOCS")).unwrap();
+            std::fs::write(root.join("DOCS/contract.txt"), b"private").unwrap();
+            assert!(
+                !verified(
+                    &root,
+                    dev,
+                    &names("DOCS/contract.txt"),
+                    "file",
+                    &tree,
+                    &engine
+                )
+                .unwrap()
+            );
+        }
+        std::fs::rename(root.join("Docs"), root.join("Moved")).unwrap();
+        std::fs::create_dir(root.join("Docs")).unwrap();
+        std::fs::write(&file, b"private").unwrap();
+        assert_eq!(valid(), [false; 3]);
+    }
+
+    #[tokio::test]
+    async fn server_tree_pages_must_describe_one_unchanged_head() {
+        for second in [(10, "first"), (11, "next"), (10, "other-history")] {
+            let replies = [(10, "first"), second]
+                .into_iter()
+                .enumerate()
+                .map(|(i, (seq, id))| {
+                    let page = TreePage {
+                        next_cursor: if i == 0 { "next".into() } else { String::new() },
+                        head_seq: seq,
+                        head_commit_id: id.into(),
+                        ..Default::default()
+                    };
+                    (
+                        format!("POST /v1/spaces/{SPACE}/rpc"),
+                        200,
+                        RpcResponse {
+                            result: Some(rpc_response::Result::Tree(page)),
+                            ..Default::default()
+                        }
+                        .encode_to_vec(),
+                    )
+                })
+                .collect();
+            let (server, served) = serve(replies).await;
+            let result = server_tree(&auth(&server), SPACE).await;
+            if second == (10, "first") {
+                assert!(result.unwrap().is_empty());
+            } else {
+                assert!(matches!(result, Err(DriverError::ShareTreeChanged)));
+            }
+            served.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn linked_roots_accept_the_spellings_the_filesystem_accepts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let linked = root.join("Projects/Cafe\u{301}");
+        std::fs::create_dir_all(linked.join("Docs")).unwrap();
+        std::fs::create_dir(root.join("Elsewhere")).unwrap();
+        symlink(root.join("Elsewhere"), linked.join("Docs/away")).unwrap();
+        symlink(&linked, root.join("Alias")).unwrap();
+        let linked = linked.canonicalize().unwrap();
+        let folders = [folder(&linked)];
+
+        for spelling in [
+            "Projects/Cafe\u{301}",
+            "projects/Cafe\u{301}",
+            "PROJECTS/CAFE\u{301}",
+            "Projects/Caf\u{e9}",
+            "projects/CAF\u{c9}",
+            "Alias",
+            "alias",
+        ] {
+            let typed = root.join(spelling);
+            let path = typed.join("Docs/plan.txt");
+            if !typed.exists() {
+                assert!(matches!(
+                    locate(&folders, &path),
+                    Err(DriverError::OutsideLinkedFolders(_))
+                ));
+                continue;
+            }
+            let (found, path) = locate(&folders, &path).unwrap();
+            assert_eq!(found.path, linked.to_str().unwrap());
+            assert_eq!(path, names("Docs/plan.txt"));
+            assert_eq!(
+                locate(&folders, &typed.join("Docs/../server-only.txt"))
+                    .unwrap()
+                    .1,
+                names("server-only.txt")
+            );
+            assert!(matches!(
+                locate(&folders, &typed.join("Docs/away/..")),
+                Err(DriverError::NotOnServer(_))
+            ));
+        }
     }
 
     #[test]
