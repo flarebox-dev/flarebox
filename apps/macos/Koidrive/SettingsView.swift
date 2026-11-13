@@ -56,9 +56,15 @@ struct FoldersSettings: View {
                     addButton
                 }
             } else {
-                ForEach(model.state.folders, id: \.spaceId) { folder in
-                    FolderRow(folder: folder) { unlinking = folder }
+                ScrollView {
+                    VStack(spacing: 4) {
+                        ForEach(model.state.folders, id: \.spaceId) { folder in
+                            FolderRow(folder: folder) { unlinking = folder }
+                        }
+                    }
                 }
+                .frame(maxHeight: CGFloat(model.state.folders.count) * 48 - 4)
+                .layoutPriority(1)
                 if let error {
                     ErrorLine(error)
                         .padding(.horizontal, 12)
@@ -551,7 +557,7 @@ private struct ProblemBand: View {
             GroupBand(title: "Unlinked space") {
                 if let spaceID {
                     Text(verbatim: spaceID)
-                        .foregroundStyle(Color.text3)
+                        .foregroundStyle(Color.text2)
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }

@@ -20,9 +20,10 @@ enum Snapshots {
                 await capture(MenuContent().environment(model).background(.background), width: 330, titled: nil,
                               dark: dark, to: directory.appending(path: "menubar-\(name)-\(suffix).png"))
             }
-            for (name, setup, app) in await setupStates() {
+            for (name, setup, app, afterAppearing) in await setupStates() {
                 await capture(SetupSteps(setup: setup).environment(app).frame(width: 480), width: 480,
-                              titled: "Set Up Koidrive", dark: dark, to: directory.appending(path: "setup-\(name)-\(suffix).png"))
+                              titled: "Set Up Koidrive", dark: dark, to: directory.appending(path: "setup-\(name)-\(suffix).png"),
+                              afterAppearing: afterAppearing)
             }
             for (name, scenario) in [("mass-delete", FakeScenario.massDelete), ("recovery", .recovery),
                                      ("ambiguous", .ambiguousDisappearance), ("two-spaces", .manyQuestions),
@@ -90,7 +91,7 @@ enum Snapshots {
         return states
     }
 
-    private static func setupStates() async -> [(String, SetupModel, AppModel)] {
+    private static func setupStates() async -> [(String, SetupModel, AppModel, (@MainActor () async -> Void)?)] {
         func start(claimed: Bool) -> (SetupModel, AppModel) {
             let app = AppModel.preview(.firstRun)
             try? app.session.fakeCore()?.setServerClaimed(claimed: claimed)
@@ -151,8 +152,10 @@ enum Snapshots {
         let (overlap, overlapApp) = addFolder()
         await overlap.loadSpaces()
         overlap.folderPath = documents.path(percentEncoded: false)
-        overlapApp.session.fakeCore()?.failNext(error: .FolderOverlaps(other: "~/Koidrive/Photos"))
-        await overlap.link()
+        let failLinking: @MainActor () async -> Void = {
+            overlapApp.session.fakeCore()?.failNext(error: .FolderOverlaps(other: "~/Koidrive/Photos"))
+            await overlap.link()
+        }
 
         let (done, doneApp) = start(claimed: false)
         done.serverURL = "https://koi.example.com"
@@ -164,12 +167,12 @@ enum Snapshots {
         done.folderPath = projects.path(percentEncoded: false)
         await done.link()
 
-        return [("1-server", server, serverApp), ("1a-server-error", unreachable, unreachableApp),
-                ("1b-server-decided", decided, decidedApp), ("2-sign-in", pairing, pairingApp),
-                ("2a-sign-in-error", pair, pairApp), ("2b-claim", claim, claimApp),
-                ("3-folder", folder, folderApp), ("3a-folder-existing", existing, existingApp),
-                ("3b-folder-none", noFolder, noFolderApp), ("3c-folder-overlap", overlap, overlapApp),
-                ("4-done", done, doneApp)]
+        return [("1-server", server, serverApp, nil), ("1a-server-error", unreachable, unreachableApp, nil),
+                ("1b-server-decided", decided, decidedApp, nil), ("2-sign-in", pairing, pairingApp, nil),
+                ("2a-sign-in-error", pair, pairApp, nil), ("2b-claim", claim, claimApp, nil),
+                ("3-folder", folder, folderApp, nil), ("3a-folder-existing", existing, existingApp, nil),
+                ("3b-folder-none", noFolder, noFolderApp, nil), ("3c-folder-overlap", overlap, overlapApp, failLinking),
+                ("4-done", done, doneApp, nil)]
     }
 
     private static func settingsStates() async -> [(String, AnyView)] {
@@ -196,7 +199,7 @@ enum Snapshots {
     }
 
     private static func capture(_ view: some View, width: CGFloat, height: CGFloat? = nil, titled: String?,
-                                dark: Bool, to url: URL) async {
+                                dark: Bool, to url: URL, afterAppearing: (@MainActor () async -> Void)? = nil) async {
         let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         let host = NSHostingView(rootView: view
             .buttonStyle(.secondary)
@@ -220,6 +223,9 @@ enum Snapshots {
             if window.contentRect(forFrameRect: window.frame).size != size {
                 window.setContentSize(size)
             }
+        }
+        if let afterAppearing {
+            await afterAppearing()
         }
         try? await Task.sleep(for: .milliseconds(300))
         let screencapture = Process()
