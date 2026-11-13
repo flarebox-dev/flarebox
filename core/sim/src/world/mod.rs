@@ -1107,6 +1107,16 @@ impl World {
                         },
                     )
                 }
+                Err(Refused::Overtaken) => {
+                    note(
+                        &mut self.seen,
+                        "restart finds a written file its user changed since",
+                    );
+                    if let Some(content) = download.filter(|c| device.disk.holds(c.mtime_ns)) {
+                        self.copied.insert(content.mtime_ns);
+                    }
+                    effects.overtaken(trees, &record.effect_id)
+                }
                 outcome => {
                     note(
                         &mut self.seen,

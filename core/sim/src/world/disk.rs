@@ -54,6 +54,9 @@ pub enum Refused {
     /// Recovery found that the effect stopped before it displaced anything, or that its target
     /// is not in the effect's final state any more.
     Interrupted,
+    /// Recovery found that the effect wrote its file and sent the entry it replaced to the local
+    /// trash, and that the user changed or removed the written file since.
+    Overtaken,
 }
 
 /// How far an effect gets on the disk before the device crashes.
@@ -249,7 +252,7 @@ impl Disk {
             record.effect,
             Effect::RemoveFile { .. } | Effect::RemoveDir { .. }
         );
-        if until == Cut::Done && outcome.is_ok() && removal {
+        if until == Cut::Done && (outcome.is_ok() && removal || trashed.is_some()) {
             self.trash.insert(record.effect_id.clone());
         }
         self.binned
@@ -335,8 +338,10 @@ impl Disk {
     /// entry goes to the local trash. With nothing in quarantine and nothing staged, the effect
     /// is done when its target is in the effect's final state, which for a removal also takes its
     /// entry in the local trash. A removal whose name is empty without that entry fails, since the
-    /// user moved or deleted the entry before the effect reached it. Anything else is an effect
-    /// that stopped early or whose target the user has changed since.
+    /// user moved or deleted the entry before the effect reached it. A write whose replaced entry
+    /// is in the local trash and whose file is not at its target any more is overtaken: the user
+    /// changed the written file. Anything else is an effect that stopped early or whose target the
+    /// user has changed since.
     pub fn recover(&mut self, record: &EffectRecord) -> Applied {
         self.marker = record.counter;
         let staged = std::mem::take(&mut self.staged);
@@ -358,10 +363,11 @@ impl Disk {
                 })
             }
             Effect::WriteFile { at, content, .. } => {
-                (self.written(at, content).map(Some)).ok_or(Refused::Taken)
+                (self.written(at, content).map(Some)).ok_or(Refused::Overtaken)
             }
             _ => Ok(None),
         };
+        self.trash.insert(record.effect_id.clone());
         self.binned
             .extend(entry.content.as_ref().map(|content| content.mtime_ns));
         Applied {
@@ -378,7 +384,10 @@ impl Disk {
             Effect::CreateDir { at: place } => at(place)?
                 .filter(|ino| self.entries[ino].content.is_none())
                 .map(|ino| Some(identity(ino))),
-            Effect::WriteFile { at, content, .. } => self.written(at, content).map(Some),
+            Effect::WriteFile { at, content, .. } => match self.written(at, content) {
+                None if self.trash.contains(&record.effect_id) => return Err(Refused::Overtaken),
+                written => written.map(Some),
+            },
             Effect::Move {
                 identity: moved,
                 to,

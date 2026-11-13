@@ -746,3 +746,33 @@ fn recovery_of_a_removal_whose_file_the_user_moved_first_fails() {
         assert!(trashed(root).is_empty(), "{scenario}");
     }
 }
+
+#[test]
+fn recovery_of_a_replacement_whose_written_file_the_user_changed_is_overtaken() {
+    let changes: [fn(&Path); 2] = [
+        |file| fs::remove_file(file).unwrap(),
+        |file| fs::write(file, EDITED).unwrap(),
+    ];
+    for kill in [Step::Placed, Step::Trashed] {
+        for change in changes {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let effect = replace(root);
+            let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                apply(root, &effect, |step| {
+                    if step == kill {
+                        panic!("crash");
+                    }
+                })
+            }));
+            assert!(crashed.is_err());
+            change(&root.join("docs/report.txt"));
+            let outcome = bind(root)
+                .recover(&marker(), &effect, &mut Bytes, now(), &mut |_| {})
+                .unwrap();
+            assert_eq!(outcome, failed(Reason::Overtaken), "{kill:?}");
+            assert_eq!(trashed(root), [SYNCED], "{kill:?}");
+            assert_settled(root);
+        }
+    }
+}

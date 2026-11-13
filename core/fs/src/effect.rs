@@ -131,6 +131,10 @@ pub enum Reason {
     Taken,
     /// Recovery found the effect stopped before it displaced anything.
     Interrupted,
+    /// Recovery found that the effect wrote its file and sent the entry it
+    /// replaced to the local trash, and that the user changed or removed the
+    /// written file since.
+    Overtaken,
     /// The folder a removal acts on holds entries other than platform files,
     /// named here in order. The folder went back as it was.
     Holds(Vec<OsString>),
@@ -489,7 +493,7 @@ impl Space {
                     Some(identity) => Outcome::Done {
                         identity: Some(identity),
                     },
-                    None => failed(Reason::Taken),
+                    None => failed(Reason::Overtaken),
                 },
                 None => Outcome::Done { identity: None },
             };
@@ -542,8 +546,11 @@ impl Space {
                 Some(Some(stat)) if stat.file_type == FileType::Directory => Some(stat.id),
                 _ => return Ok(None),
             },
-            Action::WriteFile { at, .. } => match self.written_at(at, contents)? {
+            Action::WriteFile { at, replaces } => match self.written_at(at, contents)? {
                 Some(identity) => Some(identity),
+                None if replaces.is_some() && trashed()? => {
+                    return Ok(Some(failed(Reason::Overtaken)));
+                }
                 None => return Ok(None),
             },
             Action::Move { to, id, .. } => match entry_at(to)? {

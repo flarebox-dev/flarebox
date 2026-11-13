@@ -838,6 +838,39 @@ fn a_crash_at_every_cut_of_every_effect_is_recovered_on_the_next_start() {
 }
 
 #[test]
+fn a_replaced_file_the_user_changed_before_the_start_leaves_s() {
+    let changes: [fn(&Path); 2] = [
+        |file| fs::remove_file(file).unwrap(),
+        |file| fs::write(file, b"edited").unwrap(),
+    ];
+    for cut in [
+        Cut::Step(Step::Placed),
+        Cut::Step(Step::Trashed),
+        Cut::BeforeAck,
+    ] {
+        for change in changes {
+            let folder = Folder::new();
+            let mut server = Server::default();
+            (SCENARIOS[2].setup)(&folder, &mut server);
+            let crashed = catch_unwind(AssertUnwindSafe(|| {
+                let mut running = folder.start(crash_at(cut)).unwrap();
+                running.step(&server);
+            }));
+            assert!(
+                crashed.is_err_and(|payload| payload.is::<Crash>()),
+                "{cut:?}: no crash"
+            );
+            change(&folder.root.join("report.txt"));
+            let running = folder.start(no_hook()).unwrap();
+            assert_eq!(running.engine.trees.synced().get(NODE), None, "{cut:?}");
+            let (_, stored) = folder.open();
+            assert_eq!(stored.trees.synced().get(NODE), None, "{cut:?}");
+            assert!(trashed(&folder, SYNCED), "{cut:?}");
+        }
+    }
+}
+
+#[test]
 fn a_crash_during_recovery_is_recovered_on_the_start_after() {
     for scenario in SCENARIOS
         .iter()
