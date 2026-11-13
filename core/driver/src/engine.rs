@@ -2494,6 +2494,7 @@ mod tests {
         rules: &mut koidrive_fs::Rules,
         scope: PathBuf,
     ) -> Vec<PathBuf> {
+        let whole = scope.as_os_str().is_empty();
         let rescan = snapshot.rescan_with_rules(root, [scope], rules).unwrap();
         let entry = |path: &Path| snapshot.entries[path];
         let batch: Vec<Observed> = (rescan.changes.into_iter())
@@ -2501,19 +2502,19 @@ mod tests {
                 Change::Created { path, kind } => Observed::Created {
                     content: (kind == EntryKind::File).then(|| bytes(entry(&path).size)),
                     id: entry(&path).id,
-                    linked: false,
+                    linked: entry(&path).linked,
                     path,
                     kind,
                 },
                 Change::Modified { path } => Observed::Modified {
                     content: Some(bytes(entry(&path).size)),
                     id: entry(&path).id,
-                    linked: false,
+                    linked: entry(&path).linked,
                     path,
                 },
                 Change::Renamed { from, to, kind } => Observed::Renamed {
                     id: entry(&to).id,
-                    linked: false,
+                    linked: entry(&to).linked,
                     from,
                     to,
                     kind,
@@ -2528,7 +2529,10 @@ mod tests {
                 Change::Removed { path, kind } => Observed::Removed { path, kind },
             })
             .collect();
-        engine.observe(&batch, 0);
+        match whole {
+            true => engine.observe(&batch, 0),
+            false => engine.observe_part(&batch, 0),
+        };
         rescan.unsettled
     }
 
@@ -2617,6 +2621,156 @@ mod tests {
             );
             assert!(holding(&engine, "a/g.txt").is_some());
             assert!(holding(&engine, "a/f.txt").is_none());
+        }
+    }
+
+    fn synced_everywhere(engine: &mut Engine) {
+        let local: Vec<_> = (engine.trees.local().iter())
+            .map(|(id, node)| (id.clone(), node.shape.clone()))
+            .collect();
+        for (id, shape) in local {
+            engine.trees.set_synced(id.clone(), Some(shape.clone()));
+            let node = RemoteNode {
+                shape,
+                trashed: false,
+                content_rev: 1,
+                meta_rev: 1,
+                meta_edit_rev: 1,
+                trash_group: String::new(),
+                version_id: String::new(),
+                edit_rev: 1,
+            };
+            engine.trees.set_remote(id, node);
+        }
+    }
+
+    #[test]
+    fn a_file_moved_out_of_a_folder_removed_in_another_scan_keeps_its_node() {
+        for linked in [false, true] {
+            for order in [["x", "e"], ["e", "x"]] {
+                let case = format!("linked {linked}, scans {order:?}");
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path().to_path_buf();
+                fs::create_dir_all(root.join("x/d")).unwrap();
+                fs::create_dir_all(root.join("e")).unwrap();
+                fs::create_dir_all(root.join("ig")).unwrap();
+                fs::write(root.join(koidrive_fs::RULES_FILE), "ig/\n").unwrap();
+                fs::write(root.join("x/d/g.txt"), "g").unwrap();
+                if linked {
+                    fs::hard_link(root.join("x/d/g.txt"), root.join("ig/g.txt")).unwrap();
+                }
+                let mut rules = search_rules(usize::MAX);
+                let mut snapshot = Snapshot::default();
+                let (_dir, mut engine) = mapper();
+                engine.rules(
+                    vec![RulesChange {
+                        dir: PathBuf::new(),
+                        rules: Some(koidrive_engine::ignore::RuleFile::parse(b"ig/\n")),
+                    }],
+                    true,
+                );
+                observe_rescan(&mut engine, &mut snapshot, &root, &mut rules);
+                synced_everywhere(&mut engine);
+                let (file, identity, _) = holding(&engine, "x/d/g.txt").unwrap();
+                fs::rename(root.join("x/d/g.txt"), root.join("e/moved.txt")).unwrap();
+                fs::remove_dir_all(root.join("x/d")).unwrap();
+                for scope in order {
+                    let mut scans = 0;
+                    while !observe_scoped(
+                        &mut engine,
+                        &mut snapshot,
+                        &root,
+                        &mut rules,
+                        scope.into(),
+                    )
+                    .is_empty()
+                    {
+                        scans += 1;
+                        assert!(scans < 40, "{case}: the scan of {scope} never settled");
+                    }
+                }
+                let moved = holding(&engine, "e/moved.txt").map(|(id, _, _)| id);
+                assert_eq!(moved, Some(file.clone()), "{case}");
+                assert!(!engine.trees.recorded_local(&file), "{case}");
+                assert!(!engine.trees.excluded(&file), "{case}");
+                assert_eq!(
+                    engine.trees.locals_with_identity(&identity).count(),
+                    1,
+                    "{case}"
+                );
+                assert_eq!(holding(&engine, "x/d"), None, "{case}");
+                assert_eq!(engine.trees.check(), Ok(()), "{case}");
+            }
+        }
+    }
+
+    fn moved_out_of_a_removed_folder(linked: bool) -> (tempfile::TempDir, Engine, NodeId) {
+        let (dir, mut engine) = mapper();
+        engine.rules(
+            vec![RulesChange {
+                dir: PathBuf::new(),
+                rules: Some(koidrive_engine::ignore::RuleFile::parse(b"ig/\n")),
+            }],
+            true,
+        );
+        let folder = |path: &str, id: u64| Observed::Created {
+            path: path.into(),
+            kind: EntryKind::Dir,
+            id: ino(id),
+            linked: false,
+            content: None,
+        };
+        engine.observe(
+            &[
+                folder("x", 1),
+                folder("x/d", 2),
+                folder("e", 3),
+                created("x/d/g.txt", ino(10), linked, 5),
+            ],
+            0,
+        );
+        synced_everywhere(&mut engine);
+        let (file, _, _) = holding(&engine, "x/d/g.txt").unwrap();
+        (dir, engine, file)
+    }
+
+    #[test]
+    fn a_file_moved_out_of_a_folder_removed_in_the_same_batch_keeps_its_node_whichever_comes_first()
+    {
+        let removed = Observed::Removed {
+            path: "x/d".into(),
+            kind: EntryKind::Dir,
+        };
+        let moved = created("e/moved.txt", ino(10), false, 5);
+        for batch in [[removed.clone(), moved.clone()], [moved, removed]] {
+            let (_dir, mut engine, file) = moved_out_of_a_removed_folder(false);
+            engine.observe(&batch, 1);
+            let at = holding(&engine, "e/moved.txt").map(|(id, _, _)| id);
+            assert_eq!(at, Some(file), "{batch:?}");
+            assert_eq!(holding(&engine, "x/d"), None, "{batch:?}");
+            assert_eq!(engine.trees.check(), Ok(()), "{batch:?}");
+        }
+    }
+
+    #[test]
+    fn a_linked_file_placed_again_in_the_batch_that_finds_its_old_link_ignored_is_not_recorded() {
+        let removed = Observed::Removed {
+            path: "x/d".into(),
+            kind: EntryKind::Dir,
+        };
+        let ignored = renamed("x/d/g.txt", "ig/g.txt", ino(10), true);
+        let moved = created("e/moved.txt", ino(10), true, 5);
+        for batch in [
+            [moved.clone(), removed.clone(), ignored.clone()],
+            [removed, ignored, moved],
+        ] {
+            let (_dir, mut engine, file) = moved_out_of_a_removed_folder(true);
+            engine.observe(&batch, 1);
+            let at = holding(&engine, "e/moved.txt").map(|(id, _, _)| id);
+            assert_eq!(at, Some(file.clone()), "{batch:?}");
+            assert!(!engine.trees.recorded_local(&file), "{batch:?}");
+            assert!(!engine.trees.excluded(&file), "{batch:?}");
+            assert_eq!(engine.trees.check(), Ok(()), "{batch:?}");
         }
     }
 
