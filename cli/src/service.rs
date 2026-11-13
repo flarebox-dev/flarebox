@@ -13,10 +13,11 @@ use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use koidrive_driver::{Config, Paths};
+use koidrive_ipc::{Blocked, Request, Response};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-use crate::ipc::{self, Request, Response};
+use crate::ipc;
 
 /// The unit that koi fills in with this profile's binary and directories.
 const UNIT: &str = include_str!("../systemd/koidrive.service");
@@ -246,14 +247,6 @@ pub fn plan(folders: usize, state: State, asked: bool) -> Action {
         (_, State::SwitchedOff) if !asked => Action::Leave,
         _ => Action::Start,
     }
-}
-
-/// A folder that the daemon may not read, as its `access` request finds it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct Blocked {
-    pub folder: String,
-    /// The read still waits after two seconds, usually because macOS is asking the person. Otherwise macOS refused it.
-    pub waiting: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
@@ -522,7 +515,7 @@ async fn answers(paths: &Paths, within: Duration) -> bool {
     let deadline = Instant::now() + within;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
-        let answer = tokio::time::timeout(left, ipc::ask(paths, &Request::Status)).await;
+        let answer = tokio::time::timeout(left, koidrive_ipc::ask(paths, &Request::Status)).await;
         if matches!(answer, Ok(Ok(Some(_)))) {
             return true;
         }
@@ -566,7 +559,7 @@ async fn blocked(paths: &Paths) -> Vec<Blocked> {
     if !cfg!(target_os = "macos") {
         return Vec::new();
     }
-    match ipc::ask(paths, &Request::Access).await {
+    match koidrive_ipc::ask(paths, &Request::Access).await {
         Ok(Some(Response::Access { blocked })) => blocked,
         _ => Vec::new(),
     }

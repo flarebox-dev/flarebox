@@ -6,56 +6,11 @@
 
 use koidrive_cloudflare::{ApiError as CloudflareError, OauthError};
 use koidrive_driver::{ConfigError, DriverError, PathsError, SET_UP_AGAIN};
+use koidrive_ipc::{Code, Next};
 use koidrive_net::{ApiError, Resend, ServerError};
 use koidrive_proto::v1::{Error as ProtoError, error::Code as ServerCode};
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 
-use crate::report::{Done, Next};
-
-/// What kind of failure an error is. Each code has one exit status.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum Code {
-    /// No more specific code applies.
-    #[default]
-    Failed,
-    /// The arguments are invalid, or input the command needs is missing.
-    Usage,
-    /// `status --check` found a decision that needs a choice.
-    DecisionRequired,
-    /// Credentials are missing or refused, or a person must log in.
-    AuthRequired,
-    /// Sync is halted or stopped, and the command cannot go on until that is fixed.
-    Halted,
-    /// The server or the network is offline, unavailable or limits the rate for now.
-    Unavailable,
-    /// The decision answered no longer exists, or a request ID was used before with other arguments or for a pairing
-    /// code that has expired.
-    StaleDecision,
-    /// A signal stopped the command, or an earlier run with the same request ID has no recorded outcome.
-    Interrupted,
-}
-
-impl Code {
-    pub fn exit(self) -> u8 {
-        match self {
-            Code::Failed => 1,
-            Code::Usage => 2,
-            Code::DecisionRequired => 3,
-            Code::AuthRequired => 4,
-            Code::Halted => 5,
-            Code::Unavailable => 6,
-            Code::StaleDecision => 7,
-            Code::Interrupted => 130,
-        }
-    }
-
-    /// Whether the same command may succeed later without a change.
-    pub fn retryable(self) -> bool {
-        self == Code::Unavailable
-    }
-}
+use crate::report::Done;
 
 #[derive(Debug)]
 pub struct CliError {
@@ -267,25 +222,6 @@ mod tests {
                 message: "refused".into(),
                 ..Default::default()
             }),
-        }
-    }
-
-    #[test]
-    fn every_code_has_its_exit_status_and_only_unavailable_is_retryable() {
-        let all = [
-            (Code::Failed, 1, "failed"),
-            (Code::Usage, 2, "usage"),
-            (Code::DecisionRequired, 3, "decision_required"),
-            (Code::AuthRequired, 4, "auth_required"),
-            (Code::Halted, 5, "halted"),
-            (Code::Unavailable, 6, "unavailable"),
-            (Code::StaleDecision, 7, "stale_decision"),
-            (Code::Interrupted, 130, "interrupted"),
-        ];
-        for (code, exit, name) in all {
-            assert_eq!(code.exit(), exit, "{code:?}");
-            assert_eq!(serde_json::to_value(code).unwrap(), name);
-            assert_eq!(code.retryable(), code == Code::Unavailable, "{code:?}");
         }
     }
 

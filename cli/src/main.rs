@@ -4,7 +4,7 @@
 //! folder's trash and a file's versions, manages the account's devices and spaces, and runs the sync daemon. Commands
 //! run in the daemon through its socket when it is running, and on their own otherwise. The device, space, trash and
 //! versions commands talk to the server directly with the credential. With `--json` every command prints one
-//! envelope (see [`report`]) and exits with the status of its [`error::Code`].
+//! envelope (see [`report`]) and exits with the status of its [`koidrive_ipc::Code`].
 
 mod diagnose;
 mod error;
@@ -34,6 +34,7 @@ use koidrive_driver::{
     Answer, Credential, Driver, DriverError, FolderState, FolderStatus, Limit, MAX_DELETIONS,
     Paths, Question, QuestionKind, RecoveryGroup, Status,
 };
+use koidrive_ipc::{Code, Key, Request, RequestId, Response};
 use koidrive_net::{ApiError, Auth, Reload};
 use koidrive_proto::v1::{CreateSpaceRequest, DeviceInfo, SpaceInfo, SpaceUsage};
 use serde::{Deserialize, Serialize};
@@ -44,14 +45,13 @@ use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
 use koidrive_telemetry::schema::{DaemonStart, Failure, SetupStep};
 
-use crate::error::{CliError, Code};
-use crate::ipc::{Request, Response};
+use crate::error::CliError;
 use crate::report::{
     AccountData, AnsweredData, Decision, DeviceData, DevicesData, Done, Empty, Envelope,
     FolderData, HelpData, InvitationData, Lifecycle, RefusedSpace, RevokedData, SpaceData,
     SpacesData, StatusData, UnlinkedData, UsageData, UsagesData, VersionInfoData, WithService,
 };
-use crate::request::{Begun, Key, RequestId};
+use crate::request::Begun;
 
 #[derive(Parser)]
 #[command(
@@ -810,7 +810,7 @@ async fn daemon(paths: Paths, json: bool) -> Result<Done, CliError> {
         }
     })?;
     let socket = driver.paths().socket();
-    let listener = ipc::bind(&socket).map_err(|error| {
+    let listener = koidrive_ipc::bind(&socket).map_err(|error| {
         failed(DaemonStart::Socket);
         format!("cannot listen on {}: {error}", socket.display())
     })?;
@@ -1934,7 +1934,7 @@ fn banner(questions: &[Question]) -> Option<String> {
 async fn pending_questions(paths: &Paths) -> Vec<Question> {
     let asked = tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        ipc::ask(paths, &Request::Questions),
+        koidrive_ipc::ask(paths, &Request::Questions),
     );
     match asked.await {
         Ok(Ok(Some(Response::Questions { questions }))) => questions,

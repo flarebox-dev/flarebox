@@ -11,6 +11,7 @@ members = [
     "core/ffi",
     "core/fs",
     "core/ignore",
+    "core/ipc",
     "core/net",
     "core/proto",
     "core/sim",
