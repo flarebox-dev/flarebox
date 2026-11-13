@@ -31,6 +31,7 @@ fn a_slow_share_request_reports_its_wait_on_stderr_without_changing_json_stdout(
                     Err(error) => panic!("{error}"),
                 }
             };
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
