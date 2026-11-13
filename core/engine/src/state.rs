@@ -73,7 +73,8 @@ pub struct TreesState {
     /// The folders of `outside` that the disk lost, which L keeps only for what is recorded below them.
     pub lost: BTreeSet<NodeId>,
     /// The nodes whose local copy is in an ignored folder and whose name in L another entry took, each with the
-    /// identity L held for it. L holds none of them, and R holds each live.
+    /// identity L held for it, and the files of `halves` that left L. L holds none of them, and R holds each live
+    /// unless it waits in `halves`.
     pub displaced: BTreeMap<NodeId, FileIdentity>,
     /// The files that wait for the other half of a move, each with when the wait began (section 5.10): one a scan of
     /// part of the tree found gone, which `displaced` keeps meanwhile, and one L holds as a new link of a file at
@@ -435,7 +436,7 @@ pub enum StateError {
     /// A node is recorded as moved into an ignored folder, or as a folder the disk lost, but L does not hold it or the
     /// lost folder is not recorded.
     NotIgnoredLocal(NodeId),
-    /// A node is recorded as displaced, but L holds it or R does not hold it live.
+    /// A node is recorded as displaced, but L holds it, or R does not hold it live and it does not wait in `halves`.
     NotDisplaced(NodeId),
     /// A file waits for the other half of a move, but neither L holds it nor is it displaced.
     NotHalf(NodeId),

@@ -1128,8 +1128,8 @@ impl Trees {
     /// Takes a file out of L as [`Trees::remove_local`] does, after a scan of part of the tree found it gone, and keeps
     /// it as [`Trees::displace_local`] does until [`HALF_WAIT_MS`] after `at_ms`: an entry with its identity that a
     /// later scan finds is the file moved, and the file counts as deleted only once the wait ends
-    /// ([`Trees::release_halves`]). A file R does not hold live, or whose identity has no birth time, has nothing to
-    /// wait for, and returns false without a change.
+    /// ([`Trees::release_halves`]). A file whose identity has no birth time can't be told from another, and returns
+    /// false without a change.
     pub fn vanish_local(&mut self, id: &str, at_ms: u64) -> bool {
         let Some(node) = self.l.get(id) else {
             return false;
@@ -1138,7 +1138,6 @@ impl Trees {
         if node.parked
             || node.shape.kind != Kind::File
             || identity.birth_ns.is_none()
-            || self.r.live(id).is_none()
             || self.recorded_local(id)
         {
             return false;
@@ -2962,7 +2961,10 @@ impl Trees {
         if let Some(id) = (state.lost.iter()).find(|id| !state.outside.contains(*id)) {
             return Err(StateError::NotIgnoredLocal(id.clone()));
         }
-        let kept = |id: &&NodeId| self.l.get(id).is_none() && self.r.live(id).is_some();
+        let kept = |id: &&NodeId| {
+            self.l.get(id).is_none()
+                && (self.r.live(id).is_some() || state.halves.contains_key(*id))
+        };
         if let Some(id) = state.displaced.keys().find(|id| !kept(id)) {
             return Err(StateError::NotDisplaced(id.clone()));
         }
