@@ -1598,14 +1598,20 @@ impl World {
                     .collect();
                 let session = device.session.clone();
                 let sent = Commit { receipts, ..commit };
+                let held = self.space.nodes();
                 let made_up = sent.ops.iter().find_map(|op| match &op.op {
                     Some(op::Op::Move(moved)) => {
+                        let unchanged = held.iter().any(|node| {
+                            node.node_id == moved.node_id
+                                && node.parent_id == moved.new_parent_id
+                                && node.name == moved.new_name
+                        });
                         let restored = self.restored_names[d].get(&moved.node_id);
                         let asked = |name: &str| {
                             self.named[d].contains(name)
                                 || restored.is_some_and(|names| names.contains(name))
                         };
-                        (!given(asked, &moved.new_name)).then_some(moved)
+                        (!unchanged && !given(asked, &moved.new_name)).then_some(moved)
                     }
                     _ => None,
                 });
