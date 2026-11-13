@@ -1060,3 +1060,39 @@ fn a_restore_into_a_trashed_folder_is_sent_after_the_folders_own_move() {
     });
     assert_eq!(ops(&commit), [moved, restore_op(&intent)]);
 }
+
+#[test]
+fn a_trashed_folder_restored_into_itself_or_below_itself_is_sent_for_the_server_to_refuse() {
+    let (a, b) = (id(1), id(2));
+    for target in [&a, &b] {
+        let mut trees = trees(&[
+            in_trash(a.clone(), dir(&root(), "a")),
+            in_trash(b.clone(), dir(&a, "b")),
+        ]);
+        let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+        let intent = RestoreIntent::from_trash(a.clone(), Some(target.clone()), None).unwrap();
+        commits.restore(id(100), intent.clone());
+        let commit = build(&mut commits, &mut trees, &mut ids);
+        assert_eq!(
+            commit.map(|commit| ops(&commit)),
+            Some(vec![restore_op(&intent)]),
+            "{target}"
+        );
+    }
+}
+
+#[test]
+fn two_trashed_folders_restored_into_each_other_are_both_sent() {
+    let (a, b) = (id(1), id(2));
+    let mut trees = trees(&[
+        in_trash(a.clone(), dir(&root(), "a")),
+        in_trash(b.clone(), dir(&root(), "b")),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let into_b = RestoreIntent::from_trash(a.clone(), Some(b.clone()), None).unwrap();
+    let into_a = RestoreIntent::from_trash(b, Some(a), None).unwrap();
+    commits.restore(id(100), into_b.clone());
+    commits.restore(id(101), into_a.clone());
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [restore_op(&into_b), restore_op(&into_a)]);
+}

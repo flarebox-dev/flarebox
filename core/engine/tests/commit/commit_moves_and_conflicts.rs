@@ -1008,3 +1008,49 @@ fn a_trashed_folder_moving_onto_the_name_of_a_folder_moving_into_it_goes_through
         ]
     );
 }
+
+#[test]
+fn a_move_that_closes_a_cycle_against_trashed_folders_in_r_is_reverted() {
+    let mut trees = trees(&[
+        (
+            "p",
+            Some(dir("q", "p")),
+            Some(dir(ROOT, "p")),
+            Some(trashed(dir(ROOT, "p"))),
+        ),
+        (
+            "q",
+            Some(dir(ROOT, "q")),
+            Some(dir(ROOT, "q")),
+            Some(trashed(dir("p", "q"))),
+        ),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    assert!(trees.reverted().contains("p"));
+}
+
+#[test]
+fn a_create_into_a_trashed_folder_that_moves_out_of_a_live_one_goes_first() {
+    let mut trees = trees(&[
+        (
+            "t",
+            Some(dir(ROOT, "T2")),
+            Some(dir(ROOT, "T")),
+            Some(trashed(dir(ROOT, "T"))),
+        ),
+        (
+            "g",
+            None,
+            Some(file("t", "g", 1)),
+            Some(trashed(file("t", "g", 1))),
+        ),
+        ("h", Some(file("t", "g", 2)), None, None),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(
+        matches!(&ops(&commit)[..], [op::Op::CreateFile(create), moved] if create.node_id == "h" && *moved == mv("t", ROOT, "T2")),
+        "{commit:?}"
+    );
+}

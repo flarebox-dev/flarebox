@@ -99,7 +99,7 @@ The planner builds a commit only when the device is connected, caught up (§4.4)
 
 The planner orders ops by simulating them on a scratch copy of R. It repeatedly emits an op that is valid there (parent present, name free, no cycle, and for a delete no surviving child under it) and applies it.
 
-An op into a folder R holds in the trash revives that folder and every trashed folder above it at their old positions (R8). A `Move` or `Restore` of a trashed folder brings back only the folder and its trash group, at the position it names. So a create, move, edit or restore that would revive a trashed folder waits while that folder, or a trashed folder above it, still has its own move or restore to send.
+An op into a folder R holds in the trash revives that folder and every trashed folder above it at their old positions (R8). A `Move` or `Restore` of a trashed folder brings back only the folder and its trash group, at the position it names. So a create, move, edit or restore that would revive a trashed folder waits for a restore of that folder or of a trashed folder above it, because a restore of a live folder does nothing. It also waits for a move of such a folder whose own parent is in the trash, because going first would bring back that parent, which the move leaves behind. When the moving folder's parent is live, the op goes first and revives only what the move would bring back. A move into the node it moves is a cycle (R6), and a restore into the node it restores is sent for the server to refuse. When the waits form a cycle, the planner sends one op of the cycle.
 
 ### Name cycles and pending names
 
