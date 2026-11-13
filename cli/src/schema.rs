@@ -8,8 +8,9 @@ use crate::manifest::file_name;
 use crate::report::{
     AccountData, AnsweredData, ChoicesData, DaemonLine, DevicesData, DiagnosticsData, Empty,
     Envelope, FolderData, HelpData, InvitationData, RequestsData, RestoreAskedData, RevokedData,
-    SCHEMA_VERSION, SetupData, SpaceData, SpacesData, StatusData, TrashData, UnlinkedData,
-    UpdatedData, UsagesData, VersionInfoData, VersionsData, WithService,
+    SCHEMA_VERSION, SetupData, ShareLinkData, ShareLinksData, SharedData, SpaceData, SpacesData,
+    StatusData, TrashData, UnlinkedData, UpdatedData, UsagesData, VersionInfoData, VersionsData,
+    WithService,
 };
 use crate::telemetry::{ChoiceData, TelemetryStatusData};
 
@@ -25,7 +26,8 @@ fn data(command: &str) -> Option<&'static [Data]> {
         "status" => &[of::<StatusData>],
         "resolve" => &[of::<AnsweredData>],
         "help" | "server" | "server upgrade" | "server delete" => &[],
-        "space" | "folder" | "service" | "device" | "history" | "telemetry" | "_daemon" => &[],
+        "space" | "folder" | "service" | "device" | "history" | "share" | "telemetry"
+        | "_daemon" => &[],
         "setup" => &[
             of::<WithService<ChoicesData>>,
             of::<WithService<SetupData>>,
@@ -49,6 +51,9 @@ fn data(command: &str) -> Option<&'static [Data]> {
         "history versions" => &[of::<VersionsData>],
         "history restore" => &[of::<RestoreAskedData>],
         "history requests" => &[of::<RequestsData>],
+        "share create" => &[of::<SharedData>],
+        "share list" => &[of::<ShareLinksData>],
+        "share revoke" => &[of::<ShareLinkData>],
         "telemetry status" => &[of::<TelemetryStatusData>],
         "telemetry on" | "telemetry off" | "telemetry reset" => &[of::<ChoiceData>],
         "telemetry preview" => &[of::<Map<String, Value>>],

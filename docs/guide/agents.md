@@ -6,7 +6,7 @@ Every `koi` command can run without a person at the terminal. Add `--json` and r
 
 `--json` works on every command and in any position, as in `koidrive --json status` or `koi folder link ~/Work --space Work --json`. It selects schema 1, the only schema so far. `--json=1` names it explicitly, and any other version is a usage error. A later schema will need its number; plain `--json` keeps meaning schema 1.
 
-With `--json`, every command except `koi _daemon` prints exactly one JSON object on stdout, also when it fails, when it shows help and when it shows the version. The daemon prints one object per line, as [Watch the daemon](#watch-the-daemon) describes. Logs and progress go to stderr. A command with `--json` never asks a question, never opens a browser and prints no pending-decision line. It reads stdin only when an explicit input flag, such as `koi setup --pairing-code-stdin`, requests it.
+With `--json`, every command except `koi _daemon` prints exactly one JSON object on stdout, also when it fails, when it shows help and when it shows the version. The daemon prints one object per line, as [Watch the daemon](#watch-the-daemon) describes. Logs and progress go to stderr. A command with `--json` never opens a browser and prints no pending-decision line. It reads stdin only when an explicit input flag requests it, such as `koi setup --pairing-code-stdin` or `koi share create --password`. Only `koi share create --password` asks for input on a terminal.
 
 Without `--json`, a command whose result is one value prints only that value on stdout, and what it means on stderr, so that shell capture works: `koi space create` prints the new space's ID, `koi history restore` the restore's ID, and `koi device invite` the pairing code, as in `id=$(koi space create Notes)`.
 
@@ -84,6 +84,8 @@ These commands make a new change each time they run: `koi history restore`, `koi
 - A pairing code expires after about 10 minutes. After that, `koi device invite` with its ID fails with `stale_decision`. Run it with a new ID.
 - A command whose change is known to have failed records nothing, so running it again with its ID tries again.
 - If the first run stopped before it recorded its outcome, still runs, or couldn't tell whether its change happened (for example, the server didn't answer), the command fails with `interrupted` (exit 130). Read the state with `koi status --json` or `koi history requests`. To make the change, use a new ID.
+
+`koi share create` takes no request ID, because its record would keep the link. Each run makes a new link. If a run fails without an answer, `koi share list --json` shows whether it made one, and `koi share revoke` ends a link you don't need.
 
 The records are in `requests/` in the profile's state directory (`~/.local/state/koidrive` by default), readable only by you. A record of `koi device invite` holds the pairing code. Pairing codes never appear in the logs.
 

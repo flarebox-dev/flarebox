@@ -164,10 +164,12 @@ impl From<DriverError> for CliError {
         let message = error.to_string();
         match error {
             DriverError::Api(error) => CliError::from(error),
+            DriverError::Refused(error) => CliError::rpc_refusal(error.0),
             DriverError::NotPaired => {
                 CliError::new(Code::AuthRequired, message).then(&["koi", "setup"])
             }
             DriverError::NeedsConfirmation => CliError::new(Code::AuthRequired, message),
+            DriverError::ShareTreeChanged => CliError::new(Code::Unavailable, message),
             DriverError::QuestionNotFound(_) | DriverError::AnsweredOtherwise { .. } => {
                 CliError::new(
                     Code::StaleDecision,
@@ -203,6 +205,14 @@ impl From<DriverError> for CliError {
             | DriverError::MarkerOfOtherSpace(_)
             | DriverError::UnsupportedFileSystem
             | DriverError::NothingToLift
+            | DriverError::RelativePath(_)
+            | DriverError::OutsideLinkedFolders(_)
+            | DriverError::PathNotFound(_)
+            | DriverError::NotOnServer(_)
+            | DriverError::PasswordLength
+            | DriverError::NotAShareLink
+            | DriverError::ShareLinkNotFound
+            | DriverError::ShareLinkAmbiguous(_)
             | DriverError::Paths(PathsError::BadSpaceId(_))
             | DriverError::Config(ConfigError::Invalid { .. }) => CliError::usage(message),
             _ => CliError::from(message),

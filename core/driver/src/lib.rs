@@ -34,6 +34,7 @@ mod question;
 mod restore;
 #[cfg(test)]
 mod scripted;
+mod share;
 mod status;
 pub mod update;
 mod volume;
@@ -49,6 +50,7 @@ pub use observe::{FsObserver, Observation, Observed, Observer, RulesChange};
 pub use paths::{Paths, PathsError};
 pub use question::{Answer, HeldItem, Limit, Question, QuestionKind, RecoveryGroup};
 pub use restore::{RestoreRejection, RestoreRequest, RestoreState, RestoreStatus, RestoreWait};
+pub use share::{Expiry, LinkState, Revoked, Secret, SharedLink, Target, TargetKind};
 pub use status::{Account, FolderState, FolderStatus, Status, Wait, WaitKind};
 pub use update::Update;
 pub use volume::{Volume, volume};

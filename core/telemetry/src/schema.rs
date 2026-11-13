@@ -560,6 +560,7 @@ pub enum Command {
     Folder,
     Device,
     History,
+    Share,
     Service,
     Pause,
     Resume,
@@ -570,7 +571,7 @@ pub enum Command {
 }
 
 impl Command {
-    pub const ALL: [Command; 16] = [
+    pub const ALL: [Command; 17] = [
         Command::Status,
         Command::Resolve,
         Command::Setup,
@@ -580,6 +581,7 @@ impl Command {
         Command::Folder,
         Command::Device,
         Command::History,
+        Command::Share,
         Command::Service,
         Command::Pause,
         Command::Resume,
@@ -600,6 +602,7 @@ impl Command {
             Command::Folder => "folder",
             Command::Device => "device",
             Command::History => "history",
+            Command::Share => "share",
             Command::Service => "service",
             Command::Pause => "pause",
             Command::Resume => "resume",

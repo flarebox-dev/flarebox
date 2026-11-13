@@ -569,7 +569,7 @@ fn watching(stopped: &Arc<dyn Fn() -> bool + Send + Sync>) -> impl Fn() -> bool 
 
 /// The content of the file at `path` under `root`, or `None` when it is not the file the scan saw or changed while
 /// it was read. Fails with [`io::ErrorKind::Interrupted`] at the first chunk after `stopped` holds.
-fn read_content(
+pub(crate) fn read_content(
     root: &Path,
     path: &Path,
     entry: &Entry,
@@ -611,7 +611,7 @@ fn same_version(meta: &std::fs::Metadata, entry: &Entry) -> bool {
 }
 
 /// Opens the file at the relative `path` under `root` for reading, one folder at a time, following no symbolic link.
-fn open_beneath(root: &Path, path: &Path) -> io::Result<File> {
+pub(crate) fn open_beneath(root: &Path, path: &Path) -> io::Result<File> {
     #[cfg(test)]
     tests::before_open(path)?;
     let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;

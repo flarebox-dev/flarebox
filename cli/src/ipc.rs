@@ -39,6 +39,18 @@ impl From<CliError> for Response {
 /// to repeat once the cause is fixed. A run cancelled midway leaves the record without an outcome. The record is written in the
 /// process that runs the driver, so a client that stops waiting does not keep the outcome from being recorded.
 async fn once(driver: &Driver, request_id: RequestId, key: Key, request: Request) -> Response {
+    let mut inner = &request;
+    while let Request::Once { run, .. } = inner {
+        inner = run;
+    }
+    if matches!(
+        inner,
+        Request::Share { .. } | Request::ShareLinks | Request::RevokeShareLink { .. }
+    ) {
+        return Response::from(CliError::usage(
+            "share-link requests cannot use a request ID because their responses contain bearer URLs",
+        ));
+    }
     let claim = match request::begin(driver.paths(), &request_id, &key) {
         Ok(Begun::Claimed(claim)) => claim,
         Ok(Begun::Done(recorded)) => {
@@ -173,6 +185,20 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
             return Response::from(CliError::usage(
                 "only a running daemon can be watched, over a connection of its own",
             ));
+        }
+        Request::Share {
+            path,
+            expiry,
+            password,
+        } => (driver.share(&path, expiry, password).await).map(|link| Response::Shared { link }),
+        Request::ShareLinks => {
+            (driver.share_links().await).map(|links| Response::ShareLinks { links })
+        }
+        Request::RevokeShareLink { link } => {
+            (driver.revoke_share_link(&link).await).map(|revoked| Response::ShareLinkRevoked {
+                link: revoked.link,
+                already: revoked.already,
+            })
         }
         Request::Once {
             request_id,
@@ -722,6 +748,49 @@ pub(crate) mod tests {
         };
         assert_eq!(code, Code::StaleDecision);
         assert_eq!(next, [Next::of(&["koi", "resolve", "--json"])]);
+    }
+
+    #[tokio::test]
+    async fn share_link_requests_cannot_be_recorded_even_inside_nested_once_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let driver = Driver::open(paths.clone()).unwrap();
+        for request in [
+            Request::ShareLinks,
+            Request::Share {
+                path: dir.path().join("file.txt"),
+                expiry: koidrive_driver::Expiry::Default,
+                password: None,
+            },
+            Request::RevokeShareLink {
+                link: koidrive_driver::Secret("test-link".into()),
+            },
+        ] {
+            for depth in 1..=3 {
+                let mut wrapped = request.clone();
+                for level in 0..depth {
+                    wrapped = wrapped.once(
+                        Some(RequestId::parse(&format!("share-{depth}-{level}")).unwrap()),
+                        Key::restart(dir.path()),
+                    );
+                }
+                assert!(matches!(
+                    handle(&driver, wrapped).await,
+                    Response::Error {
+                        code: Code::Usage,
+                        ..
+                    }
+                ));
+                assert!(!paths.requests().exists());
+            }
+        }
+        assert!(matches!(
+            handle(&driver, Request::ShareLinks).await,
+            Response::Error {
+                code: Code::AuthRequired,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

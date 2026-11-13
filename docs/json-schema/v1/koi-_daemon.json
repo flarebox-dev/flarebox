@@ -612,7 +612,7 @@
       ]
     },
     "Output": {
-      "description": "What it prints on stdout with `--json`. It never reads stdin then.",
+      "description": "What it prints on stdout with `--json`. It reads stdin only when an explicit input flag requests it.",
       "oneOf": [
         {
           "const": "envelope",

@@ -13,7 +13,12 @@ fn auth(command: &str) -> Auth {
             Auth::Cloudflare
         }
         "folder link" | "history trash" | "history versions" | "history restore" => Auth::Device,
-        _ if command.starts_with("space ") || command.starts_with("device ") => Auth::Device,
+        _ if ["space ", "device ", "share "]
+            .iter()
+            .any(|group| command.starts_with(group)) =>
+        {
+            Auth::Device
+        }
         _ => Auth::None,
     }
 }
@@ -51,7 +56,7 @@ fn sample(arg: &clap::Arg) -> String {
             .arg(value_arg);
         probe.try_get_matches_from([value]).is_ok()
     };
-    let fits = ["x", "1", "0190f0a0-0000-7000-8000-00000000000a"]
+    let fits = ["x", "1", "7d", "0190f0a0-0000-7000-8000-00000000000a"]
         .into_iter()
         .find(parses);
     (possible.or(default))

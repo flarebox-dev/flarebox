@@ -11,8 +11,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use koidrive_driver::{
-    Account, Answer, Credential, FolderStatus, LinkApproval, Paths, Question, RestoreRequest,
-    RestoreStatus, Status,
+    Account, Answer, Credential, Expiry, FolderStatus, LinkApproval, Paths, Question,
+    RestoreRequest, RestoreStatus, Secret, SharedLink, Status,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -105,6 +105,18 @@ pub enum Request {
     /// Keeps the connection open and answers with a [`Response::State`] at once and after each change, until the client
     /// closes the connection.
     Watch,
+    /// `Driver::share`: a new link to the file or folder at the absolute `path`.
+    Share {
+        path: PathBuf,
+        expiry: Expiry,
+        password: Option<Secret>,
+    },
+    /// `Driver::share_links`.
+    ShareLinks,
+    /// `Driver::revoke_share_link`: `link` is a link's ID or URL.
+    RevokeShareLink {
+        link: Secret,
+    },
     /// Runs `run` once for `request_id`: a later request with the same ID and key gets the first response, and one
     /// with another key fails as stale.
     Once {
@@ -186,6 +198,16 @@ pub enum Response {
     State {
         status: Status,
         questions: Vec<Question>,
+    },
+    Shared {
+        link: SharedLink,
+    },
+    ShareLinks {
+        links: Vec<SharedLink>,
+    },
+    ShareLinkRevoked {
+        link: SharedLink,
+        already: bool,
     },
     /// A failed request. An older daemon sends only `message`, which reads as [`Code::Failed`].
     Error {
