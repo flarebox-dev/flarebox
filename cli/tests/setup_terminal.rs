@@ -533,6 +533,7 @@ enum TerminalInput {
     Direct,
     QueuedEnter,
     ControllingProxy,
+    FullProxy,
     DifferentTerminal,
 }
 
@@ -562,11 +563,18 @@ fn terminal_run(
     }
     if matches!(
         input,
-        TerminalInput::ControllingProxy | TerminalInput::DifferentTerminal
+        TerminalInput::ControllingProxy
+            | TerminalInput::FullProxy
+            | TerminalInput::DifferentTerminal
     ) {
+        let output = if matches!(input, TerminalInput::FullProxy) {
+            "fd=os.open('/dev/tty',os.O_WRONLY); os.dup2(fd,1); os.dup2(fd,2); os.close(fd);"
+        } else {
+            ""
+        };
         let mut wrapper = Command::new("python3");
         wrapper
-            .args(["-c", "import fcntl,os,sys,termios; os.setsid(); fcntl.ioctl(0,termios.TIOCSCTTY,0); fd=os.open('/dev/tty',os.O_RDONLY); os.dup2(fd,0); os.close(fd); os.execv(sys.argv[1],sys.argv[1:])"])
+            .args(["-c", &format!("import fcntl,os,sys,termios; os.setsid(); fcntl.ioctl(0,termios.TIOCSCTTY,0); fd=os.open('/dev/tty',os.O_RDONLY); os.dup2(fd,0); os.close(fd); {output} os.execv(sys.argv[1],sys.argv[1:])")])
             .arg(command.get_program())
             .args(command.get_args())
             .current_dir(home);
@@ -754,33 +762,87 @@ fn setup_accepts_input_reopened_from_the_controlling_terminal() {
 }
 
 #[test]
+fn setup_accepts_all_standard_descriptors_reopened_from_the_controlling_terminal() {
+    for rich in [false, true] {
+        let home = Home::new(&[]);
+        let daemon = home.daemon(true);
+        let output = terminal_run(
+            home.path(),
+            &full(rich, if rich { "n" } else { "n\n" }),
+            &["setup", "--interactive", "--no-browser"],
+            &[],
+            rich,
+            None,
+            TerminalInput::FullProxy,
+        );
+        daemon.finish();
+        let text = shown(output.clone());
+        assert!(output.status.success(), "{text}");
+        assert!(!text.contains("CODE@files.example.com"), "{text}");
+        assert!(home.connected(), "{text}");
+        assert_eq!(home.links().len(), 1, "{text}");
+    }
+}
+
+#[test]
+fn keyboard_ctrl_c_through_controlling_proxies_restores_input_and_reaps_helpers() {
+    for rich in [false, true] {
+        for stage in 0..2 {
+            for input in [TerminalInput::ControllingProxy, TerminalInput::FullProxy] {
+                let home = Home::new(&[]);
+                let daemon = home.daemon(true);
+                let mut steps = full(rich, if rich { "n" } else { "n\n" });
+                steps.truncate(stage + 1);
+                steps[stage].input = "\u{3}".into();
+                let output = terminal_run(
+                    home.path(),
+                    &steps,
+                    &["setup", "--interactive", "--no-browser"],
+                    &[],
+                    rich,
+                    None,
+                    input,
+                );
+                daemon.finish();
+                let text = shown(output.clone());
+                assert_eq!(output.status.code(), Some(130), "{text}");
+                assert!(!home.connected());
+                assert!(home.links().is_empty());
+            }
+        }
+    }
+}
+
+#[test]
 fn signals_through_the_controlling_terminal_reap_helpers_and_restore_input() {
     for rich in [false, true] {
         for signal in [rustix::process::Signal::INT, rustix::process::Signal::TERM] {
-            let home = Home::new(&[]);
-            let daemon = home.daemon(true);
-            let output = terminal_run(
-                home.path(),
-                &full(rich, if rich { "n" } else { "n\n" }),
-                &["setup", "--interactive", "--no-browser"],
-                &[],
-                rich,
-                Some((1, signal)),
-                TerminalInput::ControllingProxy,
-            );
-            daemon.finish();
-            assert_eq!(
-                output.status.code(),
-                Some(if signal == rustix::process::Signal::INT {
-                    130
-                } else {
-                    143
-                }),
-                "{}",
-                String::from_utf8_lossy(&output.stdout)
-            );
-            assert!(!home.connected());
-            assert!(home.links().is_empty());
+            for input in [TerminalInput::ControllingProxy, TerminalInput::FullProxy] {
+                let home = Home::new(&[]);
+                let daemon = home.daemon(true);
+                let output = terminal_run(
+                    home.path(),
+                    &full(rich, if rich { "n" } else { "n\n" }),
+                    &["setup", "--interactive", "--no-browser"],
+                    &[],
+                    rich,
+                    Some((1, signal)),
+                    input,
+                );
+                daemon.finish();
+                assert_eq!(
+                    output.status.code(),
+                    Some(if signal == rustix::process::Signal::INT {
+                        130
+                    } else {
+                        143
+                    }),
+                    "{}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+                assert!(!home.connected());
+                assert!(home.links().is_empty());
+            }
         }
     }
 }

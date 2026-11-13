@@ -1340,6 +1340,7 @@ dependencies = [
  "koidrive-proto",
  "koidrive-store",
  "koidrive-telemetry",
+ "libc",
  "plist",
  "prost",
  "reqwest",

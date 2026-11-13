@@ -111,6 +111,55 @@ struct InputBridge {
     helper: AsyncFd<OwnedFd>,
 }
 
+#[cfg(target_os = "macos")]
+fn controlling_terminal_name() -> io::Result<std::ffi::CString> {
+    unsafe extern "C" {
+        fn devname_r(
+            device: libc::dev_t,
+            mode: libc::mode_t,
+            buffer: *mut libc::c_char,
+            length: libc::c_int,
+        ) -> *mut libc::c_char;
+    }
+
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of_val(&info) as libc::c_int;
+    let count = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if count <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if count != size {
+        return Err(io::Error::other(
+            "the process terminal information is incomplete",
+        ));
+    }
+    let info = unsafe { info.assume_init() };
+    let mut buffer = [0_u8; libc::PATH_MAX as usize];
+    let name = unsafe {
+        devname_r(
+            info.e_tdev as libc::dev_t,
+            libc::S_IFCHR,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as libc::c_int,
+        )
+    };
+    if name.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let name = std::ffi::CStr::from_bytes_until_nul(&buffer).map_err(io::Error::other)?;
+    let mut path = b"/dev/".to_vec();
+    path.extend_from_slice(name.to_bytes());
+    std::ffi::CString::new(path).map_err(io::Error::other)
+}
+
 impl InputBridge {
     fn new(
         input: &OwnedFd,
@@ -124,28 +173,30 @@ impl InputBridge {
             unsafe { AsyncFd::register(fd) }.map_err(|error| error.into_parts().1)
         }
 
-        let mut name = rustix::termios::ttyname(input, Vec::new())?;
-        if name.as_c_str() == c"/dev/tty" {
-            let session = rustix::termios::tcgetsid(input)?;
-            if rustix::termios::tcgetsid(&output).ok() != Some(session) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "stdin and stderr are not the same terminal",
-                ));
-            }
-            name = rustix::termios::ttyname(&output, Vec::new())?;
-            if name.as_c_str() == c"/dev/tty" {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "the terminal device name is unavailable",
-                ));
-            }
-        }
+        let name = rustix::termios::ttyname(input, Vec::new())?;
+        let proxy = name.as_c_str() == c"/dev/tty";
+        #[cfg(target_os = "macos")]
+        let name = if proxy {
+            controlling_terminal_name()?
+        } else {
+            name
+        };
         let terminal = open(
             name.as_c_str(),
             OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
+        if proxy {
+            let session = rustix::termios::tcgetsid(input)?;
+            if rustix::termios::tcgetsid(&output).ok() != Some(session)
+                || rustix::termios::tcgetsid(&terminal).ok() != Some(session)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "stdin and stderr are not the same terminal",
+                ));
+            }
+        }
         let helper = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
         rustix::io::fcntl_setfd(&helper, rustix::io::FdFlags::CLOEXEC)?;
         fcntl_setfl(&helper, fcntl_getfl(&helper)? | OFlags::NONBLOCK)?;
