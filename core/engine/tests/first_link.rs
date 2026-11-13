@@ -1042,6 +1042,33 @@ fn a_discarded_folder_that_holds_an_entry_the_rules_leave_out_keeps_its_name_and
 }
 
 #[test]
+fn a_deep_discarded_folder_goes_to_the_local_trash_folder_by_folder() {
+    let ids: Vec<String> = (0..24).map(|depth| format!("l-{depth}")).collect();
+    let mut entries = Vec::new();
+    let mut parent = ROOT;
+    for id in &ids {
+        entries.push((id.as_str(), dir(parent, "deeper")));
+        parent = id;
+    }
+    entries.push(("l-file", file(parent, "file", 1)));
+    let mut trees = trees(&entries, &[("r-notes", file(ROOT, "notes", 9))]);
+    let mut commits = Commits::default();
+    let mut ids_gen = IdGen::new(7);
+    commits.first_link(&mut trees, &mut ids_gen, NOW);
+    trees.settle();
+    let asked = question(&commits);
+    assert!(commits.decide(&asked.id, Answer::Discard));
+    assert_eq!(ops(&mut commits, &mut trees, &mut ids_gen), []);
+    let mut effects = Effects::default();
+    let done = run_effects(&mut effects, &mut commits, &mut trees, &mut ids_gen, 100);
+    assert_eq!(done.len(), ids.len() + 2, "{done:?}");
+    assert_eq!(
+        local(&trees),
+        [("r-notes".into(), ROOT.into(), "notes".into())]
+    );
+}
+
+#[test]
 fn a_discarded_entry_stays_discarded_when_the_server_merges_its_folder_into_another() {
     let (mut commits, mut trees, mut ids) = linked();
     assert!(commits.decide(&question(&commits).id, Answer::Discard));
