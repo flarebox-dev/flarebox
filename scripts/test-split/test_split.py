@@ -105,6 +105,31 @@ class SplitTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "module header"):
                 split.verify(self.executable, self.mapping, "base")
 
+    def test_scenario_include_is_rejected(self):
+        self.generate()
+        path = self.root / "tests/scenario.rs"
+        path.write_bytes(path.read_bytes() + b'\ninclude!("common.rs");\n')
+        with patch.object(split, "git_source", return_value=self.source):
+            with self.assertRaisesRegex(ValueError, "scenario fragments cannot include"):
+                split.verify(self.executable, self.mapping, "base")
+
+    def test_scenario_inner_attributes_are_rejected(self):
+        self.generate()
+        path = self.root / "tests/scenario.rs"
+        path.write_bytes(b'#![cfg(any())]\n' + path.read_bytes())
+        with patch.object(split, "git_source", return_value=self.source):
+            with self.assertRaisesRegex(ValueError, "scenario fragments cannot have inner attributes"):
+                split.verify(self.executable, self.mapping, "base")
+
+    def test_unreferenced_nested_rust_file_is_rejected(self):
+        self.generate()
+        path = self.root / "tests/nested/extra.rs"
+        path.parent.mkdir()
+        path.write_bytes(b'#[test]\nfn hidden_added() {}\n')
+        with patch.object(split, "git_source", return_value=self.source):
+            with self.assertRaisesRegex(ValueError, "scenario file set"):
+                split.verify(self.executable, self.mapping, "base")
+
     def test_test_lists_keep_duplicates(self):
         old, new = self.root / "old", self.root / "new"
         old.write_text("one: test\none: test\n")

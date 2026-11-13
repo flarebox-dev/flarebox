@@ -54,8 +54,9 @@ def parser():
     return Path(metadata["target_directory"]) / "debug/test-split"
 
 
-def parsed(executable, source):
-    result = subprocess.run([str(executable)], input=source, capture_output=True)
+def parsed(executable, source, fragment=False):
+    command = [str(executable)] + (["--fragment"] if fragment else [])
+    result = subprocess.run(command, input=source, capture_output=True)
     if result.returncode:
         raise ValueError(result.stderr.decode().strip())
     found = json.loads(result.stdout)
@@ -65,8 +66,8 @@ def parsed(executable, source):
     return found
 
 
-def items(executable, source):
-    return [item for item in parsed(executable, source) if item["kind"] != "include"]
+def items(executable, source, fragment=False):
+    return [item for item in parsed(executable, source, fragment) if item["kind"] != "include"]
 
 
 def includes(executable, source):
@@ -190,24 +191,25 @@ def verify(executable, mapping, revision):
         original = load_source(executable, path, revision)
         root = (ROOT / path).read_bytes()
         root_items = parsed(executable, root)
-        expected_includes = Counter(f'{Path(path).stem}/{scenario}.rs'
-                                    for scenario in set(assignments.values()) - {"root"}
-                                    if output_path(path, scenario).exists())
+        original_items = items(executable, original)
+        scenarios = {assignments[item["name"]] for item in original_items} - {"root"}
+        expected_includes = Counter(f'{Path(path).stem}/{scenario}.rs' for scenario in scenarios)
         actual_includes = Counter(item["name"].removeprefix("include:")
                                   for item in root_items if item["kind"] == "include")
         if actual_includes != expected_includes:
             raise ValueError(f"{path}: include list differs from the mapping")
-        original_items = items(executable, original)
         header = original[:original_items[0]["start"]].rstrip() + b"\n\n"
         if not root_items or root[:root_items[0]["start"]] != header:
             raise ValueError(f"{path}: module header changed")
         before = {item["name"]: original[item["start"]:item["end"]]
                   for item in original_items}
         after = {}
-        paths = [ROOT / path] + sorted(output_path(path, "common").parent.glob("*.rs"))
+        paths = [ROOT / path] + sorted(output_path(path, "common").parent.rglob("*.rs"))
+        if set(paths[1:]) != {output_path(path, scenario) for scenario in scenarios}:
+            raise ValueError(f"{path}: scenario file set differs from the mapping")
         for moved in paths:
             source = moved.read_bytes()
-            for item in items(executable, source):
+            for item in items(executable, source, fragment=moved != ROOT / path):
                 name = item["name"]
                 if name in after:
                     raise ValueError(f"duplicated item in {path}: {name}")

@@ -10,6 +10,11 @@ fn main() {
     let mut source = String::new();
     io::stdin().read_to_string(&mut source).unwrap();
     let file = syn::parse_file(&source).expect("parse Rust source");
+    let fragment = std::env::args().any(|arg| arg == "--fragment");
+    assert!(
+        !fragment || file.attrs.is_empty(),
+        "scenario fragments cannot have inner attributes"
+    );
     let mut lines = vec![0];
     for (offset, byte) in source.bytes().enumerate() {
         if byte == b'\n' {
@@ -63,6 +68,7 @@ fn main() {
                 (format!("proptest:{}", names.join(",")), "property")
             }
             syn::Item::Macro(m) if m.mac.path.is_ident("include") => {
+                assert!(!fragment, "scenario fragments cannot include other files");
                 assert!(
                     m.attrs.is_empty(),
                     "include statements must be unconditional and unadorned"
