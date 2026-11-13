@@ -1,6 +1,6 @@
 # RFC 0021: How a person signs in
 
-Status: proposed. Applies to spec v0 (format_version 1). Amends RFC 0006 §2 and §6, RFC 0009 §1 and RFC 0020 §3.1. Registers the features `human_auth`, `device_authorization` and `hosted_auth` (RFC 0022). Builds on RFC 0020 for users, roles and the fence on removed users.
+Status: proposed. Applies to spec v0 (format_version 1). Amends RFC 0006 §2 and §6, RFC 0009 §1 and RFC 0020 §2.2 and §3.1. Registers the features `human_auth`, `device_authorization` and `hosted_auth` (RFC 0022). Builds on RFC 0020 for users, roles and the fence on removed users.
 
 A person has no credential of their own today. A person is the set of their devices, and a new device joins only with a pairing code from a device the person already has (spec v0 §15.2), or as the owner's device through the claim or the recovery key (`docs/design/deploy-and-upgrade.md` §2). That works for a second laptop. It does not work for a browser, for a phone that should sign in to a deployment on any domain, or for an invited person whose first device is a browser.
 
@@ -14,12 +14,14 @@ A bare section number such as §3 refers to this RFC.
 |---|---|---|
 | Browser principal | Account DO `devices`, `kind = 'browser'` | One signed-in browser of one user. Full scope. `expires_at_ms` is the session's absolute end. New `stepped_up_at_ms` (§4) |
 | Passkey | Account DO `passkeys` (new) | `credential_id` (primary key), `user_id`, `rp_id`, `public_key`, `sign_count`, `transports`, `name`, `created_at_ms`, `created_by` (a principal id), `last_used_ms`, `removed_at_ms` |
-| Challenge | Account DO `auth_challenges` (new) | `challenge_hash`, `purpose` (`register`, `sign_in` or `step_up`), `user_id` and `device_id` when known, `expires_at_ms` |
+| Challenge | Account DO `auth_challenges` (new) | `challenge_hash`, `purpose` (`register`, `sign_in`, `step_up` or `hosted`), `user_id` and `device_id` when known, `expires_at_ms`. A sign-in challenge gets a row only when it is used (§3.3) |
 | Enrollment | Account DO `passkey_enrollments` (new) | A one-time link that lets a browser register a passkey for a user (§3.2) |
-| Device authorization | Account DO `device_authorizations` (new) | `device_code_hash`, `user_code_hash`, client name and platform, state, approving principal, the new principal's id, `expires_at_ms`, `last_poll_ms` (§5) |
-| External identity | Account DO `users` | New `idp_issuer`, `idp_subject` (unique together) and `idp_org_id` (§7) |
+| Device authorization | Account DO `device_authorizations` (new) | `request_id`, `device_code_hash`, `user_code_hash`, client name and platform, the country it started from, state, approving principal, the new principal's id, `expires_at_ms`, `last_poll_ms` (§5) |
+| External identity | Account DO `users` | New `idp_issuer`, `idp_subject` (unique together among users who are not removed) and `idp_org_id` (§7) |
 
-A browser principal is a principal like any other (RFC 0006 §2). It belongs to one user, appears in that user's device list with its kind, is revoked like a device (RFC 0009), and is revoked with every other principal when its user is removed (RFC 0020 §3.5). Its authority is its user's role. The fence of RFC 0020 §3.5 applies to every transaction in this RFC that stores a passkey, a principal or an approval.
+A browser principal is a principal like any other (RFC 0006 §2). It belongs to one user, appears in that user's device list with its kind, is revoked like a device (RFC 0009), and is revoked with every other principal when its user is removed (RFC 0020 §3.5). Its authority is its user's role. The fence of RFC 0020 §3.5 applies to every transaction in this RFC that stores a passkey, a principal, an approval or a provider binding.
+
+**What a browser passes on.** A browser's `expires_at_ms` ends its session. It does not limit what the browser issues. When a browser approves a device (§5.3) or creates an enrollment (§3.2), the issuer rule of RFC 0020 §2.2 applies with the browser's scope, which is full, and without the browser's expiry. The new principal gets the expiry that a full-scope device of the same user would give it, and its `issued_by` is the browser. Each of these actions needs a step-up (§4), so the person proved they were present less than 5 minutes earlier.
 
 ## 2. Features
 
@@ -29,15 +31,17 @@ A browser principal is a principal like any other (RFC 0006 §2). It belongs to 
 | `device_authorization` | The routes of §5 |
 | `hosted_auth` | Sign-in through an external identity provider (§7). It replaces passkey sign-in on that deployment |
 
-While a feature is off its routes answer 404 (RFC 0022 §3). Pairing codes, the claim and the owner's recovery key work whatever the features say.
+`hosted_auth` is effective only while `human_auth` is, because browser sessions, step-up and sign-out belong to `human_auth`. With `human_auth` off, the hosted routes answer 404 too.
+
+While a feature is off, RFC 0022 §3 applies. Its routes answer 404, except signing out, listing and revoking sessions, and removing a passkey, which only reduce access (rule 6). With `human_auth` off, every browser principal is refused (rule 5). Pairing codes, the claim and the owner's recovery key work whatever the features say.
 
 ## 3. Passkeys
 
 ### 3.1 The relying party
 
-The relying party ID is the host name of the deployment's origin, such as `koidrive.alice.workers.dev` or a custom domain. The Account DO stores it in `settings` the first time a passkey is registered, and from then on it accepts WebAuthn ceremonies only from `https://<rp_id>`. Every passkey row records the RP ID it was made for. A request that reaches the Worker under another host name is redirected to the stored one before any ceremony starts.
+The relying party ID is the deployment's configured host name, such as `koidrive.alice.workers.dev` or a custom domain. It is never taken from a request's `Host` header. The deployment's owner sets it with `PUT /v1/auth/relying-party` from a full-scope device, and `koi setup` and `koi server upgrade` set it to the host they deployed to when none is stored. Before the Account DO stores a host in `settings`, it checks that the host reaches this deployment. It calls `https://<host>/v1/auth/relying-party/check` with a random nonce and requires the answer to be an HMAC of that nonce under the server key, with a label used for nothing else. Until a host is stored, every WebAuthn route and `POST /v1/device-authorization` answer `FORBIDDEN`. The server accepts WebAuthn ceremonies only from `https://<rp_id>`. Every passkey row records the RP ID it was made for. A request that reaches the Worker under another host name is redirected to the stored one before any ceremony starts.
 
-Changing the deployment's host name changes the origin, and passkeys made for the old RP ID stop matching. An owner who moves the deployment sets the new RP ID with `PUT /v1/auth/relying-party` from a full-scope device. Every passkey of the old RP ID then stops working for sign-in, and each person registers a new passkey through an active device (§3.2) or a recovery code. Related Origin Requests could let the new origin keep using the old RP ID (passkeys.dev/docs/advanced/related-origins, read 2026-11-13). Browser support for it is not checked, so this RFC does not rely on it.
+Changing the deployment's host name changes the origin, and passkeys made for the old RP ID stop matching. An owner who moves the deployment sets the new host the same way. Every passkey of the old RP ID then stops working for sign-in, and each person registers a new passkey through an active device (§3.2) or a recovery code. Related Origin Requests could let the new origin keep using the old RP ID (passkeys.dev/docs/advanced/related-origins, read 2026-11-13). Browser support for it is not checked, so this RFC does not rely on it.
 
 ### 3.2 Registering a passkey
 
@@ -48,13 +52,15 @@ A browser registers a passkey only for a user it can prove it acts for, in one o
 3. **A user invite redeemed in a browser** (RFC 0020 §3.2). The browser registers the passkey in the redemption, and the user's first principal is the browser principal.
 4. **A recovery code redeemed in a browser** (RFC 0020 §3.1).
 
+On a deployment with `hosted_auth` on, ways 2 to 4 bind the person's identity at the provider instead of registering a passkey (§7).
+
 The ceremony asks for a discoverable credential (`residentKey: required`) and user verification (`userVerification: required`). Attestation is not requested. The server verifies the response as WebAuthn Level 3 §7.1 requires: the challenge it issued for this purpose and user, the origin, the RP ID hash, the user-verified flag and the public key. The challenge is 256 random bits, single-use and valid for 5 minutes. A successful registration stores the passkey and, for ways 2 to 4, creates a browser principal and its session (§4) in the same transaction.
 
 A user lists and removes their passkeys from any full-scope principal. Removing a passkey from a browser needs a step-up. Removing the passkey that a browser signed in with does not end that browser's session. Revoking the browser principal does.
 
 ### 3.3 Signing in
 
-`POST /v1/auth/sign-in/options` returns a challenge with no allowed credentials, so the authenticator offers the user's discoverable passkeys. `POST /v1/auth/sign-in` takes the assertion. The server finds the passkey by credential ID, refuses it if it or its user is removed or its RP ID differs from the stored one, and verifies the assertion as WebAuthn Level 3 §7.2 requires, including user verification. A signature counter that is not zero and not above the stored one is refused, because it may come from a cloned authenticator. A counter of zero, which synced passkeys report, is accepted. A successful sign-in creates a browser principal and its session in one transaction with the fence.
+`POST /v1/auth/sign-in/options` returns a challenge with no allowed credentials, so the authenticator offers the user's discoverable passkeys. The route goes through the per-client limiter and stores nothing. The challenge is 256 random bits and an expiry, authenticated by an HMAC under the server key with its own label. The Account DO records a challenge's hash, until it expires, when an assertion uses it, so each challenge is used once. `POST /v1/auth/sign-in` takes the assertion. The server finds the passkey by credential ID, refuses it if it or its user is removed or its RP ID differs from the stored one, and verifies the assertion as WebAuthn Level 3 §7.2 requires, including user verification. A signature counter that is not zero and not above the stored one is refused, because it may come from a cloned authenticator. A counter of zero, which synced passkeys report, is accepted. A successful sign-in creates a browser principal and its session in one transaction with the fence, and counts as a step-up (§4).
 
 Wrong attempts go through the per-client limiter that pairing uses. Unknown credential IDs and failed signatures get the same answer.
 
@@ -64,8 +70,9 @@ A session is a browser principal with a cookie. The cookie value is the principa
 
 - **Cookie.** Named `__Host-koi_session`, with `Secure`, `HttpOnly`, `SameSite=Lax` and `Path=/`, and no `Domain`, so it is sent only to the deployment's own host. `Lax` allows the top-level redirect back from an external identity provider (§7).
 - **Lifetime.** A session ends 24 hours after sign-in (`expires_at_ms`) or after 1 hour without a request, whichever comes first. The server then refuses the principal as it refuses an expired one (RFC 0006 §7). Signing out revokes the principal.
-- **Requests.** The Worker accepts the cookie in place of an access token on the routes the web client uses, WebSocket upgrades included. A request that carries the cookie and changes state must carry an `Origin` header equal to the deployment's origin and an `X-Koidrive-CSRF` header equal to the CSRF token that sign-in returned for this session. The server answers no CORS preflight, so another origin cannot send these headers. A request that fails either check is refused with `FORBIDDEN` and changes nothing.
-- **Step-up.** A browser principal uses these capabilities only within 5 minutes after a passkey assertion for its own user (`purpose = step_up`), recorded in `stepped_up_at_ms`: `user.invite`, `user.manage`, `user.admin`, `space.recover`, `device.manage.any`, `member.manage`, approving a device authorization (§5.3), creating an enrollment, and adding or removing a passkey. Outside that window they answer `FORBIDDEN` with the reason "step-up required", and the web client asks for the passkey and tries again. A device principal needs no step-up, because it proves possession of the device's stored credential on every refresh.
+- **Requests.** The Worker accepts the cookie in place of an access token on the routes the web client uses. A request that carries the cookie and changes state must carry an `Origin` header equal to the deployment's origin and an `X-Koidrive-CSRF` header equal to the CSRF token that sign-in returned for this session. The server answers no CORS preflight, so another origin cannot send these headers. A request that fails either check is refused with `FORBIDDEN` and changes nothing.
+- **WebSockets.** A socket carries commits, so a WebSocket upgrade that carries the cookie must pass the same two checks. Browsers always send `Origin` on a WebSocket handshake, and it must equal the deployment's origin. A browser cannot set other headers on the handshake, so the CSRF token, base64url-encoded, goes in an offered subprotocol `koi-csrf.<token>` beside `koi`. The Worker checks both before the upgrade reaches the Space DO, refuses a failing upgrade with 403, and selects the subprotocol `koi`, so the token is not sent back. These checks, not `SameSite`, stop a page on another host of the same site, such as another `*.workers.dev` Worker of the same account, because `SameSite=Lax` sends the cookie on such a handshake.
+- **Step-up.** A browser principal uses these capabilities only within 5 minutes after a passkey assertion for its own user (`purpose = step_up`) or a sign-in (§3.3), recorded in `stepped_up_at_ms`: `user.invite`, `user.manage`, `user.admin`, `space.recover`, `device.manage.any`, `member.manage`, approving a device authorization (§5.3), creating an enrollment, and adding or removing a passkey. Outside that window they answer `FORBIDDEN` with the reason "step-up required", and the web client asks for the passkey and tries again. A device principal needs no step-up, because it proves possession of the device's stored credential on every refresh.
 
 ## 5. Device authorization
 
@@ -80,7 +87,7 @@ A client that has no credential yet (the CLI, the macOS app, the iOS app) asks t
 - `verification_uri` (`https://<rp_id>/approve`) and `verification_uri_complete` (the same with the code).
 - `expires_in_ms` of 10 minutes and `interval_ms` of 5 seconds.
 
-The per-client limiter caps how many requests one address may start.
+The per-client limiter caps how many requests one address may start. The Account DO records the country the request came from, `request.cf.country` (developers.cloudflare.com/workers/runtime-apis/request, read 2026-11-13).
 
 ### 5.2 Polling
 
@@ -100,10 +107,10 @@ The first refresh credential is an HMAC, under the deployment's server key, of t
 
 A signed-in principal of the person opens the verification page or runs `koi device approve <code>`.
 
-1. `GET /v1/device-authorization?user_code=` returns the client's name, platform and when it started, so the person can check that it is the device in front of them. A wrong code goes through the per-principal limiter.
-2. `POST /v1/device-authorization/decision` with the user code and `approve` or `deny`. Approving needs `device.pair` and, from a browser, a step-up (§4).
+1. `GET /v1/device-authorization?user_code=` returns the client's name, platform, when it started, the country it started from and an opaque `request_id`, so the person can check that it is the device in front of them. When that country differs from the approver's, the page says so above the buttons. A wrong code goes through the per-principal limiter.
+2. `POST /v1/device-authorization/decision` with the `request_id` and `approve` or `deny`. Approving needs `device.pair` and, from a browser, a step-up (§4). The decision applies only to that request, so a user code that expired and was drawn again cannot carry an approval to another request.
 
-Approval creates the principal in one Account DO transaction with the fence: a device of the approver's user, with the approver's scope and an expiry no later than the approver's (RFC 0020 §2.2), and `issued_by` set to the approver. A request decides once. The second decision is refused.
+Approval creates the principal in one Account DO transaction with the fence: a device of the approver's user, with the approver's scope, the expiry that the issuer rule of RFC 0020 §2.2 gives (§1 says what a browser passes on), and `issued_by` set to the approver. A request decides once. The second decision is refused.
 
 A client on a phone can open `verification_uri_complete` in the system browser view (`ASWebAuthenticationSession` on iOS), where the person signs in with a passkey and approves on the same phone. WebAuthn works there as in Safari (passkeys.dev/docs/reference/ios, read 2026-11-13). The app's own passkey API is not used, because it needs an associated domain for each relying party (developer.apple.com, "Supporting passkeys", read 2026-11-13), and every self-hosted deployment has its own domain.
 
@@ -116,16 +123,22 @@ A person who lost a way to sign in recovers in this order:
 3. A recovery code from an admin (RFC 0020 §3.1), redeemed in a browser or by a client.
 4. The deployment's owner only: the recovery key set as a Worker secret (`docs/design/deploy-and-upgrade.md` §2), unchanged.
 
-There is no personal recovery code. A member who is not the owner never gets owner recovery. RFC 0009 §1's last-device warning counts browser principals and passkeys: revoking the last principal of a user who still has a passkey does not warn when `human_auth` is on.
+There is no personal recovery code. A member who is not the owner never gets owner recovery. RFC 0009 §1's last-device warning counts browser principals and the ways to sign in that work now: a passkey whose RP ID is the stored one while `hosted_auth` is off, or a provider binding while it is on. Revoking the last principal of a user who still has one of them does not warn when `human_auth` is on.
 
 ## 7. An external identity provider (hosted deployments)
 
 A deployment that Koidrive hosts for a customer can let WorkOS AuthKit confirm who a person is. Self-hosted deployments do not use it. The deployment keeps issuing every credential itself, so the clients, the routes of §5 and every check stay the same. Only the step where the server learns which user is in front of it changes.
 
-- **Configuration.** Worker variables name the provider (`workos`), its client ID and the customer's organization ID. The API key is a Worker secret. With `hosted_auth` on, passkey sign-in and registration (§3) are off on that deployment, because AuthKit offers passkeys itself (workos.com/docs/authkit/passkeys, read 2026-11-13).
-- **Sign-in.** The browser goes to AuthKit and comes back to the deployment with an authorization code, which the deployment exchanges with PKCE. The deployment verifies the access token, a JWT, against the provider's JWKS (workos.com/docs/authkit/sessions, read 2026-11-13): signature, issuer, the client as audience, expiry, and an organization claim equal to the configured one. It then finds the user by `(idp_issuer, idp_subject)` and creates a browser principal as §3.3 does. The provider's tokens are not kept after this step, and no other route accepts them.
-- **Linking.** A user gets an external identity only by redeeming a user invite (RFC 0020 §3.2) while signed in at the provider. The first sign-in binds the provider's subject to the new user. A subject with no user is refused. A removed user's subject stays bound, so it cannot be used again.
-- **Step-up.** A step-up (§4) asks the provider for a fresh sign-in and accepts a token issued less than 5 minutes ago.
+- **Configuration.** Worker variables name the provider (`workos`), its client ID, its issuer and the customer's organization ID. The API key is a Worker secret. With `hosted_auth` on, passkey sign-in and registration (§3) are off on that deployment, because AuthKit offers passkeys itself (workos.com/docs/authkit/passkeys, read 2026-11-13). `hosted_auth` needs `human_auth` (§2).
+- **The round trip.** `GET /v1/auth/hosted/start` records a `hosted` challenge with a `state` of 256 random bits, the PKCE verifier and its purpose: sign-in, linking (below) or step-up. It binds the challenge to the browser with a pre-session cookie `__Host-koi_auth`, which has the session cookie's attributes and lasts 10 minutes. It then redirects to AuthKit with that `state`, the PKCE challenge and the redirect URI `https://<rp_id>/v1/auth/hosted/callback`, the only callback registered at WorkOS. `GET /v1/auth/hosted/callback` requires a `state` equal to the one of the challenge that the browser's pre-session cookie names, uses that challenge once, and exchanges the code with the verifier.
+- **The token.** The deployment verifies the access token, a JWT, against the client's JWKS at `https://api.workos.com/sso/jwks/<client_id>`: the signature, `iss` equal to the configured issuer, `client_id` equal to the configured client ID, `exp`, and `org_id` equal to the configured organization. AuthKit access tokens carry `client_id` and no `aud` (workos.com/docs/reference/authkit/session-tokens/jwks, read 2026-11-13), so no audience is checked. For a sign-in, the deployment finds the user who is not removed by `(idp_issuer, idp_subject)` and creates a browser principal as §3.3 does. A subject with no such user is refused. The provider's tokens are not kept after the callback, and no other route accepts them.
+- **Linking.** A user gets or changes their identity at the provider in the callback transaction, with the fence, in one of three ways:
+  1. Redeeming a user invite (RFC 0020 §3.2) while signed in at the provider binds the subject to the new user.
+  2. An enrollment link (§3.2, way 2) from a full-scope device of the user binds the subject to that user. This is how the deployment's owner, whom the claim creates without an identity, and every user from before `hosted_auth` was turned on get one.
+  3. A recovery code redeemed in a browser (RFC 0020 §3.1) binds the subject to the code's user.
+
+  A user has at most one binding, and a new one replaces it. A subject already bound to another user who is not removed is refused. A removed user keeps their pair for attribution. The pair is unique only among users who are not removed, so a removed person who is invited again binds the same subject to their new user.
+- **Step-up.** A step-up (§4) runs the round trip with the purpose step-up and sends `max_age=0`, so AuthKit asks for an active sign-in even while its own session is valid. The callback accepts the token only when its `auth_time` is less than 5 minutes old and its subject is bound to the browser's own user. AuthKit advances `auth_time` only on an active sign-in, never on a refresh (workos.com/docs/authkit/reauthentication, read 2026-11-13). A hosted sign-in whose `auth_time` is less than 5 minutes old also counts as a step-up.
 - **Removal.** Removing a user in Koidrive revokes their principals (RFC 0020 §3.5) whatever the provider says. Removing a person only at the provider stops new sign-ins, and their existing principals keep working until an admin removes the user.
 
 AuthKit also offers a device flow (workos.com/docs/authkit/cli-auth, read 2026-11-13). Clients do not use it. They use §5 against the deployment, so a client works the same against a self-hosted and a hosted deployment.
@@ -140,10 +153,10 @@ Protobuf, all additive.
 | `DeviceAuthorization` | `device_code = 1`, `user_code = 2`, `verification_uri = 3`, `verification_uri_complete = 4`, `expires_in_ms = 5`, `interval_ms = 6` |
 | `DeviceAuthorizationPollRequest` | `device_code = 1` |
 | `DeviceAuthorizationPoll` | `state = 1`, `credentials = 2` (`DeviceCredentials`), `interval_ms = 3` |
-| `PendingDeviceAuthorization` | `client_name = 1`, `platform = 2`, `created_at_ms = 3` |
-| `DeviceAuthorizationDecision` | `user_code = 1`, `approve = 2` |
+| `PendingDeviceAuthorization` | `client_name = 1`, `platform = 2`, `created_at_ms = 3`, `request_id = 4`, `country = 5` |
+| `DeviceAuthorizationDecision` | `request_id = 1`, `approve = 2` |
 | `PasskeyEnrollment` | `url = 1`, `expires_at_ms = 2` |
-| `PasskeyInfo` | `credential_id = 1`, `name = 2`, `created_at_ms = 3`, `last_used_ms = 4` |
+| `PasskeyInfo` | `credential_id = 1`, `name = 2`, `created_at_ms = 3`, `last_used_ms = 4`, `created_by = 5` (the principal that registered it or created its enrollment) |
 | `PasskeyList` | `passkeys = 1` |
 | `DeviceInfo.Kind` (existing enum) | new value `KIND_BROWSER = 3` |
 
@@ -160,20 +173,23 @@ The WebAuthn ceremony routes under `/v1/auth/` carry the JSON forms that WebAuth
 | `POST /v1/device-authorization`, `POST /v1/device-authorization/token` | Anyone | `device_authorization` |
 | `GET /v1/device-authorization`, `POST /v1/device-authorization/decision` | Principal with `device.pair` | `device_authorization` |
 | `PUT /v1/auth/relying-party` | The deployment's owner, from a full-scope device | `human_auth` |
-| `GET /v1/auth/hosted/start`, `GET /v1/auth/hosted/callback` | Anyone | `hosted_auth` |
+| `GET /v1/auth/relying-party/check?nonce=` | Anyone | `human_auth` |
+| `GET /v1/auth/hosted/start`, `GET /v1/auth/hosted/callback` | Anyone. A step-up needs a browser principal | `hosted_auth` |
 
-Account DO, one forward-only migration: `devices` gains `stepped_up_at_ms INTEGER`, `users` gains `idp_issuer TEXT`, `idp_subject TEXT` and `idp_org_id TEXT` with a unique index on the pair, and new tables `passkeys`, `auth_challenges`, `passkey_enrollments` and `device_authorizations`. A server that finds `kind = 'browser'` and does not know it denies the principal everything (RFC 0006 §2), so a rollback across this migration fails closed.
+Account DO, one forward-only migration: `devices` gains `stepped_up_at_ms INTEGER`, `users` gains `idp_issuer TEXT`, `idp_subject TEXT` and `idp_org_id TEXT` with a unique index on the pair over users whose `removed_at_ms` is NULL, and new tables `passkeys`, `auth_challenges`, `passkey_enrollments` and `device_authorizations`. A server that finds `kind = 'browser'` and does not know it denies the principal everything (RFC 0006 §2), so a rollback across this migration fails closed.
 
-RFC 0006 §2 gains the kind `browser` and RFC 0006 §6 gains device authorization as a way one principal creates another. RFC 0009 §1's last-device rule changes as §6 says. RFC 0020 §3.1's recovery codes can be redeemed in a browser.
+RFC 0006 §2 gains the kind `browser` and RFC 0006 §6 gains device authorization as a way one principal creates another. RFC 0009 §1's last-device rule changes as §6 says. RFC 0020 §2.2's issuer rule takes a browser's scope and not its expiry (§1). RFC 0020 §3.1's recovery codes can be redeemed in a browser.
 
 ## 9. Security
 
 | Threat | Answer |
 |---|---|
-| Someone tricks a person into approving a code shown on the attacker's device | The approval page shows the client's name, platform and start time, and says to approve only a code on a device in front of the person. A browser approval needs a step-up. The code expires in 10 minutes and decides once |
+| Someone tricks a person into approving a code shown on the attacker's device (RFC 8628 §5.4) | The approval page shows the client's name, platform, start time and country, warns when the country differs from the approver's, and says to approve only a code on a device in front of the person. A browser approval needs a step-up. The code expires in 10 minutes and decides once |
 | Guessing a user code | Approving needs a signed-in principal, and wrong codes go through a per-principal limiter. About 34.6 bits per code |
-| A stolen device code | It yields credentials only after the person approves, and only to the first collector within the replay window |
-| Cross-site requests with the cookie | `Origin` must match and the CSRF header must carry the session's token. No CORS answers. `SameSite=Lax` keeps the cookie off cross-site subrequests |
+| A stolen device code | It yields credentials only after the person approves. Until the new principal first refreshes, every holder of the device code collects the same credentials (§5.2). The new device appears in the person's device list, where they can revoke it |
+| Cross-site and same-site requests with the cookie | `Origin` must match and the session's CSRF token must be present, as a header on requests and as a subprotocol on WebSocket upgrades. No CORS answers. `SameSite=Lax` keeps the cookie off cross-site subrequests, and the `Origin` check stops other hosts of the same site |
+| Signing a victim's browser in to another account (hosted) | The callback's `state` must match the browser's pre-session cookie and is used once |
+| A flood of sign-in challenges | The sign-in options route stores nothing and goes through the per-client limiter |
 | Script injection in the web client | The cookie is `HttpOnly`. Dangerous capabilities need a step-up within 5 minutes. Sessions end after 1 hour idle or 24 hours. The pages send a strict Content-Security-Policy |
 | A cloned authenticator | A non-zero counter that does not grow is refused |
 | A removed user signing in | Every storing transaction runs the fence of RFC 0020 §3.5, and sign-in, approval and registration store a principal |
@@ -181,12 +197,12 @@ RFC 0006 §2 gains the kind `browser` and RFC 0006 §6 gains device authorizatio
 
 ## 10. Tests
 
-- **Passkeys.** Registration and sign-in against a software authenticator in workerd: a wrong origin, a wrong RP ID, a reused challenge, an expired challenge, a missing user-verified flag, a counter that does not grow, and a removed passkey or user are each refused. A sign-in that races the user's removal creates no principal.
-- **Sessions.** A cookie request without `Origin` or without the CSRF header is refused and changes nothing. A session ends at 1 hour idle and at 24 hours. A browser without a step-up is refused every capability of §4, and gets it within 5 minutes after one. Signing out revokes the principal, and its WebSockets close with 4003.
-- **Device authorization.** Polling faster than the interval gets `SLOW_DOWN`. A code decides once. A lost poll answer gets the same credentials. An approver whose user is removed between viewing and approving creates nothing. A scoped approver creates a principal no wider than itself. A request expires after 10 minutes.
+- **Passkeys.** Registration and sign-in against a software authenticator in workerd: a wrong origin, a wrong RP ID, a reused challenge, an expired challenge, a missing user-verified flag, a counter that does not grow, and a removed passkey or user are each refused. A sign-in that races the user's removal creates no principal. Sign-in options store nothing, and a used challenge is refused the second time. A passkey whose RP ID differs from the stored one does not suppress the last-device warning. Setting a relying party whose host does not answer the check is refused, and before a host is stored the WebAuthn routes answer `FORBIDDEN`.
+- **Sessions.** A cookie request without `Origin` or without the CSRF header is refused and changes nothing. A session ends at 1 hour idle and at 24 hours. A browser without a step-up is refused every capability of §4, and gets it within 5 minutes after one. Signing out revokes the principal, and its WebSockets close with 4003. A cookie WebSocket upgrade with another `Origin`, or without the CSRF subprotocol, is refused and never reaches the Space DO. An upgrade from another `*.workers.dev` host of the same account is refused. A sign-in counts as a step-up.
+- **Device authorization.** Polling faster than the interval gets `SLOW_DOWN`. A code decides once. A lost poll answer gets the same credentials. An approver whose user is removed between viewing and approving creates nothing. A scoped approver creates a principal no wider than itself. A request expires after 10 minutes. A device approved from a browser gets the expiry a full-scope device of the same user would give it, and still refreshes 25 hours after the browser's sign-in. A decision whose `request_id` names an expired request changes nothing, even when its user code was drawn again. A request from another country shows the warning.
 - **Recovery.** Each way in §6 ends with a working principal for the same user, and the device list shows who issued it.
-- **Hosted.** A token for another organization, another client, an unknown subject, or an expired token is refused. An invite redeemed through the provider binds the subject once. A provider token is refused on every file route.
-- **Features.** With each feature off its routes answer 404 and pairing still works.
+- **Hosted.** A token for another organization, another `client_id`, an unknown subject, or an expired token is refused. A token with the configured `client_id` and no `aud` is accepted. A callback whose `state` does not match the browser's pre-session cookie, or that reuses a challenge, is refused. A step-up whose token has a fresh `iat` and an `auth_time` older than 5 minutes is refused, and so is one for another user's subject. The claimed owner binds a subject through an enrollment link and then signs in as the owner. An invite redeemed through the provider binds the subject once. A subject bound to another user who is not removed is refused at linking. A removed user's subject binds to the new user of a new invite. A provider token is refused on every file route.
+- **Features.** With each feature off its routes answer 404, except signing out, listing and revoking sessions and removing a passkey, and pairing still works. With `human_auth` off, a browser principal is refused. With `hosted_auth` on and `human_auth` off, the hosted routes answer 404.
 
 ## 11. Alternatives considered
 
