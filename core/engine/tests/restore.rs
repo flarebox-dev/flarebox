@@ -1343,3 +1343,34 @@ fn a_restore_the_server_rejects_leaves_the_removal_a_later_move_out_of_the_trash
     });
     assert_eq!(ops(&commit), [delete]);
 }
+
+#[test]
+fn a_move_out_of_the_trash_waits_for_a_restore_of_a_file_its_user_removed() {
+    let (a, g, missing) = (id(1), id(2), id(3));
+    let folder = dir(&root(), "a");
+    let inside = file(&a, "g", 1);
+    let mut trees = trees(&[
+        (
+            a.clone(),
+            Some(dir(&root(), "A")),
+            Some(folder.clone()),
+            Some(trashed(folder)),
+        ),
+        (g.clone(), None, Some(inside.clone()), Some(trashed(inside))),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let intent = version(&g, &missing);
+    assert!(commits.restore(id(100), intent.clone()));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [restore_op(&intent)]);
+    acknowledge(&mut commits, &mut trees, vec![rejected("NOT_FOUND")]);
+
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    let moved = op::Op::Move(proto::Move {
+        node_id: a.clone(),
+        new_parent_id: root(),
+        new_name: "A".into(),
+        from: None,
+    });
+    assert_eq!(ops(&commit), [moved]);
+}

@@ -4377,6 +4377,41 @@ fn a_file_restored_after_its_user_removed_it_keeps_a_rename_made_before_the_rest
 }
 
 #[test]
+fn a_version_restore_the_server_rejects_leaves_a_file_its_user_removed_deleted() {
+    let mut world = world(2);
+    world
+        .phase(0, &[(0, folder("a")), (0, user(1, 0, 1, "b"))])
+        .unwrap();
+    let mut racing = vec![(0, delete(0))];
+    racing.extend(commit(0));
+    racing.extend([
+        (1, delete(1)),
+        (1, SCAN),
+        (1, DELIVER),
+        (1, rename(0, 0, "A")),
+        (1, SCAN),
+    ]);
+    world.run(1, &racing).unwrap();
+    let engine = &mut world.devices[1].engine;
+    let b = (engine.trees.remote().iter())
+        .find(|(_, node)| node.shape.name == "b")
+        .map(|(id, _)| id.clone())
+        .unwrap();
+    let request = engine.ids.uuid_v7(1_700_000_000_000);
+    let missing = engine.ids.uuid_v7(1_700_000_000_000);
+    let intent = RestoreIntent::version(b, missing).unwrap();
+    assert!(engine.commits.restore(request, intent));
+    world.phase(2, &commit(1)).unwrap();
+    for device in 0..2 {
+        assert_eq!(
+            files_on(&world, device),
+            [("A".into(), None)],
+            "device {device}"
+        );
+    }
+}
+
+#[test]
 fn a_folder_delete_superseded_behind_a_name_that_differs_only_in_case_brings_the_folder_back() {
     let made = vec![(0, folder("a")), (2, file("C.TXT"))];
     let filled = vec![(0, user(1, 0, 1, "ß"))];

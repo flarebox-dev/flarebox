@@ -108,7 +108,7 @@ A `Move` or `Restore` of a trashed folder also brings back the members of its tr
 - A member the user removed while R held it trashed by another device's delete is recorded with that delete's seq (`removed_here`) while R holds it trashed by it. When a record of this device's commit shows the member live again, S takes R's shape, so the removal is a local delete again.
 - A `Delete` that its own commit's move or restore superseded leaves S at R's shape for the same reason.
 - The scratch copy brings back the trash group with the folder. A create or move onto the name of a member that the next commit deletes waits for that commit, so it keeps its name instead of getting a conflict name.
-- A restore the user asks for brings back what it restores. When the records of its commit show the restored node live, the records of that node and of each member below it in its trash group are dropped before those records apply, so what the restore brings back is downloaded. A restore the server rejects leaves the records in place.
+- A restore the user asks for brings back what it restores. When the records of its commit show the restored node live, the records of that node and of each member below it in its trash group are dropped before those records apply, so what the restore brings back is downloaded. A restore the server rejects leaves the records in place. The records of a commit don't show which op brought a node back, so such a restore goes in a commit with no other move or restore of a node R holds in the trash.
 
 ### Name cycles and pending names
 

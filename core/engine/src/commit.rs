@@ -2645,6 +2645,14 @@ fn plan(
         trees.local().get(id).is_none()
             && (trees.synced().get(id).is_some() || trees.is_removed_here(id))
     };
+    scratch.touching = (wants.iter().flatten())
+        .filter_map(|want| match want {
+            Want::Restore { op, .. } => Some(op),
+            _ => None,
+        })
+        .filter(|op| scratch.restore_brings(op).iter().any(removed))
+        .map(|op| op.node_id.clone())
+        .collect();
     let mut emit = |want: Want, scratch: &mut Scratch, moving: &mut BTreeSet<NodeId>| {
         for node in want.nodes() {
             if let Some(left) = scratch.unsent.get_mut(node) {
@@ -2688,6 +2696,7 @@ fn plan(
                     parent_id: held.parent.clone(),
                     name: held.name.clone(),
                 });
+                scratch.revived |= held.group.is_some();
                 let (kind, group) = (held.kind, held.group.clone().filter(|_| !held.live));
                 scratch.place(&id, &parent, &name, kind);
                 if let Some(group) = group {
@@ -2729,6 +2738,7 @@ fn plan(
             }
             Want::Restore { op, .. } => {
                 scratch.restoring.remove(&op.node_id);
+                scratch.alone |= scratch.touching.contains(&op.node_id);
                 let trashed = (trees.remote().get(&op.node_id))
                     .filter(|node| node.trashed && op.version_id.is_empty());
                 match trashed {
@@ -2740,6 +2750,7 @@ fn plan(
                         let name = name.unwrap_or(&position.name);
                         let fit = scratch.fit_at(&op.node_id, parent, name);
                         if matches!(fit, Fit::Valid | Fit::NameTaken) {
+                            scratch.revived = true;
                             scratch.place(&op.node_id, parent, name, node.shape.kind);
                             scratch.revive_group(&op.node_id, &node.trash_group);
                         }
@@ -3093,6 +3104,9 @@ struct Scratch {
     restoring: BTreeSet<NodeId>,
     trashed: BTreeMap<NodeId, Vec<NodeId>>,
     owed: BTreeSet<NodeId>,
+    touching: BTreeSet<NodeId>,
+    revived: bool,
+    alone: bool,
 }
 
 impl Scratch {
@@ -3107,6 +3121,9 @@ impl Scratch {
             restoring: BTreeSet::new(),
             trashed: BTreeMap::new(),
             owed: BTreeSet::new(),
+            touching: BTreeSet::new(),
+            revived: false,
+            alone: false,
         };
         for (id, node) in trees.remote().iter() {
             let entry = Entry {
@@ -3166,6 +3183,11 @@ impl Scratch {
     fn placement(&self, want: &Want, moving: &BTreeSet<NodeId>) -> Fit {
         match want {
             Want::Create { id, shape } => self.fit_at(id, &shape.parent, &shape.name),
+            Want::Move { id, .. }
+                if !self.touching.is_empty() && self.nodes[id].group.is_some() =>
+            {
+                Fit::Wait
+            }
             Want::Move {
                 id, parent, name, ..
             } => self.fit_at(id, parent, name),
@@ -3184,6 +3206,11 @@ impl Scratch {
                 }
             }
             Want::Restore { op, .. } if self.unsent.contains_key(&op.node_id) => Fit::Wait,
+            Want::Restore { op, .. }
+                if self.alone || (self.revived && self.touching.contains(&op.node_id)) =>
+            {
+                Fit::Wait
+            }
             Want::Restore { .. } => Fit::Valid,
         }
     }
@@ -3302,20 +3329,48 @@ impl Scratch {
     }
 
     fn revive_group(&mut self, id: &str, group: &str) -> Vec<NodeId> {
-        let mut revived = Vec::new();
-        let mut parents = vec![id.to_owned()];
-        while let Some(parent) = parents.pop() {
-            for child in self.trashed.get(&parent).cloned().unwrap_or_default() {
-                let entry = &self.nodes[&child];
-                if entry.live || entry.group.as_deref() != Some(group) {
-                    continue;
-                }
-                self.link(&child);
-                parents.push(child.clone());
-                revived.push(child);
-            }
+        let revived = self.group_below(id, group);
+        for member in &revived {
+            self.link(member);
         }
         revived
+    }
+
+    fn group_below(&self, id: &str, group: &str) -> Vec<NodeId> {
+        let mut below = Vec::new();
+        let mut parents = vec![id];
+        while let Some(parent) = parents.pop() {
+            for child in self.trashed.get(parent).into_iter().flatten() {
+                let entry = &self.nodes[child];
+                if !entry.live && entry.group.as_deref() == Some(group) {
+                    parents.push(child);
+                    below.push(child.clone());
+                }
+            }
+        }
+        below
+    }
+
+    fn restore_brings(&self, op: &proto::Restore) -> Vec<NodeId> {
+        let mut brings = vec![op.node_id.clone()];
+        let Some(entry) = self.nodes.get(&op.node_id).filter(|entry| !entry.live) else {
+            return brings;
+        };
+        if let Some(group) = &entry.group {
+            brings.extend(self.group_below(&op.node_id, group));
+        }
+        let target = Some(op.target_parent_id.as_str()).filter(|target| !target.is_empty());
+        let mut current = target.unwrap_or(&entry.parent);
+        for _ in 0..=self.nodes.len() {
+            match self.nodes.get(current) {
+                Some(above) if !above.live => {
+                    brings.push(current.to_owned());
+                    current = &above.parent;
+                }
+                _ => break,
+            }
+        }
+        brings
     }
 
     /// Makes `id` live with the trashed ancestors it needs, as R8 does.
