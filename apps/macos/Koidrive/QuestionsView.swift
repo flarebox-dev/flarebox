@@ -11,28 +11,33 @@ struct QuestionsView: View {
 
     var body: some View {
         NavigationSplitView {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 2) {
-                    ForEach(model.questionSections) { section in
-                        if model.questionSectionsShowSpace {
-                            SpaceHeading(spaceID: section.spaceID, folder: section.folder)
-                                .font(.callout.weight(.semibold))
-                                .foregroundStyle(Color.text2)
-                                .lineLimit(1)
-                                .padding(.horizontal, 8)
-                                .padding(.bottom, 4)
-                                .frame(maxWidth: .infinity, minHeight: 28, alignment: .bottomLeading)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(model.questionSections) { section in
+                            if model.questionSectionsShowSpace {
+                                SpaceHeading(spaceID: section.spaceID, folder: section.folder)
+                                    .font(.callout.weight(.semibold))
+                                    .foregroundStyle(Color.text2)
+                                    .lineLimit(1)
+                                    .padding(.horizontal, 8)
+                                    .padding(.bottom, 4)
+                                    .frame(maxWidth: .infinity, minHeight: 28, alignment: .bottomLeading)
+                            }
+                            rows(of: section)
                         }
-                        rows(of: section)
                     }
+                    .padding(.vertical, 10)
+                    .padding(.horizontal, 8)
                 }
-                .padding(.vertical, 10)
-                .padding(.horizontal, 8)
-            }
-            .focusable()
-            .focusEffectDisabled()
-            .onMoveCommand { direction in
-                selection = moved(selection, in: model.questionSections.flatMap(\.questions).map(\.id), direction)
+                .focusable()
+                .focusEffectDisabled()
+                .onMoveCommand { direction in
+                    selection = moved(selection, in: model.questionSections.flatMap(\.questions).map(\.id), direction)
+                }
+                .onChange(of: selection) { _, id in
+                    if let id { proxy.scrollTo(id) }
+                }
             }
             .navigationSplitViewColumnWidth(min: 240, ideal: 260)
         } detail: {
@@ -237,25 +242,30 @@ struct QuestionDetail: View {
     }
 
     private var items: some View {
-        ScrollView {
-            LazyVStack(spacing: 2) {
-                ForEach(question.items, id: \.nodeId) { item in
-                    Button { selectedItemID = item.nodeId } label: {
-                        HeldItemRow(item: item, selected: selectedItemID == item.nodeId)
-                    }
-                    .buttonStyle(.plain)
-                    .help(item.path)
-                    .contextMenu {
-                        Button("Copy Path") { copy(fullPath(item)) }
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 2) {
+                    ForEach(question.items, id: \.nodeId) { item in
+                        Button { selectedItemID = item.nodeId } label: {
+                            HeldItemRow(item: item, selected: selectedItemID == item.nodeId)
+                        }
+                        .buttonStyle(.plain)
+                        .help(item.path)
+                        .contextMenu {
+                            Button("Copy Path") { copy(fullPath(item)) }
+                        }
                     }
                 }
+                .padding(4)
             }
-            .padding(4)
-        }
-        .focusable()
-        .focusEffectDisabled()
-        .onMoveCommand { direction in
-            selectedItemID = moved(selectedItemID, in: question.items.map(\.nodeId), direction)
+            .focusable()
+            .focusEffectDisabled()
+            .onMoveCommand { direction in
+                selectedItemID = moved(selectedItemID, in: question.items.map(\.nodeId), direction)
+            }
+            .onChange(of: selectedItemID) { _, id in
+                if let id { proxy.scrollTo(id) }
+            }
         }
         .onCopyCommand {
             selectedItem.map { [NSItemProvider(object: fullPath($0) as NSString)] } ?? []
