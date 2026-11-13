@@ -2827,8 +2827,12 @@ mod tests {
     #[tokio::test]
     async fn the_status_reports_the_saved_update_check_and_off_once_config_toml_turns_it_off() {
         let (_dir, paths, _root) = profile(&[]);
-        let release = r#"{"checked_at":7,"release":{"version":"999.0.0","url":"https://example.com/v999.0.0"}}"#;
-        fs::write(paths.update_check(), release).unwrap();
+        let release = serde_json::json!({
+            "asset": crate::update::this_asset(),
+            "checked_at": 7,
+            "release": { "version": "999.0.0", "url": "https://example.com/v999.0.0" },
+        });
+        fs::write(paths.update_check(), release.to_string()).unwrap();
         let driver = Driver::open(paths.clone()).unwrap();
         assert_eq!(
             driver.status().update,
@@ -3296,10 +3300,12 @@ mod tests {
                 let paths = linked_with_server(&base, server);
                 fs::write(
                     paths.update_check(),
-                    format!(
-                        r#"{{"checked_at":{},"successful_at":100}}"#,
-                        i64::MAX - 1000
-                    ),
+                    serde_json::json!({
+                        "asset": crate::update::this_asset(),
+                        "checked_at": i64::MAX - 1000,
+                        "successful_at": 100,
+                    })
+                    .to_string(),
                 )
                 .unwrap();
                 let driver = Driver::open(paths).unwrap();

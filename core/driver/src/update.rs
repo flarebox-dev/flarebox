@@ -95,6 +95,8 @@ pub(crate) fn switched_on(config: &UpdateCheck, variable: Option<&str>) -> bool 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Checked {
     #[serde(default)]
+    pub asset: Option<String>,
+    #[serde(default)]
     pub checked_at: Option<i64>,
     #[serde(default)]
     pub successful_at: Option<i64>,
@@ -125,12 +127,14 @@ impl Checked {
         day.max(self.retry_after.unwrap_or(i64::MIN))
     }
 
-    pub fn after(self, answer: Answer, now: i64) -> Checked {
+    pub fn after(mut self, answer: Answer, now: i64) -> Checked {
+        self.asset = Some(this_asset());
         let successful_at = self
             .successful_at
             .or_else(|| self.release.as_ref().and(self.checked_at));
         match answer {
             Answer::Releases { etag, release } => Checked {
+                asset: self.asset,
                 checked_at: Some(now),
                 successful_at: Some(now),
                 etag,
@@ -427,7 +431,8 @@ pub async fn check_now(paths: &Paths) -> Result<Option<Release>, CheckError> {
 }
 
 pub(crate) fn load(path: &Path) -> Option<Checked> {
-    serde_json::from_slice(&fs::read(path).ok()?).ok()
+    let checked: Checked = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    (checked.asset.as_deref() == Some(this_asset().as_str())).then_some(checked)
 }
 
 fn save(path: &Path, checked: &Checked) -> io::Result<()> {
@@ -1318,6 +1323,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("update-check.json");
         let answered = Checked {
+            asset: Some(this_asset()),
             checked_at: Some(1),
             release: release("9.0.0"),
             ..Checked::default()
@@ -1334,6 +1340,81 @@ mod tests {
         save(&path, &Checked::default()).unwrap();
         let on = Updates::open(true, path.clone());
         assert_eq!(on.notice(), Update::Unknown);
+    }
+
+    #[test]
+    fn foreign_or_legacy_caches_are_unknown_and_due_for_a_fresh_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update-check.json");
+        for asset in [Some("koidrive-foreign-target.tar.gz"), None] {
+            for release in [None, release("99.0.0")] {
+                let mut cached = serde_json::json!({
+                    "checked_at": i64::MAX - 1000,
+                    "successful_at": 100,
+                    "etag": "\"foreign\"",
+                    "release": release,
+                    "retry_after": i64::MAX - 1000,
+                });
+                if let Some(asset) = asset {
+                    cached["asset"] = asset.into();
+                }
+                fs::write(&path, cached.to_string()).unwrap();
+                assert_eq!(
+                    Updates::open(true, path.clone()).notice(),
+                    Update::Unknown,
+                    "{asset:?}"
+                );
+                let checked = load(&path).unwrap_or_default();
+                assert!(checked.due() <= now_ms());
+                assert_eq!(checked.etag, None);
+                assert_eq!(checked.release, None);
+                assert_eq!(checked.successful_at, None);
+            }
+        }
+    }
+
+    #[test]
+    fn same_target_caches_keep_the_last_answer_and_conditional_validator() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update-check.json");
+        let cached = serde_json::json!({
+            "asset": this_asset(),
+            "checked_at": i64::MAX - 1000,
+            "successful_at": 100,
+            "etag": "\"same\"",
+            "release": release("99.0.0"),
+        });
+        fs::write(&path, cached.to_string()).unwrap();
+        let expected = Update::Available {
+            latest: "99.0.0".into(),
+            url: "https://github.com/koidrive/koidrive/releases/tag/v99.0.0".into(),
+            checked_at_ms: 100,
+        };
+        assert_eq!(Updates::open(true, path.clone()).notice(), expected);
+        let checked = load(&path).unwrap();
+        assert!(checked.due() > now_ms());
+        assert_eq!(checked.etag.as_deref(), Some("\"same\""));
+        assert_eq!(checked.release, release("99.0.0"));
+    }
+
+    #[test]
+    fn successful_caches_persist_the_current_target_even_without_a_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update-check.json");
+        for release in [None, release("99.0.0")] {
+            let checked = Checked::default().after(
+                Answer::Releases {
+                    etag: Some("\"same\"".into()),
+                    release,
+                },
+                100,
+            );
+            save(&path, &checked).unwrap();
+            let cached: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(cached["asset"], this_asset());
+            assert_eq!(load(&path), Some(checked));
+        }
     }
 
     #[test]

@@ -173,6 +173,88 @@ fn koi_update_on_the_newest_release_changes_nothing() {
 }
 
 #[test]
+fn koi_update_rechecks_foreign_and_legacy_caches_but_keeps_same_target_conditionals() {
+    for cached_asset in [
+        Some("koidrive-foreign-target.tar.gz".to_owned()),
+        None,
+        Some(asset()),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let state = home.path().join("state/koidrive");
+        std::fs::create_dir_all(&state).unwrap();
+        let mut cached = serde_json::json!({
+            "checked_at": 1763006400000_i64,
+            "successful_at": 1763006400000_i64,
+            "etag": "\"cached\"",
+            "release": { "version": "99.0.0", "url": "https://example.com/v99.0.0" },
+        });
+        if let Some(asset) = &cached_asset {
+            cached["asset"] = asset.clone().into();
+        }
+        std::fs::write(state.join("update-check.json"), cached.to_string()).unwrap();
+        let same_target = cached_asset.as_deref() == Some(asset().as_str());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let github = GitHub {
+            base: format!("http://{}", listener.local_addr().unwrap()),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                request.push_str(&line);
+            }
+            let body = serde_json::json!([{
+                "tag_name": "v99.0.0",
+                "html_url": "https://example.com/v99.0.0",
+                "assets": [{ "name": "koidrive-foreign-target.tar.gz" }],
+            }])
+            .to_string();
+            let response = if same_target {
+                "HTTP/1.1 304 Not Modified\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    .to_owned()
+            } else {
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            };
+            stream.write_all(response.as_bytes()).unwrap();
+            request
+        });
+        let calls = homebrew(home.path(), "99.0.0");
+        let output = koi(home.path(), &github, &["update", "--json"])
+            .output()
+            .unwrap();
+        let request = server.join().unwrap().to_ascii_lowercase();
+        assert_eq!(
+            request.contains("if-none-match: \"cached\""),
+            same_target,
+            "{request}"
+        );
+        let envelope = envelope(&output);
+        assert_eq!(output.status.success(), same_target, "{envelope:#}");
+        if same_target {
+            assert_eq!(envelope["outcome"], "unchanged");
+            assert_eq!(envelope["data"]["to"], "99.0.0");
+        } else {
+            assert_eq!(envelope["outcome"], "error");
+            assert_eq!(
+                envelope["error"]["message"],
+                "GitHub lists no Koidrive release for this system"
+            );
+        }
+        assert!(!calls.exists(), "brew did not run");
+    }
+}
+
+#[test]
 fn koi_update_preserves_disabled_login_items_and_only_fails_for_a_real_problem() {
     for problem in [None, Some("the service could not be registered")] {
         let home = tempfile::tempdir().unwrap();
@@ -382,7 +464,13 @@ fn without_a_daemon_status_reads_the_last_check_and_the_switch_turns_it_off() {
     std::fs::create_dir_all(&state).unwrap();
     std::fs::write(
         state.join("update-check.json"),
-        r#"{"checked_at":1763006400000,"etag":"\"e1\"","release":{"version":"99.0.0","url":"https://example.com/v99.0.0"}}"#,
+        serde_json::json!({
+            "asset": asset(),
+            "checked_at": 1763006400000_i64,
+            "etag": "\"e1\"",
+            "release": { "version": "99.0.0", "url": "https://example.com/v99.0.0" },
+        })
+        .to_string(),
     )
     .unwrap();
     let output = koi(home.path(), &github, &["status", "--json"])
