@@ -344,14 +344,19 @@ impl Commits {
             || (self.in_flight.as_ref()).is_some_and(|flight| flight.commit.commit_id == commit_id)
     }
 
-    /// Whether the commit in flight is `commit_id` and edits the content of `id`, other than as a
-    /// resend: a record of it that arrives before the result is this device's edit.
+    /// Whether the commit in flight is `commit_id` and its last op that sets the content of `id` is
+    /// an edit other than a resend: a record of it that arrives before the result is this device's
+    /// edit.
     pub fn edits_in_flight(&self, commit_id: &str, id: &str) -> bool {
         (self.in_flight.as_ref()).is_some_and(|flight| {
             flight.commit.commit_id == commit_id
-                && (flight.commit.ops.iter()).any(|op| {
-                    matches!(&op.op, Some(op::Op::UpdateContent(update)) if update.node_id == id && !update.resend)
-                })
+                && (flight.commit.ops.iter().rev()).find_map(|op| match &op.op {
+                    Some(op::Op::UpdateContent(update)) if update.node_id == id => {
+                        Some(!update.resend)
+                    }
+                    Some(op::Op::Restore(restore)) if restore.node_id == id => Some(false),
+                    _ => None,
+                }) == Some(true)
         })
     }
 

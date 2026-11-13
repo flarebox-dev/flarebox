@@ -350,6 +350,61 @@ fn a_version_restore_leaves_s_and_l_alone_and_the_file_is_replaced() {
 }
 
 #[test]
+fn an_edit_and_a_restore_of_one_file_in_one_commit_leave_the_restored_content_remote() {
+    let n = id(1);
+    let edited = (
+        n.clone(),
+        Some(file(&root(), "f", 3)),
+        Some(file(&root(), "f", 2)),
+        Some(remote(file(&root(), "f", 2))),
+    );
+    let mut trees = trees(&[edited]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let intent = version(&n, &id(50));
+    commits.restore(id(100), intent.clone());
+    let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&sent), [update(&n, 3), restore_op(&intent)]);
+    let restored = RemoteNode {
+        content_rev: 3,
+        edit_rev: 3,
+        ..remote(file(&root(), "f", 4))
+    };
+    if commits.edits_in_flight(&sent.commit_id, &n) {
+        trees.set_remote_edited_here(n.clone(), restored.clone());
+    } else {
+        trees.set_remote_made_here(n.clone(), restored.clone());
+    }
+    let result = CommitResult {
+        seq: 3,
+        results: vec![outcome(op_result::Code::Applied); 2],
+        ..Default::default()
+    };
+    commits.received(result).unwrap();
+    assert!(commits.acknowledge(&mut trees, 3));
+    trees.settle();
+    assert_eq!(trees.synced().get(&n).unwrap().content, Some(content(3)));
+    assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
+    let trashed = trees.trashed_here();
+    let edited = trees.edited_here();
+    let synced = trees.taken_from_others(|seq| commits.lost_here(seq));
+    let moved = trees.moved_here();
+    let untaken = trees.untaken_edits(|seq| commits.lost_here(seq));
+    trees.set_listed_remote(n.clone(), restored);
+    trees.forget_lost(
+        trashed,
+        edited,
+        synced,
+        moved,
+        untaken,
+        commits.held_through(),
+        commits.accepted(),
+    );
+    trees.settle();
+    let next = build(&mut commits, &mut trees, &mut ids);
+    assert!(next.is_none(), "{:?}", next.as_ref().map(ops));
+}
+
+#[test]
 fn a_restore_follows_the_edit_of_its_own_file() {
     let (n, v) = (id(1), id(50));
     let edited = (
