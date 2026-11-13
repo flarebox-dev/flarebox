@@ -92,6 +92,32 @@ commit env >/dev/null
 expect "a file gated on target_env, and not a name that starts with target_" "core/net/src/tls.rs "
 
 base="$(git rev-parse HEAD)"
+write cli/src/host.rs '#[cfg(target_os = "macos")]
+mod tests {
+    include!("host/tests.rs");
+}'
+write cli/src/host/tests.rs 'include!("../shared/cases.rs");'
+write cli/src/shared/cases.rs 'fn case() {}'
+write cli/src/spaced.rs '#[cfg(target_os = "macos")]
+mod tests {
+    include! (
+        "spaced/tests.rs"
+    );
+}'
+write cli/src/spaced/tests.rs 'fn t() {}'
+write core/engine/tests/all.rs 'include!("all/one.rs");'
+write core/engine/tests/all/one.rs 'fn one() {}'
+commit includes >/dev/null
+base="$(git rev-parse HEAD)"
+write cli/src/host/tests.rs 'include!("../shared/cases.rs");
+fn more() {}'
+write cli/src/shared/cases.rs 'fn case() { }'
+write cli/src/spaced/tests.rs 'fn t() { }'
+write core/engine/tests/all/one.rs 'fn one() { }'
+commit included >/dev/null
+expect "files that platform-specific Rust includes directly, through another include or across lines, and not files only portable Rust includes" "cli/src/host/tests.rs cli/src/shared/cases.rs cli/src/spaced/tests.rs "
+
+base="$(git rev-parse HEAD)"
 {
   echo '#[cfg(target_os = "macos")]'
   seq 200000 | sed 's/.*/fn filler() {}/'

@@ -21,6 +21,42 @@ has() {
   return 1
 }
 
+normalize() {
+  local part parts out=()
+  IFS=/ read -r -a parts <<<"$1"
+  for part in "${parts[@]}"; do
+    case "$part" in
+      "" | .) ;;
+      ..) [ "${#out[@]}" -eq 0 ] || unset "out[$((${#out[@]} - 1))]" ;;
+      *) out+=("$part") ;;
+    esac
+  done
+  (IFS=/; printf '%s\n' "${out[*]}")
+}
+
+includes="$(
+  for rev in "$base" "$head"; do
+    git grep -l -I -E 'include!' "$rev" -- '*.rs' || true
+  done | while IFS= read -r entry; do
+    includer=${entry#*:}
+    git show "$entry" | perl -0777 -ne 'print "$1\n" while /include!\s*\(\s*"([^"]+)"\s*\)/g' | while IFS= read -r included; do
+      printf '%s\t%s\n' "$includer" "$(normalize "$(dirname "$includer")/$included")"
+    done
+  done | sort -u
+)"
+
+platform_includer() {
+  local path=$1 depth=$2 includer
+  [ "$depth" -lt 8 ] || return 1
+  while IFS= read -r includer; do
+    if has "$includer" "$platform_rust" || platform_includer "$includer" $((depth + 1)) >/dev/null; then
+      printf '%s\n' "$includer"
+      return 0
+    fi
+  done < <(awk -F '\t' -v path="$path" '$2 == path { print $1 }' <<<"$includes")
+  return 1
+}
+
 changed="$(git diff -z --name-only --no-renames "$base" "$head" | tr '\0' '\n')"
 while IFS= read -r path; do
   reason=""
@@ -32,7 +68,13 @@ while IFS= read -r path; do
     Cargo.lock | rust-toolchain.toml | .cargo/*) reason="toolchain or dependencies" ;;
     build.rs | */build.rs) reason="build script" ;;
     Cargo.toml | */Cargo.toml) has "$path" '^\[target\.' && reason="platform-specific dependencies" ;;
-    *.rs) has "$path" "$platform_rust" && reason="platform-specific Rust" ;;
+    *.rs)
+      if has "$path" "$platform_rust"; then
+        reason="platform-specific Rust"
+      elif includer="$(platform_includer "$path" 0)"; then
+        reason="Rust included by platform-specific $includer"
+      fi
+      ;;
   esac
   if [ -n "$reason" ]; then
     printf '%s\t%s\n' "$path" "$reason"
