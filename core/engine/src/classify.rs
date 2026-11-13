@@ -512,9 +512,7 @@ impl Trees {
                 at.same(&node.shape)
             });
         self.mark(&id);
-        if node.trashed {
-            self.yield_resends(&id);
-        }
+        let trashed = node.trashed;
         if (self.trashed_here.get(&id)).is_some_and(|&seq| !(node.trashed && node.meta_rev == seq))
         {
             self.trashed_here.remove(&id);
@@ -563,6 +561,9 @@ impl Trees {
         self.count_trashed(&id, true);
         self.note_position(&id);
         self.record_edit_in_trash(&id);
+        if trashed {
+            self.yield_resends();
+        }
         if created_over_resend {
             self.take_local(id);
         }
@@ -572,15 +573,31 @@ impl Trees {
         &self.resends
     }
 
-    fn yield_resends(&mut self, trashed: &str) {
-        let under = |trees: &Self, id: &str| {
-            std::iter::successors(Some(id), |id| {
-                trees.l.get(id).map(|node| node.shape.parent.as_str())
+    fn local_chain<'a>(&'a self, id: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        std::iter::successors(Some(id), |id| {
+            self.l.get(id).map(|node| node.shape.parent.as_str())
+        })
+    }
+
+    pub(crate) fn yield_resends(&mut self) {
+        if self.resends.is_empty() {
+            return;
+        }
+        let holding_changes: BTreeSet<&str> = (self.dirty.iter())
+            .filter(|id| !self.resends.contains(*id))
+            .filter(|id| {
+                self.unsent_edits.contains(*id)
+                    || (self.l.get(id))
+                        .is_some_and(|local| !self.s.get(id).is_some_and(|s| s.same(&local.shape)))
             })
-            .any(|id| id == trashed)
-        };
+            .flat_map(|id| self.local_chain(id).skip(1))
+            .collect();
         let yielded: Vec<NodeId> = (self.resends.iter())
-            .filter(|id| under(self, id))
+            .filter(|id| !holding_changes.contains(id.as_str()))
+            .filter(|id| {
+                self.local_chain(id)
+                    .any(|id| self.r.get(id).is_some_and(|remote| remote.trashed))
+            })
             .cloned()
             .collect();
         for id in yielded {
@@ -1483,7 +1500,9 @@ impl Trees {
     /// did, is sent again with no change of this device's user in it ([`TreesState::resends`]). A
     /// delete that R holds of it, or of a folder L holds it under, before the server takes the
     /// resend was made after the loss by a user who may have held what the resend brings back, so
-    /// the delete beats the resend (GUN-548). R taking a node it lacked again, live with the
+    /// the delete beats the resend (GUN-548), unless L holds a change of this device's user below
+    /// the resend: that change beats the delete (R8) and needs the resend as its folder. Once L
+    /// holds no such change, the next build gives way. R taking a node it lacked again, live with the
     /// content L holds, ends its resend too: another device sent it first, and its position is a
     /// remote move. The device that made the change sends it again itself, as above.
     ///
@@ -1739,18 +1758,7 @@ impl Trees {
                 self.wait(id, Some(kept), Origin::Other);
             }
         }
-        let trashed: BTreeSet<NodeId> = (self.resends.iter())
-            .flat_map(|id| {
-                std::iter::successors(Some(id.as_str()), |id| {
-                    self.l.get(id).map(|node| node.shape.parent.as_str())
-                })
-            })
-            .filter(|id| self.r.get(id).is_some_and(|remote| remote.trashed))
-            .map(str::to_owned)
-            .collect();
-        for id in trashed {
-            self.yield_resends(&id);
-        }
+        self.yield_resends();
         let unproven: Vec<NodeId> = (self.watched_positions.iter())
             .filter(|(id, agreed)| {
                 agreed.as_ref().is_some_and(|agreed| {
