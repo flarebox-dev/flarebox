@@ -61,14 +61,28 @@ cask "koidrive" do
   desc "File sync you deploy to your own Cloudflare account"
   homepage "https://koidrive.com/"
 
-  auto_updates true
   depends_on arch: :arm64
-  depends_on formula: "koidrive/tap/koidrive"
   depends_on macos: :tahoe
 
   app "Koidrive.app"
+  binary "#{appdir}/Koidrive.app/Contents/Helpers/koi"
 
-  zap trash: "~/Library/Application Support/Koidrive"
+  uninstall quit: "dev.koidrive.Koidrive"
+
+  zap script: {
+        executable: "#{appdir}/Koidrive.app/Contents/MacOS/Koidrive",
+        args:       ["--unregister-login-item"],
+        sudo:       false,
+      },
+      trash:  [
+        "~/Library/Application Support/Koidrive",
+        "~/Library/Preferences/dev.koidrive.Koidrive.plist",
+      ]
+
+  caveats <<~EOS
+    For full removal of the app, its login item and preferences, run:
+      brew uninstall --zap --cask koidrive
+  EOS
 end
 EOF
 render v0.1.0-alpha.3 "$tmp/SHA256SUMS" > "$tmp/actual.rb"

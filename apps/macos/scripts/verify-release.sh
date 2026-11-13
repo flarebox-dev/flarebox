@@ -57,9 +57,12 @@ echo "== Contents/Helpers/koi"
 helper="$app/Contents/Helpers/koi"
 [ -x "$helper" ] || fail "The app has no Contents/Helpers/koi."
 expected="$(plutil -extract KoidriveVersion raw -o - "$app/Contents/Info.plist" 2>/dev/null || echo "${VERSION:-}")"
-reported="$("$helper" --version)" || fail "Contents/Helpers/koi does not run."
-echo "$reported"
-[ "$reported" = "koi $expected" ] || fail "Contents/Helpers/koi reports '$reported', but the app is $expected."
+check_helper_version() {
+  local reported
+  reported="$("$helper" --version)" || fail "Contents/Helpers/koi does not run."
+  echo "$reported"
+  [ "$reported" = "koi $expected" ] || fail "Contents/Helpers/koi reports '$reported', but the app is $expected."
+}
 codesign --verify --strict --verbose=2 "$helper" || fail "codesign could not verify the signature of Contents/Helpers/koi."
 helper_details="$(codesign --display --verbose=4 "$helper" 2>&1)"
 echo "$helper_details" | grep -E '^(Identifier|Signature|Authority|Timestamp|TeamIdentifier)'
@@ -78,8 +81,13 @@ fi
 
 if [ "$mode" = unsigned ]; then
   grep -q '^Signature=adhoc' <<<"$details" || fail "The unsigned build is expected to carry an ad hoc signature."
+  attributes="$(xattr -lr "$app" "$dmg")"
+  if grep -q 'com.apple.quarantine:' <<<"$attributes"; then
+    fail "Unsigned verification requires a locally built, unquarantined disk image and app."
+  fi
   echo "== spctl (expected to reject an unsigned build)"
   spctl --assess --type execute --verbose=2 "$app" || true
+  check_helper_version
   echo "Verified the unsigned disk image: ad hoc signature with the hardened runtime, not notarized."
   exit 0
 fi
@@ -103,4 +111,5 @@ assessment="$(spctl --assess --type open --context context:primary-signature --v
 echo "$assessment"
 grep -q 'source=Notarized Developer ID' <<<"$assessment" || fail "Gatekeeper accepts the disk image, but not as notarized Developer ID software."
 
+check_helper_version
 echo "Verified the signed disk image: Developer ID, hardened runtime, notarized and stapled."

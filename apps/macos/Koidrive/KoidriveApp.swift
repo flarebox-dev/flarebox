@@ -10,6 +10,15 @@ struct KoidriveApp: App {
     @State private var model: AppModel
 
     init() {
+        if CommandLine.arguments.dropFirst().first == "--unregister-login-item" {
+            do {
+                try LoginItemCommand.unregister()
+                exit(0)
+            } catch {
+                FileHandle.standardError.write(Data("Could not unregister Koidrive's login item: \(error.localizedDescription)\n".utf8))
+                exit(1)
+            }
+        }
         let model: AppModel
         #if DEBUG
         if let directory = Snapshots.directory {

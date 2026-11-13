@@ -16,20 +16,23 @@ If the installer warns that `~/.local/bin` is not on `PATH`, add it to your shel
 
 ## Install with Homebrew
 
-On macOS 26 or later with Apple silicon and [Homebrew](https://brew.sh), install the app and CLI. Homebrew 7 requires [trusting the CLI dependency](https://docs.brew.sh/Taps) first:
-
-```sh
-brew tap koidrive/tap
-brew trust --formula koidrive/tap/koidrive
-```
-
-Install the cask:
+On macOS 26 or later with Apple silicon and [Homebrew](https://brew.sh), install the app and its bundled CLI:
 
 ```sh
 brew install --cask koidrive/tap/koidrive
 ```
 
-The cask is marked `auto_updates`. To include it in [Homebrew upgrades](https://docs.brew.sh/Manpage), run `brew upgrade --cask --greedy koidrive/tap/koidrive`. Uninstalling with `brew uninstall --cask --zap koidrive/tap/koidrive` deletes the app state in `~/Library/Application Support/Koidrive`, but keeps synced folders and CLI state.
+The cask links the app's `koi` into Homebrew's `bin`, so the app and command share a version. Upgrade both with `brew update && brew upgrade --cask koidrive/tap/koidrive`.
+
+The cask and CLI-only formula are alternatives. Before switching from the formula, run `brew uninstall --formula koidrive/tap/koidrive`. To switch to the formula, uninstall the cask first.
+
+For full removal of the app and its settings:
+
+```sh
+brew uninstall --zap --cask koidrive
+```
+
+This quits the app, unregisters its login item, removes the app and CLI link, and deletes `~/Library/Application Support/Koidrive` and `~/Library/Preferences/dev.koidrive.Koidrive.plist`. It keeps synced folders and CLI state.
 
 For the CLI only on macOS or Linux:
 
