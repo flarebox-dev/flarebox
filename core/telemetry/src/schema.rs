@@ -561,13 +561,15 @@ pub enum Command {
     Device,
     History,
     Service,
+    Pause,
+    Resume,
     Daemon,
     Telemetry,
     Diagnose,
 }
 
 impl Command {
-    pub const ALL: [Command; 13] = [
+    pub const ALL: [Command; 15] = [
         Command::Status,
         Command::Resolve,
         Command::Setup,
@@ -578,6 +580,8 @@ impl Command {
         Command::Device,
         Command::History,
         Command::Service,
+        Command::Pause,
+        Command::Resume,
         Command::Daemon,
         Command::Telemetry,
         Command::Diagnose,
@@ -595,6 +599,8 @@ impl Command {
             Command::Device => "device",
             Command::History => "history",
             Command::Service => "service",
+            Command::Pause => "pause",
+            Command::Resume => "resume",
             Command::Daemon => "daemon",
             Command::Telemetry => "telemetry",
             Command::Diagnose => "diagnose",

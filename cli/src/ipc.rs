@@ -14,8 +14,10 @@ use koidrive_driver::{
     Answered, Driver, DriverError, FolderState, FolderStatus, Linked, Paths, Status,
 };
 use koidrive_engine::commit::Lift;
-use koidrive_ipc::{Blocked, Key, Request, RequestId, Response, read_line, write_line};
+use koidrive_ipc::{Blocked, Key, Request, RequestId, Response, read_line, write_json, write_line};
 use rustix::io::Errno;
+use tokio::io::AsyncReadExt;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::error::CliError;
@@ -148,6 +150,19 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
         Request::Access => Ok(Response::Access {
             blocked: unreadable(driver.status().folders).await,
         }),
+        Request::Pause => driver.pause().await.map(|paused| match paused {
+            true => Response::Paused,
+            false => Response::AlreadyPaused,
+        }),
+        Request::Resume => driver.resume().await.map(|resumed| match resumed {
+            true => Response::Resumed,
+            false => Response::NotPaused,
+        }),
+        Request::Watch => {
+            return Response::from(CliError::usage(
+                "only a running daemon can be watched, over a connection of its own",
+            ));
+        }
         Request::Once {
             request_id,
             key,
@@ -227,15 +242,39 @@ pub async fn serve(listener: UnixListener, driver: Driver) {
 }
 
 async fn answer(stream: UnixStream, driver: &Driver) -> io::Result<()> {
-    let (reader, mut writer) = stream.into_split();
-    let line = read_line(reader).await?;
+    let (mut reader, mut writer) = stream.into_split();
+    let line = read_line(&mut reader).await?;
     let response = match serde_json::from_str::<Request>(&line) {
+        Ok(Request::Watch) => return watch(reader, writer, driver).await,
         Ok(request) => handle(driver, request).await,
         Err(error) => Response::from(CliError::usage(format!(
             "the request is not valid: {error}"
         ))),
     };
     write_line(&mut writer, &response).await
+}
+
+async fn watch(
+    mut reader: OwnedReadHalf,
+    mut writer: OwnedWriteHalf,
+    driver: &Driver,
+) -> io::Result<()> {
+    let mut changes = driver.watch();
+    let mut closed = [0; 1];
+    loop {
+        let state = match driver.questions() {
+            Ok(questions) => Response::State {
+                status: driver.status(),
+                questions,
+            },
+            Err(error) => Response::from(CliError::from(error)),
+        };
+        write_json(&mut writer, &state).await?;
+        tokio::select! {
+            changed = changes.changed() => changed.map_err(io::Error::other)?,
+            _ = reader.read(&mut closed) => return Ok(()),
+        }
+    }
 }
 
 /// The error for a profile that a process holds while its socket does not answer.
@@ -248,7 +287,7 @@ pub fn busy(paths: &Paths) -> String {
 
 /// Runs `request` in the daemon, or in a driver of its own when no daemon runs. A failed request is an error. Without
 /// a daemon and without a state directory, the status and the questions, answered or not, are read as a profile that is not set up,
-/// without opening a driver, so reading them creates nothing.
+/// and a resume finds nothing paused, without opening a driver, so they create nothing.
 pub async fn run(paths: &Paths, request: Request) -> Result<Response, CliError> {
     let response = match koidrive_ipc::ask(paths, &request).await? {
         Some(response) => response,
@@ -266,6 +305,9 @@ pub async fn run(paths: &Paths, request: Request) -> Result<Response, CliError> 
             && !paths.state_dir.exists() =>
         {
             Response::AnsweredQuestion { question: None }
+        }
+        None if matches!(request, Request::Resume) && !paths.state_dir.exists() => {
+            Response::NotPaused
         }
         None => {
             let driver = Driver::open(paths.clone()).map_err(|error| match error {
@@ -289,7 +331,7 @@ pub async fn run(paths: &Paths, request: Request) -> Result<Response, CliError> 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
@@ -332,6 +374,76 @@ mod tests {
         server.abort();
     }
 
+    async fn next_state(lines: &mut koidrive_ipc::Watch) -> Status {
+        let line = tokio::time::timeout(Duration::from_secs(30), lines.next()).await;
+        match line.unwrap().unwrap() {
+            Some(Response::State { status, questions }) => {
+                assert_eq!(questions.len(), status.folders.len(), "{questions:?}");
+                status
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_watcher_gets_the_state_at_once_and_again_after_a_pause_and_an_unlink() {
+        let (_dir, paths, root) = linked_profile();
+        let driver = Driver::open(paths.clone()).unwrap();
+        let server = tokio::spawn(serve(bind(&paths.socket()).unwrap(), driver.clone()));
+        let uid = rustix::process::getuid().as_raw();
+        let mut lines = koidrive_ipc::watch(&paths.socket(), uid)
+            .await
+            .unwrap()
+            .unwrap();
+        let first = next_state(&mut lines).await;
+        assert_eq!((first.paused, first.folders.len()), (false, 1));
+
+        assert_eq!(run(&paths, Request::Pause).await.unwrap(), Response::Paused);
+        assert!(next_state(&mut lines).await.paused);
+        let unlinked = run(&paths, Request::Unlink { folder: root }).await.unwrap();
+        assert!(
+            matches!(unlinked, Response::Unlinked { .. }),
+            "{unlinked:?}"
+        );
+        let mut status = next_state(&mut lines).await;
+        while !status.folders.is_empty() {
+            status = next_state(&mut lines).await;
+        }
+        assert!(status.paused);
+        assert_eq!(
+            run(&paths, Request::Status).await.unwrap(),
+            Response::Status {
+                status: driver.status()
+            }
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_watch_ends_when_its_client_hangs_up_and_needs_the_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Driver::open(Paths::under(dir.path())).unwrap();
+        let (client, daemon) = UnixStream::pair().unwrap();
+        let answering = tokio::spawn({
+            let driver = driver.clone();
+            async move { answer(daemon, &driver).await }
+        });
+        let (reader, mut writer) = client.into_split();
+        write_json(&mut writer, &Request::Watch).await.unwrap();
+        let line = read_line(reader).await.unwrap();
+        assert!(line.starts_with(r#"{"response":"state""#), "{line}");
+        drop(writer);
+        tokio::time::timeout(Duration::from_secs(30), answering)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let Response::Error { code, .. } = handle(&driver, Request::Watch).await else {
+            panic!("a watch ran without a daemon");
+        };
+        assert_eq!(code, Code::Usage);
+    }
+
     #[tokio::test]
     async fn without_a_daemon_a_command_opens_the_profile_itself() {
         let dir = tempfile::tempdir().unwrap();
@@ -344,10 +456,10 @@ mod tests {
         assert!(error.message.contains("does not answer"), "{error:?}");
     }
 
-    const SPACE: &str = "0190f0a0-0000-7000-8000-000000000001";
+    pub(crate) const SPACE: &str = "0190f0a0-0000-7000-8000-000000000001";
 
     /// A profile whose folder `Koidrive` syncs one space, which waits on the decision `q1`.
-    fn linked_profile() -> (tempfile::TempDir, Paths, PathBuf) {
+    pub(crate) fn linked_profile() -> (tempfile::TempDir, Paths, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();
         let paths = Paths::under(&base.join("profile"));
@@ -355,6 +467,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let store_path = paths.store(SPACE).unwrap();
         fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+        fs::set_permissions(&paths.state_dir, fs::Permissions::from_mode(0o700)).unwrap();
         let question = Question {
             id: "q1".into(),
             lineage: "q1".into(),

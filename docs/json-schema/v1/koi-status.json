@@ -259,6 +259,19 @@
           "type": "object"
         },
         {
+          "description": "Sync is paused until `koi resume`. `status --check` exits 0 for it, and the folders the pause stops add no\n`stopped` condition.",
+          "properties": {
+            "condition": {
+              "const": "paused",
+              "type": "string"
+            }
+          },
+          "required": [
+            "condition"
+          ],
+          "type": "object"
+        },
+        {
           "properties": {
             "condition": {
               "const": "halted",
@@ -793,6 +806,12 @@
           },
           "type": "array"
         },
+        "folders": {
+          "description": "The folders the profile links, as the command that brought the service in line counted them. Left out when it\nlinks none or the command did not count them.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "lingers": {
           "type": [
             "boolean",
@@ -847,7 +866,7 @@
         },
         {
           "const": "switched_off",
-          "description": "The launch agent is installed but not loaded: the person switched koi off in Login Items, which unloads it.",
+          "description": "The launch agent is installed but launchd lists it as disabled: the person switched koi off in Login Items.",
           "type": "string"
         },
         {
@@ -886,6 +905,10 @@
             "$ref": "#/$defs/FolderData"
           },
           "type": "array"
+        },
+        "paused": {
+          "description": "Sync is paused until `koi resume`, so the folders are stopped.",
+          "type": "boolean"
         },
         "running": {
           "type": "boolean"

@@ -219,6 +219,7 @@ struct Inner {
     /// Held for the whole of a pair, claim, sign-out, link or unlink, so one runs at a time: a sign-out waits for a
     /// claim or a link in flight and then undoes it, and a credential the server issued is always stored.
     lifecycle: tokio::sync::Mutex<()>,
+    pausing: Arc<tokio::sync::Mutex<()>>,
     credential: Mutex<Option<Credential>>,
     /// The one [`Auth`] of this process while it is signed in, which every caller uses, so that a rotation of the
     /// refresh credential reaches all of them (RFC 0011 section 2). None while signed out, or when the credential's
@@ -228,6 +229,7 @@ struct Inner {
     credential_writes: Arc<Mutex<()>>,
     folders: Mutex<BTreeMap<String, Folder>>,
     running: AtomicBool,
+    paused: AtomicBool,
     changed: Arc<watch::Sender<()>>,
     #[cfg(test)]
     observe_fault: Option<Arc<crate::folder::ObserveFault>>,
@@ -357,6 +359,7 @@ impl Driver {
             .and_then(|stored| rotating_auth(&paths, stored, &credential_writes).ok());
         let credential = stored.map(|stored| stored.credential);
         let folders = load_folders(&paths)?;
+        let paused = paths.paused().is_file();
         Ok(Driver {
             inner: Arc::new(Inner {
                 matcher,
@@ -366,11 +369,13 @@ impl Driver {
                 paths,
                 _lock: lock,
                 lifecycle: tokio::sync::Mutex::new(()),
+                pausing: Arc::default(),
                 credential: Mutex::new(credential),
                 auth: Mutex::new(auth),
                 credential_writes,
                 folders: Mutex::new(folders),
                 running: AtomicBool::new(false),
+                paused: AtomicBool::new(paused),
                 changed: Arc::new(watch::Sender::new(())),
                 #[cfg(test)]
                 observe_fault: None,
@@ -410,6 +415,8 @@ impl Driver {
         Status {
             account,
             running: self.inner.running.load(Ordering::SeqCst),
+            paused: self.inner.paused.load(Ordering::SeqCst),
+            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             folders,
         }
     }
@@ -766,7 +773,7 @@ impl Driver {
             unlink: None,
         };
         drop(lock);
-        if self.inner.running.load(Ordering::SeqCst) {
+        if self.syncs() {
             self.spawn(&mut folder, &credential, linked);
         }
         folders.insert(space.space_id, folder);
@@ -999,20 +1006,71 @@ impl Driver {
             .map_err(store_error(&path))
     }
 
-    /// Starts syncing every linked folder, each in a task on the current Tokio runtime. Starting a running driver
-    /// does nothing.
+    /// Starts syncing every linked folder, each in a task on the current Tokio runtime, unless sync is paused: then
+    /// the folders start at [`Driver::resume`]. Starting a running driver does nothing.
     pub fn start(&self) {
         if self.inner.running.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.start_folders();
+        self.changed();
+    }
+
+    /// Pauses sync: stops every folder as [`Driver::stop`] does and keeps the profile's paused file, so that a driver
+    /// opened on the profile later stays paused too. Returns false when sync was paused already. Once it holds the pause
+    /// lock, the pause runs in a task of its own on the current Tokio runtime, so it finishes stopping the folders even
+    /// when its caller stops waiting, and a later resume waits until it has. A pause dropped before it holds the lock
+    /// changes nothing.
+    pub async fn pause(&self) -> Result<bool, DriverError> {
+        let pausing = self.inner.pausing.clone().lock_owned().await;
+        let driver = self.clone();
+        let paused = tokio::spawn(async move {
+            let _pausing = pausing;
+            let path = driver.inner.paths.paused();
+            fs::write(&path, b"paused\n").map_err(io_error(&path))?;
+            if driver.inner.paused.swap(true, Ordering::SeqCst) {
+                return Ok(false);
+            }
+            driver.stop_folders().await;
+            Ok(true)
+        });
+        paused
+            .await
+            .unwrap_or_else(|error| std::panic::resume_unwind(error.into_panic()))
+    }
+
+    /// Ends a pause: removes the profile's paused file and starts the folders if the driver was started. Returns false
+    /// when sync was not paused.
+    pub async fn resume(&self) -> Result<bool, DriverError> {
+        let _pausing = self.inner.pausing.lock().await;
+        let path = self.inner.paths.paused();
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(_) if !path.is_file() => {}
+            Err(error) => return Err(io_error(&path)(error)),
+        }
+        if !self.inner.paused.swap(false, Ordering::SeqCst) {
+            return Ok(false);
+        }
+        self.start_folders();
+        self.changed();
+        Ok(true)
+    }
+
+    fn syncs(&self) -> bool {
+        self.inner.running.load(Ordering::SeqCst) && !self.inner.paused.load(Ordering::SeqCst)
+    }
+
+    fn start_folders(&self) {
         let credential = self.inner.credential.lock().unwrap().clone();
         let mut folders = self.inner.folders.lock().unwrap();
+        if !self.syncs() {
+            return;
+        }
         let all = roots(&folders);
         for folder in folders.values_mut() {
             self.start_folder(folder, credential.as_ref(), &all);
         }
-        drop(folders);
-        self.changed();
     }
 
     /// Syncs the folder at `folder` again from the start: stops its task, waits for it to end, and starts a new one.
@@ -1039,15 +1097,15 @@ impl Driver {
         lift: Option<Lift>,
     ) -> Result<FolderStatus, DriverError> {
         let _lifecycle = self.inner.lifecycle.lock().await;
-        let (space_id, done) = {
-            let mut folders = self.inner.folders.lock().unwrap();
-            let found = find(&mut folders, folder)?;
-            (
-                found.link.space_id.clone(),
-                found.run.as_ref().map(Running::stop),
-            )
-        };
-        if let Some(done) = done {
+        let space_id = find(&mut self.inner.folders.lock().unwrap(), folder)?
+            .link
+            .space_id
+            .clone();
+        loop {
+            let done = (self.inner.folders.lock().unwrap().get(&space_id))
+                .and_then(|folder| folder.run.as_ref().filter(|run| !run.ended()))
+                .map(Running::stop);
+            let Some(done) = done else { break };
             ended(done).await;
         }
         let lifted = match lift {
@@ -1062,9 +1120,11 @@ impl Driver {
         let folder = folders
             .get_mut(&space_id)
             .expect("only an unlink removes a folder, and it holds the lifecycle lock");
-        folder.run = None;
-        folder.status.lock().unwrap().state = FolderState::Stopped;
-        if self.inner.running.load(Ordering::SeqCst) {
+        if folder.run.as_ref().is_none_or(Running::ended) {
+            folder.run = None;
+            folder.status.lock().unwrap().state = FolderState::Stopped;
+        }
+        if self.syncs() {
             self.start_folder(folder, credential.as_ref(), &all);
         }
         let status = folder.status.lock().unwrap().clone();
@@ -1098,6 +1158,10 @@ impl Driver {
     /// State on disk is kept.
     pub async fn stop(&self) {
         self.inner.running.store(false, Ordering::SeqCst);
+        self.stop_folders().await;
+    }
+
+    async fn stop_folders(&self) {
         let stopping: Vec<_> = self
             .inner
             .folders
@@ -1112,7 +1176,9 @@ impl Driver {
         for folder in self.inner.folders.lock().unwrap().values_mut() {
             if folder.run.as_ref().is_none_or(Running::ended) {
                 folder.run = None;
-                folder.status.lock().unwrap().state = FolderState::Stopped;
+                let mut status = folder.status.lock().unwrap();
+                status.state = FolderState::Stopped;
+                status.wait = None;
             }
         }
         self.changed();
@@ -2485,6 +2551,225 @@ mod tests {
         assert_eq!(served.await.unwrap().0, "/v1/pair/complete");
         assert_eq!(account.user_name, None);
         assert_eq!(account.device_name, "desktop");
+    }
+
+    #[tokio::test]
+    async fn a_pause_stops_every_folder_outlives_the_driver_and_only_a_resume_ends_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Koidrive");
+        let paths = Paths::under(&base.join("profile"));
+        linked(&paths, &root, "d1");
+        let state = |driver: &Driver| driver.status().folders[0].state;
+        let driver = Driver::open(paths.clone()).unwrap();
+        driver.start();
+        assert_ne!(state(&driver), FolderState::Stopped);
+        let mut watch = driver.watch();
+        watch.borrow_and_update();
+
+        assert!(driver.pause().await.unwrap());
+        assert!(watch.has_changed().unwrap());
+        assert!(!driver.pause().await.unwrap());
+        let status = driver.status();
+        assert!(status.running && status.paused, "{status:?}");
+        assert_eq!(status.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(state(&driver), FolderState::Stopped);
+        driver.restart(&root).await.unwrap();
+        assert_eq!(state(&driver), FolderState::Stopped);
+        drop(driver);
+
+        let driver = Driver::open(paths.clone()).unwrap();
+        driver.start();
+        assert!(driver.status().paused);
+        assert_eq!(state(&driver), FolderState::Stopped);
+        assert!(driver.resume().await.unwrap());
+        assert!(!driver.resume().await.unwrap());
+        assert!(!paths.paused().exists());
+        assert!(!driver.status().paused);
+        assert_ne!(state(&driver), FolderState::Stopped);
+        driver.stop().await;
+        drop(driver);
+        assert!(!Driver::open(paths).unwrap().status().paused);
+    }
+
+    #[tokio::test]
+    async fn a_pause_and_a_resume_during_a_restart_leave_the_folder_one_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Koidrive");
+        let paths = Paths::under(&base.join("profile"));
+        linked(&paths, &root, "d1");
+        let driver = Driver::open(paths).unwrap();
+        driver.inner.running.store(true, Ordering::SeqCst);
+        let (stop, _stopped) = watch::channel(false);
+        let (finished, done) = watch::channel(());
+        let stopping = Running {
+            stop,
+            requests: Arc::new(Notify::new()),
+            done,
+        };
+        driver
+            .inner
+            .folders
+            .lock()
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap()
+            .run = Some(stopping);
+        let (replaced, mut replacement) = tokio::sync::oneshot::channel::<watch::Receiver<()>>();
+        let restarting = tokio::spawn({
+            let driver = driver.clone();
+            let root = root.clone();
+            async move {
+                driver.restart(&root).await.unwrap();
+                replacement.try_recv().unwrap().has_changed().is_err()
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        driver
+            .inner
+            .folders
+            .lock()
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap()
+            .run = None;
+        assert!(driver.pause().await.unwrap());
+        assert!(driver.resume().await.unwrap());
+        let started = (driver
+            .inner
+            .folders
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .run
+            .as_ref())
+        .map(|run| run.done.clone())
+        .unwrap();
+        replaced.send(started).unwrap();
+        drop(finished);
+        assert!(
+            restarting.await.unwrap(),
+            "the restart stopped the task the resume started before it started its own"
+        );
+        eventually("the folder is claimed", || {
+            claim::owner(&root).unwrap().is_some()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let folder = &driver.status().folders[0];
+        assert_ne!(folder.state, FolderState::Halted, "{:?}", folder.problem);
+        driver.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_resume_after_a_pause_cancelled_before_its_task_ran_stays_resumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let driver = Driver::open(paths.clone()).unwrap();
+        let mut pausing = Box::pin(driver.pause());
+        let first = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(pausing.as_mut(), cx))
+        })
+        .await;
+        assert!(first.is_pending());
+        drop(pausing);
+        driver.resume().await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!driver.status().paused);
+        assert!(!paths.paused().exists());
+    }
+
+    #[tokio::test]
+    async fn a_resume_after_a_pause_whose_caller_stopped_waiting_starts_every_folder_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let paths = Paths::under(&base.join("profile"));
+        linked(&paths, &base.join("Koidrive"), "d1");
+        let driver = Driver::open(paths).unwrap();
+        driver.inner.running.store(true, Ordering::SeqCst);
+        let (stop, _stopped) = watch::channel(false);
+        let (finished, done) = watch::channel(());
+        let stopping = Running {
+            stop,
+            requests: Arc::new(Notify::new()),
+            done,
+        };
+        driver
+            .inner
+            .folders
+            .lock()
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap()
+            .run = Some(stopping);
+
+        let abandoned = tokio::time::timeout(Duration::from_millis(100), driver.pause()).await;
+        assert!(
+            abandoned.is_err(),
+            "the pause waits for the folder's task to end"
+        );
+        assert!(driver.status().paused);
+        let resuming = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.resume().await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(finished);
+        assert!(resuming.await.unwrap().unwrap());
+        {
+            let folders = driver.inner.folders.lock().unwrap();
+            let run = folders.values().next().unwrap().run.as_ref();
+            assert!(
+                run.is_some_and(|run| !run.ended()),
+                "a new task syncs the folder"
+            );
+        }
+        driver.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_pause_ends_the_wait_of_each_folder_it_stops() {
+        let (_dir, paths, _root) = profile(&[]);
+        let driver = Driver::open(paths).unwrap();
+        let wait = crate::status::Wait {
+            kind: crate::status::WaitKind::Retry,
+            until_ms: i64::MAX,
+        };
+        for folder in driver.inner.folders.lock().unwrap().values() {
+            folder.status.lock().unwrap().wait = Some(wait);
+        }
+        assert_eq!(driver.status().folders[0].wait, Some(wait));
+        assert!(driver.pause().await.unwrap());
+        let folder = &driver.status().folders[0];
+        assert_eq!((folder.state, folder.wait), (FolderState::Stopped, None));
+    }
+
+    #[tokio::test]
+    async fn only_a_file_marks_a_profile_paused() {
+        let (_dir, paths, _root) = profile(&[]);
+        fs::create_dir_all(paths.paused()).unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+        assert!(!driver.status().paused);
+        assert!(!driver.resume().await.unwrap());
+        assert!(matches!(driver.pause().await, Err(DriverError::Io { .. })));
+        assert!(!driver.status().paused);
+    }
+
+    #[tokio::test]
+    async fn a_pause_of_a_driver_that_was_not_started_only_keeps_the_profile_paused() {
+        let (_dir, paths, _root) = profile(&[]);
+        let driver = Driver::open(paths.clone()).unwrap();
+        assert!(driver.pause().await.unwrap());
+        assert!(paths.paused().exists());
+        assert!(!driver.status().running);
+        assert!(driver.resume().await.unwrap());
+        assert_eq!(driver.status().folders[0].state, FolderState::Stopped);
     }
 
     #[tokio::test]

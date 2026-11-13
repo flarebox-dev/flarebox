@@ -6,11 +6,10 @@
 //! The driver keeps the credential, the linked folders, their stores and the questions; this
 //! module maps its [`Status`] and questions onto [`SessionState`] and sends what changed as
 //! [`SessionEvent`]s. Calls the driver does not have (`connect`, `start_pairing`, `spaces`,
-//! `create_space`, `space_usage`) are one `core/net` call each. The pause is the driver stopped, remembered in
-//! the profile so that it outlives a relaunch.
+//! `create_space`, `space_usage`) are one `core/net` call each. The pause is the driver's, which the profile
+//! keeps so that it outlives a relaunch.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,7 +55,6 @@ struct Inner {
     /// The server [`Core::connect`] found, for signing in.
     server: Option<Api>,
     started: bool,
-    paused: bool,
     /// The state as last sent to the listener.
     sent: SessionState,
     /// Each halted folder's reason, by space, with when it was first seen.
@@ -78,7 +76,6 @@ impl DriverCore {
         let paths = Paths::under(dir);
         let driver = Driver::open(paths.clone()).map_err(driver_error)?;
         let changes = driver.watch();
-        let paused = paused_file(&paths).exists();
         let core = Arc::new(DriverCore {
             runtime,
             paths,
@@ -87,7 +84,6 @@ impl DriverCore {
                 driver: Some(driver),
                 server: None,
                 started: false,
-                paused,
                 sent: SessionState {
                     status: SyncStatus::Stopped,
                     progress: None,
@@ -190,7 +186,7 @@ impl DriverCore {
             None => (inner.sent.questions.clone(), inner.sent.notices.clone()),
         };
         SessionState {
-            status: sync_status(&status, inner.started, inner.paused),
+            status: sync_status(&status, inner.started),
             progress: None,
             account: status.account.as_ref().map(account),
             folders: status.folders.iter().map(folder).collect(),
@@ -281,9 +277,7 @@ impl Core for DriverCore {
         let mut inner = self.lock();
         if !inner.started {
             inner.started = true;
-            if !inner.paused
-                && let Some(driver) = &inner.driver
-            {
+            if let Some(driver) = &inner.driver {
                 self.start_driver(driver);
             }
         }
@@ -303,14 +297,13 @@ impl Core for DriverCore {
 
     fn pause(&self) -> Result<(), SessionError> {
         let mut inner = self.lock();
-        if !inner.started || inner.paused {
+        if !inner.started {
             return Ok(());
         }
-        let path = paused_file(&self.paths);
-        fs::write(&path, b"paused\n").map_err(not_saved(&path))?;
-        inner.paused = true;
         if let Some(driver) = &inner.driver {
-            self.runtime.block_on(driver.stop());
+            self.runtime
+                .block_on(driver.pause())
+                .map_err(driver_error)?;
         }
         self.refresh(&mut inner, false);
         Ok(())
@@ -318,20 +311,13 @@ impl Core for DriverCore {
 
     fn resume(&self) -> Result<(), SessionError> {
         let mut inner = self.lock();
-        if !inner.paused {
-            return Ok(());
-        }
-        let path = paused_file(&self.paths);
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(not_saved(&path)(error)),
-        }
-        inner.paused = false;
-        if inner.started
-            && let Some(driver) = &inner.driver
-        {
-            self.start_driver(driver);
+        if let Some(driver) = &inner.driver {
+            self.runtime
+                .block_on(driver.resume())
+                .map_err(driver_error)?;
+            if inner.started {
+                self.start_driver(driver);
+            }
         }
         self.refresh(&mut inner, false);
         Ok(())
@@ -393,8 +379,7 @@ impl Core for DriverCore {
             self.runtime
                 .block_on(driver.sign_out(confirm_last_device))
                 .map_err(driver_error)?;
-            let inner = self.lock();
-            if inner.started && !inner.paused {
+            if self.lock().started {
                 self.start_driver(driver);
             }
             Ok(())
@@ -604,10 +589,6 @@ impl Core for DriverCore {
     }
 }
 
-fn paused_file(paths: &Paths) -> PathBuf {
-    paths.state_dir.join("paused")
-}
-
 fn base_url(api: &Api) -> String {
     api.base().as_str().trim_end_matches('/').to_owned()
 }
@@ -628,11 +609,11 @@ fn not_saved(path: &Path) -> impl FnOnce(io::Error) -> SessionError + '_ {
 /// The session's status: what its folders are doing, unless the session is stopped (also by a
 /// sign-out that failed), paused or has nothing to sync. A halted folder outranks the others, and the session is idle only when
 /// every folder is up to date.
-fn sync_status(status: &Status, started: bool, paused: bool) -> SyncStatus {
+fn sync_status(status: &Status, started: bool) -> SyncStatus {
     if !started {
         return SyncStatus::Stopped;
     }
-    if paused {
+    if status.paused {
         return SyncStatus::Paused;
     }
     if !status.running {
@@ -909,6 +890,7 @@ fn error_chain(error: &dyn std::error::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
 
@@ -946,6 +928,8 @@ mod tests {
                 device_name: "Mac".into(),
             }),
             running: true,
+            paused: false,
+            version: None,
             folders: states.iter().map(|state| folder_in(*state, None)).collect(),
         }
     }
@@ -954,20 +938,18 @@ mod tests {
     fn the_session_status_follows_its_folders() {
         use DriverFolderState::*;
         let up = status_of(&[UpToDate]);
-        assert_eq!(sync_status(&up, false, false), SyncStatus::Stopped);
-        assert_eq!(sync_status(&up, true, true), SyncStatus::Paused);
-        assert_eq!(
-            sync_status(&status_of(&[]), true, false),
-            SyncStatus::NeedsSetup
-        );
+        assert_eq!(sync_status(&up, false), SyncStatus::Stopped);
+        let paused = Status {
+            paused: true,
+            ..up.clone()
+        };
+        assert_eq!(sync_status(&paused, true), SyncStatus::Paused);
+        assert_eq!(sync_status(&status_of(&[]), true), SyncStatus::NeedsSetup);
         let signed_out = Status {
             account: None,
             ..status_of(&[Halted])
         };
-        assert_eq!(
-            sync_status(&signed_out, true, false),
-            SyncStatus::NeedsSetup
-        );
+        assert_eq!(sync_status(&signed_out, true), SyncStatus::NeedsSetup);
         for (states, expected) in [
             (vec![UpToDate], SyncStatus::Idle),
             (vec![UpToDate, UpToDate], SyncStatus::Idle),
@@ -982,7 +964,7 @@ mod tests {
             (vec![Offline, UpToDate], SyncStatus::Offline),
         ] {
             assert_eq!(
-                sync_status(&status_of(&states), true, false),
+                sync_status(&status_of(&states), true),
                 expected,
                 "{states:?}"
             );
@@ -1500,6 +1482,21 @@ mod tests {
         assert!(!session.telemetry().enabled || locked);
         session.set_telemetry(false).unwrap();
         assert_eq!(store.settings().unwrap().install_id, None);
+    }
+
+    #[test]
+    fn a_resume_starts_the_folders_a_failed_sign_out_left_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener: Arc<Box<dyn SessionListener>> = Arc::new(Box::new(Recorder(Arc::default())));
+        let core = DriverCore::open(dir.path(), Events::new(&listener)).unwrap();
+        core.start();
+        assert_eq!(core.state().status, SyncStatus::NeedsSetup);
+        let driver = core.lock().driver.clone().unwrap();
+        core.runtime.block_on(driver.stop());
+        assert_eq!(core.state().status, SyncStatus::Stopped);
+        core.resume().unwrap();
+        assert_eq!(core.state().status, SyncStatus::NeedsSetup);
+        core.close();
     }
 
     #[test]

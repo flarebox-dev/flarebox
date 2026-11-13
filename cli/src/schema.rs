@@ -28,7 +28,10 @@ fn data(command: &str) -> Option<&'static [Data]> {
         "space" | "folder" | "service" | "device" | "history" | "telemetry" | "_daemon" => &[],
         "setup" => &[of::<WithService<ChoicesData>>, of::<WithService<Empty>>],
         "join" | "server claim" => &[of::<WithService<AccountData>>],
-        "server deploy" | "server add-device" | "service start" => &[of::<WithService<Empty>>],
+        "server deploy" | "server add-device" | "service start" | "_reconcile" => {
+            &[of::<WithService<Empty>>]
+        }
+        "pause" | "resume" => &[of::<Empty>],
         "space create" => &[of::<SpaceData>],
         "space list" => &[of::<SpacesData>],
         "space usage" => &[of::<UsagesData>],

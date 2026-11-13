@@ -112,7 +112,7 @@ The `error.code` values match these: `failed`, `usage`, `decision_required`, `au
 3. 3 when a decision needs a choice. A notice that only takes `dismiss` doesn't count.
 4. 6 when a folder is offline, or puts a call off until later. The folder's `wait` says why: `quota` when the server refused for a used-up limit or full storage, `retry` when the call kept failing for another reason. `until_ms` is when it's sent again.
 
-Connecting and catching up aren't failures, so they exit 0. `data.conditions` lists every condition found, with or without `--check`.
+Connecting and catching up aren't failures, so they exit 0. Neither is a pause: while sync is paused, `data.paused` is true (it's left out otherwise), `data.conditions` holds `paused`, which exits 0, the folders the pause stopped add no `stopped` condition, and `next_commands` names `koi resume`. `data.conditions` lists every condition found, with or without `--check`.
 
 ## Watch the daemon
 

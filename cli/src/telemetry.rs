@@ -402,6 +402,7 @@ mod tests {
             account: None,
             running: true,
             folders: vec![folder(1_000), folder(500)],
+            ..Status::default()
         };
         let mut last = Volume {
             bytes_uploaded: 100,
