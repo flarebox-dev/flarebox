@@ -35,6 +35,15 @@ enum Snapshots {
             try? oneSpace.session.unlinkFolder(spaceId: "space-photos")
             await capture(QuestionsView().environment(oneSpace).frame(width: 860, height: 560), width: 860, height: 560,
                           titled: "Needs You", dark: dark, to: directory.appending(path: "questions-one-space-\(suffix).png"))
+            for (name, scenario, error, answering) in [("answer-failed", FakeScenario.ambiguousDisappearance, SessionError.QuestionNotFound, false),
+                                                       ("sending", .massDelete, nil, true)] {
+                let model = AppModel.preview(scenario)
+                if let question = model.state.questions.first {
+                    await capture(QuestionDetail(question: question, folder: model.folder(spaceID: question.spaceId), error: error, answering: answering)
+                        .environment(model).background(Color.panel).frame(width: 600, height: 528), width: 600, height: 528, titled: nil,
+                                  dark: dark, to: directory.appending(path: "questions-detail-\(name)-\(suffix).png"))
+                }
+            }
             let mass = AppModel.preview(.massDelete)
             if let question = mass.state.questions.first {
                 await capture(ConfirmSheet(title: question.confirmation(for: .delete),

@@ -11,20 +11,28 @@ struct QuestionsView: View {
 
     var body: some View {
         NavigationSplitView {
-            List(selection: $selection) {
-                if model.questionSectionsShowSpace {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 2) {
                     ForEach(model.questionSections) { section in
-                        Section {
-                            rows(of: section)
-                        } header: {
+                        if model.questionSectionsShowSpace {
                             SpaceHeading(spaceID: section.spaceID, folder: section.folder)
+                                .font(.callout.weight(.semibold))
+                                .foregroundStyle(Color.text2)
+                                .lineLimit(1)
+                                .padding(.horizontal, 8)
+                                .padding(.bottom, 4)
+                                .frame(maxWidth: .infinity, minHeight: 28, alignment: .bottomLeading)
                         }
-                    }
-                } else {
-                    ForEach(model.questionSections) { section in
                         rows(of: section)
                     }
                 }
+                .padding(.vertical, 10)
+                .padding(.horizontal, 8)
+            }
+            .focusable()
+            .focusEffectDisabled()
+            .onMoveCommand { direction in
+                selection = moved(selection, in: model.questionSections.flatMap(\.questions).map(\.id), direction)
             }
             .navigationSplitViewColumnWidth(min: 240, ideal: 260)
         } detail: {
@@ -34,13 +42,10 @@ struct QuestionsView: View {
                         .id(question.id)
                         .frame(minWidth: 480, minHeight: 360)
                 } else {
-                    ContentUnavailableView(
-                        "Nothing needs you",
-                        systemImage: "checkmark.circle",
-                        description: Text("Decisions Koidrive needs from you appear here.")
-                    )
+                    NothingNeedsYou()
                 }
             }
+            .background(Color.panel)
             .buttonStyle(.secondary)
         }
         .buttonStyle(.automatic)
@@ -57,19 +62,37 @@ struct QuestionsView: View {
     @ViewBuilder
     private func rows(of section: QuestionSection) -> some View {
         if let cause = section.recoveryCause {
-            Label(cause.shortText, systemImage: "clock")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .selectionDisabled()
+            HStack(spacing: 6) {
+                Image(systemName: "clock")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.text3)
+                Text(cause.shortText)
+                    .font(.callout)
+                    .foregroundStyle(Color.text2)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 8)
+            .frame(height: 24)
         }
         ForEach(section.questions) { question in
-            QuestionRow(question: question, selected: selection == question.id)
-                .tag(question.id)
+            Button { selection = question.id } label: {
+                QuestionRow(question: question, selected: selection == question.id)
+            }
+            .buttonStyle(.plain)
         }
     }
 
     private func seen() {
         model.markQuestionsSeen()
+    }
+}
+
+private func moved(_ id: String?, in ids: [String], _ direction: MoveCommandDirection) -> String? {
+    guard let index = id.flatMap(ids.firstIndex(of:)) else { return ids.first }
+    switch direction {
+    case .up: return ids[max(index - 1, 0)]
+    case .down: return ids[min(index + 1, ids.count - 1)]
+    default: return id
     }
 }
 
@@ -99,94 +122,102 @@ private struct QuestionRow: View {
     let selected: Bool
 
     var body: some View {
-        Label {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(question.title)
-                    .fontWeight(selected ? .semibold : .regular)
-                Text(verbatim: "\(itemCount(question.items.count)) · \(fileCount(question.affectedFiles))")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        } icon: {
+        HStack(spacing: 10) {
             Image(systemName: question.symbolName)
-                .foregroundStyle(selected ? Color.koiText : .secondary)
+                .foregroundStyle(selected ? Color.koiText : Color.text2)
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(question.listTitle)
+                    .fontWeight(selected ? .semibold : .regular)
+                    .foregroundStyle(Color.text)
+                Text(question.counts)
+                    .font(.callout)
+                    .foregroundStyle(Color.text2)
+            }
+            .lineLimit(1)
+            Spacer(minLength: 0)
         }
-        .padding(.vertical, 2)
+        .padding(.horizontal, 8)
+        .frame(height: 44)
+        .background {
+            if selected { RoundedRectangle(cornerRadius: 6).fill(Color.fillStrong) }
+        }
+        .contentShape(Rectangle())
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
 
-private struct QuestionDetail: View {
+struct QuestionDetail: View {
     @Environment(AppModel.self) private var model
     let question: Question
     let folder: LinkedFolder?
     @State private var confirming: Answer?
     @State private var error: SessionError?
-    @State private var answering = false
+    @State private var answering: Bool
     @State private var selectedItemID: String?
+
+    init(question: Question, folder: LinkedFolder?, error: SessionError? = nil, answering: Bool = false) {
+        self.question = question
+        self.folder = folder
+        _error = State(initialValue: error)
+        _answering = State(initialValue: answering)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 12) {
                 Text(question.title)
-                    .font(.system(size: 17, weight: .semibold))
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(Color.text)
                 Text(question.explanation)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Color.text2)
                     .fixedSize(horizontal: false, vertical: true)
                 if let cause = question.recoveryCause {
                     Label(cause.text, systemImage: "clock")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Color.text2)
                         .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 8)
-                        .background(RoundedRectangle(cornerRadius: 8).fill(.quaternary.opacity(0.6)))
+                        .background(RoundedRectangle(cornerRadius: 6).fill(Color.group))
                 }
                 HStack {
                     Text(question.itemsHeading)
                         .fontWeight(.semibold)
+                        .foregroundStyle(Color.text)
                     Spacer()
                     Text("Asked \(Date(milliseconds: question.askedAtMs), format: .relative(presentation: .named))")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(.callout)
+                        .foregroundStyle(Color.text2)
                 }
-                .padding(.top, 4)
             }
             .padding([.horizontal, .top], 20)
             .padding(.bottom, 8)
-            List(question.items, id: \.nodeId, selection: $selectedItemID) { item in
-                HeldItemRow(item: item)
-                    .help(item.path)
-                    .contextMenu {
-                        Button("Copy Path") { copy(fullPath(item)) }
-                    }
-            }
-            .listStyle(.bordered(alternatesRowBackgrounds: false))
-            .frame(minHeight: 80)
-            .padding(.horizontal, 20)
-            .onCopyCommand {
-                selectedItem.map { [NSItemProvider(object: fullPath($0) as NSString)] } ?? []
-            }
+            items
             if let selectedItem {
-                HStack(alignment: .firstTextBaseline) {
+                HStack(spacing: 6) {
                     Text("Selected path:")
-                        .foregroundStyle(.secondary)
+                        .font(.callout)
+                        .foregroundStyle(Color.text2)
                     Text(verbatim: fullPath(selectedItem))
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
+                        .font(.caption)
+                        .foregroundStyle(Color.text)
                         .textSelection(.enabled)
-                        .lineLimit(2)
+                        .lineLimit(1)
                         .truncationMode(.middle)
-                    Spacer()
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     Button("Copy Path") { copy(fullPath(selectedItem)) }
-                        .controlSize(.small)
+                        .buttonStyle(.plain)
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(Color.text)
                 }
-                .font(.caption)
                 .padding(.horizontal, 20)
                 .padding(.top, 8)
+                .padding(.bottom, 12)
+            } else {
+                Spacer(minLength: 12)
+                    .frame(maxHeight: 12)
             }
-            Spacer(minLength: 12)
-                .frame(maxHeight: 12)
-            Divider()
             footer
         }
         .onAppear { selectedItemID = question.items.first?.nodeId }
@@ -201,17 +232,53 @@ private struct QuestionDetail: View {
         }
     }
 
+    private var items: some View {
+        ScrollView {
+            LazyVStack(spacing: 2) {
+                ForEach(question.items, id: \.nodeId) { item in
+                    Button { selectedItemID = item.nodeId } label: {
+                        HeldItemRow(item: item, selected: selectedItemID == item.nodeId)
+                    }
+                    .buttonStyle(.plain)
+                    .help(item.path)
+                    .contextMenu {
+                        Button("Copy Path") { copy(fullPath(item)) }
+                    }
+                }
+            }
+            .padding(4)
+        }
+        .focusable()
+        .focusEffectDisabled()
+        .onMoveCommand { direction in
+            selectedItemID = moved(selectedItemID, in: question.items.map(\.nodeId), direction)
+        }
+        .onCopyCommand {
+            selectedItem.map { [NSItemProvider(object: fullPath($0) as NSString)] } ?? []
+        }
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.line))
+        .frame(minHeight: 80, maxHeight: .infinity)
+        .padding(.horizontal, 20)
+    }
+
     private var footer: some View {
         HStack(spacing: 8) {
             if let error {
-                Label(error.message, systemImage: "exclamationmark.triangle")
-                    .foregroundStyle(Color.statusRed)
-                    .lineLimit(2)
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .foregroundStyle(Color.statusRed)
+                    Text(error.message)
+                        .font(.callout)
+                        .foregroundStyle(Color.text)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             } else {
                 Label(question.scope, systemImage: "questionmark.circle")
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Color.text2)
+                    .lineLimit(1)
             }
-            Spacer()
+            Spacer(minLength: 0)
             if answering {
                 ProgressView().controlSize(.small)
             }
@@ -227,7 +294,8 @@ private struct QuestionDetail: View {
         .disabled(answering)
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
-        .background(.bar)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .overlay(alignment: .top) { Color.line.frame(height: 1) }
     }
 
     private var primaryAnswer: Answer? {
@@ -279,6 +347,25 @@ extension Answer: @retroactive Identifiable {
     public var id: Self { self }
 }
 
+private struct NothingNeedsYou: View {
+    var body: some View {
+        VStack(spacing: 6) {
+            Image(systemName: "checkmark.circle")
+                .font(.system(size: 28))
+                .foregroundStyle(Color.text3)
+                .padding(.bottom, 12)
+            Text("Nothing needs you")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(Color.text)
+            Text("Decisions Koidrive needs from you appear here.")
+                .foregroundStyle(Color.text2)
+        }
+        .multilineTextAlignment(.center)
+        .padding(20)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
 struct ConfirmSheet: View {
     let title: String
     let message: String
@@ -292,13 +379,14 @@ struct ConfirmSheet: View {
                 .font(.system(size: 32))
                 .foregroundStyle(Color.statusRed)
             Text(title)
-                .font(.headline)
+                .fontWeight(.semibold)
+                .foregroundStyle(Color.text)
                 .multilineTextAlignment(.center)
             Text(message)
-                .font(.callout)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Color.text2)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
+                .frame(width: 240)
             VStack(spacing: 8) {
                 Button(action: confirm) {
                     Text(action).frame(maxWidth: .infinity)
@@ -319,27 +407,35 @@ struct ConfirmSheet: View {
 
 private struct HeldItemRow: View {
     let item: HeldItem
+    let selected: Bool
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 10) {
             Image(systemName: item.kind == .folder ? "folder" : "doc")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Color.text2)
+                .frame(width: 16)
             VStack(alignment: .leading, spacing: 1) {
-                Text(verbatim: item.path)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                PathText(path: item.path)
                 if let detail = item.detail.text {
                     Text(detail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(.callout)
+                        .foregroundStyle(Color.text2)
+                        .lineLimit(1)
                 }
             }
-            Spacer()
+            Spacer(minLength: 0)
             Text(verbatim: fileCount(item.files))
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .font(.callout)
+                .foregroundStyle(Color.text2)
         }
-        .padding(.vertical, 2)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .frame(minHeight: 36)
+        .background {
+            if selected { RoundedRectangle(cornerRadius: 6).fill(Color.group) }
+        }
+        .contentShape(Rectangle())
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
 
