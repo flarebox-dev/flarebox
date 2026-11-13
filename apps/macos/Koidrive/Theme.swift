@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import AppKit
+import KoidriveFFI
 import SwiftUI
 
 extension Color {
@@ -200,12 +201,21 @@ struct StatusPill: View {
 }
 
 struct GroupBand<Trailing: View>: View {
-    let title: LocalizedStringKey
+    let title: Text
     @ViewBuilder var trailing: Trailing
+
+    init(_ title: Text, @ViewBuilder trailing: () -> Trailing) {
+        self.title = title
+        self.trailing = trailing()
+    }
+
+    init(title: LocalizedStringKey, @ViewBuilder trailing: () -> Trailing) {
+        self.init(Text(title), trailing: trailing)
+    }
 
     var body: some View {
         HStack(spacing: 8) {
-            Text(title)
+            title
                 .font(.body.weight(.medium))
                 .foregroundStyle(Color.text)
             Spacer(minLength: 0)
@@ -219,7 +229,11 @@ struct GroupBand<Trailing: View>: View {
 
 extension GroupBand where Trailing == EmptyView {
     init(_ title: LocalizedStringKey) {
-        self.init(title: title) { EmptyView() }
+        self.init(Text(title)) { EmptyView() }
+    }
+
+    init(verbatim title: String) {
+        self.init(Text(verbatim: title)) { EmptyView() }
     }
 }
 
@@ -235,5 +249,65 @@ struct PathText: View {
         return Text(folder + name)
             .lineLimit(1)
             .truncationMode(.head)
+    }
+}
+
+struct EmptyState<Actions: View>: View {
+    let systemImage: String
+    let title: LocalizedStringKey
+    let message: Text?
+    @ViewBuilder var actions: Actions
+
+    var body: some View {
+        VStack(spacing: 6) {
+            Image(systemName: systemImage)
+                .font(.system(size: 22, weight: .light))
+                .foregroundStyle(Color.text3)
+                .padding(.bottom, 6)
+            Text(title)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(Color.text)
+            if let message {
+                message
+                    .font(.body)
+                    .foregroundStyle(Color.text2)
+                    .multilineTextAlignment(.center)
+            }
+            actions
+                .padding(.top, 8)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+extension EmptyState where Actions == EmptyView {
+    init(systemImage: String, title: LocalizedStringKey, message: Text? = nil) {
+        self.init(systemImage: systemImage, title: title, message: message) { EmptyView() }
+    }
+}
+
+struct ErrorLine: View {
+    let message: String
+    var detail: String?
+
+    init(_ error: SessionError) {
+        message = error.message
+        detail = error.detail
+    }
+
+    init(message: String) {
+        self.message = message
+    }
+
+    var body: some View {
+        Label {
+            Text(verbatim: message)
+                .foregroundStyle(Color.text)
+                .fixedSize(horizontal: false, vertical: true)
+        } icon: {
+            Image(systemName: "exclamationmark.triangle")
+                .foregroundStyle(Color.statusRed)
+        }
+        .help(detail ?? "")
     }
 }

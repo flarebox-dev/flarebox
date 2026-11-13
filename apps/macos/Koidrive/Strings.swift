@@ -286,7 +286,7 @@ extension SessionError {
     var message: String {
         switch self {
         case .InvalidServerUrl: String(localized: "Enter an address starting with https://.")
-        case .ServerUnreachable(let reason): String(localized: "Can't reach the server: \(reason)")
+        case .ServerUnreachable: String(localized: "Can't reach the server.")
         case .ServerIncompatible(let version): String(localized: "Update Koidrive to use this server (version \(version)).")
         case .NoServer: String(localized: "Connect to a server first.")
         case .AlreadyClaimed: String(localized: "This server has an owner. Sign in with a pairing code.")
@@ -315,6 +315,13 @@ extension SessionError {
         case .MarkerOfOtherSpace: String(localized: "This folder belongs to another space. Unlink it there first.")
         case .UnsupportedFileSystem: String(localized: "Choose a folder on your Mac's disk. This file system isn't supported.")
         case .Failed(let reason): reason
+        }
+    }
+
+    var detail: String? {
+        switch self {
+        case .ServerUnreachable(let reason), .NotRevoked(let reason), .NotSaved(let reason): reason
+        default: nil
         }
     }
 }
