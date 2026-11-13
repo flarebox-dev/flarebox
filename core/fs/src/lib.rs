@@ -1484,7 +1484,7 @@ fn hold_back(
         .collect();
     for change in changes.iter_mut() {
         match &*change {
-            Change::Removed { path, .. } if searched.contains(&path) => {
+            Change::Removed { path, .. } if !exempt.contains(&path) => {
                 if let Some(ignored) = found(path) {
                     *change = ignored;
                 }
