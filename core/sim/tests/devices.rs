@@ -97,10 +97,6 @@ fn phases(losses: Losses) -> impl Strategy<Value = Vec<Vec<(usize, Step)>>> {
     )
 }
 
-/// Device 0 renames a folder while device 1 replaces it with a new folder that holds a new file, and
-/// each builds its commit before it sends it, among random steps of every device. The files device
-/// 1 makes and deletes first change the IDs it gives the new nodes, and with them the order of the
-/// ops.
 fn replaced_folder() -> impl Strategy<Value = (usize, Vec<Vec<(usize, Step)>>)> {
     let name = || prop::sample::select(NAMES);
     (
@@ -111,7 +107,7 @@ fn replaced_folder() -> impl Strategy<Value = (usize, Vec<Vec<(usize, Step)>>)> 
         prop::collection::vec(any::<prop::sample::Index>(), 4),
     )
         .prop_map(
-            |(devices, (renamed, made, inside), fillers, mut phases, at)| {
+            |(devices, (renamed, made, inside), ids_minted_before, mut phases, at)| {
                 let race = [
                     vec![(0, rename(0, 0, renamed)), (0, SCAN), (0, COMMIT)],
                     vec![
@@ -131,7 +127,7 @@ fn replaced_folder() -> impl Strategy<Value = (usize, Vec<Vec<(usize, Step)>>)> 
                 for (place, block) in places.into_iter().zip(race).rev() {
                     first.splice(place..place, block);
                 }
-                for _ in 0..fillers {
+                for _ in 0..ids_minted_before {
                     phases.insert(0, vec![(1, delete(1))]);
                     phases.insert(0, vec![(1, file("ss"))]);
                 }
@@ -3011,10 +3007,6 @@ fn an_author_that_crashes_while_it_sends_a_lost_edit_again_sends_it_at_its_name(
     }
 }
 
-/// Device 0 owes the rename of the folder "A (pending)" to "A". Device 2 deletes that folder, makes
-/// a folder "a" with a file in it and commits both before it hears of the rename.
-///
-/// Found as GUN-632.
 #[test]
 fn a_write_on_a_third_device_reaches_the_server_around_an_owed_rename() {
     let user = |kind, target, parent, name| {
@@ -3055,22 +3047,17 @@ fn a_write_on_a_third_device_reaches_the_server_around_an_owed_rename() {
     converge(3, &[vec![(0, file("a"))], steps]).unwrap();
 }
 
-/// Device 0 renames the folder "b" to `renamed`. Before device 1 hears of it, its user deletes "b"
-/// and makes a folder `made` with `inside` in it, and device 1 sends both in one commit. The server
-/// merges the new folder into the renamed one (R2), and R7 keeps that folder from the delete. The
-/// fillers that device 1 makes and deletes first change the IDs it gives the new nodes, and with
-/// them the order of the ops.
 fn a_new_folder_merged_into_a_renamed_folder_its_commit_deletes(
     renamed: &str,
     made: &str,
     synced: &[Step],
     inside: &[Step],
 ) {
-    for fillers in 0..=4 {
+    for ids_minted_before in 0..=4 {
         let mut first = vec![(0, folder("b"))];
         first.extend(synced.iter().map(|step| (0, *step)));
         let mut phases = vec![first];
-        for _ in 0..fillers {
+        for _ in 0..ids_minted_before {
             phases.push(vec![(1, file("ss"))]);
             phases.push(vec![(1, delete(1 + synced.len()))]);
         }
@@ -3081,7 +3068,7 @@ fn a_new_folder_merged_into_a_renamed_folder_its_commit_deletes(
         racing.extend([(1, SCAN), (1, COMMIT), (1, COMMIT)]);
         phases.push(racing);
         if let Err(failure) = converge(2, &phases) {
-            panic!("with {fillers} fillers: {failure:?}");
+            panic!("with {ids_minted_before} IDs minted before: {failure:?}");
         }
     }
 }
