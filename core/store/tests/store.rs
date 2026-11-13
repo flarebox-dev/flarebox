@@ -401,6 +401,38 @@ fn migrations_that_touch_different_things_commute_and_ones_that_clash_do_not() {
         },
     ];
     assert_eq!(differences(&clashing, &permutations(2)).len(), 1);
+    for (first, second) in [
+        (
+            "CREATE TABLE IF NOT EXISTS z_defaults (v TEXT DEFAULT 'a  b');",
+            "CREATE TABLE IF NOT EXISTS z_defaults (v TEXT DEFAULT 'a b');",
+        ),
+        (
+            "CREATE VIEW IF NOT EXISTS z_view (a, b) AS SELECT 1, 2;",
+            "CREATE VIEW IF NOT EXISTS z_view (b, a) AS SELECT 1, 2;",
+        ),
+        (
+            "CREATE TABLE z_captured AS SELECT node_id, randomblob(8) AS nonce FROM synced_nodes;",
+            "UPDATE synced_nodes SET node_id = 'renamed' WHERE node_id = 'moved';",
+        ),
+    ] {
+        let pair = [
+            Step {
+                name: "z_first",
+                requires: vec![],
+                sql: first,
+            },
+            Step {
+                name: "z_second",
+                requires: vec![],
+                sql: second,
+            },
+        ];
+        assert_eq!(
+            differences(&pair, &permutations(2)).len(),
+            1,
+            "{first} / {second}"
+        );
+    }
     let ordered = [
         Step {
             name: "x_seen",
@@ -493,28 +525,39 @@ fn differences(steps: &[Step], priorities: &[Vec<usize>]) -> Vec<String> {
         }
         drop(conn);
         let names: Vec<&str> = order.iter().map(|step| step.name).collect();
-        (names, schema(&path), every_row(&path))
+        let (schema, rows) = (schema(&path), every_row(&path));
+        (names, Connection::open(&path).unwrap(), schema, rows)
     };
     let by_name: Vec<usize> = (0..steps.len()).collect();
-    let (_, schema_by_name, rows_by_name) = outcome("by_name.db", &by_name);
-    let (_, _, rows_again) = outcome("again.db", &by_name);
-    let count = |rows: &(Vec<String>, Vec<String>)| rows.1.len();
+    let (_, by_name_db, schema_by_name, rows_by_name) = outcome("by_name.db", &by_name);
+    let (_, again_db, _, _) = outcome("again.db", &by_name);
+    let repeatable: BTreeMap<&String, Vec<String>> = rows_by_name
+        .iter()
+        .map(|(table, (columns, _))| {
+            let kept = columns
+                .iter()
+                .filter(|column| {
+                    let one = [(*column).clone()];
+                    table_rows(&by_name_db, table, &one) == table_rows(&again_db, table, &one)
+                })
+                .cloned()
+                .collect();
+            (table, kept)
+        })
+        .collect();
     let mut found = vec![];
     for (n, priority) in priorities.iter().enumerate() {
-        let (names, schema, rows) = outcome(&format!("{n}.db"), priority);
-        let rows_differ = rows.len() != rows_by_name.len()
-            || rows
-                .iter()
-                .zip(&rows_by_name)
-                .any(|((table, rows), (other, expected))| {
-                    table != other
-                        || if rows_again[table] == rows_by_name[table] {
-                            rows != expected
-                        } else {
-                            count(rows) != count(expected)
-                        }
-                });
-        if schema != schema_by_name || rows_differ {
+        let (names, db, schema, rows) = outcome(&format!("{n}.db"), priority);
+        let differs = schema != schema_by_name
+            || !rows.keys().eq(rows_by_name.keys())
+            || rows.iter().any(|(table, (_, rows))| {
+                let columns = &repeatable[table];
+                rows.len() != rows_by_name[table].1.len()
+                    || (!columns.is_empty()
+                        && table_rows(&db, table, columns)
+                            != table_rows(&by_name_db, table, columns))
+            });
+        if differs {
             found.push(names.join(", "));
         }
     }
@@ -778,37 +821,65 @@ fn schema(path: &Path) -> BTreeMap<String, Vec<String>> {
     .unwrap()
     .map(|row| {
         let (object, sql) = row.unwrap();
-        (object, definitions(&sql))
+        let sorted = object.starts_with("table ");
+        (object, definitions(&sql, sorted))
     })
     .collect()
 }
 
-fn definitions(sql: &str) -> Vec<String> {
-    let collapse = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let (Some(open), Some(close)) = (sql.find('('), sql.rfind(')')) else {
-        return vec![collapse(sql)];
-    };
-    let mut parts = vec![];
-    let (mut depth, mut start) = (0, open + 1);
-    for (at, c) in sql
-        .char_indices()
-        .filter(|(at, _)| *at > open && *at < close)
-    {
-        match c {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            ',' if depth == 0 => {
-                parts.push(collapse(&sql[start..at]));
-                start = at + 1;
+fn definitions(sql: &str, sorted: bool) -> Vec<String> {
+    let mut pieces = vec![];
+    let mut piece = String::new();
+    let (mut depth, mut quote, mut closed) = (0, None, false);
+    for c in sql.chars() {
+        if let Some(end) = quote {
+            piece.push(c);
+            if c == end {
+                quote = None;
             }
-            _ => {}
+            continue;
+        }
+        match c {
+            '\'' | '"' | '`' => {
+                quote = Some(c);
+                piece.push(c);
+            }
+            '[' => {
+                quote = Some(']');
+                piece.push(c);
+            }
+            c if c.is_whitespace() => {
+                if !piece.is_empty() && !piece.ends_with(' ') {
+                    piece.push(' ');
+                }
+            }
+            '(' if depth == 0 && !closed => {
+                pieces.push(std::mem::take(&mut piece));
+                depth = 1;
+            }
+            ',' if depth == 1 && !closed => pieces.push(std::mem::take(&mut piece)),
+            ')' if depth == 1 && !closed => {
+                pieces.push(std::mem::take(&mut piece));
+                closed = true;
+            }
+            '(' => {
+                depth += 1;
+                piece.push(c);
+            }
+            ')' => {
+                depth -= 1;
+                piece.push(c);
+            }
+            _ => piece.push(c),
         }
     }
-    parts.push(collapse(&sql[start..close]));
-    parts.sort();
-    parts.insert(0, collapse(&sql[..open]));
-    parts.push(collapse(&sql[close + 1..]));
-    parts
+    pieces.push(piece);
+    let mut pieces: Vec<String> = pieces.iter().map(|p| p.trim_end().to_owned()).collect();
+    if sorted && pieces.len() > 2 {
+        let tail = pieces.len() - 1;
+        pieces[1..tail].sort();
+    }
+    pieces
 }
 
 #[test]
