@@ -1362,7 +1362,24 @@ fn hold_back(
         .filter(|path| !removed.contains(*path) && !carried(path))
         .collect();
     let key = |path: &Path| (old[path].id, old[path].kind);
-    let gone: Vec<&PathBuf> = (removed.iter()).chain(held.iter().copied()).collect();
+    let mut overwrites: HashMap<Key, usize> = HashMap::new();
+    for path in &replaced {
+        *overwrites
+            .entry((new[path].id, new[path].kind))
+            .or_default() += 1;
+    }
+    let searched: Vec<&PathBuf> = (removed.iter())
+        .filter(|path| match overwrites.get_mut(&key(path)) {
+            Some(left @ 1..) => {
+                *left -= 1;
+                false
+            }
+            _ => true,
+        })
+        .collect();
+    let gone: Vec<&PathBuf> = (searched.iter().copied())
+        .chain(held.iter().copied())
+        .collect();
     let mut wanted: Wanted = gone.iter().map(|path| (key(path), None)).collect();
     let fresh: HashSet<Key> = (gone.iter().copied())
         .filter(|path| !path.as_os_str().as_bytes().contains(&0))
@@ -1381,7 +1398,7 @@ fn hold_back(
                 .unwrap_or_else(|| path.to_path_buf()),
         )
     };
-    let mut deferred: Vec<(PathBuf, PathBuf)> = (removed.iter())
+    let mut deferred: Vec<(PathBuf, PathBuf)> = (searched.iter().copied())
         .filter(|path| {
             wanted.get(&key(path)) == Some(&None)
                 && (held.iter().copied())
@@ -1465,7 +1482,7 @@ fn hold_back(
         .collect();
     for change in changes.iter_mut() {
         match &*change {
-            Change::Removed { path, .. } => {
+            Change::Removed { path, .. } if searched.contains(&path) => {
                 if let Some(ignored) = found(path) {
                     *change = ignored;
                 }
