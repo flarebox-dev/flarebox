@@ -719,6 +719,7 @@ impl Commits {
         if self.in_flight.is_some() {
             return None;
         }
+        trees.resend_folders_of_changes();
         self.retry_waiting(trees, BTreeSet::new(), Vec::new());
         if self.halted.is_some() || !trees.rules_known() {
             return None;
