@@ -510,13 +510,19 @@ impl Trees {
         let Some(write) = local.content.as_ref() else {
             return false;
         };
+        let unchanged_here = |other: &str, held: &Content| match self.l.live(other) {
+            Some(local) => (local.content.as_ref()).is_some_and(|kept| same_content(kept, held)),
+            None => self.s.get(other).is_none(),
+        };
         local.same_position(remote)
             && (self.r.iter()).any(|(other, node)| {
                 other != id
                     && node.is_live()
                     && node.shape.parent == remote.parent
                     && (node.shape.content.as_ref()).is_some_and(|held| {
-                        same_content(held, write) && held.mtime_ns == write.mtime_ns
+                        same_content(held, write)
+                            && held.mtime_ns == write.mtime_ns
+                            && unchanged_here(other, held)
                     })
             })
     }

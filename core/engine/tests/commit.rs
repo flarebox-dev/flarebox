@@ -408,6 +408,34 @@ fn an_edit_on_both_sides_whose_write_a_file_beside_it_holds_downloads_r_instead_
 }
 
 #[test]
+fn an_edit_on_both_sides_is_forked_when_this_device_changed_the_file_beside_it_that_holds_its_write()
+ {
+    let cases = [("deleted", None), ("overwritten", Some(file(ROOT, "c", 4)))];
+    for (case, local) in cases {
+        let mut trees = trees(&[
+            (
+                "f",
+                Some(file(ROOT, "f", 2)),
+                Some(file(ROOT, "f", 1)),
+                Some(remote(file(ROOT, "f", 3))),
+            ),
+            (
+                "c",
+                local,
+                Some(file(ROOT, "c", 2)),
+                Some(remote(file(ROOT, "c", 2))),
+            ),
+        ]);
+        let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+        let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+        let created = (ops(&commit).iter()).any(
+            |op| matches!(op, op::Op::CreateFile(create) if create.content == Some(content(2))),
+        );
+        assert!(created, "{case}: {commit:?}");
+    }
+}
+
+#[test]
 fn an_edit_on_both_sides_is_forked_unless_the_same_write_is_beside_it() {
     let later = |shape: Shape| Shape {
         content: Some(Content {
