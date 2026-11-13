@@ -23,7 +23,7 @@ use super::*;
 use crate::config::SyncRules;
 use crate::disk::tests::{Server, ready};
 use crate::driver::{DriverError, lift_halt};
-use crate::ignore::{local_rules, matcher};
+use crate::ignore::{Matcher, local_rules, matcher, scan_rules};
 use crate::observe::Observed;
 use crate::question::Answer;
 
@@ -86,12 +86,7 @@ fn a_file_sent_aside_in_a_split_swap_and_deleted_in_flight_takes_its_name() {
     };
     let step = b.folder.sent(Err(CallError::Server(ServerError(refusal))));
     b.take(step).unwrap();
-    for _ in 0..3 {
-        if !b.work.is_empty() {
-            break;
-        }
-        b.scan(Duration::from_millis(150));
-    }
+    b.scan_until(|b| !b.work.is_empty());
     let Some(Work::Send(split)) = b.work.pop_front() else {
         panic!("the split swap is sent");
     };
@@ -108,11 +103,8 @@ fn a_file_sent_aside_in_a_split_swap_and_deleted_in_flight_takes_its_name() {
     let result = remote.commit(&b.caller, &split).unwrap();
     fs::remove_file(site.root.join(&target)).unwrap();
     b.settle();
-    for _ in 0..12 {
-        a.pull(&remote);
-        a.run(&mut remote);
-        a.scan(Duration::from_millis(150));
-    }
+    a.pull(&remote);
+    a.rest(&mut remote);
     fs::write(site_a.root.join(aside), b"edited remotely").unwrap();
     a.scan_until(|a| !a.work.is_empty());
     a.run(&mut remote);
@@ -327,6 +319,8 @@ impl Site {
         Device {
             folder,
             observer,
+            root: self.root.clone(),
+            matcher: matcher(sync).unwrap(),
             caller: self.caller.clone(),
             work: VecDeque::new(),
             sent: Vec::new(),
@@ -339,6 +333,8 @@ impl Site {
 struct Device {
     folder: Folder,
     observer: FsObserver,
+    root: PathBuf,
+    matcher: Arc<dyn Matcher>,
     caller: Caller,
     /// Work the folder asked for that the test has not run.
     work: VecDeque<Work>,
@@ -408,10 +404,29 @@ impl Device {
         }
     }
 
-    /// Observes for about a second, to take in changes that must lead to no work.
     fn settle(&mut self) {
-        for _ in 0..3 {
-            self.scan(Duration::from_millis(300));
+        let started = Instant::now();
+        let mut caught_up = false;
+        loop {
+            self.scan(Duration::from_millis(100));
+            let mut known = self.observer.snapshot().clone();
+            let rescan = known.rescan_with_rules(
+                &self.root,
+                [PathBuf::new()],
+                &mut scan_rules(&self.matcher),
+            );
+            let unseen = rescan.map_or(true, |rescan| {
+                !rescan.changes.is_empty() || !rescan.unsettled.is_empty()
+            });
+            let now = self.observer.answered() && self.observer.scanned().is_some() && !unseen;
+            if now && caught_up {
+                return;
+            }
+            caught_up = now;
+            assert!(
+                started.elapsed() < Duration::from_secs(120),
+                "the observer does not catch up with the disk"
+            );
         }
     }
 
@@ -528,6 +543,16 @@ impl Device {
 
     fn run(&mut self, remote: &mut Remote) -> Vec<&'static str> {
         self.try_run(remote).unwrap()
+    }
+
+    fn rest(&mut self, remote: &mut Remote) {
+        loop {
+            self.run(remote);
+            self.settle();
+            if self.work.is_empty() {
+                return;
+            }
+        }
     }
 
     /// Writes a file and syncs it to the space.
@@ -928,11 +953,11 @@ fn a_move_onto_a_name_a_symlink_holds_still_lets_the_new_file_take_the_old_name(
     a.run(&mut remote);
     a.create(&mut remote, &site_a.root.join("d"), b"new remote file");
     b.pull(&remote);
-    for _ in 0..24 {
+    while fs::read(site.root.join("d")).ok().as_deref() != Some(&b"new remote file"[..]) {
         if let Some(work) = b.work.pop_front() {
             b.perform(work, &mut remote).unwrap();
         }
-        b.scan(Duration::ZERO);
+        b.scan(Duration::from_millis(100));
     }
     assert_eq!(
         fs::read_link(site.root.join("e")).unwrap(),
@@ -1002,26 +1027,22 @@ fn entries(root: &Path) -> Vec<(String, Option<String>)> {
     entries
 }
 
-/// Runs two devices as their tasks would, each one piece of work at a time with a pass of its observer after it,
-/// until neither has had work for a while. Both must then hold the server's head and the same entries.
 fn sync(remote: &mut Remote, a: (&Site, &mut Device), b: (&Site, &mut Device)) {
-    let (mut quiet, mut rounds) = (0, 0);
-    while quiet < 4 {
+    let (mut busy, mut rounds) = (true, 0);
+    while busy {
         rounds += 1;
         assert!(rounds < 200, "the devices do not come to rest");
-        quiet += 1;
+        busy = false;
         for (site, device) in [(a.0, &mut *a.1), (b.0, &mut *b.1)] {
             match device.work.pop_front() {
                 Some(work) => {
                     device.perform(work, remote).unwrap();
-                    quiet = 0;
+                    busy = true;
                 }
                 None => device.pull(remote),
             }
-            device.scan(Duration::from_millis(150));
-            if !device.work.is_empty() {
-                quiet = 0;
-            }
+            device.settle();
+            busy |= !device.work.is_empty();
             site.stored();
         }
     }
@@ -6779,12 +6800,9 @@ fn a_question_asked_again_under_a_new_id_marks_the_questions_changed() {
     for i in 0..2 {
         fs::remove_file(site.root.join(format!("{i}.txt"))).unwrap();
     }
-    for _ in 0..20 {
+    while asked(&site) == before {
         a.scan(Duration::from_millis(100));
         a.run(&mut remote);
-        if asked(&site) != before {
-            break;
-        }
     }
 
     let after = asked(&site);
@@ -7671,10 +7689,7 @@ fn a_file_unreadable_until_its_folder_swapped_names_reaches_the_other_device() {
         eprintln!("SKIPPED: running as root, so permissions do not block reads");
         return;
     }
-    for _ in 0..8 {
-        b.scan(Duration::from_millis(150));
-        b.run(&mut remote);
-    }
+    b.rest(&mut remote);
     for (from, to) in [("a", "t"), ("b", "a"), ("t", "b")] {
         fs::rename(site.root.join(from), site.root.join(to)).unwrap();
     }
@@ -7710,12 +7725,7 @@ fn a_held_folder_another_devices_rules_leave_out_stays_held_when_renamed() {
     b.scan_until(|b| !b.folder.disk.awaits_rules());
     b.run(&mut remote);
     fs::rename(site.root.join("held"), site.root.join("open")).unwrap();
-    for _ in 0..3 {
-        b.scan(Duration::from_millis(300));
-        b.run(&mut remote);
-        b.settle();
-        b.run(&mut remote);
-    }
+    b.rest(&mut remote);
     assert_eq!(remote.names(), [".koiignore", "notes.txt"]);
 }
 
@@ -7747,10 +7757,7 @@ fn a_folder_that_returns_from_a_path_the_rules_exclude_keeps_its_node() {
         }
         for rules in [&b""[..], b"docs/\n"] {
             fs::write(site.root.join(".koiignore"), rules).unwrap();
-            for _ in 0..3 {
-                b.scan(Duration::from_millis(300));
-                b.run(&mut remote);
-            }
+            b.rest(&mut remote);
         }
         let before = remote.tree();
         assert!(before.contains_key(from), "{from} is synced: {before:?}");
@@ -7764,12 +7771,7 @@ fn a_folder_that_returns_from_a_path_the_rules_exclude_keeps_its_node() {
         } else {
             fs::rename(site.root.join(from), site.root.join(to)).unwrap();
         }
-        for _ in 0..3 {
-            b.scan(Duration::from_millis(300));
-            b.run(&mut remote);
-            b.settle();
-            b.run(&mut remote);
-        }
+        b.rest(&mut remote);
         let moved = |path: &String| match path.strip_prefix(from) {
             Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("{to}{rest}"),
             _ => path.clone(),
@@ -7805,12 +7807,7 @@ fn a_held_folder_renamed_while_another_devices_rule_lets_it_in_stays_held() {
     b.pull(&remote);
     b.run(&mut remote);
     b.scan_until(|b| !b.folder.disk.awaits_rules());
-    for _ in 0..3 {
-        b.scan(Duration::from_millis(300));
-        b.run(&mut remote);
-        b.settle();
-        b.run(&mut remote);
-    }
+    b.rest(&mut remote);
     assert_eq!(remote.names(), [".koiignore", "notes.txt"]);
     assert_eq!(b.folder.view().questions, 1);
 }
@@ -7837,11 +7834,6 @@ fn a_held_folder_another_devices_rules_leave_out_stays_held_when_renamed_while_s
     drop(b);
     fs::rename(site.root.join("held"), site.root.join("open")).unwrap();
     let mut b = restarted(&site, &mut remote);
-    for _ in 0..3 {
-        b.scan(Duration::from_millis(300));
-        b.run(&mut remote);
-        b.settle();
-        b.run(&mut remote);
-    }
+    b.rest(&mut remote);
     assert_eq!(remote.names(), [".koiignore", "notes.txt"]);
 }
