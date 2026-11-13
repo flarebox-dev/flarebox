@@ -25,9 +25,9 @@ struct KoidriveApp: App {
         if let scenario = AppModel.launchScenario(in: .standard) {
             model = AppModel.fake(scenario: scenario)
         } else {
-            let profile = URL.applicationSupportDirectory.appending(path: "Koidrive", directoryHint: .isDirectory)
+            let helper = Bundle.main.bundleURL.appending(path: "Contents/Helpers/koi")
             do {
-                model = try AppModel.open(profileDirectory: profile)
+                model = try AppModel.open(helper: helper)
             } catch {
                 Self.quit(after: error)
             }

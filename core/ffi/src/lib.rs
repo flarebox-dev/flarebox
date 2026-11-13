@@ -6,13 +6,16 @@
 //! engine's inputs and outputs (docs/design/sync-engine.md §1): session lifecycle, server and
 //! device sign-in, linking folders to spaces, a stream of [`SessionEvent`]s for status,
 //! progress and recent changes, the engine's questions with typed [`Answer`]s, its notices and
-//! its problems. [`SyncSession::open`] runs the sync driver of `core/driver` on a profile;
+//! its problems. [`SyncSession::open`] works through the `koi` command and its daemon on the CLI's profile;
 //! [`SyncSession::fake`] runs [`FakeCore`], which plays back scripted states for previews and tests.
 
 mod core;
-mod driver;
+mod daemon;
 mod fake;
+mod helper;
+mod profile;
 mod session;
+mod state;
 mod types;
 
 pub use crate::core::{Core, Events, SessionListener};

@@ -15,7 +15,7 @@ use std::io::{self, Read, Write};
 use std::ops::Deref;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use koidrive_fs::PRIVATE_DIR;
@@ -161,16 +161,40 @@ pub(crate) fn set_owner(root: &Path, owner: &Owner) -> io::Result<()> {
     Ok(())
 }
 
-/// Removes the record if it names `owner`, so another device may link the folder.
-pub(crate) fn release(root: &Path, owner: &Owner) -> io::Result<()> {
+pub(crate) fn record(root: &Path) -> PathBuf {
+    root.join(PRIVATE_DIR).join(OWNER)
+}
+
+pub(crate) fn check_release(root: &Path, owner: &Owner) -> io::Result<()> {
     if self::owner(root)?.as_ref() != Some(owner) {
         return Ok(());
     }
     let dir = private_dir(root)?;
-    match rustix::fs::unlinkat(&dir, OWNER, rustix::fs::AtFlags::empty()) {
-        Ok(()) | Err(Errno::NOENT) => Ok(()),
-        Err(error) => Err(error.into()),
+    let access = rustix::fs::Access::WRITE_OK | rustix::fs::Access::EXEC_OK;
+    rustix::fs::accessat(&dir, ".", access, rustix::fs::AtFlags::empty())?;
+    Ok(())
+}
+
+/// Removes the record if it names `owner`, so another device may link the folder.
+pub(crate) fn release(root: &Path, owner: &Owner) -> io::Result<()> {
+    let current = match self::owner(root) {
+        Ok(current) => current,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return crate::leave::sync_parent(&record(root));
+        }
+        Err(error) => return Err(error),
+    };
+    if current.as_ref().is_some_and(|current| current != owner) {
+        return Ok(());
     }
+    let dir = private_dir(root)?;
+    if current.is_some() {
+        match rustix::fs::unlinkat(&dir, OWNER, rustix::fs::AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    crate::leave::sync_dir(&File::from(dir))
 }
 
 #[cfg(test)]

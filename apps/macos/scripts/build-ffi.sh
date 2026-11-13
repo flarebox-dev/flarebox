@@ -5,7 +5,6 @@
 # bindings with UniFFI, and places both in the KoidriveFFI Swift package:
 #   KoidriveFFI/Frameworks/koidrive_ffiFFI.xcframework  (library, header, modulemap)
 #   KoidriveFFI/Sources/KoidriveFFI/koidrive_ffi.swift  (Swift API)
-# Run it again after every change to core/ffi.
 set -euo pipefail
 
 macos_dir="$(cd "$(dirname "$0")/.." && pwd)"
@@ -16,8 +15,10 @@ export MACOSX_DEPLOYMENT_TARGET=26.0
 
 cd "$repo_root"
 target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
-cargo build --locked --release -p koidrive-ffi --target-dir "$target_dir"
+cargo build --locked --release -p koidrive-ffi -p koidrive-cli --target-dir "$target_dir"
 lib="$target_dir/release/libkoidrive_ffi.a"
+mkdir -p "$macos_dir/build"
+cp "$target_dir/release/koi" "$macos_dir/build/koi"
 
 rm -rf "$work_dir"
 bindgen=(cargo run --locked --quiet -p koidrive-ffi --features bindgen --bin uniffi-bindgen-swift

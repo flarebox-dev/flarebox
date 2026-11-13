@@ -283,6 +283,8 @@ pub enum RecoveryTrigger {
     /// The folder was linked without earlier sync state (a first link of a folder that already
     /// has files, or lost state), so local files could not be matched with certainty.
     NoSyncState,
+    /// The daemon did not record a cause, or this app does not recognize it.
+    Unknown,
 }
 
 /// A group of held files in a recovery (design §6.4, What the user sees), with its answers.
@@ -471,6 +473,8 @@ pub enum ProblemKind {
     StateNotWritable { reason: String },
     /// The folder stopped syncing for the reason the driver gives, which only a person can fix.
     FolderHalted { reason: String },
+    /// Both versions of a file are syncing. `resolve_command` lists the choices in the bundled CLI.
+    Conflict { resolve_command: String },
 }
 
 /// Whether this profile sends anonymous usage reports (docs/guide/telemetry.md).
@@ -579,8 +583,6 @@ pub enum SessionError {
     NoticeNotFound,
     #[error("the change could not be saved on this device, so it was not made: {reason}")]
     NotSaved { reason: String },
-    #[error("another Koidrive process is using this device's sync state")]
-    ProfileInUse,
     #[error("the path is not a folder")]
     NotAFolder,
     #[error("another Koidrive process is syncing the folder")]

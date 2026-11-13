@@ -299,6 +299,26 @@ fn mode(path: &Path) -> u32 {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs the Worker; run cli/scripts/integration-test.sh"]
+async fn a_wrong_pairing_code_is_named_as_one() {
+    owner().await;
+    let server = server_url().to_string();
+    let machine = Machine::new();
+    let join = ["join", "AAAA-BBBB", "--server", &server, "--name", "desk"];
+    let output = machine.output(&[&join[..], &["--json"]].concat());
+    assert_eq!(output.status.code(), Some(8), "{output:?}");
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "wrong_code", "{envelope:#}");
+    assert_eq!(
+        envelope["error"]["message"],
+        "the code is wrong or has expired"
+    );
+    let said = machine.fails(&join);
+    assert!(said.contains("the code is wrong or has expired"), "{said}");
+    assert!(!machine.path("state/koidrive/credential.json").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Worker; run cli/scripts/integration-test.sh"]
 async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
     let owner = Arc::new(Auth::new(api(), owner().await));
     let space_name = format!("agent work {}", uuidv7());
@@ -1587,8 +1607,15 @@ async fn a_device_shows_a_pairing_code_that_adds_another() {
             .any(|device| device["name"] == name.as_str()),
         "{devices:#}"
     );
+    let again = Machine::new().output(&[&join[..], &["--json"]].concat());
+    assert_eq!(again.status.code(), Some(8), "{again:?}");
+    let refused: Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(refused["error"]["code"], "wrong_code", "{refused:#}");
     let again = Machine::new().fails(&join);
-    assert!(again.contains("invalid or expired pairing code"), "{again}");
+    assert!(
+        again.contains("the code is wrong or has expired"),
+        "{again}"
+    );
 
     let invite = ["device", "invite", "--request-id", "invite-1"];
     let traced = first
@@ -1626,7 +1653,12 @@ async fn a_claim_of_a_claimed_server_is_refused_and_sets_nothing_up() {
     owner().await;
     let server = server_url().to_string();
     let machine = Machine::new();
-    let refused = machine.fails(&["server", "claim", &server, "ABCD-EFGH", "--user", "Mallory"]);
+    let claim = ["server", "claim", &server, "ABCD-EFGH", "--user", "Mallory"];
+    let output = machine.output(&[&claim[..], &["--json"]].concat());
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "failed", "{envelope:#}");
+    let refused = machine.fails(&claim);
     assert!(refused.contains("already has an owner"), "{refused}");
     let status = machine.run(&["status"]);
     assert!(status.starts_with("Device: not set up"), "{status}");

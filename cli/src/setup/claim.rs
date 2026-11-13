@@ -249,7 +249,23 @@ pub async fn saved_device(paths: &Paths, server: &Url) -> Result<bool, CliError>
                 device_id: credential.device_id,
             };
             match ipc::run(paths, request).await? {
-                Response::SignedOut => {
+                Response::SignedOut { not_removed } => {
+                    if !not_removed.is_empty() {
+                        let failures = not_removed
+                            .iter()
+                            .map(|failure| {
+                                format!("{:?}: {}", failure.path, crate::printable(&failure.error))
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        return Err(CliError::new(
+                            koidrive_ipc::Code::Failed,
+                            format!(
+                                "the server no longer accepts this device's saved credential, but cleanup is incomplete: {failures}. Run koi device leave to finish cleanup before setting up this device again"
+                            ),
+                        )
+                        .then(&["koi", "device", "leave"]));
+                    }
                     println!(
                         "The server no longer accepts this device's saved credential, so it was removed."
                     );
@@ -426,6 +442,82 @@ mod tests {
 
         assert!(!saved_device(&paths, &fake.base).await.unwrap());
         assert!(!paths.credential().exists());
+    }
+
+    #[tokio::test]
+    async fn incomplete_cleanup_stops_setup_and_reports_every_remaining_path() {
+        let fake = Fake::start(vec![tokens(), token(401, refusal(Code::Unauthenticated))]).await;
+        let mut session = session(&fake).await;
+        let (_dir, paths) = profile(&fake.base);
+        let failures = vec![
+            koidrive_driver::CleanupFailure {
+                path: paths.credential(),
+                error: "permission denied".into(),
+            },
+            koidrive_driver::CleanupFailure {
+                path: paths.state_dir.join("cleanup\n\u{1b}[2J"),
+                error: "disk\n\u{1b}[31m error".into(),
+            },
+        ];
+        let listener = koidrive_ipc::bind(&paths.socket()).unwrap();
+        let reply = failures.clone();
+        let served = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let line = koidrive_ipc::read_line(&mut stream).await.unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&line).unwrap(),
+                Request::SignOut { .. }
+            ));
+            koidrive_ipc::write_line(&mut stream, &Response::SignedOut { not_removed: reply })
+                .await
+                .unwrap();
+        });
+
+        let server = Found {
+            script: koidrive_cloudflare::Script {
+                id: "koidrive".into(),
+                created_on: None,
+                tags: Vec::new(),
+                migration_tag: None,
+                has_assets: true,
+            },
+            bucket: None,
+            url: fake.base.clone(),
+            info: None,
+        };
+        let state = SetupState {
+            setup_attempt: Some("attempt".into()),
+            ..SetupState::default()
+        };
+        let error = Claim::new(&mut session, &paths, &server, "laptop", state, None)
+            .run(Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        served.await.unwrap();
+
+        assert_eq!(error.code, koidrive_ipc::Code::Failed);
+        for failure in failures {
+            assert!(error.message.contains(&format!("{:?}", failure.path)));
+            assert!(error.message.contains(&crate::printable(&failure.error)));
+        }
+        assert!(!error.message.contains(['\n', '\u{1b}']));
+        assert!(error.message.contains("cleanup\\n\\u{1b}[2J\""));
+        assert!(error.message.contains("disk\\u{a}\\u{1b}[31m error"));
+        assert!(!error.message.contains("so it was removed"));
+        assert_eq!(
+            error.next,
+            [koidrive_ipc::Next::of(&["koi", "device", "leave"])]
+        );
+        assert!(paths.credential().exists());
+        let saved = StateFile::new(&paths).load().unwrap().unwrap();
+        assert_eq!(saved.setup_attempt.as_deref(), Some("attempt"));
+        assert_eq!(
+            fake.seen()
+                .iter()
+                .map(|request| request.path.as_str())
+                .collect::<Vec<_>>(),
+            ["/oauth2/token", "/v1/token"]
+        );
     }
 
     #[tokio::test]

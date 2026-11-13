@@ -836,6 +836,8 @@ thread 'tokio-runtime-worker' panicked at /Users/ada/Secret Plans/ledger.rs:1:1:
             space_id: "s1".to_owned(),
             kind: crate::report::DecisionKind::Conflict,
             group: None,
+            recovery_cause: None,
+            conflict: None,
             asked_at_ms: 1,
             requires_choice: true,
             counts: None,

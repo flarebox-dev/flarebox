@@ -6,8 +6,6 @@ Install the `koi` command on Linux x86_64 or arm64, or macOS on Apple silicon:
 curl -fsSL https://koidrive.com/install.sh | sh
 ```
 
-Downloads become available with the first published CLI release. Until then, build from source below.
-
 The installer downloads the latest GitHub Release for x86_64 or arm64, checks its SHA256 checksum, and installs it in `~/.local/bin`. It needs `curl`, `tar`, `awk`, `grep`, `sed`, `mktemp`, and either `sha256sum` or `shasum`. It never needs root. Add `~/.local/bin` to your shell's `PATH` if the installer warns that it is missing, then run `koi --version`. The installer also warns when another program named `koi` comes first on `PATH`, such as the Koi theme switcher for KDE; put `~/.local/bin` before it. It refuses to replace a `koi` in the install directory that is another program.
 
 Run the same command again, or [`koi update`](#update-koidrive), to upgrade. The installer restarts the [background service](#background-sync) of every profile that runs one, so each runs the new `koi`. To choose a version or another directory, set `KOIDRIVE_VERSION` or `KOIDRIVE_INSTALL_DIR` on the `sh` command:
@@ -115,7 +113,7 @@ Containers, WSL without systemd, and shells started with `su` or `sudo -u` have 
 
 macOS privacy settings treat the launch agent as a program of its own, so the access you gave Terminal doesn't carry over. When you link a folder in Documents, Desktop, Downloads or iCloud Drive, or on an external or network volume, macOS asks whether koi may access it. Click Allow. If you clicked Don't Allow, `koi status` names the folder. Open System Settings > Privacy & Security > Files & Folders and switch the folder on under koi, or add koi under Full Disk Access. Then run `koi folder restart <folder>`. macOS keeps these permissions across upgrades for a koi signed with a Developer ID. For an unsigned build it asks again after each upgrade.
 
-The macOS app syncs on its own and doesn't use this service. A folder syncs with the app or with the command, whichever linked it: Koidrive refuses to link a folder that the other one syncs.
+The macOS app runs the `koi` inside it, so it shows the same device, folders and service as the command. Opening the app brings the service in line, as the commands above do, and never starts a service you switched off.
 
 ## Run the daemon yourself
 
@@ -132,7 +130,7 @@ Koidrive then never installs, starts or removes the service, so unlink every fol
 koi _daemon
 ```
 
-`_daemon` is the service's entry point, so `koi --help` doesn't list it. It runs in the foreground until you press Ctrl-C or send it SIGTERM. Commands that change this device's folders, such as `folder link`, `folder restart` and `folder retry`, talk to the daemon through a socket when it runs, and open the profile themselves when it doesn't. The `device` and `space` commands talk to the server directly. `history trash` and `history versions` read from the server too, but first ask the daemon, when it runs, which space the folder syncs.
+`_daemon` is the service's entry point, so `koi --help` doesn't list it. It runs in the foreground until you press Ctrl-C or send it SIGTERM. Commands that change this device's folders, such as `folder link`, `folder restart`, `folder retry` and `device leave`, talk to the daemon through a socket when it runs, and open the profile themselves when it doesn't. The other `device` commands and the `space` commands talk to the server directly. `history trash` and `history versions` read from the server too, but first ask the daemon, when it runs, which space the folder syncs.
 
 The daemon logs at the `info` level. Set `KOIDRIVE_LOG` to change it, for example `KOIDRIVE_LOG=debug`. `--log-format json` writes one JSON object per line.
 

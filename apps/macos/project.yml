@@ -27,6 +27,23 @@ targets:
         product: KoidriveFFI
       - package: KoidriveFFI
         product: KoidriveModel
+    postBuildScripts:
+      - name: Embed koi
+        inputFiles:
+          - $(SRCROOT)/build/koi
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Helpers/koi
+        script: |
+          set -euo pipefail
+          if [ ! -x "$SCRIPT_INPUT_FILE_0" ]; then
+            echo "error: $SCRIPT_INPUT_FILE_0 is missing; run scripts/build-ffi.sh first."
+            exit 1
+          fi
+          mkdir -p "$(dirname "$SCRIPT_OUTPUT_FILE_0")"
+          cp "$SCRIPT_INPUT_FILE_0" "$SCRIPT_OUTPUT_FILE_0"
+          if [ "$CODE_SIGNING_ALLOWED" = YES ]; then
+            codesign --force --options runtime --sign "${EXPANDED_CODE_SIGN_IDENTITY:--}" "$SCRIPT_OUTPUT_FILE_0"
+          fi
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.koidrive.Koidrive

@@ -6,7 +6,7 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use koidrive_engine::commit::{Commits, Lift, LiftError};
@@ -17,6 +17,7 @@ use koidrive_ignore::LocalRulesError;
 use koidrive_net::{ApiError, Auth, ROTATION_PERIOD, ServerError, UploadGate};
 use koidrive_proto::v1::{ClaimRequest, DeviceCredentials, PairCompleteRequest, SpaceInfo};
 use koidrive_store::{EngineState, GivenAnswer, Link, Store, StoredQuestion};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, watch};
 
 use crate::claim::{self, Flock, Owner};
@@ -28,6 +29,7 @@ use crate::credential::{
 use crate::failures::{self, Failure, Halted};
 use crate::folder::FolderTask;
 use crate::ignore::{Matcher, local_rules, matcher};
+use crate::leave::{Leaving, Phase};
 use crate::paths::{Paths, PathsError};
 use crate::question::{Answer, Limit, Question, QuestionKind};
 use crate::restore::{self, RestoreRequest, RestoreStatus};
@@ -51,6 +53,19 @@ impl LinkApproval {
         }
         Ok(())
     }
+}
+
+/// A file or directory that a sign-out could not remove after the server had revoked the device. Signing out again
+/// retries it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupFailure {
+    #[serde(serialize_with = "cleanup_path")]
+    pub path: PathBuf,
+    pub error: String,
+}
+
+fn cleanup_path<S: serde::Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
+    path.to_string_lossy().serialize(serializer)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -131,6 +146,11 @@ pub enum DriverError {
         koidrive_fs::quoted(.0)
     )]
     UnlinkUnfinished(PathBuf),
+    #[error(
+        "this device was not signed out, because {} cannot be unlinked: {error}",
+        koidrive_fs::quoted(.path)
+    )]
+    UnlinkBlocked { path: PathBuf, error: io::Error },
     #[error("no unanswered question has the id {0:?}")]
     QuestionNotFound(String),
     #[error("the question was answered with {given}")]
@@ -273,9 +293,19 @@ struct Inner {
     running: AtomicBool,
     paused: AtomicBool,
     updates: Arc<Updates>,
+    startup_blocked: AtomicBool,
+    startup_pending: AtomicBool,
     changed: Arc<watch::Sender<()>>,
     #[cfg(test)]
     observe_fault: Option<Arc<crate::folder::ObserveFault>>,
+    #[cfg(test)]
+    restart_stopped: Mutex<Option<RestartStopped>>,
+}
+
+#[cfg(test)]
+struct RestartStopped {
+    reached: tokio::sync::oneshot::Sender<()>,
+    proceed: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl Drop for Inner {
@@ -294,6 +324,7 @@ struct Folder {
     /// Set from the moment an unlink begins until it has removed the folder or failed. No task starts for the folder
     /// meanwhile, also after its last task has ended, so the cleanup never leaves a task it does not wait for.
     unlink: Option<Unlink>,
+    store: Arc<RwLock<()>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -329,6 +360,23 @@ struct Running {
     requests: Arc<Notify>,
     /// Closed when the task has ended, its observer and its hold on the folder included.
     done: watch::Receiver<()>,
+}
+
+struct BlockedStartup<'a>(&'a Driver);
+
+impl Drop for BlockedStartup<'_> {
+    fn drop(&mut self) {
+        let pending = {
+            let _folders = self.0.inner.folders.lock().unwrap();
+            self.0.inner.startup_blocked.store(false, Ordering::SeqCst);
+            self.0.inner.startup_pending.swap(false, Ordering::SeqCst)
+        };
+        let signed_in = self.0.inner.credential.lock().unwrap().is_some();
+        if pending && signed_in {
+            self.0.start_folders();
+        }
+        self.0.changed();
+    }
 }
 
 impl Running {
@@ -395,7 +443,16 @@ impl Driver {
         };
         let local = local_rules(&config.sync).map_err(invalid)?;
         let matcher = matcher(&config.sync).map_err(invalid)?;
-        let stored = Credential::load_stored(&paths.credential())?;
+        let leaving =
+            Leaving::load(&paths.state_dir).map_err(io_error(&paths.state_dir.join("leaving")))?;
+        let blocked = leaving
+            .as_ref()
+            .is_some_and(|leaving| leaving.phase != Phase::Prepared);
+        let stored = if blocked {
+            None
+        } else {
+            Credential::load_stored(&paths.credential())?
+        };
         if let Some(stored) = &stored {
             Credential::keep_out_of_backups(&paths.credential())?;
             if stored.staged.is_some() {
@@ -407,7 +464,11 @@ impl Driver {
             .as_ref()
             .and_then(|stored| rotating_auth(&paths, stored, &credential_writes).ok());
         let credential = stored.map(|stored| stored.credential);
-        let folders = load_folders(&paths)?;
+        let folders = if blocked {
+            Default::default()
+        } else {
+            load_folders(&paths)?
+        };
         let paused = paths.paused().is_file();
         let variable = std::env::var(update::VARIABLE).ok();
         let updates = Updates::open(
@@ -431,9 +492,13 @@ impl Driver {
                 running: AtomicBool::new(false),
                 paused: AtomicBool::new(paused),
                 updates: Arc::new(updates),
+                startup_blocked: AtomicBool::new(false),
+                startup_pending: AtomicBool::new(false),
                 changed: Arc::new(watch::Sender::new(())),
                 #[cfg(test)]
                 observe_fault: None,
+                #[cfg(test)]
+                restart_stopped: Mutex::default(),
             }),
         })
     }
@@ -565,14 +630,23 @@ impl Driver {
     /// or claimed again (RFC 0009 section 5).
     ///
     /// Unless `confirm_last_device` is set, the sign-out goes on only once the server has revoked the device, or
-    /// answers that another device already did. Otherwise it keeps the credential and the folders, syncs again if it
-    /// was syncing, and returns [`DriverError::LastDevice`] for any HTTP 409, the server's refusal to revoke the
+    /// answers that another device already did. A definitive refusal keeps the credential and the folders and restores
+    /// sync if it was running. It returns [`DriverError::LastDevice`] for any HTTP 409, the server's refusal to revoke the
     /// user's last active device, or [`DriverError::NotRevoked`] when the server cannot be reached or does not
-    /// answer, so the person can be told that this may be their last device and confirm. With `confirm_last_device`
+    /// answer, so the person can be told that this may be their last device and confirm. While a revoke may have reached
+    /// the server without a definitive answer, the account is hidden and sync stays stopped until a retry resolves it,
+    /// including after a restart. With `confirm_last_device`
     /// the revocation is best effort: a sign-out without the server finishes on the device, and the device stays active
-    /// there until another device revokes it. A folder that cannot be unlinked stops the sign-out with its error and
-    /// stays linked, so signing out again finishes it.
-    pub async fn sign_out(&self, confirm_last_device: bool) -> Result<(), DriverError> {
+    /// there until another device revokes it.
+    ///
+    /// Before it asks the server, it checks that every folder's owner record and store can be removed, and returns
+    /// [`DriverError::UnlinkBlocked`] without changing anything when one cannot. Once the server has revoked the device,
+    /// it attempts every local cleanup and returns each path that stayed. A durable cleanup record lets another
+    /// sign-out finish without the credential or the stores, including after a restart.
+    pub async fn sign_out(
+        &self,
+        confirm_last_device: bool,
+    ) -> Result<Vec<CleanupFailure>, DriverError> {
         let _lifecycle = self.inner.lifecycle.lock().await;
         self.signing_out(confirm_last_device).await
     }
@@ -580,9 +654,13 @@ impl Driver {
     /// Signs out like [`Driver::sign_out`] with `confirm_last_device`, but only while the saved credential is
     /// `device_id`'s. A caller that found the server refusing that device's credential uses it, so a credential another
     /// run saved meanwhile is kept and [`DriverError::CredentialReplaced`] names its device.
-    pub async fn sign_out_device(&self, device_id: &str) -> Result<(), DriverError> {
+    pub async fn sign_out_device(
+        &self,
+        device_id: &str,
+    ) -> Result<Vec<CleanupFailure>, DriverError> {
         let _lifecycle = self.inner.lifecycle.lock().await;
-        if let Some(saved) = self.inner.credential.lock().unwrap().as_ref()
+        let saved = Credential::load_stored_for_revocation(&self.inner.paths.credential())?;
+        if let Some(saved) = saved.as_ref().map(|stored| &stored.credential)
             && saved.device_id != device_id
         {
             return Err(DriverError::CredentialReplaced {
@@ -592,42 +670,282 @@ impl Driver {
         self.signing_out(true).await
     }
 
-    /// The sign-out itself, run while the caller holds the lifecycle lock.
-    async fn signing_out(&self, confirm_last_device: bool) -> Result<(), DriverError> {
+    async fn signing_out(
+        &self,
+        confirm_last_device: bool,
+    ) -> Result<Vec<CleanupFailure>, DriverError> {
         let was_running = self.inner.running.load(Ordering::SeqCst);
         let was_checking = self.inner.updates.is_running();
+        self.inner.startup_blocked.store(true, Ordering::SeqCst);
+        let _startup = BlockedStartup(self);
         self.stop().await;
-        let signed_in = self.inner.credential.lock().unwrap().clone();
-        if let Some(credential) = &signed_in
-            && let Err(refused) =
-                revoke(credential, self.auth(credential), confirm_last_device).await
+        let state = &self.inner.paths.state_dir;
+        let path = state.join("leaving");
+        let leaving = match Leaving::load(state) {
+            Ok(leaving) => leaving,
+            Err(error) => {
+                if was_running {
+                    self.start();
+                }
+                if was_checking {
+                    self.check_for_updates();
+                }
+                return Err(io_error(&path)(error));
+            }
+        };
+        let resume = was_running
+            || leaving
+                .as_ref()
+                .is_some_and(|leaving| leaving.intent.resume);
+        let resume_updates = was_checking
+            || leaving
+                .as_ref()
+                .is_some_and(|leaving| leaving.intent.resume_updates);
+        let mut failed = Vec::new();
+        let mut leaving = if leaving
+            .as_ref()
+            .is_none_or(|leaving| leaving.phase == Phase::Prepared)
         {
-            if was_running {
-                self.start();
+            let prepared = (|| {
+                if self.inner.credential.lock().unwrap().is_some() {
+                    self.check_unlinks()?;
+                }
+                let mut intent = leaving.map(|leaving| leaving.intent).unwrap_or_default();
+                intent.resume = resume;
+                intent.resume_updates = resume_updates;
+                for folder in self.inner.folders.lock().unwrap().values() {
+                    let current = (&folder.link).into();
+                    if !intent.links.contains(&current) {
+                        intent.links.push(current);
+                    }
+                }
+                Leaving::begin(state, intent).map_err(io_error(&path))
+            })();
+            match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    if resume {
+                        self.start();
+                    }
+                    if resume_updates {
+                        self.check_for_updates();
+                    }
+                    return Err(error);
+                }
             }
-            if was_checking {
-                self.check_for_updates();
+        } else {
+            leaving.expect("an in-flight sign-out has its intent")
+        };
+        if leaving.phase != Phase::Committed {
+            let recovering = leaving.phase == Phase::Revoking;
+            let stored = Credential::load_stored_for_revocation(&self.inner.paths.credential())?;
+            let mut previous_auth = None;
+            let revoked = match stored {
+                Some(stored) => {
+                    let credential = stored.credential.clone();
+                    let auth = self.revocation_auth(&stored, recovering).await;
+                    leaving
+                        .set_phase(Phase::Revoking)
+                        .map_err(io_error(&path))?;
+                    previous_auth = self.inner.auth.lock().unwrap().take();
+                    *self.inner.credential.lock().unwrap() = None;
+                    self.changed();
+                    revoke(&credential, auth, confirm_last_device, recovering).await
+                }
+                None => Ok(()),
+            };
+            if let Err(refused) = revoked {
+                if refused.definitive {
+                    leaving
+                        .set_phase(Phase::Prepared)
+                        .map_err(io_error(&path))?;
+                    let stored = Credential::load_stored(&self.inner.paths.credential())?;
+                    *self.inner.credential.lock().unwrap() = stored.map(|stored| stored.credential);
+                    *self.inner.auth.lock().unwrap() = previous_auth;
+                    if self.inner.folders.lock().unwrap().is_empty() {
+                        let folders = load_folders(&self.inner.paths)?;
+                        *self.inner.folders.lock().unwrap() = folders;
+                    }
+                    if let Err(error) = leaving.finish() {
+                        tracing::warn!(path = %koidrive_fs::quoted(&path), %error, "the refused sign-out record could not be removed");
+                    }
+                    if resume {
+                        self.start();
+                    }
+                    self.changed();
+                }
+                if resume_updates {
+                    self.check_for_updates();
+                }
+                return Err(refused.error);
             }
-            return Err(refused);
+            if let Err(error) = leaving.set_phase(Phase::Committed) {
+                failed.push(CleanupFailure {
+                    path: path.clone(),
+                    error: error.to_string(),
+                });
+            }
         }
-        let roots = roots(&self.inner.folders.lock().unwrap());
-        for root in roots {
-            self.unlink_folder(&root).await?;
+        failed.extend(self.forget_credential());
+        for link in &leaving.intent.links {
+            let (done, store) = {
+                let mut folders = self.inner.folders.lock().unwrap();
+                folders
+                    .get_mut(&link.space_id)
+                    .map_or((None, None), |folder| {
+                        folder.unlink = Some(Unlink::Running);
+                        (
+                            folder.run.as_ref().map(Running::stop),
+                            Some(folder.store.clone()),
+                        )
+                    })
+            };
+            if let Some(done) = done {
+                ended(done).await;
+            }
+            let _readers_gone = store
+                .as_ref()
+                .map(|store| store.write().unwrap_or_else(PoisonError::into_inner));
+            if let Err(error) = claim::release(&link.root, &link.owner)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                failed.push(CleanupFailure {
+                    path: claim::record(&link.root),
+                    error: error.to_string(),
+                });
+            }
+            match self.inner.paths.store(&link.space_id) {
+                Ok(store) => {
+                    let dir = store.parent().expect("a store has a parent");
+                    let removed = fs::remove_dir_all(dir).or_else(|error| match error.kind() {
+                        io::ErrorKind::NotFound => Ok(()),
+                        _ => Err(error),
+                    });
+                    if let Err(error) = removed.and_then(|()| crate::leave::sync_parent(dir)) {
+                        failed.push(CleanupFailure {
+                            path: dir.to_path_buf(),
+                            error: error.to_string(),
+                        });
+                    }
+                }
+                Err(error) => failed.push(CleanupFailure {
+                    path: self.inner.paths.spaces(),
+                    error: error.to_string(),
+                }),
+            }
+            self.inner.folders.lock().unwrap().remove(&link.space_id);
         }
+        if failed.is_empty()
+            && let Err(error) = leaving.finish()
+        {
+            failed.push(CleanupFailure {
+                path,
+                error: error.to_string(),
+            });
+        }
+        self.changed();
+        Ok(failed)
+    }
+
+    async fn revocation_auth(
+        &self,
+        stored: &StoredCredential,
+        recovering: bool,
+    ) -> Result<Arc<Auth>, ApiError> {
+        if recovering {
+            let path = self.inner.paths.credential();
+            let original = stored.credential.clone();
+            let reload = Arc::new(move || {
+                let stored = Credential::load_stored_for_revocation(&path)
+                    .map_err(io::Error::other)?
+                    .ok_or_else(|| io::Error::other("the recovery credential is missing"))?;
+                if (
+                    &stored.credential.server,
+                    &stored.credential.user_id,
+                    &stored.credential.device_id,
+                ) != (&original.server, &original.user_id, &original.device_id)
+                {
+                    return Err(io::Error::other(
+                        "the profile now holds another device's credential",
+                    ));
+                }
+                Ok(stored.net())
+            });
+            return Ok(Arc::new(Auth::reloading(
+                stored.credential.api()?,
+                stored.credential.net(),
+                reload,
+            )));
+        }
+        let auth = self.auth(&stored.credential)?;
+        let token = tokio::time::timeout(SERVER_WAIT, auth.access_token())
+            .await
+            .map_err(|_| {
+                ApiError::Credential(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the server did not answer the token request",
+                ))
+            })??;
+        Ok(Arc::new(
+            Auth::new(stored.credential.api()?, auth.credentials()).with_token(token),
+        ))
+    }
+
+    fn forget_credential(&self) -> Vec<CleanupFailure> {
         let path = self.inner.paths.credential();
-        let _writes = self.inner.credential_writes.lock().unwrap();
-        for path in [next_path(&path), path] {
-            match fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(io_error(&path)(error)),
-            }
-        }
+        let failed = {
+            let _writes = self.inner.credential_writes.lock().unwrap();
+            [next_path(&path), path]
+                .into_iter()
+                .filter_map(|path| match fs::remove_file(&path) {
+                    Ok(()) => None,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                    Err(error) => Some(CleanupFailure {
+                        path,
+                        error: error.to_string(),
+                    }),
+                })
+                .collect()
+        };
         *self.inner.auth.lock().unwrap() = None;
         *self.inner.credential.lock().unwrap() = None;
         self.inner.running.store(false, Ordering::SeqCst);
         tracing::info!("signed out");
         self.changed();
+        failed
+    }
+
+    fn check_unlinks(&self) -> Result<(), DriverError> {
+        let links: Vec<Link> = (self.inner.folders.lock().unwrap().values())
+            .map(|folder| folder.link.clone())
+            .collect();
+        let paths = &self.inner.paths;
+        let mut dirs = vec![paths.state_dir.clone(), paths.spaces()];
+        for link in &links {
+            match claim::check_release(&link.root, &owner_of(link)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(DriverError::UnlinkBlocked {
+                        path: link.root.clone(),
+                        error,
+                    });
+                }
+            }
+            dirs.extend(paths.store(&link.space_id)?.parent().map(Path::to_path_buf));
+        }
+        for dir in dirs {
+            let access = rustix::fs::Access::WRITE_OK | rustix::fs::Access::EXEC_OK;
+            match rustix::fs::access(&dir, access) {
+                Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+                Err(error) => {
+                    return Err(DriverError::UnlinkBlocked {
+                        path: dir,
+                        error: error.into(),
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -636,6 +954,14 @@ impl Driver {
     /// Their stores and owner records belong to that device, so the new device links the folders again; their files
     /// stay.
     async fn unlink_folders_of_lost_credential(&self) -> Result<(), DriverError> {
+        let state = &self.inner.paths.state_dir;
+        if Leaving::load(state)
+            .map_err(io_error(&state.join("leaving")))?
+            .is_some()
+            && let Some(failure) = self.signing_out(false).await?.into_iter().next()
+        {
+            return Err(io_error(&failure.path)(io::Error::other(failure.error)));
+        }
         let roots = roots(&self.inner.folders.lock().unwrap());
         for root in roots {
             self.unlink_folder(&root).await?;
@@ -644,6 +970,12 @@ impl Driver {
     }
 
     fn check_unpaired(&self) -> Result<(), DriverError> {
+        let state = &self.inner.paths.state_dir;
+        if crate::leave::phase(state).map_err(io_error(&state.join("leaving")))?
+            == Some(Phase::Revoking)
+        {
+            return Err(CredentialError::SignOutPending.into());
+        }
         match self.inner.credential.lock().unwrap().as_ref() {
             Some(credential) => Err(DriverError::AlreadyPaired {
                 device_id: credential.device_id.clone(),
@@ -859,6 +1191,7 @@ impl Driver {
             status: status.clone(),
             run: None,
             unlink: None,
+            store: Arc::default(),
         };
         drop(lock);
         if self.syncs() {
@@ -880,11 +1213,12 @@ impl Driver {
     }
 
     async fn unlink_folder(&self, folder: &Path) -> Result<Link, DriverError> {
-        let (link, done) = {
+        let (link, done, store) = {
             let mut folders = self.inner.folders.lock().unwrap();
             let found = find(&mut folders, folder)?;
             found.unlink = Some(Unlink::Running);
-            (found.link.clone(), found.run.as_ref().map(Running::stop))
+            let done = found.run.as_ref().map(Running::stop);
+            (found.link.clone(), done, found.store.clone())
         };
         let _unlinking = Unlinking {
             driver: self,
@@ -893,7 +1227,10 @@ impl Driver {
         if let Some(done) = done {
             ended(done).await;
         }
-        let forgotten = self.forget(&link);
+        let forgotten = {
+            let _readers_gone = store.write().unwrap_or_else(PoisonError::into_inner);
+            self.forget(&link)
+        };
         let mut folders = self.inner.folders.lock().unwrap();
         match forgotten {
             Ok(()) => {
@@ -947,7 +1284,7 @@ impl Driver {
     pub fn questions(&self) -> Result<Vec<Question>, DriverError> {
         let mut questions = Vec::new();
         for space_id in self.space_ids() {
-            for stored in self.stored_questions(&space_id)? {
+            for stored in self.stored_questions(&space_id)?.unwrap_or_default() {
                 if stored.answer.is_none()
                     && let Some(question) = decode_question(&space_id, &stored)
                 {
@@ -963,10 +1300,8 @@ impl Driver {
     /// dropped it before it took an answer.
     pub fn answered_question(&self, question_id: &str) -> Result<Option<Question>, DriverError> {
         for space_id in self.space_ids() {
-            let path = self.inner.paths.store(&space_id)?;
-            let mut store = Store::open(&path).map_err(store_error(&path))?;
-            let stored = store
-                .transaction(|tx| {
+            let stored = self.read_store(&space_id, |store| {
+                store.transaction(|tx| {
                     let current = (tx.questions()?.into_iter())
                         .find(|stored| stored.question_id == question_id);
                     match current {
@@ -974,8 +1309,10 @@ impl Driver {
                         None => tx.taken_question(question_id),
                     }
                 })
-                .map_err(store_error(&path))?;
-            if let Some(question) = stored.and_then(|stored| decode_question(&space_id, &stored)) {
+            })?;
+            if let Some(question) =
+                (stored.flatten()).and_then(|stored| decode_question(&space_id, &stored))
+            {
                 return Ok(Some(question));
             }
         }
@@ -993,10 +1330,8 @@ impl Driver {
             Err(_) => Err(DriverError::QuestionNotFound(question_id.to_owned())),
         };
         for space_id in self.space_ids() {
-            let path = self.inner.paths.store(&space_id)?;
-            let mut store = Store::open(&path).map_err(store_error(&path))?;
-            let outcome = store
-                .transaction(|tx| {
+            let outcome = self.read_store(&space_id, |store| {
+                store.transaction(|tx| {
                     let stored = (tx.questions()?.into_iter())
                         .find(|stored| stored.question_id == question_id);
                     let stored = match stored {
@@ -1030,8 +1365,8 @@ impl Driver {
                         .count();
                     Ok(Some(Ok(Some(left as u64))))
                 })
-                .map_err(store_error(&path))?;
-            match outcome {
+            })?;
+            match outcome.flatten() {
                 None => continue,
                 Some(Err(error)) => return Err(error),
                 Some(Ok(None)) => return Ok(Answered::Already),
@@ -1059,17 +1394,14 @@ impl Driver {
     /// A malformed ID is refused here, because the server refuses a whole commit for one. Whether the node or the
     /// version still exists is the server's answer.
     pub fn restore(&self, space_id: &str, request: RestoreRequest) -> Result<String, DriverError> {
-        if !self.inner.folders.lock().unwrap().contains_key(space_id) {
-            return Err(DriverError::SpaceNotLinked(space_id.to_owned()));
-        }
         let intent = request
             .intent()
             .map_err(|malformed| DriverError::InvalidRestore(malformed.0))?;
         let id = restore::new_id(now_ms() as u64);
-        let path = self.inner.paths.store(space_id)?;
-        Store::open(&path)
-            .and_then(|mut store| store.transaction(|tx| tx.request_restore(&id, &intent)))
-            .map_err(store_error(&path))?;
+        self.read_store(space_id, |store| {
+            store.transaction(|tx| tx.request_restore(&id, &intent))
+        })?
+        .ok_or_else(|| DriverError::SpaceNotLinked(space_id.to_owned()))?;
         tracing::info!(space_id, restore_id = %id, "recorded a restore request");
         // A task that is not running takes the request when it next opens the folder.
         let folders = self.inner.folders.lock().unwrap();
@@ -1085,13 +1417,8 @@ impl Driver {
     /// that wait, in request order. A waiting restore whose node has a problem says so, because it stays pending
     /// until the problem is cleared. The store keeps the last 1,000 that ended and drops older ones.
     pub fn restores(&self, space_id: &str) -> Result<Vec<RestoreStatus>, DriverError> {
-        if !self.inner.folders.lock().unwrap().contains_key(space_id) {
-            return Err(DriverError::SpaceNotLinked(space_id.to_owned()));
-        }
-        let path = self.inner.paths.store(space_id)?;
-        Store::open(&path)
-            .and_then(|mut store| store.transaction(restore::list))
-            .map_err(store_error(&path))
+        self.read_store(space_id, |store| store.transaction(restore::list))?
+            .ok_or_else(|| DriverError::SpaceNotLinked(space_id.to_owned()))
     }
 
     /// Starts syncing every linked folder, each in a task on the current Tokio runtime, unless sync is paused: then
@@ -1146,15 +1473,21 @@ impl Driver {
     }
 
     fn syncs(&self) -> bool {
-        self.inner.running.load(Ordering::SeqCst) && !self.inner.paused.load(Ordering::SeqCst)
+        self.inner.running.load(Ordering::SeqCst)
+            && !self.inner.paused.load(Ordering::SeqCst)
+            && !self.inner.startup_blocked.load(Ordering::SeqCst)
     }
 
     fn start_folders(&self) {
-        let credential = self.inner.credential.lock().unwrap().clone();
         let mut folders = self.inner.folders.lock().unwrap();
+        if self.inner.startup_blocked.load(Ordering::SeqCst) {
+            self.inner.startup_pending.store(true, Ordering::SeqCst);
+            return;
+        }
         if !self.syncs() {
             return;
         }
+        let credential = self.inner.credential.lock().unwrap().clone();
         let all = roots(&folders);
         for folder in folders.values_mut() {
             self.start_folder(folder, credential.as_ref(), &all);
@@ -1185,6 +1518,9 @@ impl Driver {
         lift: Option<Lift>,
     ) -> Result<FolderStatus, DriverError> {
         let _lifecycle = self.inner.lifecycle.lock().await;
+        let _pausing = self.inner.pausing.lock().await;
+        self.inner.startup_blocked.store(true, Ordering::SeqCst);
+        let startup = BlockedStartup(self);
         let space_id = find(&mut self.inner.folders.lock().unwrap(), folder)?
             .link
             .space_id
@@ -1196,12 +1532,20 @@ impl Driver {
             let Some(done) = done else { break };
             ended(done).await;
         }
+        #[cfg(test)]
+        let stopped = self.inner.restart_stopped.lock().unwrap().take();
+        #[cfg(test)]
+        if let Some(stopped) = stopped {
+            let _ = stopped.reached.send(());
+            let _ = stopped.proceed.await;
+        }
         let lifted = match lift {
             Some(lift) => (self.inner.paths.store(&space_id))
                 .map_err(DriverError::from)
                 .and_then(|path| lift_halt(&path, lift)),
             None => Ok(()),
         };
+        drop(startup);
         let credential = self.inner.credential.lock().unwrap().clone();
         let mut folders = self.inner.folders.lock().unwrap();
         let all = roots(&folders);
@@ -1382,10 +1726,27 @@ impl Driver {
         self.inner.folders.lock().unwrap().keys().cloned().collect()
     }
 
-    fn stored_questions(&self, space_id: &str) -> Result<Vec<StoredQuestion>, DriverError> {
+    fn stored_questions(&self, space_id: &str) -> Result<Option<Vec<StoredQuestion>>, DriverError> {
+        self.read_store(space_id, |store| store.transaction(|tx| tx.questions()))
+    }
+
+    fn read_store<T>(
+        &self,
+        space_id: &str,
+        read: impl FnOnce(&mut Store) -> Result<T, koidrive_store::Error>,
+    ) -> Result<Option<T>, DriverError> {
         let path = self.inner.paths.store(space_id)?;
-        Store::open(&path)
-            .and_then(|mut store| store.transaction(|tx| tx.questions()))
+        let folders = self.inner.folders.lock().unwrap();
+        let Some(store) = (folders.get(space_id))
+            .filter(|folder| folder.unlink != Some(Unlink::Running))
+            .map(|folder| folder.store.clone())
+        else {
+            return Ok(None);
+        };
+        let _reading = store.read().unwrap_or_else(PoisonError::into_inner);
+        drop(folders);
+        (Store::open(&path).and_then(|mut store| read(&mut store)))
+            .map(Some)
             .map_err(store_error(&path))
     }
 
@@ -1395,6 +1756,13 @@ impl Driver {
         folders: &BTreeMap<String, Folder>,
     ) -> Result<(), DriverError> {
         check_placement(root, &self.inner.paths.private_dirs(), &roots(folders))
+    }
+}
+
+fn owner_of(link: &Link) -> Owner {
+    Owner {
+        server: link.server_url.clone(),
+        device_id: link.device_id.clone(),
     }
 }
 
@@ -1507,6 +1875,7 @@ fn load_folders(paths: &Paths) -> Result<BTreeMap<String, Folder>, DriverError> 
                     link,
                     run: None,
                     unlink: None,
+                    store: Arc::default(),
                 },
             )
         })
@@ -1653,11 +2022,18 @@ fn rotating_auth(
     )))
 }
 
+struct RevokeFailure {
+    error: DriverError,
+    definitive: bool,
+}
+
 async fn revoke(
     credential: &Credential,
     auth: Result<Arc<Auth>, ApiError>,
     confirm_last_device: bool,
-) -> Result<(), DriverError> {
+    recovering: bool,
+) -> Result<(), RevokeFailure> {
+    let may_have_been_sent = recovering || auth.is_ok();
     let revoked = async {
         let auth = auth?;
         auth.api().revoke_self(&auth, confirm_last_device).await
@@ -1671,7 +2047,10 @@ async fn revoke(
             return Ok(());
         }
         Ok(Err(error)) if !confirm_last_device && error.status() == Some(409) => {
-            return Err(DriverError::LastDevice);
+            return Err(RevokeFailure {
+                error: DriverError::LastDevice,
+                definitive: !recovering,
+            });
         }
         Ok(Err(error)) if error.is_unauthenticated() => {
             tracing::info!(
@@ -1680,14 +2059,27 @@ async fn revoke(
             );
             return Ok(());
         }
-        Ok(Err(error)) => error.to_string(),
-        Err(_) => format!("no answer within {} seconds", SERVER_WAIT.as_secs()),
+        Ok(Err(error)) => (
+            error.to_string(),
+            !recovering
+                && (!may_have_been_sent
+                    || error
+                        .status()
+                        .is_some_and(|status| (400..500).contains(&status) && status != 408)),
+        ),
+        Err(_) => (
+            format!("no answer within {} seconds", SERVER_WAIT.as_secs()),
+            false,
+        ),
     };
     if !confirm_last_device {
-        return Err(DriverError::NotRevoked(failure));
+        return Err(RevokeFailure {
+            error: DriverError::NotRevoked(failure.0),
+            definitive: failure.1,
+        });
     }
     tracing::warn!(
-        failure,
+        failure = failure.0,
         "the server did not revoke this device; revoke it from another device"
     );
     Ok(())
@@ -1695,14 +2087,36 @@ async fn revoke(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
     use std::time::{Duration, Instant};
 
+    use crate::leave::Intent;
     use crate::question::{HeldItem, QuestionKind};
     use crate::restore::{RestoreRejection, RestoreState, RestoreWait};
 
     use super::*;
 
     const SPACE: &str = "0190f0a0-0000-7000-8000-000000000001";
+
+    #[test]
+    fn cleanup_results_serialize_lossy_paths_without_changing_the_retry_path() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let bytes = b"/tmp/cleanup-\xff\n\x1b[31m";
+        let failure = CleanupFailure {
+            path: PathBuf::from(OsString::from_vec(bytes.to_vec())),
+            error: "denied\n\x1b[31m".into(),
+        };
+        let data = serde_json::to_value(&failure)
+            .expect("a cleanup result must serialize a non-UTF-8 path");
+        assert_eq!(data["path"], failure.path.to_string_lossy().as_ref());
+        assert_eq!(data["error"], failure.error);
+        assert_eq!(failure.path.as_os_str().as_bytes(), bytes);
+        let json = serde_json::to_string(&failure).unwrap();
+        assert!(!json.contains('\n'));
+        assert!(!json.contains('\x1b'));
+    }
 
     fn credential(device_id: &str) -> Credential {
         Credential {
@@ -1752,6 +2166,7 @@ mod tests {
 
     fn mass_delete(id: &str) -> Question {
         Question {
+            recovery_cause: None,
             id: id.into(),
             lineage: id.into(),
             space_id: SPACE.into(),
@@ -1833,7 +2248,7 @@ mod tests {
         assert_eq!(driver.questions().unwrap(), [mass_delete("q2")]);
         assert_eq!(driver.status().folders[0].questions, 1);
 
-        let stored = driver.stored_questions(SPACE).unwrap();
+        let stored = driver.stored_questions(SPACE).unwrap().unwrap();
         assert_eq!(stored[0].answer.as_ref().unwrap().answer, "restore");
     }
 
@@ -1928,6 +2343,7 @@ mod tests {
             sent_in: None,
         };
         let shown = Question {
+            recovery_cause: None,
             id: "c1".into(),
             lineage: "c1".into(),
             space_id: SPACE.into(),
@@ -1964,7 +2380,7 @@ mod tests {
 
         driver.start();
         eventually("the folder takes the answer", || {
-            driver.stored_questions(SPACE).unwrap().is_empty()
+            driver.stored_questions(SPACE).unwrap().unwrap().is_empty()
         })
         .await;
         assert_eq!(
@@ -2698,13 +3114,8 @@ mod tests {
         linked(&paths, &root, "d1");
         let driver = Driver::open(paths).unwrap();
         driver.inner.running.store(true, Ordering::SeqCst);
-        let (stop, _stopped) = watch::channel(false);
+        let (stop, mut stopped) = watch::channel(false);
         let (finished, done) = watch::channel(());
-        let stopping = Running {
-            stop,
-            requests: Arc::new(Notify::new()),
-            done,
-        };
         driver
             .inner
             .folders
@@ -2713,54 +3124,84 @@ mod tests {
             .values_mut()
             .next()
             .unwrap()
-            .run = Some(stopping);
-        let (replaced, mut replacement) = tokio::sync::oneshot::channel::<watch::Receiver<()>>();
+            .run = Some(Running {
+            stop,
+            requests: Arc::new(Notify::new()),
+            done,
+        });
+        let (reached, stopped_before_lift) = tokio::sync::oneshot::channel();
+        let (proceed, released) = tokio::sync::oneshot::channel();
+        *driver.inner.restart_stopped.lock().unwrap() = Some(RestartStopped {
+            reached,
+            proceed: released,
+        });
         let restarting = tokio::spawn({
             let driver = driver.clone();
             let root = root.clone();
             async move {
                 driver.restart(&root).await.unwrap();
-                replacement.try_recv().unwrap().has_changed().is_err()
+                driver
+                    .inner
+                    .folders
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .next()
+                    .unwrap()
+                    .run
+                    .as_ref()
+                    .unwrap()
+                    .done
+                    .clone()
             }
         });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        driver
-            .inner
-            .folders
-            .lock()
-            .unwrap()
-            .values_mut()
-            .next()
-            .unwrap()
-            .run = None;
-        assert!(driver.pause().await.unwrap());
-        assert!(driver.resume().await.unwrap());
-        let started = (driver
-            .inner
-            .folders
-            .lock()
-            .unwrap()
-            .values()
-            .next()
-            .unwrap()
-            .run
-            .as_ref())
-        .map(|run| run.done.clone())
-        .unwrap();
-        replaced.send(started).unwrap();
+        stopped.changed().await.unwrap();
+        assert!(*stopped.borrow());
         drop(finished);
+        stopped_before_lift.await.unwrap();
+        let changing = tokio::spawn({
+            let driver = driver.clone();
+            async move {
+                assert!(driver.pause().await.unwrap());
+                assert!(driver.resume().await.unwrap());
+                driver
+                    .inner
+                    .folders
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .next()
+                    .unwrap()
+                    .run
+                    .as_ref()
+                    .map(|run| run.done.clone())
+            }
+        });
+        let blocked = still_waiting(&changing).await;
+        proceed.send(()).unwrap();
+        let restarted = restarting.await.unwrap();
+        let resumed = changing.await.unwrap();
         assert!(
-            restarting.await.unwrap(),
-            "the restart stopped the task the resume started before it started its own"
+            blocked,
+            "pause/resume bypassed the stop/lift/start transition"
+        );
+        let resumed = resumed.unwrap();
+        assert!(
+            restarted.has_changed().is_err(),
+            "pause left the task from restart running"
+        );
+        assert!(
+            resumed.has_changed().is_ok(),
+            "resume lost its replacement task"
         );
         eventually("the folder is claimed", || {
             claim::owner(&root).unwrap().is_some()
         })
         .await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
         let folder = &driver.status().folders[0];
         assert_ne!(folder.state, FolderState::Halted, "{:?}", folder.problem);
         driver.stop().await;
+        assert!(resumed.has_changed().is_err());
     }
 
     #[tokio::test]
@@ -2934,6 +3375,41 @@ mod tests {
         watch.borrow_and_update();
         driver.stop().await;
         assert!(watch.has_changed().unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_reader_opens_the_store_of_a_folder_while_it_is_unlinked() {
+        for _ in 0..25 {
+            let (_dir, paths, root) = profile(&[]);
+            let driver = Driver::open(paths.clone()).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let reads = Arc::new(AtomicUsize::new(0));
+            let reader = {
+                let (driver, stop, reads) = (driver.clone(), stop.clone(), reads.clone());
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::SeqCst) {
+                        let _ = driver.questions();
+                        let _ = driver.answered_question("q1");
+                        let _ = driver.answer("q1", Answer::Delete);
+                        let _ = driver.restores(SPACE);
+                        reads.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            };
+            while reads.load(Ordering::SeqCst) == 0 {
+                std::thread::yield_now();
+            }
+            let unlinked = driver.unlink(&root).await;
+            stop.store(true, Ordering::SeqCst);
+            reader.join().unwrap();
+            assert!(unlinked.is_ok(), "{unlinked:?}");
+            let store_dir = paths.store(SPACE).unwrap().parent().unwrap().to_path_buf();
+            assert!(
+                !store_dir.exists(),
+                "a reader left {} behind",
+                store_dir.display()
+            );
+        }
     }
 
     #[tokio::test]
@@ -3212,6 +3688,1179 @@ mod tests {
                 ("/v1/devices/d1?confirm=last-device".to_owned(), true),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn review_cancel_after_remote_revoke_does_not_reload_the_old_account() {
+        use tokio::io::AsyncWriteExt;
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Koidrive");
+        let private = root.join(".koidrive");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = format!("http://{}/", listener.local_addr().unwrap());
+        let paths = linked_with_server(&base, server);
+        owned(&paths, &root);
+        let (revoked, accepted) = tokio::sync::oneshot::channel();
+        let served = tokio::spawn({
+            let private = private.clone();
+            async move {
+                for (status, body) in [access_token(), (204, Vec::new())] {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let request = read_request(&mut socket).await.0;
+                    let head = format!(
+                        "HTTP/1.1 {status} Reply\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    socket.write_all(head.as_bytes()).await.unwrap();
+                    socket.write_all(&body).await.unwrap();
+                    if request == "/v1/devices/d1" {
+                        close_dir(&private);
+                        revoked.send(()).unwrap();
+                        return;
+                    }
+                }
+            }
+        });
+        let driver = Driver::open(paths.clone()).unwrap();
+        {
+            let leave = driver.sign_out(false);
+            tokio::pin!(leave);
+            tokio::select! {
+                biased;
+                _ = accepted => {},
+                result = &mut leave => panic!("sign-out completed before cancellation: {result:?}"),
+            }
+        }
+        served.await.unwrap();
+        drop(driver);
+        let reopened = Driver::open(paths.clone()).unwrap();
+        let account = reopened.status().account;
+        let retry = reopened.sign_out(false).await;
+        open_dir(&private);
+        assert!(
+            account.is_none(),
+            "the remotely revoked account became locally signed in again"
+        );
+        assert!(matches!(retry, Err(DriverError::NotRevoked(_))));
+    }
+
+    async fn recovery_refusal_stays_blocked(status: u16) {
+        for reopen in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = fs::canonicalize(dir.path()).unwrap();
+            let credential_path = Paths::under(&base.join("profile")).credential();
+            let unauthenticated = (
+                401,
+                prost::Message::encode_to_vec(&koidrive_proto::v1::Error {
+                    code: koidrive_proto::v1::error::Code::Unauthenticated.into(),
+                    message: "the earlier DELETE revoked this device".into(),
+                    ..Default::default()
+                }),
+            );
+            let (server, served) = serve_each(
+                vec![
+                    access_token(),
+                    (500, Vec::new()),
+                    (status, Vec::new()),
+                    unauthenticated,
+                ],
+                credential_path,
+            )
+            .await;
+            let paths = linked_with_server(&base, server);
+            let mut driver = Driver::open(paths.clone()).unwrap();
+            driver.start();
+            assert!(matches!(
+                driver.sign_out(false).await,
+                Err(DriverError::NotRevoked(_))
+            ));
+            let credential = fs::read(paths.credential()).unwrap();
+            if reopen {
+                drop(driver);
+                driver = Driver::open(paths.clone()).unwrap();
+            }
+            assert!(driver.sign_out(false).await.is_err());
+            let account = driver.status().account;
+            let running = driver.status().running;
+            let pending = matches!(
+                Credential::load(&paths.credential()),
+                Err(CredentialError::SignOutPending)
+            );
+            let revoking = matches!(
+                crate::leave::phase(&paths.state_dir),
+                Ok(Some(Phase::Revoking))
+            );
+            let raw_kept = fs::read(paths.credential()).unwrap() == credential;
+            let store_kept = paths.store(SPACE).unwrap().exists();
+            driver.sign_out(false).await.unwrap();
+            assert_eq!(served.await.unwrap().len(), 4);
+            assert!(
+                account.is_none(),
+                "recovery {status} restored the account, reopen={reopen}"
+            );
+            assert!(!running, "recovery {status} resumed sync, reopen={reopen}");
+            assert!(pending && revoking && raw_kept && store_kept);
+            assert!(!paths.credential().exists());
+            assert!(driver.status().folders.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_recovery_429_cannot_restore_the_account() {
+        recovery_refusal_stays_blocked(429).await;
+    }
+
+    #[tokio::test]
+    async fn a_recovery_409_cannot_restore_the_account() {
+        recovery_refusal_stays_blocked(409).await;
+    }
+
+    async fn prepared_retry_restores_authority(running: bool, checking: bool) {
+        use tokio::io::AsyncWriteExt;
+
+        for (reopen, updates_off) in [(false, false), (true, false), (true, true)] {
+            if updates_off && !checking {
+                continue;
+            }
+            for paused in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let base = fs::canonicalize(dir.path()).unwrap();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let server = format!("http://{}/", listener.local_addr().unwrap());
+                let paths = linked_with_server(&base, server);
+                fs::write(
+                    paths.update_check(),
+                    serde_json::json!({
+                        "asset": crate::update::this_asset(),
+                        "checked_at": i64::MAX - 1000,
+                        "successful_at": 100,
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+                let (entered, token_started) = tokio::sync::oneshot::channel();
+                let (release, released) = tokio::sync::oneshot::channel();
+                let served = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    assert_eq!(read_request(&mut socket).await.0, "/v1/token");
+                    entered.send(()).unwrap();
+                    released.await.unwrap();
+                    drop(socket);
+                    let mut calls = Vec::new();
+                    for (status, body) in [access_token(), last_device_refused()] {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        calls.push(read_request(&mut socket).await.0);
+                        let head = format!(
+                            "HTTP/1.1 {status} Reply\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        socket.write_all(head.as_bytes()).await.unwrap();
+                        socket.write_all(&body).await.unwrap();
+                    }
+                    calls
+                });
+                let mut driver = Driver::open(paths.clone()).unwrap();
+                if running {
+                    driver.start();
+                }
+                if checking {
+                    driver.check_for_updates();
+                }
+                {
+                    let leave = driver.sign_out(false);
+                    tokio::pin!(leave);
+                    tokio::select! {
+                        biased;
+                        _ = token_started => {},
+                        result = &mut leave => panic!("sign-out finished before Prepared cancellation: {result:?}"),
+                    }
+                }
+                assert!(matches!(
+                    crate::leave::phase(&paths.state_dir),
+                    Ok(Some(Phase::Prepared))
+                ));
+                assert!(!driver.status().running);
+                assert!(!driver.inner.updates.is_running());
+                if paused {
+                    driver.pause().await.unwrap();
+                    fs::write(paths.paused(), b"pause stays\n").unwrap();
+                }
+                if updates_off {
+                    fs::write(&paths.config_file, "[updates]\ncheck = false\n").unwrap();
+                }
+                if reopen {
+                    drop(driver);
+                    driver = Driver::open(paths.clone()).unwrap();
+                }
+                release.send(()).unwrap();
+                assert!(matches!(
+                    driver.sign_out(false).await,
+                    Err(DriverError::LastDevice)
+                ));
+                assert_eq!(served.await.unwrap(), ["/v1/token", "/v1/devices/d1"]);
+                let status = driver.status();
+                let checking_after = driver.inner.updates.is_running();
+                driver.stop().await;
+                assert_eq!(
+                    status.running, running,
+                    "running authority lost, reopen={reopen}, paused={paused}"
+                );
+                assert_eq!(
+                    checking_after,
+                    checking && !updates_off,
+                    "update authority changed, reopen={reopen}, paused={paused}, updates_off={updates_off}"
+                );
+                if updates_off {
+                    assert_eq!(status.update, crate::Update::Off);
+                    assert!(!paths.update_check().exists());
+                }
+                assert_eq!(status.paused, paused);
+                if paused {
+                    assert_eq!(fs::read(paths.paused()).unwrap(), b"pause stays\n");
+                    assert!(
+                        status
+                            .folders
+                            .iter()
+                            .all(|folder| folder.state == FolderState::Stopped)
+                    );
+                } else {
+                    assert!(!paths.paused().exists());
+                }
+                assert!(status.account.is_some());
+                assert!(!paths.state_dir.join("leaving").exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_retry_preserves_running_authority() {
+        prepared_retry_restores_authority(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn prepared_retry_preserves_update_check_authority() {
+        prepared_retry_restores_authority(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn prepared_retry_does_not_invent_running_or_update_check_authority() {
+        prepared_retry_restores_authority(false, false).await;
+    }
+
+    async fn serve_calling(
+        replies: Vec<(u16, Vec<u8>)>,
+        at: usize,
+        call: impl FnOnce() + Send + 'static,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = format!("http://{}/", listener.local_addr().unwrap());
+        let served = tokio::spawn(async move {
+            let mut call = Some(call);
+            let mut requests = Vec::new();
+            for (i, (status, body)) in replies.into_iter().enumerate() {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                requests.push(read_request(&mut socket).await.0);
+                if i == at {
+                    call.take().unwrap()();
+                }
+                let head = format!(
+                    "HTTP/1.1 {status} Reply\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+            }
+            requests
+        });
+        (server, served)
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_revocation_resolves_before_restoring_the_account_or_checking_cleanup() {
+        use koidrive_net::CredentialStore;
+        use tokio::io::AsyncWriteExt;
+
+        for remote_revoked in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = fs::canonicalize(dir.path()).unwrap();
+            let root = base.join("Koidrive");
+            let private = root.join(".koidrive");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let server = format!("http://{}/", listener.local_addr().unwrap());
+            let paths = linked_with_server(&base, server);
+            owned(&paths, &root);
+            fs::write(paths.paused(), b"paused\n").unwrap();
+            let (sent, accepted) = tokio::sync::oneshot::channel();
+            let mut replies = vec![access_token()];
+            let unauthenticated = (
+                401,
+                prost::Message::encode_to_vec(&koidrive_proto::v1::Error {
+                    code: koidrive_proto::v1::error::Code::Unauthenticated.into(),
+                    message: "this device was revoked".into(),
+                    ..Default::default()
+                }),
+            );
+            if remote_revoked {
+                replies.push((204, Vec::new()));
+                replies.push(unauthenticated);
+            } else {
+                replies.extend([
+                    last_device_refused(),
+                    access_token(),
+                    last_device_refused(),
+                    unauthenticated,
+                ]);
+            }
+            let served = tokio::spawn({
+                let private = private.clone();
+                let state = paths.state_dir.clone();
+                async move {
+                    let mut sent = Some(sent);
+                    let mut calls = Vec::new();
+                    for (i, (status, body)) in replies.into_iter().enumerate() {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        calls.push(read_request(&mut socket).await.0);
+                        let head = format!(
+                            "HTTP/1.1 {status} Reply\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        socket.write_all(head.as_bytes()).await.unwrap();
+                        socket.write_all(&body).await.unwrap();
+                        if i == 1 {
+                            assert!(matches!(
+                                crate::leave::phase(&state),
+                                Ok(Some(Phase::Revoking))
+                            ));
+                            close_dir(&private);
+                            sent.take().unwrap().send(()).unwrap();
+                        }
+                    }
+                    calls
+                }
+            });
+            let driver = Driver::open(paths.clone()).unwrap();
+            let credential = Credential::load(&paths.credential()).unwrap().unwrap();
+            driver.start();
+            {
+                let leave = driver.sign_out(false);
+                tokio::pin!(leave);
+                tokio::select! {
+                    biased;
+                    _ = accepted => {},
+                    result = &mut leave => panic!("sign-out completed before interruption: {result:?}"),
+                }
+            }
+            assert_eq!(driver.status().account, None);
+            drop(driver);
+
+            let driver = Driver::open(paths.clone()).unwrap();
+            assert_eq!(driver.status().account, None);
+            assert!(!driver.status().running);
+            assert!(driver.status().paused);
+            assert!(matches!(
+                Credential::load(&paths.credential()),
+                Err(CredentialError::SignOutPending)
+            ));
+            assert!(matches!(
+                Credential::load_stored(&paths.credential()),
+                Err(CredentialError::SignOutPending)
+            ));
+            for refused in [
+                driver.pair(NOWHERE, "code", "other").await,
+                driver.claim(NOWHERE, "code", "Ada", "other").await,
+                driver.save_credential(credential.clone()).await,
+            ] {
+                assert!(matches!(
+                    refused,
+                    Err(DriverError::Credential(CredentialError::SignOutPending))
+                ));
+            }
+            let bytes = fs::read(paths.credential()).unwrap();
+            let files = CredentialFiles::new(&paths.credential(), credential, Arc::default());
+            let staged = koidrive_net::Staged {
+                refresh_credential: "replacement".into(),
+                rotate_before_ms: i64::MAX,
+            };
+            assert!(files.stage(&staged).is_err());
+            assert!(files.promote(&staged).is_err());
+            assert_eq!(fs::read(paths.credential()).unwrap(), bytes);
+            assert!(matches!(
+                crate::leave::phase(&paths.state_dir),
+                Ok(Some(Phase::Revoking))
+            ));
+
+            let retry = driver.sign_out(false).await;
+            let failed = if remote_revoked {
+                retry.unwrap()
+            } else {
+                assert!(matches!(retry, Err(DriverError::LastDevice)));
+                assert_eq!(driver.status().account, None);
+                assert!(!driver.status().running);
+                assert!(driver.status().paused);
+                assert!(driver.status().folders.is_empty());
+                assert!(matches!(
+                    crate::leave::phase(&paths.state_dir),
+                    Ok(Some(Phase::Revoking))
+                ));
+                assert!(matches!(
+                    Credential::load(&paths.credential()),
+                    Err(CredentialError::SignOutPending)
+                ));
+                assert_eq!(fs::read(paths.credential()).unwrap(), bytes);
+                assert!(paths.store(SPACE).unwrap().exists());
+                driver.sign_out(false).await.unwrap()
+            };
+            let calls = served.await.unwrap();
+            open_dir(&private);
+            if remote_revoked {
+                assert_eq!(calls, ["/v1/token", "/v1/devices/d1", "/v1/token"]);
+            } else {
+                assert_eq!(
+                    calls,
+                    [
+                        "/v1/token",
+                        "/v1/devices/d1",
+                        "/v1/token",
+                        "/v1/devices/d1",
+                        "/v1/token"
+                    ]
+                );
+            }
+            assert_eq!(driver.status().account, None);
+            assert!(!paths.credential().exists());
+            assert!(!paths.store(SPACE).unwrap().parent().unwrap().exists());
+            if !rustix::process::geteuid().is_root() {
+                assert_eq!(failed.len(), 1);
+                assert_eq!(failed[0].path, private.join("device.json"));
+            }
+            drop(driver);
+            let driver = Driver::open(paths.clone()).unwrap();
+            assert_eq!(driver.sign_out(false).await.unwrap(), []);
+            assert_eq!(claim::owner(&root).unwrap(), None);
+        }
+    }
+
+    fn owned(paths: &Paths, root: &Path) {
+        let owner = Owner {
+            server: NOWHERE.into(),
+            device_id: "d1".into(),
+        };
+        claim::set_owner(root, &owner).unwrap();
+        assert_eq!(claim::owner(root).unwrap(), Some(owner));
+        assert!(paths.store(SPACE).unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn signing_out_changes_nothing_while_a_folder_cannot_be_unlinked() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Koidrive");
+        let credential_path = Paths::under(&base.join("profile")).credential();
+        let (server, served) = serve_each(Vec::new(), credential_path).await;
+        let paths = linked_with_server(&base, server);
+        owned(&paths, &root);
+        if rustix::process::geteuid().is_root() {
+            eprintln!("SKIPPED: running as root, so permissions do not block reads");
+            return;
+        }
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+
+        for confirm_last_device in [false, true] {
+            let blocked = driver.sign_out(confirm_last_device).await;
+            assert!(
+                matches!(&blocked, Err(DriverError::UnlinkBlocked { path, .. }) if *path == root),
+                "{blocked:?}"
+            );
+            assert_eq!(driver.status().account.unwrap().device_id, "d1");
+            assert_eq!(driver.status().folders.len(), 1);
+            assert!(paths.credential().exists());
+            assert!(paths.store(SPACE).unwrap().exists());
+        }
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(claim::owner(&root).unwrap().is_some());
+        assert_eq!(served.await.unwrap(), []);
+    }
+
+    #[tokio::test]
+    async fn reviewer_a_refused_leave_does_not_keep_an_outdated_root_after_credential_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let paths = Paths::under(&base.join("profile"));
+        let old = base.join("Old");
+        let new = base.join("New");
+        linked(&paths, &old, "d1");
+        let owner = Owner {
+            server: NOWHERE.into(),
+            device_id: "d1".into(),
+        };
+        claim::set_owner(&old, &owner).unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+        assert!(matches!(
+            driver.sign_out(false).await,
+            Err(DriverError::NotRevoked(_))
+        ));
+        assert!(!paths.state_dir.join("leaving").exists());
+        driver.unlink(&old).await.unwrap();
+        drop(driver);
+        linked_to(&paths, &new, "d1", SPACE);
+        claim::set_owner(&new, &owner).unwrap();
+        fs::remove_file(paths.credential()).unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+        assert_eq!(driver.sign_out(true).await.unwrap(), []);
+        assert_eq!(
+            claim::owner(&new).unwrap(),
+            None,
+            "the current folder must be released, not only the old prepared root"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prepared_sign_out_releases_every_current_root_and_owner_after_credential_loss() {
+        for (same_root, device_id) in [(true, "d2"), (false, "d1")] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = fs::canonicalize(dir.path()).unwrap();
+            let paths = Paths::under(&base.join("profile"));
+            let root = base.join("Koidrive");
+            linked(&paths, &root, "d1");
+            let old = Owner {
+                server: NOWHERE.into(),
+                device_id: "d1".into(),
+            };
+            claim::set_owner(&root, &old).unwrap();
+            let driver = Driver::open(paths.clone()).unwrap();
+            let links = driver
+                .inner
+                .folders
+                .lock()
+                .unwrap()
+                .values()
+                .map(|folder| (&folder.link).into())
+                .collect();
+            Leaving::begin(
+                &paths.state_dir,
+                Intent {
+                    links,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            drop(driver);
+            let current_root = if same_root {
+                root.clone()
+            } else {
+                base.join("New")
+            };
+            linked_to(&paths, &current_root, device_id, SPACE);
+            let current = Owner {
+                device_id: device_id.into(),
+                ..old
+            };
+            claim::set_owner(&current_root, &current).unwrap();
+            fs::remove_file(paths.credential()).unwrap();
+
+            let driver = Driver::open(paths.clone()).unwrap();
+            assert_eq!(driver.sign_out(true).await.unwrap(), []);
+            assert_eq!(claim::owner(&root).unwrap(), None);
+            assert_eq!(claim::owner(&current_root).unwrap(), None);
+            assert!(!paths.store(SPACE).unwrap().parent().unwrap().exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_cleanup_preserves_a_new_owner_at_the_same_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let paths = Paths::under(&base.join("profile"));
+        let root = base.join("Koidrive");
+        linked(&paths, &root, "d1");
+        let driver = Driver::open(paths.clone()).unwrap();
+        let links = driver
+            .inner
+            .folders
+            .lock()
+            .unwrap()
+            .values()
+            .map(|folder| (&folder.link).into())
+            .collect();
+        let mut leaving = Leaving::begin(
+            &paths.state_dir,
+            Intent {
+                links,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        leaving.set_phase(Phase::Committed).unwrap();
+        drop(driver);
+        let replacement = Owner {
+            server: NOWHERE.into(),
+            device_id: "d2".into(),
+        };
+        claim::set_owner(&root, &replacement).unwrap();
+
+        let driver = Driver::open(paths.clone()).unwrap();
+        assert_eq!(driver.sign_out(false).await.unwrap(), []);
+        assert_eq!(claim::owner(&root).unwrap(), Some(replacement));
+        assert!(!paths.store(SPACE).unwrap().parent().unwrap().exists());
+    }
+
+    struct CleanupSyncProbe;
+
+    impl Drop for CleanupSyncProbe {
+        fn drop(&mut self) {
+            crate::leave::SYNC_HOOK.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+
+    async fn cleanup_parent_sync_failure_is_retryable(target: usize) {
+        use std::cell::{Cell, RefCell};
+        use std::os::unix::fs::MetadataExt;
+        use std::rc::Rc;
+
+        for reopen in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = fs::canonicalize(dir.path()).unwrap();
+            let paths = Paths::under(&base.join("profile"));
+            let root = base.join("Koidrive");
+            let other = base.join("Other");
+            let other_id = "0190f0a0-0000-7000-8000-000000000002";
+            linked(&paths, &root, "d1");
+            owned(&paths, &root);
+            linked_to(&paths, &other, "d1", other_id);
+            claim::set_owner(&other, &claim::owner(&root).unwrap().unwrap()).unwrap();
+            fs::write(root.join("keep.txt"), b"keep").unwrap();
+            fs::write(other.join("keep.txt"), b"keep too").unwrap();
+            let mut driver = Driver::open(paths.clone()).unwrap();
+            fs::write(next_path(&paths.credential()), b"unpromoted credential").unwrap();
+            let links = driver
+                .inner
+                .folders
+                .lock()
+                .unwrap()
+                .values()
+                .map(|folder| (&folder.link).into())
+                .collect();
+            let mut leaving = Leaving::begin(
+                &paths.state_dir,
+                Intent {
+                    links,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            leaving.set_phase(Phase::Committed).unwrap();
+            drop(leaving);
+            let parents = [
+                paths.state_dir.clone(),
+                paths.spaces(),
+                root.join(".koidrive"),
+                other.join(".koidrive"),
+            ];
+            let identities: Vec<_> = parents
+                .iter()
+                .map(|path| {
+                    let metadata = fs::metadata(path).unwrap();
+                    (metadata.dev(), metadata.ino())
+                })
+                .collect();
+            let fail = Rc::new(Cell::new(true));
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let _probe = CleanupSyncProbe;
+            crate::leave::SYNC_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new({
+                    let fail = fail.clone();
+                    let events = events.clone();
+                    let state = paths.state_dir.clone();
+                    let target = identities[target];
+                    move |dir| {
+                        let metadata = dir.metadata()?;
+                        let identity = (metadata.dev(), metadata.ino());
+                        events
+                            .borrow_mut()
+                            .push((identity, state.join("leaving").exists()));
+                        if fail.get() && identity == target {
+                            return Err(io::Error::other(
+                                "injected cleanup directory sync failure",
+                            ));
+                        }
+                        Ok(())
+                    }
+                }))
+            });
+            let failed = driver.sign_out(false).await.unwrap();
+            assert!(
+                !failed.is_empty(),
+                "sync failure was not reported for target {target}"
+            );
+            assert!(
+                failed.iter().all(|failure| failure
+                    .error
+                    .contains("injected cleanup directory sync failure")),
+                "{failed:?}"
+            );
+            assert!(
+                matches!(
+                    crate::leave::phase(&paths.state_dir),
+                    Ok(Some(Phase::Committed))
+                ),
+                "sync failure lost committed intent for target {target}"
+            );
+            assert!(
+                events.borrow().iter().all(|(_, recorded)| *recorded),
+                "a cleanup sync ran after journal removal"
+            );
+            assert!(!paths.credential().exists());
+            assert!(!next_path(&paths.credential()).exists());
+            assert_eq!(claim::owner(&root).unwrap(), None);
+            assert_eq!(claim::owner(&other).unwrap(), None);
+            assert!(!paths.store(SPACE).unwrap().parent().unwrap().exists());
+            assert!(!paths.store(other_id).unwrap().parent().unwrap().exists());
+            assert!(driver.status().account.is_none());
+            assert!(driver.status().folders.is_empty());
+            let boundary = events.borrow().len();
+            fail.set(false);
+            if reopen {
+                drop(driver);
+                driver = Driver::open(paths.clone()).unwrap();
+            }
+            assert_eq!(driver.sign_out(false).await.unwrap(), []);
+            let events = events.borrow();
+            let retry = &events[boundary..];
+            let (last, cleanup) = retry.split_last().unwrap();
+            assert_eq!(*last, (identities[0], false));
+            assert!(cleanup.iter().all(|(_, recorded)| *recorded));
+            for identity in &identities {
+                assert!(
+                    cleanup.iter().any(|(seen, _)| seen == identity),
+                    "retry did not flush an already-removed cleanup entry"
+                );
+            }
+            assert!(!paths.state_dir.join("leaving").exists());
+            assert_eq!(fs::read(root.join("keep.txt")).unwrap(), b"keep");
+            assert_eq!(fs::read(other.join("keep.txt")).unwrap(), b"keep too");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_store_parent_sync_keeps_committed_cleanup_for_retry() {
+        cleanup_parent_sync_failure_is_retryable(1).await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_owner_parent_sync_keeps_committed_cleanup_for_retry() {
+        cleanup_parent_sync_failure_is_retryable(2).await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_credential_parent_sync_keeps_committed_cleanup_for_retry() {
+        cleanup_parent_sync_failure_is_retryable(0).await;
+    }
+
+    #[tokio::test]
+    async fn absent_cleanup_parents_and_no_folders_do_not_block_sign_out() {
+        use std::cell::RefCell;
+        use std::os::unix::fs::MetadataExt;
+        use std::rc::Rc;
+
+        for linked_folder in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = fs::canonicalize(dir.path()).unwrap();
+            let paths = Paths::under(&base.join("profile"));
+            let root = base.join("Koidrive");
+            if linked_folder {
+                linked(&paths, &root, "d1");
+                owned(&paths, &root);
+                fs::write(root.join("keep.txt"), b"keep").unwrap();
+            }
+            let driver = Driver::open(paths.clone()).unwrap();
+            let links = driver
+                .inner
+                .folders
+                .lock()
+                .unwrap()
+                .values()
+                .map(|folder| (&folder.link).into())
+                .collect();
+            let mut leaving = Leaving::begin(
+                &paths.state_dir,
+                Intent {
+                    links,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            leaving.set_phase(Phase::Committed).unwrap();
+            drop(leaving);
+            drop(driver);
+            if linked_folder {
+                fs::remove_dir_all(root.join(".koidrive")).unwrap();
+                fs::remove_dir_all(paths.spaces()).unwrap();
+            }
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let _probe = CleanupSyncProbe;
+            crate::leave::SYNC_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new({
+                    let events = events.clone();
+                    let journal = paths.state_dir.join("leaving");
+                    move |dir| {
+                        let metadata = dir.metadata()?;
+                        events
+                            .borrow_mut()
+                            .push(((metadata.dev(), metadata.ino()), journal.exists()));
+                        Ok(())
+                    }
+                }))
+            });
+            let driver = Driver::open(paths.clone()).unwrap();
+            assert_eq!(driver.sign_out(false).await.unwrap(), []);
+            let metadata = fs::metadata(&paths.state_dir).unwrap();
+            let state = (metadata.dev(), metadata.ino());
+            let events = events.borrow();
+            assert!(
+                events.contains(&(state, true)),
+                "credential parent was not flushed before journal removal"
+            );
+            assert_eq!(events.last(), Some(&(state, false)));
+            if linked_folder {
+                let metadata = fs::metadata(&root).unwrap();
+                assert!(
+                    events.contains(&((metadata.dev(), metadata.ino()), true)),
+                    "missing owner parent was not made durable through its existing ancestor"
+                );
+                assert_eq!(fs::read(root.join("keep.txt")).unwrap(), b"keep");
+            }
+            assert!(!paths.state_dir.join("leaving").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sign_out_whose_owner_record_stays_after_the_revoke_finishes_when_run_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Koidrive");
+        let private = root.join(".koidrive");
+        let (server, served) = serve_calling(vec![access_token(), (204, Vec::new())], 1, {
+            let private = private.clone();
+            move || {
+                close_dir(&private);
+            }
+        })
+        .await;
+        let paths = linked_with_server(&base, server);
+        owned(&paths, &root);
+        let driver = Driver::open(paths.clone()).unwrap();
+
+        let failed = driver.sign_out(false).await;
+        let revoked = served.await.unwrap();
+        open_dir(&private);
+        if rustix::process::geteuid().is_root() {
+            eprintln!("SKIPPED: running as root, so permissions do not block writes");
+            return;
+        }
+        let failed = failed.unwrap();
+        assert_eq!(revoked, ["/v1/token", "/v1/devices/d1"]);
+        let [failure] = failed.as_slice() else {
+            panic!("one path stays: {failed:?}");
+        };
+        assert_eq!(failure.path, private.join("device.json"));
+        assert!(
+            failure.error.contains("ermission denied"),
+            "{}",
+            failure.error
+        );
+        assert_eq!(driver.status().account, None);
+        assert!(!paths.credential().exists());
+        assert!(driver.status().folders.is_empty());
+        assert!(!paths.store(SPACE).unwrap().parent().unwrap().exists());
+        drop(driver);
+
+        let driver = Driver::open(paths.clone()).unwrap();
+        assert_eq!(driver.sign_out(false).await.unwrap(), []);
+        assert_eq!(claim::owner(&root).unwrap(), None);
+        assert!(driver.status().folders.is_empty());
+        assert!(!paths.store(SPACE).unwrap().parent().unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn a_sign_out_whose_store_stays_after_the_revoke_finishes_when_run_again_after_a_restart()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Koidrive");
+        let spaces = Paths::under(&base.join("profile")).spaces();
+        let (server, served) = serve_calling(vec![access_token(), (204, Vec::new())], 1, {
+            let spaces = spaces.clone();
+            move || {
+                close_dir(&spaces);
+            }
+        })
+        .await;
+        let paths = linked_with_server(&base, server);
+        owned(&paths, &root);
+        let store_dir = paths.store(SPACE).unwrap().parent().unwrap().to_path_buf();
+        let driver = Driver::open(paths.clone()).unwrap();
+
+        let failed = driver.sign_out(false).await;
+        let revoked = served.await.unwrap();
+        open_dir(&spaces);
+        if rustix::process::geteuid().is_root() {
+            eprintln!("SKIPPED: running as root, so permissions do not block writes");
+            return;
+        }
+        let failed = failed.unwrap();
+        assert_eq!(revoked, ["/v1/token", "/v1/devices/d1"]);
+        let [failure] = failed.as_slice() else {
+            panic!("one path stays: {failed:?}");
+        };
+        assert_eq!(failure.path, store_dir);
+        assert_eq!(driver.status().account, None);
+        assert!(!paths.credential().exists());
+        assert_eq!(claim::owner(&root).unwrap(), None);
+        drop(driver);
+
+        let driver = Driver::open(paths.clone()).unwrap();
+        assert_eq!(driver.status().account, None);
+        assert_eq!(driver.sign_out(false).await.unwrap(), []);
+        assert!(driver.status().folders.is_empty());
+        assert!(!store_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn start_and_resume_cannot_replace_a_folder_task_during_sign_out() {
+        use tokio::io::AsyncWriteExt;
+
+        for held_at in [0, 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = fs::canonicalize(dir.path()).unwrap();
+            let root = base.join("Koidrive");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let server = format!("http://{}/", listener.local_addr().unwrap());
+            let paths = linked_with_server(&base, server.clone());
+            fs::write(root.join("file"), b"mine").unwrap();
+            Store::open(paths.store(SPACE).unwrap())
+                .unwrap()
+                .transaction(|tx| {
+                    let mut link = tx.link()?.unwrap();
+                    link.server_url = server.clone();
+                    tx.set_link(&link)
+                })
+                .unwrap();
+            claim::set_owner(
+                &root,
+                &Owner {
+                    server,
+                    device_id: "d1".into(),
+                },
+            )
+            .unwrap();
+            fs::write(paths.paused(), b"paused\n").unwrap();
+            let (arrived, waiting) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let served = tokio::spawn(async move {
+                let mut arrived = Some(arrived);
+                let mut released = Some(released);
+                for (i, (status, body)) in
+                    [access_token(), (204, Vec::new())].into_iter().enumerate()
+                {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let _ = read_request(&mut socket).await;
+                    if i == held_at {
+                        arrived.take().unwrap().send(()).unwrap();
+                        released.take().unwrap().await.unwrap();
+                    }
+                    let head = format!(
+                        "HTTP/1.1 {status} Reply\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    socket.write_all(head.as_bytes()).await.unwrap();
+                    socket.write_all(&body).await.unwrap();
+                }
+            });
+            let driver = Driver::open(paths.clone()).unwrap();
+            let signing_out = tokio::spawn({
+                let driver = driver.clone();
+                async move { driver.sign_out(false).await }
+            });
+            waiting.await.unwrap();
+            driver.start();
+            assert!(driver.resume().await.unwrap());
+            let replacement = driver
+                .inner
+                .folders
+                .lock()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .run
+                .as_ref()
+                .map(|run| run.done.clone());
+            release.send(()).unwrap();
+            let left = signing_out.await.unwrap();
+            served.await.unwrap();
+            assert!(
+                replacement.is_none(),
+                "a task started while sign-out held the startup barrier"
+            );
+            let left = left.unwrap();
+            assert!(left.is_empty(), "{left:?}");
+            signed_out(&driver, &paths, &root);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_commit_and_credential_deletion_cannot_reexpose_a_revoked_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Koidrive");
+        let state = Paths::under(&base.join("profile")).state_dir;
+        let revoked = koidrive_proto::v1::Error {
+            code: koidrive_proto::v1::error::Code::Unauthenticated.into(),
+            message: "this device was revoked".into(),
+            ..Default::default()
+        };
+        let (server, served) = serve_calling(
+            vec![
+                access_token(),
+                (204, Vec::new()),
+                (401, prost::Message::encode_to_vec(&revoked)),
+            ],
+            1,
+            {
+                let state = state.clone();
+                move || {
+                    close_dir(&state);
+                    crate::leave::FAIL_PHASE.with(|failure| failure.set(Some(Phase::Committed)));
+                }
+            },
+        )
+        .await;
+        let paths = linked_with_server(&base, server);
+        owned(&paths, &root);
+        let driver = Driver::open(paths.clone()).unwrap();
+        let left = driver.sign_out(false).await;
+        crate::leave::FAIL_PHASE.with(|failure| failure.set(None));
+        open_dir(&state);
+        if rustix::process::geteuid().is_root() {
+            served.abort();
+            let _ = served.await;
+            return;
+        }
+        let left = left.unwrap();
+        assert!(
+            left.iter()
+                .any(|failure| failure.path == state.join("leaving"))
+        );
+        assert!(
+            left.iter()
+                .any(|failure| failure.path == paths.credential())
+        );
+        assert!(paths.credential().exists());
+        assert!(matches!(
+            Credential::load(&paths.credential()),
+            Err(CredentialError::SignOutPending)
+        ));
+        assert_eq!(driver.status().account, None);
+        drop(driver);
+
+        let driver = Driver::open(paths.clone()).unwrap();
+        assert_eq!(driver.status().account, None);
+        driver.start();
+        assert!(driver.status().folders.is_empty());
+        assert_eq!(driver.sign_out(false).await.unwrap(), []);
+        assert_eq!(
+            served.await.unwrap(),
+            ["/v1/token", "/v1/devices/d1", "/v1/token"]
+        );
+        assert!(!paths.credential().exists());
+        assert!(!state.join("leaving").exists());
+    }
+
+    #[tokio::test]
+    async fn signing_out_attempts_every_cleanup_and_stays_signed_out_when_the_credential_cannot_be_deleted()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Koidrive");
+        let other = base.join("Other");
+        let paths = Paths::under(&base.join("profile"));
+        let private = root.join(".koidrive");
+        let store = paths.store(SPACE).unwrap().parent().unwrap().to_path_buf();
+        let (server, served) = serve_calling(vec![access_token(), (204, Vec::new())], 1, {
+            let private = private.clone();
+            let store = store.clone();
+            let state = paths.state_dir.clone();
+            move || {
+                close_dir(&private);
+                close_dir(&store);
+                close_dir(&state);
+            }
+        })
+        .await;
+        let paths = linked_with_server(&base, server);
+        owned(&paths, &root);
+        let other_id = "0190f0a0-0000-7000-8000-000000000002";
+        linked_to(&paths, &other, "d1", other_id);
+        claim::set_owner(
+            &other,
+            &Owner {
+                server: NOWHERE.into(),
+                device_id: "d1".into(),
+            },
+        )
+        .unwrap();
+        fs::write(root.join("keep.txt"), b"keep").unwrap();
+        fs::write(other.join("keep.txt"), b"keep too").unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+
+        let failed = driver.sign_out(false).await;
+        assert_eq!(served.await.unwrap(), ["/v1/token", "/v1/devices/d1"]);
+        open_dir(&private);
+        open_dir(&store);
+        open_dir(&paths.state_dir);
+        if rustix::process::geteuid().is_root() {
+            eprintln!("SKIPPED: running as root, so permissions do not block writes");
+            return;
+        }
+        let failed = failed.unwrap();
+        let mut remaining: Vec<_> = failed.iter().map(|failure| failure.path.clone()).collect();
+        remaining.sort();
+        let mut expected = vec![
+            paths.credential(),
+            private.join("device.json"),
+            store.clone(),
+        ];
+        expected.sort();
+        assert_eq!(remaining, expected, "{failed:?}");
+        assert_eq!(driver.status().account, None);
+        assert!(driver.status().folders.is_empty());
+        assert!(paths.credential().exists());
+        assert_eq!(claim::owner(&other).unwrap(), None);
+        assert_eq!(Credential::load(&paths.credential()).unwrap(), None);
+        assert!(
+            Credential::load_stored(&paths.credential())
+                .unwrap()
+                .is_none()
+        );
+        assert!(!paths.store(other_id).unwrap().parent().unwrap().exists());
+        drop(driver);
+
+        let driver = Driver::open(paths.clone()).unwrap();
+        assert_eq!(driver.status().account, None);
+        assert!(driver.status().folders.is_empty());
+        assert_eq!(driver.sign_out(false).await.unwrap(), []);
+        assert!(!paths.credential().exists());
+        assert_eq!(claim::owner(&root).unwrap(), None);
+        assert!(!store.exists());
+        assert!(!paths.state_dir.join("leaving").exists());
+        assert_eq!(fs::read(root.join("keep.txt")).unwrap(), b"keep");
+        assert_eq!(fs::read(other.join("keep.txt")).unwrap(), b"keep too");
     }
 
     #[tokio::test]
@@ -3502,14 +5151,14 @@ mod tests {
 
         let failed = driver.sign_out(true).await;
         open_dir(&private);
-        assert!(matches!(failed, Err(DriverError::Io { .. })), "{failed:?}");
-        assert!(watch.has_changed().unwrap());
+        assert!(
+            matches!(failed, Err(DriverError::UnlinkBlocked { .. })),
+            "{failed:?}"
+        );
         watch.borrow_and_update();
         let status = driver.status();
         assert_eq!(status.account.unwrap().device_id, "d1");
-        assert_eq!(status.folders[0].state, FolderState::Halted);
-        let problem = status.folders[0].problem.clone().unwrap();
-        assert!(problem.contains("could not be unlinked"), "{problem}");
+        assert_eq!(status.folders[0].problem, None);
         assert!(paths.credential().exists());
         assert!(paths.store(SPACE).unwrap().exists());
         assert!(claim::owner(&root).unwrap().is_some());
@@ -4554,6 +6203,7 @@ mod tests {
     fn a_question_stored_without_its_limits_names_them() {
         let decoded = |deletions, affected_files, space_files| {
             let question = Question {
+                recovery_cause: None,
                 id: "q1".into(),
                 space_id: SPACE.into(),
                 asked_at_ms: 1,

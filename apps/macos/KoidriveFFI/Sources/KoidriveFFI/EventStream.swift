@@ -3,18 +3,15 @@
 import Foundation
 
 extension SyncSession {
-    /// Opens the sync profile in `profileDirectory` with the sync driver, and the stream of its
-    /// events. The profile keeps this Mac's credential, its linked folders and their sync state
-    /// across relaunches; one process at a time can open it, so a second open throws
-    /// `SessionError.ProfileInUse`.
+    /// Opens the CLI's sync profile on this Mac through the `koi` at `helper`, and the stream of its events.
     ///
     /// The stream finishes when the Rust session is dropped, which happens once the last reference
-    /// to the returned session is released. Dropping it also releases the profile.
-    public static func openWithEventStream(profileDirectory: URL) throws -> (SyncSession, AsyncStream<SessionEvent>) {
+    /// to the returned session is released.
+    public static func openWithEventStream(helper: URL) throws -> (SyncSession, AsyncStream<SessionEvent>) {
         let (events, continuation) = AsyncStream.makeStream(of: SessionEvent.self)
         let session = try SyncSession.open(
             listener: EventRelay(continuation: continuation),
-            profileDir: profileDirectory.path(percentEncoded: false)
+            helper: helper.path(percentEncoded: false)
         )
         return (session, events)
     }

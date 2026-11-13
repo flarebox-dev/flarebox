@@ -528,8 +528,24 @@ pub fn version_of(binary: &Path) -> Option<Version> {
     Version::parse(printed.strip_prefix("koi ")?.trim()).ok()
 }
 
+fn volatile_binary(binary: &Path) -> bool {
+    let volatile = |path: &Path| {
+        path.starts_with("/Volumes")
+            || path
+                .components()
+                .any(|part| part.as_os_str() == "AppTranslocation")
+    };
+    volatile(binary) || fs::canonicalize(binary).is_ok_and(|path| volatile(&path))
+}
+
+const MOVE_TO_APPLICATIONS: &str =
+    "Move Koidrive to Applications, then open it again to enable background sync.";
+
 fn newer_installed(manager: &dyn Manager, service: &Service) -> Option<PathBuf> {
     let binary = PathBuf::from(manager.installed(service)?);
+    if volatile_binary(&binary) {
+        return None;
+    }
     let version = version_of(&binary)?;
     version
         .cmp_precedence(&this_version())
@@ -601,10 +617,21 @@ pub fn this_version() -> Version {
 }
 
 fn start(manager: &dyn Manager, service: &Service, daemon: &Daemon) -> Result<(), String> {
-    let installed = manager.installed(service);
+    let installed = manager
+        .installed(service)
+        .filter(|binary| !volatile_binary(Path::new(binary)));
+    let volatile = volatile_binary(Path::new(&service.binary));
+    if volatile && installed.is_none() {
+        return Err(MOVE_TO_APPLICATIONS.to_owned());
+    }
     let version = (installed.as_deref()).and_then(|binary| version_of(Path::new(binary)));
-    let target = target(version.as_ref(), &this_version(), daemon);
-    match (target.keep, installed) {
+    let caller = this_version();
+    let caller = match volatile {
+        true => version.as_ref().unwrap_or(&caller),
+        false => &caller,
+    };
+    let target = target(version.as_ref(), caller, daemon);
+    match (target.keep || volatile, installed) {
         (true, Some(binary)) => manager.start(
             &Service {
                 binary,
@@ -1746,6 +1773,111 @@ mod tests {
     }
 
     #[test]
+    fn mounted_and_translocated_binaries_are_volatile_but_installed_and_development_paths_are_not()
+    {
+        for binary in [
+            "/Volumes/Koidrive/Koidrive.app/Contents/Helpers/koi",
+            "/var/folders/ab/cd/T/AppTranslocation/123/d/Koidrive.app/Contents/Helpers/koi",
+            "/private/var/folders/ab/cd/T/AppTranslocation/123/d/Koidrive.app/Contents/Helpers/koi",
+        ] {
+            assert!(volatile_binary(Path::new(binary)), "{binary}");
+        }
+        for binary in [
+            "/Applications/Koidrive.app/Contents/Helpers/koi",
+            "/Users/ada/Applications/Koidrive.app/Contents/Helpers/koi",
+            "/Users/ada/koidrive/target/debug/koi",
+            "/Users/ada/Volumes/Koidrive.app/Contents/Helpers/koi",
+            "/Volumes-backup/Koidrive.app/Contents/Helpers/koi",
+            "/Applications/AppTranslocation.app/Contents/Helpers/koi",
+        ] {
+            assert!(!volatile_binary(Path::new(binary)), "{binary}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let translocated = dir.path().join("AppTranslocation/koi");
+        fs::create_dir_all(translocated.parent().unwrap()).unwrap();
+        fs::write(&translocated, "").unwrap();
+        let alias = dir.path().join("koi");
+        std::os::unix::fs::symlink(&translocated, &alias).unwrap();
+        assert!(volatile_binary(&alias));
+    }
+
+    #[test]
+    fn a_volatile_helper_cannot_install_a_service_or_replace_one_with_another_volatile_path() {
+        let caller = Service {
+            binary: "/Volumes/Koidrive/Koidrive.app/Contents/Helpers/koi".into(),
+            ..service(&[])
+        };
+        let fake = Fake::default();
+        let report = converge(&fake, &caller, 1, false, true, &Daemon::Absent);
+        assert_eq!(report.state, State::NotInstalled);
+        assert_eq!(report.problem.as_deref(), Some(MOVE_TO_APPLICATIONS));
+        assert!(report.text().contains("Move Koidrive to Applications"));
+        assert!(fake.unit.borrow().is_none());
+
+        running_on(
+            &fake,
+            Path::new("/Volumes/Older/Koidrive.app/Contents/Helpers/koi"),
+        );
+        let before = fake.unit.borrow().clone();
+        let report = converge(&fake, &caller, 1, false, true, &Daemon::Absent);
+        assert_eq!(report.problem.as_deref(), Some(MOVE_TO_APPLICATIONS));
+        assert_eq!(*fake.unit.borrow(), before);
+        assert_eq!(fake.restarts.get(), 0);
+    }
+
+    #[test]
+    fn a_volatile_helper_keeps_an_older_stable_service_and_can_start_it_without_repointing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let stable = koi_printing(dir.path(), "koi", "koi 0.0.1\n", 0);
+        let fake = Fake::default();
+        running_on(&fake, &stable);
+        let before = fake.unit.borrow().clone();
+        for binary in [
+            "/Volumes/Koidrive/Koidrive.app/Contents/Helpers/koi",
+            "/private/var/folders/ab/cd/T/AppTranslocation/123/d/Koidrive.app/Contents/Helpers/koi",
+        ] {
+            let caller = Service {
+                binary: binary.into(),
+                ..service(&[])
+            };
+            let daemon = Daemon::Running(Some(version("0.0.1")));
+            for _ in 0..2 {
+                let report = converge(&fake, &caller, 1, false, false, &daemon);
+                assert_eq!(report.state, State::Running);
+                assert!(report.problem.is_none());
+                assert_eq!(*fake.unit.borrow(), before);
+            }
+            assert_eq!(fake.restarts.get(), 0);
+
+            fake.running.set(false);
+            fake.switched_off.set(true);
+            let left = converge(&fake, &caller, 1, false, false, &Daemon::Absent);
+            assert_eq!(left.state, State::SwitchedOff);
+            let started = converge(&fake, &caller, 1, false, true, &Daemon::Absent);
+            assert_eq!((started.state, started.started), (State::Running, true));
+            assert!(started.problem.is_none());
+            assert_eq!(*fake.unit.borrow(), before);
+        }
+    }
+
+    #[test]
+    fn a_stable_helper_replaces_a_volatile_service_even_when_it_reports_a_newer_version() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("AppTranslocation")).unwrap();
+        let volatile = koi_printing(dir.path(), "AppTranslocation/koi", "koi 99.0.0\n", 0);
+        let fake = Fake::default();
+        running_on(&fake, &volatile);
+        let caller = service(&[]);
+        assert_eq!(newer_installed(&fake, &caller), None);
+        let report = converge(&fake, &caller, 1, false, false, &Daemon::Absent);
+        assert_eq!(report.state, State::Running);
+        assert!(report.problem.is_none());
+        assert_eq!(runs(&fake), caller.binary);
+        assert_eq!(fake.restarts.get(), 1);
+    }
+
+    #[test]
     fn a_service_on_a_newer_koi_keeps_it_and_one_on_an_older_or_broken_koi_moves_to_this_one() {
         let dir = tempfile::tempdir().unwrap();
         let caller = service(&[]);
@@ -1839,6 +1971,72 @@ mod tests {
         }
         assert_eq!(runs(&fake), same.to_str().unwrap());
         assert_eq!(fake.restarts.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn resume_without_a_daemon_starts_the_service_implicitly() {
+        let (_dir, paths, _root) = crate::ipc::tests::linked_profile();
+        assert_eq!(
+            ipc::run(&paths, Request::Pause).await.unwrap(),
+            Response::Paused
+        );
+        assert_eq!(crate::resume(&paths).await.unwrap().text, "Resumed sync.\n");
+        assert!(!paths.paused().exists());
+        assert!(!paths.socket().exists());
+        let fake = Fake::default();
+        let caller = service(&[]);
+        let mut daemon = None;
+        let start_daemon = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !fake.running.get() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("implicit reconciliation starts the service");
+            let driver = koidrive_driver::Driver::open(paths.clone()).unwrap();
+            driver.start();
+            daemon = Some(tokio::spawn(ipc::serve(
+                koidrive_ipc::bind(&paths.socket()).unwrap(),
+                driver,
+            )));
+        };
+        let (report, ()) = tokio::join!(
+            reconcile_with(&fake, Ok(caller), &paths, false),
+            start_daemon
+        );
+        assert_eq!(
+            (report.state, report.started, report.problem),
+            (State::Running, true, None)
+        );
+        let daemon = daemon.unwrap();
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
+    #[tokio::test]
+    async fn resume_without_a_daemon_preserves_disabled_login_items() {
+        let (_dir, paths, _root) = crate::ipc::tests::linked_profile();
+        assert_eq!(
+            ipc::run(&paths, Request::Pause).await.unwrap(),
+            Response::Paused
+        );
+        crate::resume(&paths).await.unwrap();
+        let fake = Fake::default();
+        let caller = service(&[]);
+        *fake.unit.borrow_mut() = Some(caller.unit());
+        fake.switched_off.set(true);
+
+        let report = reconcile_with(&fake, Ok(caller), &paths, false).await;
+
+        assert_eq!(
+            (report.state, report.started, report.problem),
+            (State::SwitchedOff, false, None)
+        );
+        assert!(!fake.running.get());
+        assert!(fake.switched_off.get());
+        assert!(!paths.paused().exists());
+        assert!(!paths.socket().exists());
     }
 
     #[tokio::test]

@@ -549,6 +549,7 @@ private struct ProblemRow: View {
                 Text(problem.kind.advice)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
                 Text("Since \(Date(milliseconds: problem.sinceMs), format: .dateTime.day().month(.abbreviated).hour().minute())")
                     .font(.caption)
                     .foregroundStyle(.secondary)

@@ -53,6 +53,22 @@ details="$(codesign --display --verbose=4 "$app" 2>&1)"
 echo "$details" | grep -E '^(Identifier|Format|CodeDirectory|Signature|Authority|Timestamp|TeamIdentifier|Runtime Version)'
 grep -qE '^CodeDirectory .*flags=0x[0-9a-f]*\(.*runtime' <<<"$details" || fail "The app is not signed with the hardened runtime."
 
+echo "== Contents/Helpers/koi"
+helper="$app/Contents/Helpers/koi"
+[ -x "$helper" ] || fail "The app has no Contents/Helpers/koi."
+expected="$(plutil -extract KoidriveVersion raw -o - "$app/Contents/Info.plist" 2>/dev/null || echo "${VERSION:-}")"
+reported="$("$helper" --version)" || fail "Contents/Helpers/koi does not run."
+echo "$reported"
+[ "$reported" = "koi $expected" ] || fail "Contents/Helpers/koi reports '$reported', but the app is $expected."
+codesign --verify --strict --verbose=2 "$helper" || fail "codesign could not verify the signature of Contents/Helpers/koi."
+helper_details="$(codesign --display --verbose=4 "$helper" 2>&1)"
+echo "$helper_details" | grep -E '^(Identifier|Signature|Authority|Timestamp|TeamIdentifier)'
+grep -qE '^CodeDirectory .*flags=0x[0-9a-f]*\(.*runtime' <<<"$helper_details" || fail "Contents/Helpers/koi is not signed with the hardened runtime."
+if [ "$mode" = signed ]; then
+  grep -q '^Authority=Developer ID Application: ' <<<"$helper_details" || fail "Contents/Helpers/koi is not signed with a Developer ID Application certificate."
+  grep -q '^Timestamp=' <<<"$helper_details" || fail "The signature of Contents/Helpers/koi has no secure timestamp."
+fi
+
 echo "== Entitlements"
 entitlements="$(codesign --display --entitlements - --xml "$app" 2>/dev/null)"
 echo "${entitlements:-<none>}"

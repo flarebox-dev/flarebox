@@ -29,7 +29,7 @@ use koidrive_store::{Cursor, EngineState, Error, StoredQuestion, SyncedNode, Tx}
 
 use crate::disk::Stop;
 use crate::observe::{Observed, Reset, RulesChange};
-use crate::question::{HeldItem, Question};
+use crate::question::{HeldItem, Question, RecoveryCause};
 
 pub(crate) struct Engine {
     pub trees: Trees,
@@ -43,6 +43,7 @@ pub(crate) struct Engine {
     /// Whether [`Engine::ask`] changed the stored questions since the folder last showed them, also when their
     /// number did not, as when a question is asked again under a new id or a notice's counts grow.
     pub asked: bool,
+    pub recovery_cause: Option<RecoveryCause>,
     unscanned: Option<BTreeSet<NodeId>>,
 }
 
@@ -109,6 +110,7 @@ impl Engine {
             cursor: tx.cursor()?,
             stored,
             asked: false,
+            recovery_cause: None,
             unscanned: None,
         })
     }
@@ -185,11 +187,16 @@ impl Engine {
                 .filter(|lineage| !lineage.is_empty())
                 .unwrap_or_else(|| row.question_id.clone())
         };
-        let replaced: Vec<(&engine::Question, String)> = (asked.iter())
+        let cause = |row: &StoredQuestion| {
+            serde_json::from_slice::<Question>(&row.body)
+                .ok()
+                .and_then(|shown| shown.recovery_cause)
+        };
+        let replaced: Vec<(&engine::Question, String, Option<RecoveryCause>)> = (asked.iter())
             .filter(|question| !open(asking, &question.id))
             .filter_map(|question| {
                 let row = rows.get(&question.id).filter(|row| row.answer.is_none())?;
-                Some((question, lineage(row)))
+                Some((question, lineage(row), cause(row)))
             })
             .collect();
         for question in asked.iter().filter(|question| !open(asking, &question.id)) {
@@ -202,8 +209,10 @@ impl Engine {
             let kept = rows
                 .get(&question.id)
                 .map_or_else(|| question.id.clone(), lineage);
-            let body = serde_json::to_vec(&self.shown(tx, space_id, question, kept)?)
-                .expect("a question serializes");
+            let recovery_cause = rows.get(&question.id).and_then(cause);
+            let body =
+                serde_json::to_vec(&self.shown(tx, space_id, question, kept, recovery_cause)?)
+                    .expect("a question serializes");
             tx.reshow_question(&question.id, &body)?;
             changed = true;
         }
@@ -220,8 +229,9 @@ impl Engine {
             let Some(row) = rows.get(&question.id) else {
                 continue;
             };
-            let body = serde_json::to_vec(&self.shown(tx, space_id, question, lineage(row))?)
-                .expect("a question serializes");
+            let body =
+                serde_json::to_vec(&self.shown(tx, space_id, question, lineage(row), None)?)
+                    .expect("a question serializes");
             if body != row.body {
                 tx.reshow_question(&question.id, &body)?;
                 changed = true;
@@ -234,9 +244,18 @@ impl Engine {
             .iter()
             .filter(|question| !open(asked, &question.id) || dropped(question) || unshown(question))
         {
-            let continued = (replaced.iter())
-                .find(|(before, _)| same_kind(&before.kind, &question.kind))
-                .map_or_else(|| question.id.clone(), |(_, lineage)| lineage.clone());
+            let previous =
+                (replaced.iter()).find(|(before, _, _)| same_kind(&before.kind, &question.kind));
+            let continued =
+                previous.map_or_else(|| question.id.clone(), |(_, lineage, _)| lineage.clone());
+            let recovery_cause = rows
+                .get(&question.id)
+                .and_then(cause)
+                .or_else(|| previous.and_then(|(_, _, cause)| cause.clone()))
+                .or_else(|| match question.kind {
+                    engine::QuestionKind::Recovery { .. } => self.recovery_cause.clone(),
+                    _ => None,
+                });
             tracing::warn!(
                 space_id,
                 question_id = question.id,
@@ -248,13 +267,20 @@ impl Engine {
             tx.put_question(&StoredQuestion {
                 question_id: question.id.clone(),
                 asked_at_ms: question.asked_at_ms as i64,
-                body: serde_json::to_vec(&self.shown(tx, space_id, question, continued)?)
-                    .expect("a question serializes"),
+                body: serde_json::to_vec(&self.shown(
+                    tx,
+                    space_id,
+                    question,
+                    continued,
+                    recovery_cause,
+                )?)
+                .expect("a question serializes"),
                 answer: None,
             })?;
             changed = true;
         }
         self.asked |= changed;
+        self.recovery_cause = None;
         Ok(())
     }
 
@@ -266,6 +292,7 @@ impl Engine {
         space_id: &str,
         asked: &engine::Question,
         lineage: String,
+        recovery_cause: Option<RecoveryCause>,
     ) -> Result<Question, Error> {
         let mut items: Vec<HeldItem> = match &asked.kind {
             engine::QuestionKind::Conflict { original, copy, .. } => [original, copy]
@@ -300,6 +327,7 @@ impl Engine {
             kind,
             items,
             lineage,
+            recovery_cause,
         })
     }
 
@@ -1662,10 +1690,65 @@ mod tests {
             .unwrap();
     }
 
-    /// The engine dropped the answer to a conflict without sending an op, as it does for keep the copy when R's record
-    /// of the copy leaves out its chunk list. It still asks the question under the same id and kind, and
-    /// `accept_answers` removed its row when it took the answer. Asking puts the row back unanswered and marks the
-    /// questions changed.
+    #[test]
+    fn stored_recovery_causes_survive_a_restart_and_a_replaced_question() {
+        for cause in [
+            None,
+            Some(RecoveryCause {
+                trigger: crate::RecoveryTrigger::SpaceRewound,
+                restore_point_ms: Some(1_794_442_424_000),
+            }),
+            Some(RecoveryCause {
+                trigger: crate::RecoveryTrigger::Unknown,
+                restore_point_ms: None,
+            }),
+        ] {
+            let (_dir, mut store) = store();
+            let asking = engine::Question {
+                id: "recovery-1".into(),
+                asked_at_ms: 1,
+                kind: engine::QuestionKind::Recovery {
+                    group: engine::RecoveryGroup::CreatedAfterRestorePoint,
+                },
+                held: BTreeMap::new(),
+                answer: None,
+                shown: BTreeMap::new(),
+            };
+            store
+                .transaction(|tx| {
+                    let mut engine = Engine::load(tx, ROOT)?;
+                    engine.commits = Commits::from_state(CommitsState {
+                        questions: vec![asking.clone()],
+                        ..Default::default()
+                    })
+                    .unwrap();
+                    engine.recovery_cause = cause.clone();
+                    engine.ask(tx, ROOT)?;
+                    engine.checkpoint(tx)?;
+                    Ok::<_, Error>(())
+                })
+                .unwrap();
+            store
+                .transaction(|tx| {
+                    let mut engine = Engine::load(tx, ROOT)?;
+                    let mut state = engine.commits.state();
+                    state.questions[0].id = "recovery-2".into();
+                    engine.commits = Commits::from_state(state).unwrap();
+                    engine.ask(tx, ROOT)?;
+                    let rows = tx.questions()?;
+                    assert_eq!(rows.len(), 1);
+                    let shown: Question = serde_json::from_slice(&rows[0].body).unwrap();
+                    assert_eq!(shown.id, "recovery-2");
+                    assert_eq!(shown.lineage, "recovery-1");
+                    assert_eq!(shown.kind, asking.kind);
+                    assert_eq!(shown.recovery_cause, cause);
+                    engine.checkpoint(tx)?;
+                    Ok::<_, Error>(())
+                })
+                .unwrap();
+        }
+    }
+
     #[test]
     fn a_conflict_answer_dropped_before_it_was_sent_is_shown_again_under_the_same_id() {
         use engine::{Answer, ConflictFile, QuestionKind, Revisions};
@@ -1809,6 +1892,7 @@ mod tests {
             cursor: None,
             stored: EngineState::default(),
             asked: false,
+            recovery_cause: None,
             unscanned: None,
         };
         Case {

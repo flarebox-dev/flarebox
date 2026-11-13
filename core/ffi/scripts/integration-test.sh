@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Runs the app session's tests against the Worker in server/ under wrangler dev, with fresh local state.
 # Needs the server's dependencies (pnpm install in server/). Extra arguments go to the test binary.
 
 set -euo pipefail
@@ -34,7 +33,9 @@ trap cleanup EXIT
 
 # Build first, so the Worker is not kept waiting for the compiler.
 cd "$root"
-cargo test -p koidrive-ffi --locked --test server --no-run
+cargo build -p koidrive-cli --locked
+cargo test -p koidrive-ffi --locked --lib --no-run
+koi="${CARGO_TARGET_DIR:-$root/target}/debug/koi"
 
 # set -m puts the server in its own process group, so cleanup stops workerd with it.
 (cd "$root/server" && WRANGLER_SEND_METRICS=false exec "$wrangler" dev --ip 127.0.0.1 --port "$port" \
@@ -56,5 +57,5 @@ if ! grep -q "Ready on" "$log"; then
   exit 1
 fi
 
-KOIDRIVE_TEST_SERVER="http://127.0.0.1:$port" KOIDRIVE_TEST_SERVER_LOG="$log" \
-  cargo test -p koidrive-ffi --locked --test server -- --ignored --nocapture "$@"
+KOIDRIVE_TEST_SERVER="http://127.0.0.1:$port" KOIDRIVE_TEST_SERVER_LOG="$log" KOIDRIVE_TEST_KOI="$koi" DO_NOT_TRACK=1 \
+  cargo test -p koidrive-ffi --locked --lib -- --ignored --nocapture "$@"

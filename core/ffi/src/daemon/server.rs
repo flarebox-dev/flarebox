@@ -1,26 +1,48 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::ffi::OsString;
 use std::fs;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use koidrive_driver as driver;
-use koidrive_ffi::{
-    Answer, FolderState, LinkedFolder, MassDeleteLimit, Notice, NoticeKind, Problem, ProblemKind,
-    Question, QuestionKind, RecoveryGroup, SessionError, SessionEvent, SessionListener,
-    SessionState, SyncSession, SyncStatus,
-};
 use koidrive_net::Auth;
 use koidrive_store::{Store, StoredQuestion};
 
+use super::*;
+use crate::core::SessionListener;
+use crate::types::{
+    FolderState, MassDeleteLimit, Notice, NoticeKind, Problem, ProblemKind, Question, QuestionKind,
+    RecoveryGroup,
+};
+
 const WAIT: Duration = Duration::from_secs(30);
+
+const PROFILE_CONFIG: &str = "[service]\nbackground = false\n\n[updates]\ncheck = false\n";
+
+#[test]
+fn integration_profile_disables_background_service_and_update_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    fs::write(&path, PROFILE_CONFIG).unwrap();
+    let config = driver::Config::load(&path).unwrap();
+    assert!(!config.service.background);
+    assert!(!config.updates.check);
+}
 
 fn server_url() -> String {
     std::env::var("KOIDRIVE_TEST_SERVER").expect(
         "KOIDRIVE_TEST_SERVER is not set; run core/ffi/scripts/integration-test.sh, which starts the Worker",
     )
+}
+
+fn koi() -> PathBuf {
+    std::env::var_os("KOIDRIVE_TEST_KOI")
+        .expect("KOIDRIVE_TEST_KOI is not set; run core/ffi/scripts/integration-test.sh, which builds koi")
+        .into()
 }
 
 fn claim_code() -> String {
@@ -42,7 +64,7 @@ fn claim_code() -> String {
             return code;
         }
         assert!(started.elapsed() < WAIT, "no claim code in {log}");
-        std::thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -114,46 +136,111 @@ impl Mirror {
 
 struct Device {
     home: tempfile::TempDir,
-    session: Option<Arc<SyncSession>>,
+    daemon: Option<Child>,
+    core: Option<Arc<DaemonCore>>,
     seen: Arc<Seen>,
+    listener: Option<Arc<Box<dyn SessionListener>>>,
     opened: Option<SessionState>,
 }
 
 impl Device {
     fn new() -> Self {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("config/koidrive");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(config.join("config.toml"), PROFILE_CONFIG).unwrap();
+        fs::create_dir_all(home.path().join("home")).unwrap();
         let mut device = Device {
-            home: tempfile::tempdir().unwrap(),
-            session: None,
+            home,
+            daemon: None,
+            core: None,
             seen: Arc::default(),
+            listener: None,
             opened: None,
         };
+        device.start_daemon();
         device.reopen();
         device
     }
 
-    fn profile(&self) -> PathBuf {
-        self.home.path().join("profile")
+    fn env(&self) -> Vec<(&'static str, Option<OsString>)> {
+        let dir = |name: &str| Some(self.path(name).into_os_string());
+        vec![
+            ("HOME", dir("home")),
+            ("XDG_CONFIG_HOME", dir("config")),
+            ("XDG_STATE_HOME", dir("state")),
+            ("XDG_RUNTIME_DIR", None),
+        ]
+    }
+
+    fn paths(&self) -> driver::Paths {
+        let env = self.env();
+        driver::Paths::from_vars(|name| {
+            let (_, value) = env.iter().find(|(set, _)| *set == name)?;
+            value.clone()
+        })
+        .unwrap()
     }
 
     fn path(&self, rel: &str) -> PathBuf {
         self.home.path().join(rel)
     }
 
-    fn session(&self) -> &SyncSession {
-        self.session.as_ref().unwrap()
+    fn start_daemon(&mut self) {
+        let log = fs::File::create(self.path("daemon.log")).unwrap();
+        let mut command = Command::new(koi());
+        command
+            .arg("_daemon")
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log);
+        for (name, value) in self.env() {
+            match value {
+                Some(value) => command.env(name, value),
+                None => command.env_remove(name),
+            };
+        }
+        self.daemon = Some(command.spawn().unwrap());
+        let socket = self.paths().socket();
+        let started = Instant::now();
+        while UnixStream::connect(&socket).is_err() {
+            let log = fs::read_to_string(self.path("daemon.log")).unwrap_or_default();
+            assert!(started.elapsed() < WAIT, "the daemon did not answer: {log}");
+            thread::sleep(Duration::from_millis(20));
+        }
+        if let Some(core) = &self.core {
+            core.wake.notify_one();
+        }
+    }
+
+    fn stop_daemon(&mut self) {
+        let Some(mut daemon) = self.daemon.take() else {
+            return;
+        };
+        let _ = Command::new("kill")
+            .args(["-TERM", &daemon.id().to_string()])
+            .status();
+        daemon.wait().unwrap();
+    }
+
+    fn session(&self) -> &DaemonCore {
+        self.core.as_ref().unwrap()
     }
 
     fn reopen(&mut self) {
-        self.session = None;
+        self.core = None;
         self.seen = Arc::default();
-        let opened = SyncSession::open(
-            Box::new(Recorder(self.seen.clone())),
-            path_str(&self.profile()),
-        );
-        let session = opened.unwrap();
+        let listener: Arc<Box<dyn SessionListener>> =
+            Arc::new(Box::new(Recorder(self.seen.clone())));
+        let profile = Profile {
+            paths: self.paths(),
+            env: self.env(),
+        };
+        let core = DaemonCore::open(koi(), profile, Events::new(&listener)).unwrap();
         self.seen.events.lock().unwrap().clear();
-        self.opened = Some(session.state());
-        self.session = Some(session);
+        self.opened = Some(core.state());
+        self.core = Some(core);
+        self.listener = Some(listener);
     }
 
     fn until(&self, what: &str, done: impl Fn(&Mirror) -> bool) -> Mirror {
@@ -172,10 +259,17 @@ impl Device {
             events = self.seen.changed.wait_timeout(events, left).unwrap().0;
         }
     }
+
+    fn keep_credential(&self, copy: &Path) {
+        fs::copy(self.paths().credential(), copy).unwrap();
+    }
 }
 
-fn keep_credential(profile: &Path, copy: &Path) {
-    fs::copy(driver::Paths::under(profile).credential(), copy).unwrap();
+impl Drop for Device {
+    fn drop(&mut self) {
+        self.core = None;
+        self.stop_daemon();
+    }
 }
 
 fn accepted(copy: &Path) -> bool {
@@ -194,55 +288,42 @@ fn path_str(path: &Path) -> String {
 }
 
 #[test]
-#[ignore = "needs the Worker; run core/ffi/scripts/integration-test.sh"]
-fn the_app_claims_pairs_links_and_follows_the_driver() {
+#[ignore = "needs the Worker and koi; run core/ffi/scripts/integration-test.sh"]
+fn the_app_claims_pairs_links_and_follows_the_daemon() {
     let server = server_url();
 
     let mut mac = Device::new();
-    assert!(matches!(
-        SyncSession::open(Box::new(Recorder(Arc::default())), path_str(&mac.profile())),
-        Err(SessionError::ProfileInUse)
-    ));
     mac.session().start();
     mac.until("setup being needed", |m| m.status == SyncStatus::NeedsSetup);
     assert_eq!(mac.session().spaces(), Err(SessionError::NotSignedIn));
     assert_eq!(
-        mac.session()
-            .claim("ABCD-EFGH".into(), "Ada".into(), "Mac".into()),
+        mac.session().claim("ABCD-EFGH", "Ada", "Mac"),
         Err(SessionError::NoServer)
     );
 
-    let unclaimed = mac.session().connect(format!("{server}/")).unwrap();
+    let unclaimed = mac.session().connect(&format!("{server}/")).unwrap();
     assert_eq!(unclaimed.url, server.trim_end_matches('/'));
     assert!(!unclaimed.claimed);
     assert_eq!(
-        mac.session().connect("files.example.com".into()),
+        mac.session().connect("files.example.com"),
         Err(SessionError::InvalidServerUrl)
     );
     let code = claim_code();
     assert_eq!(
-        mac.session()
-            .claim("WRONG-CODE".into(), "Ada".into(), "Mac".into()),
+        mac.session().claim("WRONG-CODE", "Ada", "Mac"),
         Err(SessionError::InvalidCode)
     );
-    let owner = mac
-        .session()
-        .claim(code, "Ada".into(), "Ada's Mac".into())
-        .unwrap();
+    let owner = mac.session().claim(&code, "Ada", "Ada's Mac").unwrap();
     assert_eq!(owner.device_name, "Ada's Mac");
     assert_eq!(owner.user_name, "Ada");
-    assert!(mac.session().connect(server.clone()).unwrap().claimed);
+    assert!(mac.session().connect(&server).unwrap().claimed);
     mac.until("the account arriving", |m| m.signed_in);
 
-    let space = mac.session().create_space("Documents".into()).unwrap();
+    let space = mac.session().create_space("Documents").unwrap();
     assert!(
-        mac.session()
-            .spaces()
-            .unwrap()
-            .iter()
-            .any(|listed| listed.space_id == space.space_id)
+        (mac.session().spaces().unwrap().iter()).any(|listed| listed.space_id == space.space_id)
     );
-    let usage = mac.session().space_usage(space.space_id.clone()).unwrap();
+    let usage = mac.session().space_usage(&space.space_id).unwrap();
     assert_eq!(
         (usage.live_files, usage.live_bytes, usage.unreferenced_bytes),
         (0, 0, 0)
@@ -252,17 +333,12 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
     fs::write(folder.join("notes.txt"), b"notes").unwrap();
     assert!(matches!(
         mac.session()
-            .link_folder(space.space_id.clone(), path_str(&mac.profile())),
-        Err(SessionError::FolderOverlaps { .. })
+            .link_folder(&space.space_id, &path_str(&mac.path("Missing"))),
+        Err(SessionError::Failed { .. })
     ));
-    assert_eq!(
-        mac.session()
-            .link_folder(space.space_id.clone(), path_str(&mac.path("Missing"))),
-        Err(SessionError::FolderNotFound)
-    );
     let linked = mac
         .session()
-        .link_folder(space.space_id.clone(), path_str(&folder))
+        .link_folder(&space.space_id, &path_str(&folder))
         .unwrap();
     assert_eq!(linked.space_name, "Documents");
     let synced = mac.until("the first sync", |m| {
@@ -286,27 +362,32 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
     mac.until("sync after resuming", |m| m.status == SyncStatus::Idle);
 
     let pairing = mac.session().start_pairing().unwrap();
-    let other = Device::new();
-    other.session().connect(server.clone()).unwrap();
     assert_eq!(
-        other.session().pair("AAAA-BBBB".into(), "Laptop".into()),
+        pairing.code.split_whitespace().skip(1).collect::<Vec<_>>(),
+        ["--server", &format!("{server}/")]
+    );
+    let other = Device::new();
+    other.session().connect(&server).unwrap();
+    assert_eq!(
+        other.session().pair("AAAA-BBBB", "Laptop"),
         Err(SessionError::InvalidCode)
     );
-    let paired = other.session().pair(pairing.code, "Laptop".into()).unwrap();
+    let paired = other.session().pair(&pairing.code, "Laptop").unwrap();
     assert_eq!(paired.user_id, owner.user_id);
     assert_ne!(paired.device_id, owner.device_id);
     let other_folder = other.path("Documents");
     fs::create_dir_all(&other_folder).unwrap();
     other
         .session()
-        .link_folder(space.space_id.clone(), path_str(&other_folder))
+        .link_folder(&space.space_id, &path_str(&other_folder))
         .unwrap();
     other.session().start();
     other.until("the paired device's first sync", |m| {
         m.status == SyncStatus::Idle
     });
+    assert_eq!(fs::read(other_folder.join("notes.txt")).unwrap(), b"notes");
     let kept = other.path("credential");
-    keep_credential(&other.profile(), &kept);
+    other.keep_credential(&kept);
     other.session().sign_out(false).unwrap();
     other.until("the paired device's sign-out", |m| !m.signed_in);
     assert!(!accepted(&kept));
@@ -321,9 +402,9 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
     };
     assert_eq!(listed(&mac), [("Ada's Mac".to_owned(), true)]);
     let old = Device::new();
-    old.session().connect(server.clone()).unwrap();
+    old.session().connect(&server).unwrap();
     let pairing = mac.session().start_pairing().unwrap();
-    let old_account = old.session().pair(pairing.code, "Old Mac".into()).unwrap();
+    let old_account = old.session().pair(&pairing.code, "Old Mac").unwrap();
     assert_eq!(
         listed(&mac),
         [
@@ -339,31 +420,16 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
         ]
     );
     assert_eq!(
-        mac.session().revoke_device(owner.device_id.clone()),
+        mac.session().revoke_device(&owner.device_id),
         Err(SessionError::ThisDevice)
     );
-    assert_eq!(
-        mac.session()
-            .revoke_device(format!("{}?confirm=last-device", owner.device_id)),
-        Err(SessionError::DeviceNotFound)
-    );
-    assert_eq!(
-        listed(&mac),
-        [
-            ("Ada's Mac".to_owned(), true),
-            ("Old Mac".to_owned(), false)
-        ]
-    );
     let old_kept = old.path("credential");
-    keep_credential(&old.profile(), &old_kept);
-    mac.session()
-        .revoke_device(old_account.device_id.clone())
-        .unwrap();
+    old.keep_credential(&old_kept);
+    mac.session().revoke_device(&old_account.device_id).unwrap();
     assert!(!accepted(&old_kept));
     assert_eq!(listed(&mac), [("Ada's Mac".to_owned(), true)]);
     assert_eq!(
-        mac.session()
-            .revoke_device("0190b6a5-0000-7000-8000-000000000000".into()),
+        mac.session().revoke_device(&old_account.device_id),
         Err(SessionError::DeviceNotFound)
     );
     drop(old);
@@ -371,6 +437,7 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
     let held = driver::Question {
         id: "q-mass-delete".into(),
         lineage: "q-mass-delete".into(),
+        recovery_cause: None,
         space_id: space.space_id.clone(),
         asked_at_ms: 1,
         kind: driver::QuestionKind::MassDelete {
@@ -389,6 +456,7 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
     let noticed = driver::Question {
         id: "n-remote-mass-delete".into(),
         lineage: "n-remote-mass-delete".into(),
+        recovery_cause: None,
         space_id: space.space_id.clone(),
         asked_at_ms: 2,
         kind: driver::QuestionKind::RemoteMassDelete {
@@ -399,10 +467,9 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
         },
         items: Vec::new(),
     };
-    let store = mac
-        .profile()
-        .join(format!("state/spaces/{}/store.sqlite", space.space_id));
-    mac.session().stop();
+    let store = mac.paths().store(&space.space_id).unwrap();
+    mac.stop_daemon();
+    mac.until("the daemon leaving", |m| m.status == SyncStatus::Stopped);
     Store::open(&store)
         .unwrap()
         .transaction(|tx| {
@@ -417,7 +484,7 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
             Ok::<_, koidrive_store::Error>(())
         })
         .unwrap();
-    mac.session().start();
+    mac.start_daemon();
     let asked = mac.until("the stored question and notice", |m| {
         m.questions.len() == 1 && m.notices.len() == 1
     });
@@ -431,18 +498,18 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
         }
     );
     assert_eq!(
-        mac.session().dismiss_notice(held.id.clone()),
+        mac.session().dismiss_notice(&held.id),
         Err(SessionError::NoticeNotFound),
         "a question is not a notice"
     );
     assert_eq!(
-        mac.session().answer(noticed.id.clone(), Answer::Delete),
+        mac.session().answer(&noticed.id, Answer::Delete),
         Err(SessionError::AnswerNotAllowed)
     );
-    mac.session().dismiss_notice(noticed.id.clone()).unwrap();
+    mac.session().dismiss_notice(&noticed.id).unwrap();
     mac.until("the dismissed notice leaving", |m| m.notices.is_empty());
     assert_eq!(
-        mac.session().dismiss_notice(noticed.id),
+        mac.session().dismiss_notice(&noticed.id),
         Err(SessionError::NoticeNotFound)
     );
     assert_eq!(
@@ -450,21 +517,19 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
         vec![Answer::Delete, Answer::Restore]
     );
     assert_eq!(
-        mac.session().answer(held.id.clone(), Answer::Keep),
+        mac.session().answer(&held.id, Answer::Keep),
         Err(SessionError::AnswerNotAllowed)
     );
-    mac.session()
-        .answer(held.id.clone(), Answer::Restore)
-        .unwrap();
+    mac.session().answer(&held.id, Answer::Restore).unwrap();
     mac.until("the answered question leaving", |m| m.questions.is_empty());
     assert_eq!(
-        mac.session().answer(held.id, Answer::Restore),
+        mac.session().answer(&held.id, Answer::Restore),
         Err(SessionError::QuestionNotFound)
     );
 
-    mac.session().stop();
+    mac.stop_daemon();
     fs::remove_file(folder.join(".koidrive/space.json")).unwrap();
-    mac.session().start();
+    mac.start_daemon();
     let halted = mac.until("the missing marker halting the folder", |m| {
         m.folders.first().map(|folder| folder.state) == Some(FolderState::Halted)
             && !m.problems.is_empty()
@@ -478,14 +543,14 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
         Some(space.space_id.as_str())
     );
 
-    mac.session().unlink_folder(space.space_id.clone()).unwrap();
+    mac.session().unlink_folder(&space.space_id).unwrap();
     let unlinked = mac.until("the unlink", |m| {
         m.folders.is_empty() && m.problems.is_empty()
     });
     assert_eq!(unlinked.status, SyncStatus::NeedsSetup);
     assert_eq!(fs::read(folder.join("notes.txt")).unwrap(), b"notes");
     assert_eq!(
-        mac.session().unlink_folder(space.space_id.clone()),
+        mac.session().unlink_folder(&space.space_id),
         Err(SessionError::FolderNotLinked)
     );
 
@@ -493,7 +558,7 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
     fs::create_dir_all(&again).unwrap();
     fs::write(again.join("kept.txt"), b"kept").unwrap();
     mac.session()
-        .link_folder(space.space_id, path_str(&again))
+        .link_folder(&space.space_id, &path_str(&again))
         .unwrap();
     let asked = mac.until("the second link's question", |m| m.questions.len() == 1);
     let question = &asked.questions[0];
@@ -508,20 +573,18 @@ fn the_app_claims_pairs_links_and_follows_the_driver() {
         .map(|item| item.path.as_str())
         .collect();
     assert_eq!(held, ["kept.txt"]);
-    mac.session()
-        .answer(question.id.clone(), Answer::Publish)
-        .unwrap();
+    mac.session().answer(&question.id, Answer::Publish).unwrap();
     mac.until("the second link's sync", |m| {
         m.status == SyncStatus::Idle && m.questions.is_empty()
     });
     let spare = Device::new();
-    spare.session().connect(server).unwrap();
+    spare.session().connect(&server).unwrap();
     let pairing = mac.session().start_pairing().unwrap();
-    spare.session().pair(pairing.code, "Spare".into()).unwrap();
+    spare.session().pair(&pairing.code, "Spare").unwrap();
     let kept = mac.path("credential");
-    keep_credential(&mac.profile(), &kept);
+    mac.keep_credential(&kept);
     let spare_kept = spare.path("credential");
-    keep_credential(&spare.profile(), &spare_kept);
+    spare.keep_credential(&spare_kept);
     let (mac_out, spare_out) = thread::scope(|scope| {
         let spare_out = scope.spawn(|| spare.session().sign_out(false));
         (mac.session().sign_out(false), spare_out.join().unwrap())

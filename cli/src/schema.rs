@@ -7,10 +7,10 @@ use serde_json::{Map, Value, json};
 use crate::manifest::file_name;
 use crate::report::{
     AccountData, AnsweredData, ChoicesData, DaemonLine, DevicesData, DiagnosticsData, Empty,
-    Envelope, FolderData, HelpData, InvitationData, RequestsData, RestoreAskedData, RevokedData,
-    SCHEMA_VERSION, SetupData, ShareLinkData, ShareLinksData, SharedData, SpaceData, SpacesData,
-    StatusData, TrashData, UnlinkedData, UpdatedData, UsagesData, VersionInfoData, VersionsData,
-    WithService,
+    Envelope, FolderData, HelpData, InvitationData, LeftData, RequestsData, RestoreAskedData,
+    RevokedData, SCHEMA_VERSION, SetupData, ShareLinkData, ShareLinksData, SharedData, SpaceData,
+    SpacesData, StatusData, TrashData, UnlinkedData, UpdatedData, UsagesData, VersionInfoData,
+    VersionsData, WithService,
 };
 use crate::telemetry::{ChoiceData, TelemetryStatusData};
 
@@ -37,7 +37,8 @@ fn data(command: &str) -> Option<&'static [Data]> {
         "server deploy" | "server add-device" | "service start" | "_reconcile" => {
             &[of::<WithService<Empty>>]
         }
-        "pause" | "resume" => &[of::<Empty>],
+        "pause" => &[of::<Empty>],
+        "resume" => &[of::<WithService<Empty>>],
         "space create" => &[of::<SpaceData>],
         "space list" => &[of::<SpacesData>],
         "space usage" => &[of::<UsagesData>],
@@ -47,6 +48,7 @@ fn data(command: &str) -> Option<&'static [Data]> {
         "device invite" => &[of::<InvitationData>],
         "device list" => &[of::<DevicesData>],
         "device revoke" => &[of::<RevokedData>],
+        "device leave" => &[of::<WithService<LeftData>>],
         "history trash" => &[of::<TrashData>],
         "history versions" => &[of::<VersionsData>],
         "history restore" => &[of::<RestoreAskedData>],

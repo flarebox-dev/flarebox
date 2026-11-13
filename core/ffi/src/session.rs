@@ -3,8 +3,9 @@
 use std::sync::Arc;
 
 use crate::core::{Core, Events, SessionListener};
-use crate::driver::DriverCore;
+use crate::daemon::DaemonCore;
 use crate::fake::FakeCore;
+use crate::profile::Profile;
 use crate::types::{
     Account, Answer, Device, LinkedFolder, PairingCode, ServerInfo, SessionError, SessionState,
     Space, SpaceUsage, TelemetrySetting,
@@ -28,16 +29,18 @@ impl Drop for SyncSession {
 
 #[uniffi::export]
 impl SyncSession {
-    /// Opens the sync profile in `profile_dir` with the sync driver (docs/design/driver.md): the
-    /// device credential, the linked folders and their sync state, kept across relaunches. One
-    /// process at a time can open a profile. The session is stopped until [`SyncSession::start`].
+    /// Opens the CLI's profile on this machine through the `koi` at `helper`: the profile of the installed launch agent,
+    /// or else the one the environment names. Changes run as `koi` commands and the state follows the daemon, so the
+    /// app and the command show one device. The session is stopped until [`SyncSession::start`].
     #[uniffi::constructor]
     pub fn open(
         listener: Box<dyn SessionListener>,
-        profile_dir: String,
+        helper: String,
     ) -> Result<Arc<Self>, SessionError> {
         let listener = Arc::new(listener);
-        let core = DriverCore::open(profile_dir.as_ref(), Events::new(&listener))?;
+        let profile =
+            Profile::discover(std::path::Path::new(&helper), |name| std::env::var_os(name))?;
+        let core = DaemonCore::open(helper.into(), profile, Events::new(&listener))?;
         Ok(Arc::new(Self {
             core,
             fake: None,

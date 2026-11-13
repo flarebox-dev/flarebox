@@ -67,6 +67,10 @@ pub enum CredentialError {
     #[error("this profile already has a credential at {}", koidrive_fs::quoted(.path))]
     Exists { path: PathBuf },
     #[error(
+        "a previous sign-out is awaiting confirmation from the server; run koi device leave again"
+    )]
+    SignOutPending,
+    #[error(
         "cannot keep the credential file {} out of Time Machine backups ({source}); Koidrive does not use a credential that backups would copy. Restore write access to the file (it may be locked), keep the profile on storage that supports extended attributes, then restart Koidrive",
         koidrive_fs::quoted(.path)
     )]
@@ -75,6 +79,19 @@ pub enum CredentialError {
         #[source]
         source: io::Error,
     },
+}
+
+fn signed_out(path: &Path) -> Result<bool, CredentialError> {
+    let state = path.parent().unwrap_or(Path::new("."));
+    let phase = crate::leave::phase(state).map_err(|source| CredentialError::Io {
+        path: state.join("leaving"),
+        source,
+    })?;
+    match phase {
+        Some(crate::leave::Phase::Revoking) => Err(CredentialError::SignOutPending),
+        Some(crate::leave::Phase::Committed) => Ok(true),
+        _ => Ok(false),
+    }
 }
 
 impl Credential {
@@ -100,9 +117,12 @@ impl Credential {
         api_for(&self.server)
     }
 
-    /// Reads the credential, or returns `None` when there is none. A file that another user owns or may read is
-    /// refused rather than used.
+    /// Reads the credential, or returns `None` when there is none or the profile has signed out. A file that another
+    /// user owns or may read is refused rather than used. An unresolved revocation returns [`CredentialError::SignOutPending`].
     pub fn load(path: &Path) -> Result<Option<Self>, CredentialError> {
+        if signed_out(path)? {
+            return Ok(None);
+        }
         read_private(path)?
             .map(|(text, _)| parse(path, &text))
             .transpose()
@@ -114,6 +134,15 @@ impl Credential {
     /// new file into place or removes one, so unchanged identities mean the two files held what was read. Returns
     /// `None` when there is no credential.
     pub fn load_stored(path: &Path) -> Result<Option<StoredCredential>, CredentialError> {
+        if signed_out(path)? {
+            return Ok(None);
+        }
+        Self::load_stored_for_revocation(path)
+    }
+
+    pub(crate) fn load_stored_for_revocation(
+        path: &Path,
+    ) -> Result<Option<StoredCredential>, CredentialError> {
         let next_path = next_path(path);
         for _ in 0..READ_ATTEMPTS {
             let next = read_private(&next_path)?;

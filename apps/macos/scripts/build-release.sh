@@ -1,12 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Builds Koidrive.app in the Release configuration without signing it and copies it to
-# build/release/Koidrive.app. scripts/sign-app.sh signs it afterwards.
-# Optional environment:
-#   VERSION       the version, for example 0.1.0 or 0.1.0-alpha.2. It becomes KoidriveVersion, and
-#                 its X.Y.Z part the marketing version (CFBundleShortVersionString).
-#   BUILD_NUMBER  the build number (CFBundleVersion)
 set -euo pipefail
 
 macos_dir="$(cd "$(dirname "$0")/.." && pwd)"
@@ -15,21 +9,30 @@ cd "$macos_dir"
 scripts/build-ffi.sh
 scripts/generate-project.sh
 
-overrides=()
-if [ -n "${VERSION:-}" ]; then overrides+=("MARKETING_VERSION=${VERSION%%-*}" "KOIDRIVE_VERSION=$VERSION"); fi
+koi_version="$(build/koi --version)"
+koi_version="${koi_version#koi }"
+if [ -n "${VERSION:-}" ] && [ "$VERSION" != "$koi_version" ]; then
+  echo "error: koi --version reports $koi_version, but VERSION is $VERSION. Set version in [workspace.package] of Cargo.toml." >&2
+  exit 1
+fi
+version="${VERSION:-$koi_version}"
+overrides=("MARKETING_VERSION=${version%%-*}" "KOIDRIVE_VERSION=$version")
 if [ -n "${BUILD_NUMBER:-}" ]; then overrides+=("CURRENT_PROJECT_VERSION=$BUILD_NUMBER"); fi
 
 xcodebuild -project Koidrive.xcodeproj -scheme Koidrive -configuration Release \
   -derivedDataPath build/DerivedData -destination "platform=macOS,arch=$(uname -m)" \
-  CODE_SIGNING_ALLOWED=NO ${overrides[@]+"${overrides[@]}"} build
+  CODE_SIGNING_ALLOWED=NO "${overrides[@]}" build
 
 built=build/DerivedData/Build/Products/Release/Koidrive.app
-if [ ! -x "$built/Contents/MacOS/Koidrive" ]; then
-  echo "error: xcodebuild reported success but $built/Contents/MacOS/Koidrive is missing." >&2
-  exit 1
-fi
+for executable in MacOS/Koidrive Helpers/koi; do
+  if [ ! -x "$built/Contents/$executable" ]; then
+    echo "error: xcodebuild reported success but $built/Contents/$executable is missing." >&2
+    exit 1
+  fi
+done
 rm -rf build/release
 mkdir -p build/release
 ditto "$built" build/release/Koidrive.app
 echo "Built $macos_dir/build/release/Koidrive.app:"
 plutil -p build/release/Koidrive.app/Contents/Info.plist | grep -E '"(CFBundleShortVersionString|CFBundleVersion|CFBundleIdentifier|KoidriveVersion)"'
+echo "Contents/Helpers/koi: $(build/release/Koidrive.app/Contents/Helpers/koi --version)"

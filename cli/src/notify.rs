@@ -129,6 +129,7 @@ mod tests {
             id: id.into(),
             space_id: space_id.into(),
             asked_at_ms: 1,
+            recovery_cause: None,
             kind: QuestionKind::MassDelete {
                 deletions: 11,
                 affected_files: 11,
