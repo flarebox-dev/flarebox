@@ -725,6 +725,44 @@ fn koi_update_through_a_script_alias_installs_into_the_canonical_directory() {
 }
 
 #[test]
+fn an_app_outside_the_installer_inventory_never_updates_another_bundle() {
+    let home = tempfile::tempdir().unwrap();
+    let github = github("v99.0.0");
+    let binary = copy_koi(
+        &home
+            .path()
+            .join("Custom Apps/Koidrive.app/Contents/Helpers/koi"),
+    );
+    let other = home
+        .path()
+        .join("Applications/Koidrive.app/Contents/Helpers/koi");
+    executable(
+        &other,
+        "#!/bin/sh\necho called >> \"$0.calls\"\necho 'koi 99.0.0'\n",
+    );
+    let before = std::fs::read(&binary).unwrap();
+    let other_before = std::fs::read(&other).unwrap();
+    let output = koi_at(&binary, home.path(), &github, &["update", "--json"])
+        .output()
+        .unwrap();
+    if development_update(&output, home.path(), &github) {
+        return;
+    }
+    let response = envelope(&output);
+    assert!(!output.status.success(), "{response:#}");
+    assert_eq!(response["outcome"], "error");
+    assert_eq!(
+        response["error"]["message"],
+        "Download Koidrive 99.0.0 from https://github.com/koidrive/koidrive/releases/tag/v99.0.0"
+    );
+    assert_eq!(std::fs::read(&binary).unwrap(), before);
+    assert_eq!(std::fs::read(&other).unwrap(), other_before);
+    assert!(!other.with_extension("calls").exists());
+    assert!(!update_log(home.path()).exists());
+    assert_eq!(github.requests.lock().unwrap().len(), 1);
+}
+
+#[test]
 fn koi_update_keeps_a_direct_app_helper_on_the_manual_download_path() {
     let home = tempfile::tempdir().unwrap();
     let github = github("v99.0.0");

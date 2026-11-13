@@ -63,7 +63,7 @@ The daemon logs at the `info` level. Set `KOIDRIVE_LOG` to change it, for exampl
 
 - For the Homebrew cask, it prints `brew upgrade --cask koidrive`. For the formula, it prints `brew upgrade koidrive`. If PATH selects a different Homebrew, the command names the owning brew executable. It does not run Homebrew, replace its files or change the service.
 - For an installer copy, it asks GitHub for the newest release and runs `https://koidrive.com/install.sh` with `KOIDRIVE_INSTALL_DIR` set to the executable's real folder and `KOIDRIVE_VERSION` set to the release.
-- For a manually installed app, it downloads and verifies the release's app, then replaces the older copy.
+- For a manually installed app in `/Applications` or `~/Applications`, it downloads and verifies the release's app, then replaces the older copy. Other app locations get the release's download link.
 - Development builds do not update to releases.
 
 After an upgrade, the new `koi` takes over the background service. When the `koi` already runs the newest release, `koi update` changes nothing and reports `unchanged`. It upgrades Koidrive for one user, so it refuses to run as root. Each run writes what it ran and printed to `update.log`, in `~/Library/Logs/Koidrive/` on macOS and in the state folder on Linux.

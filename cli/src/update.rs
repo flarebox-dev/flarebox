@@ -663,6 +663,14 @@ pub async fn run(paths: &Paths, json: bool) -> Result<Done, CliError> {
             "GitHub names the release {version}, which is not a version"
         ))
     })?;
+    if install.method == Method::App
+        && !Installs::of_this_machine()
+            .apps
+            .iter()
+            .any(|helper| fs::canonicalize(helper).is_ok_and(|helper| helper == install.binary))
+    {
+        return Err(failed(format!("Download Koidrive {to} from {url}")));
+    }
     let manager = service::system();
     let service = service::this_service(paths);
     let app_deadline = tokio::time::Instant::now() + RECONCILE;
