@@ -195,6 +195,7 @@ async fn a_commit_round_trips_to_another_device() {
             node_id: docs,
             new_parent_id: space.space_id.clone(),
             new_name: "Papers".into(),
+            from: None,
         })),
     };
     let result = b

@@ -135,6 +135,24 @@ fn replaced_folder() -> impl Strategy<Value = (usize, Vec<Vec<(usize, Step)>>)> 
         )
 }
 
+fn owing_a_rename(losses: Losses) -> impl Strategy<Value = Vec<Vec<(usize, Step)>>> {
+    let change = prop_oneof![
+        Just(delete(1)),
+        Just(rename(1, 0, "b")),
+        Just(rename(1, 0, "A"))
+    ];
+    (phases(losses), any::<prop::sample::Index>(), change).prop_map(|(mut phases, at, change)| {
+        let first = &mut phases[0];
+        first.insert(at.index(first.len() + 1), (1, change));
+        let mut owing = vec![(0, folder("A")), (0, rename(0, 1, "a"))];
+        owing.extend([(0, Step::Work(0)); 5]);
+        owing.extend([(1, Step::Work(0)); 8]);
+        first.splice(0..0, owing);
+        phases.insert(0, vec![(0, file("a"))]);
+        phases
+    })
+}
+
 /// Devices that print every step with the state it leaves when `KOIDRIVE_SIM_TRACE` is set.
 fn world(devices: usize) -> World {
     let mut world = World::new(devices);
@@ -193,6 +211,17 @@ proptest! {
     }
 
     #[test]
+    fn devices_converge_around_an_owed_rename(devices in 2..=3usize, phases in owing_a_rename(Losses::None)) {
+        converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
+    }
+
+    #[test]
+    #[ignore = "after a server loss, the author of an owed rename sends it again without from and brings back what another device deleted (GUN-615)"]
+    fn devices_lose_no_write_around_an_owed_rename_across_server_restores(devices in 2..=3usize, phases in owing_a_rename(Losses::Restores)) {
+        keep(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
+    }
+
+    #[test]
     fn devices_lose_no_write_across_server_restores(devices in 2..=3usize, phases in phases(Losses::Restores)) {
         keep(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
@@ -217,13 +246,21 @@ proptest! {
 /// harness counts, so a change to the strategies cannot drop one without this test failing.
 #[test]
 fn the_schedules_reach_every_fault() {
-    reaches(Losses::None, &EVENTS);
+    reaches(phases(Losses::None), &EVENTS);
+}
+
+#[test]
+fn the_owed_rename_schedules_reach_both_answers() {
+    reaches(
+        owing_a_rename(Losses::None),
+        &["move with from applied", "move with from superseded"],
+    );
 }
 
 #[test]
 fn the_rewind_schedules_reach_every_recovery() {
     reaches(
-        Losses::Rewinds,
+        phases(Losses::Rewinds),
         &[
             "server rewound",
             "rewind takes a write a disk holds",
@@ -237,9 +274,9 @@ fn the_rewind_schedules_reach_every_recovery() {
     );
 }
 
-fn reaches(losses: Losses, events: &[&str]) {
+fn reaches(phases: impl Strategy<Value = Vec<Vec<(usize, Step)>>>, events: &[&str]) {
     let mut runner = TestRunner::deterministic();
-    let strategy = (2..=3usize, phases(losses));
+    let strategy = (2..=3usize, phases);
     let mut seen: BTreeMap<&str, u64> = BTreeMap::new();
     for _ in 0..256 {
         let (devices, phases) = strategy.new_tree(&mut runner).unwrap().current();
@@ -3219,6 +3256,18 @@ fn a_delete_pulled_after_the_authors_edit(resend_first: bool) -> World {
     world
 }
 
+fn an_owed_rename_in_flight_while_another_device_changes_it(change: Step) -> World {
+    let mut world = converge(2, &[vec![(0, file("a"))]]).unwrap();
+    let mut steps = vec![(0, folder("A")), (0, rename(0, 1, "a"))];
+    steps.extend([(0, Step::Work(0)); 5]);
+    steps.extend([(1, Step::Work(0)); 8]);
+    steps.extend([(1, change), (1, SCAN)]);
+    steps.extend([(1, Step::Work(0)); 4]);
+    steps.extend([(0, Step::Work(0)); 16]);
+    world.phase(1, &steps).unwrap();
+    world
+}
+
 #[test]
 fn a_device_that_deleted_the_file_keeps_the_authors_edit_that_follows_a_resend_it_planned_against()
 {
@@ -4803,4 +4852,189 @@ fn a_conflict_copy_the_engine_names_is_no_change_once_the_server_holds_it() {
         ["a", "a/ss (conflict from device-0 2026-11-09)", "a/ß"]
     );
     assert_eq!(recorded_in_sync(&world, 0), Vec::<String>::new());
+}
+
+#[test]
+fn a_folder_deleted_while_its_owed_rename_is_in_flight_stays_deleted() {
+    let world = an_owed_rename_in_flight_while_another_device_changes_it(delete(1));
+    for device in &world.devices {
+        assert!(
+            device.disk.entries().is_empty(),
+            "{:?}",
+            device.disk.entries()
+        );
+    }
+}
+
+#[test]
+fn a_folder_renamed_while_its_owed_rename_is_in_flight_keeps_that_name() {
+    let world = an_owed_rename_in_flight_while_another_device_changes_it(rename(1, 0, "b"));
+    for device in &world.devices {
+        let mut names: Vec<&str> = (device.disk.entries().values())
+            .map(|entry| entry.name.as_str())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a", "b"]);
+    }
+}
+
+fn an_owed_rename_landed_before_another_devices_change(change: Step, heard: usize) -> World {
+    let mut world = converge(2, &[vec![(0, file("a"))]]).unwrap();
+    let mut steps = vec![(0, folder("A")), (0, rename(0, 1, "a"))];
+    steps.extend([(0, Step::Work(0)); 5]);
+    steps.extend([(1, Step::Work(0)); 8]);
+    steps.extend([(1, change), (1, SCAN), (1, COMMIT)]);
+    steps.extend([(0, Step::Work(0)); 16]);
+    steps.extend(std::iter::repeat_n((1, DELIVER), heard));
+    steps.push((1, COMMIT));
+    world.phase(1, &steps).unwrap();
+    world
+}
+
+#[test]
+fn a_folder_deleted_before_its_owed_rename_landed_stays_deleted() {
+    for heard in [0, 8] {
+        let world = an_owed_rename_landed_before_another_devices_change(delete(1), heard);
+        assert_eq!(names(&world), [[""; 0]; 2], "heard {heard}");
+    }
+}
+
+#[test]
+fn a_folder_renamed_before_its_owed_rename_landed_keeps_that_name() {
+    for heard in [0, 8] {
+        let world = an_owed_rename_landed_before_another_devices_change(rename(1, 0, "b"), heard);
+        assert_eq!(names(&world), [["a", "b"]; 2], "heard {heard}");
+    }
+}
+
+#[test]
+fn a_folder_deleted_on_a_device_that_hears_its_owed_rename_first_stays_deleted() {
+    let mut world = converge(2, &[vec![(0, file("a"))]]).unwrap();
+    let mut steps = vec![(0, folder("A")), (0, rename(0, 1, "a"))];
+    steps.extend([(0, Step::Work(0)); 5]);
+    steps.extend([(1, Step::Work(0)); 8]);
+    steps.push((1, delete(1)));
+    steps.extend([(0, Step::Work(0)); 16]);
+    steps.extend([(1, Step::Work(0)); 12]);
+    world.phase(1, &steps).unwrap();
+    assert_eq!(names(&world), [[""; 0]; 2]);
+}
+
+#[test]
+fn a_folder_deleted_while_its_owed_rename_waits_for_a_reconnect_stays_deleted() {
+    let wide = |kind, parent| {
+        Step::User(Action {
+            kind,
+            target: 0,
+            parent,
+            name: 1,
+            text: 0,
+        })
+    };
+    let mut steps = vec![(0, folder("A")), (0, rename(0, 1, "a"))];
+    steps.extend([(0, Step::Work(0)); 5]);
+    steps.extend([(1, Step::Work(0)); 8]);
+    steps.extend([(0, Step::Drop), (2, wide(0, 3525480467146600595))]);
+    steps.extend([(0, folder("a")); 4]);
+    steps.extend([
+        (1, delete(1)),
+        (0, Step::Work(8189)),
+        (2, SCAN),
+        (1, Step::Work(6345002853588532233)),
+        (2, Step::Effect(Outcome::Fail)),
+        (2, Step::Drop),
+        (1, Step::Work(10884997234294703724)),
+        (1, Step::Work(8368452453479477715)),
+    ]);
+    converge(2, &[vec![(0, file("a"))], steps]).unwrap();
+}
+
+#[test]
+fn a_folder_deleted_after_a_restore_stays_deleted_on_a_device_that_heard_its_owed_rename() {
+    let mut steps = vec![(0, folder("A")), (0, rename(0, 1, "a"))];
+    steps.extend([(0, Step::Work(0)); 5]);
+    steps.extend([(1, Step::Work(0)); 8]);
+    steps.extend([
+        (1, delete(1)),
+        (2, Step::Work(0)),
+        (2, EFFECT),
+        (0, Step::Backup),
+        (2, Step::Work(0)),
+        (0, COMMIT),
+        (2, Step::Work(4133075421559048010)),
+        (0, Step::Restore),
+    ]);
+    keep(3, &[vec![(0, file("a"))], steps]).unwrap();
+}
+
+#[test]
+#[ignore = "after a server loss, the author of an owed rename sends it again without from and brings back what another device deleted (GUN-615)"]
+fn a_folder_deleted_before_a_restore_stays_deleted_when_its_owed_rename_is_sent_again() {
+    let create = |parent| {
+        Step::User(Action {
+            kind: 0,
+            target: 0,
+            parent,
+            name: 0,
+            text: 0,
+        })
+    };
+    let mut steps = vec![(0, folder("A")), (0, rename(0, 1, "a"))];
+    steps.extend([(0, Step::Work(0)); 5]);
+    steps.extend([(1, Step::Work(0)); 8]);
+    steps.extend([
+        (1, delete(1)),
+        (0, Step::Backup),
+        (0, create(2837005791047431358)),
+        (0, create(0)),
+        (0, create(0)),
+        (0, Step::Work(3925350407796910387)),
+        (0, COMMIT),
+        (0, Step::Work(0)),
+        (0, Step::Restore),
+    ]);
+    keep(3, &[vec![(0, file("a"))], steps]).unwrap();
+}
+
+#[test]
+fn a_folder_deleted_after_its_rename_was_sent_stays_deleted_past_an_owed_rename() {
+    let mut world = converge(2, &[vec![(0, file("a"))]]).unwrap();
+    let mut steps = vec![(0, folder("A")), (0, rename(0, 1, "a"))];
+    steps.extend([(0, Step::Work(0)); 5]);
+    steps.extend([(1, Step::Work(0)); 8]);
+    steps.extend([
+        (1, rename(1, 0, "A")),
+        (1, SCAN),
+        (1, COMMIT),
+        (1, delete(1)),
+        (1, SCAN),
+    ]);
+    steps.push((0, COMMIT));
+    steps.push((1, COMMIT));
+    world.phase(1, &steps).unwrap();
+    assert_eq!(names(&world), [[""; 0]; 2]);
+}
+
+#[test]
+fn a_folder_revived_before_its_owed_rename_is_answered_keeps_converging() {
+    let mut world = converge(3, &[vec![(0, file("a"))]]).unwrap();
+    let mut steps = vec![(0, folder("A")), (0, rename(0, 1, "a"))];
+    steps.extend([(0, Step::Work(0)); 5]);
+    steps.extend([(1, Step::Work(0)); 8]);
+    steps.extend([
+        (1, delete(1)),
+        (1, delete(3979821551319602821)),
+        (1, Step::Work(0)),
+        (2, overwrite(0)),
+        (2, Step::Work(67468823311028661)),
+        (2, DELIVER),
+        (2, Step::Work(3613414708570467567)),
+        (1, Step::Work(0)),
+        (2, Step::Work(0)),
+        (2, Step::Work(0)),
+        (1, COMMIT),
+        (0, Step::Work(1304240622328750977)),
+        (2, Step::Work(2365667432405746353)),
+    ]);
+    world.phase(1, &steps).unwrap();
 }

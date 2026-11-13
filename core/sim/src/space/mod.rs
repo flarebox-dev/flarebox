@@ -81,6 +81,8 @@ pub(crate) struct Node {
     edit_dev: String,
     meta_rev: u64,
     meta_dev: String,
+    meta_edit_rev: u64,
+    meta_edit_dev: String,
     /// The seq and device of the commit that last gave the node a new parent or brought it back from
     /// the trash. `parent_dev` is empty unless that commit's op named both the node and the parent.
     parent_rev: u64,
@@ -151,6 +153,7 @@ impl State {
             content_rev: node.content_rev,
             edit_rev: node.edit_rev,
             meta_rev: node.meta_rev,
+            meta_edit_rev: node.meta_edit_rev,
             trash_group: node.trash_group.clone().unwrap_or_default(),
             current: node
                 .cur_version_id
@@ -414,6 +417,8 @@ impl SpaceDo {
             edit_dev: String::new(),
             meta_rev: 0,
             meta_dev: String::new(),
+            meta_edit_rev: 0,
+            meta_edit_dev: String::new(),
             parent_rev: 0,
             parent_dev: String::new(),
             cur_version_id: None,

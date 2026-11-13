@@ -509,6 +509,7 @@ fn a_kept_move_that_another_device_reverses_before_a_loss_is_not_sent_again() {
         content_rev: 2,
         edit_rev: 2,
         meta_rev: 2,
+        meta_edit_rev: 2,
         ..remote(file(ROOT, "old", 0))
     };
     trees.set_remote("n".into(), reversed);
@@ -647,6 +648,7 @@ fn an_effect_on_a_node_whose_update_waits_keeps_its_slot_for_a_loss() {
         content_rev: 5,
         edit_rev: 5,
         meta_rev: 5,
+        meta_edit_rev: 5,
         ..remote(file(ROOT, "x", 1))
     };
     trees.set_remote("n".into(), moved);
@@ -658,6 +660,7 @@ fn an_effect_on_a_node_whose_update_waits_keeps_its_slot_for_a_loss() {
     trees.set_local("k".into(), local(file(ROOT, "z2", 8), 3));
     let k_moved = RemoteNode {
         meta_rev: 6,
+        meta_edit_rev: 6,
         ..remote(file(ROOT, "w", 8))
     };
     trees.set_remote("k".into(), k_moved);
@@ -665,6 +668,7 @@ fn an_effect_on_a_node_whose_update_waits_keeps_its_slot_for_a_loss() {
         content_rev: 5,
         edit_rev: 5,
         meta_rev: 7,
+        meta_edit_rev: 7,
         ..remote(file(ROOT, "z", 1))
     };
     trees.set_remote("n".into(), moved_again);
@@ -722,6 +726,7 @@ fn a_lost_update_is_not_made_when_another_device_restores_the_node() {
         content_rev: 2,
         edit_rev: 2,
         meta_rev: 2,
+        meta_edit_rev: 2,
         ..remote(file(ROOT, "old", 7))
     };
     trees.set_remote("n".into(), restored);
@@ -762,6 +767,7 @@ fn a_lost_update_is_not_the_effects_base_while_it_cannot_fit() {
         content_rev: 2,
         edit_rev: 2,
         meta_rev: 2,
+        meta_edit_rev: 2,
         ..remote(file(ROOT, "old", 7))
     };
     trees.set_remote("n".into(), restored);

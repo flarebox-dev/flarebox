@@ -6,7 +6,7 @@ use koidrive_engine::ids::IdGen;
 use koidrive_engine::names::MAX_NAME_BYTES;
 use koidrive_proto::v1::{
     ChangeRecord, ChunkRef, Commit, CommitResult, Content, CreateDir, CreateFile, Delete, Error,
-    ListVersions, Move, NodeKind, NodeRevisions, NodeState, NodeStatus, Op, OpResult,
+    ListVersions, Move, NodeKind, NodeRevisions, NodeState, NodeStatus, Op, OpResult, Place,
     PrepareUpload, Restore, RpcRequest, UpdateContent, UploadReceipt, VersionInfo, change_record,
     chunk_plan, error, op, op_result, rpc_request, rpc_response,
 };
@@ -1205,7 +1205,8 @@ impl Run {
                 continue;
             }
             let allowed: &[&str] = match kind.as_str() {
-                "create_dir" | "move" => &["node", "parent", "name"],
+                "create_dir" => &["node", "parent", "name"],
+                "move" => &["node", "parent", "name", "from"],
                 "create_file" => &["node", "parent", "name", "content"],
                 "update_content" => &["node", "content", "resend"],
                 "delete" => &["node", "requires"],
@@ -1252,6 +1253,17 @@ impl Run {
                     node_id: node,
                     new_parent_id: parent,
                     new_name: name,
+                    from: match body.get("from") {
+                        None => None,
+                        Some(from) => {
+                            keys(from, "from", &["parent", "name"])?;
+                            Some(Place {
+                                parent_id: self
+                                    .id(space, req(opt_str(from, "parent"), "parent")?)?,
+                                name: req(opt_str(from, "name"), "name")?.to_owned(),
+                            })
+                        }
+                    },
                 }),
                 "delete" => op::Op::Delete(Delete {
                     node_id: node,
@@ -1481,6 +1493,7 @@ impl Run {
             status,
             content_rev,
             meta_rev,
+            meta_edit_rev: _,
             trash_group,
             current,
             edit_rev: _,
@@ -1938,13 +1951,21 @@ impl Run {
         complete: bool,
     ) -> Outcome {
         if complete {
-            keys(want, "a node", &[NODE_FIELDS, &["edit_rev"]].concat())?;
+            keys(
+                want,
+                "a node",
+                &[NODE_FIELDS, &["edit_rev", "meta_edit_rev"]].concat(),
+            )?;
             every(want, NODE_FIELDS)?;
         } else {
             keys(
                 want,
                 "a node",
-                &[NODE_FIELDS, &["absent", "content", "edit_rev"]].concat(),
+                &[
+                    NODE_FIELDS,
+                    &["absent", "content", "edit_rev", "meta_edit_rev"],
+                ]
+                .concat(),
             )?;
         }
         let NodeState {
@@ -1955,6 +1976,7 @@ impl Run {
             status,
             content_rev,
             meta_rev,
+            meta_edit_rev,
             trash_group,
             current,
             edit_rev,
@@ -1998,6 +2020,11 @@ impl Run {
             && *edit_rev != rev
         {
             return Err(differs("edit_rev", edit_rev));
+        }
+        if let Some(rev) = opt_u64(want, "meta_edit_rev")?
+            && *meta_edit_rev != rev
+        {
+            return Err(differs("meta_edit_rev", meta_edit_rev));
         }
         match want.get("trash_group") {
             None => {}

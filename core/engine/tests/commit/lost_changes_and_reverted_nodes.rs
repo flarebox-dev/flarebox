@@ -48,11 +48,13 @@ fn a_delete_the_server_lost_is_sent_again_only_for_what_it_saw() {
         content_rev: 2,
         edit_rev: 2,
         meta_rev: 2,
+        meta_edit_rev: 2,
         ..remote(file(ROOT, "edited", 2))
     };
     trees.set_remote("edited".into(), edited);
     let restored = RemoteNode {
         meta_rev: 3,
+        meta_edit_rev: 3,
         ..remote(file(ROOT, "restored", 1))
     };
     trees.set_remote("restored".into(), restored);
@@ -138,6 +140,7 @@ fn an_edit_the_server_lost_is_sent_again_over_a_later_delete() {
     let edited = trees.edited_here();
     let deleted = RemoteNode {
         meta_rev: 3,
+        meta_edit_rev: 3,
         ..trashed(file(ROOT, "a", 1))
     };
     trees.set_remote("a".into(), deleted);

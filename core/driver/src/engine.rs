@@ -1338,6 +1338,7 @@ impl Staging {
             state.content_rev > held.content_rev
                 || state.meta_rev > held.meta_rev
                 || state.edit_rev > held.edit_rev
+                || state.meta_edit_rev > held.meta_edit_rev
         });
         if newer {
             self.nodes.insert(state.node_id.clone(), state);
@@ -1889,6 +1890,7 @@ mod tests {
                     trashed: false,
                     content_rev: 1,
                     meta_rev: 1,
+                    meta_edit_rev: 1,
                     trash_group: String::new(),
                     version_id: String::new(),
                     edit_rev: 1,
@@ -2131,6 +2133,7 @@ mod tests {
                     node_id: "n".into(),
                     new_parent_id: ROOT.into(),
                     new_name: "x".into(),
+                    from: None,
                 }),
             ),
             sending(
@@ -2180,6 +2183,7 @@ mod tests {
                         trashed: false,
                         content_rev: 1,
                         meta_rev: 2,
+                        meta_edit_rev: 2,
                         trash_group: String::new(),
                         version_id: String::new(),
                         edit_rev: 1,

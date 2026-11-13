@@ -555,6 +555,7 @@ fn remote(id: &str, name: &str, content: Option<Content>) -> NodeState {
         content_rev: 1,
         meta_rev: 1,
         edit_rev: 1,
+        meta_edit_rev: 1,
         trash_group: String::new(),
         current: content.map(|content| VersionInfo {
             version_id: format!("version-{id}"),

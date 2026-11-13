@@ -472,22 +472,35 @@ impl Trees {
             && !(self.l.live(&id).and_then(|local| local.content.as_ref()))
                 .zip(node.shape.content.as_ref())
                 .is_some_and(|(local, remote)| same_content(local, remote));
-        let local_gone = !made_here && self.l.get(&id).is_none();
-        let resent_over_delete = local_gone
-            && (self.r.get(&id)).is_some_and(|old| {
-                !old.trashed
-                    && !node.trashed
-                    && old.content_rev != node.content_rev
-                    && old.edit_rev == node.edit_rev
-                    && old.meta_rev == node.meta_rev
-                    && old.shape.same_position(&node.shape)
-                    && (self.acknowledged(&id)).is_some_and(|synced| synced.same(&old.shape))
+        let synced = self.acknowledged(&id);
+        let local = self.l.get(&id);
+        let local_gone = !made_here && local.is_none();
+        let old = (self.r.get(&id)).filter(|old| !old.trashed && !node.trashed);
+        let no_user_change = old.is_some_and(|old| {
+            old.edit_rev == node.edit_rev
+                && old.meta_edit_rev == node.meta_edit_rev
+                && synced.is_some_and(|synced| synced.same(&old.shape))
+        });
+        let passed_over_delete = local_gone
+            && no_user_change
+            && old.is_some_and(|old| {
+                old.content_rev != node.content_rev || old.meta_rev != node.meta_rev
+            });
+        let placed_here = no_user_change
+            && old.is_some_and(|old| old.meta_rev != node.meta_rev)
+            && local.is_some_and(|local| {
+                !local.parked && synced.is_some_and(|synced| synced.same(&local.shape))
             });
         let edited_over_delete = local_gone
-            && self.acknowledged(&id).is_some()
+            && synced.is_some()
             && (self.r.get(&id)).is_some_and(|old| {
                 old.edit_rev != node.edit_rev
                     && (old.content_rev == node.content_rev || old.edit_rev < old.content_rev)
+            });
+        let moved_over_delete = local_gone
+            && synced.is_some()
+            && old.is_some_and(|old| {
+                old.meta_rev == node.meta_rev && old.meta_edit_rev != node.meta_edit_rev
             });
         if let Some(replaced) = (self.r.get(&id))
             .map(|old| &old.version_id)
@@ -512,10 +525,22 @@ impl Trees {
         if hidden && !self.set_synced_if_valid(id.clone(), None) {
             self.wait(id.clone(), None, Origin::Other);
         }
-        if resent_over_delete && !self.set_synced_if_valid(id.clone(), Some(shape.clone())) {
+        let placed_here = placed_here
+            && !path(&self.r, &id).is_some_and(|(names, kind)| self.ignores(&names, kind))
+            && (shape.parent == self.l.root
+                || (self.l.get(&shape.parent))
+                    .is_some_and(|parent| !parent.parked && parent.shape.kind == Kind::Dir))
+            && self
+                .local_holders(&shape.parent, &shape.name)
+                .all(|other| *other == id);
+        if placed_here && self.set_synced_if_valid(id.clone(), Some(shape.clone())) {
+            self.revert(id.clone());
+        }
+        if passed_over_delete && !self.set_synced_if_valid(id.clone(), Some(shape.clone())) {
             self.wait(id.clone(), Some(shape), Origin::Other);
         }
-        if edited_over_delete && !self.set_synced_if_valid(id.clone(), None) {
+        if (edited_over_delete || moved_over_delete) && !self.set_synced_if_valid(id.clone(), None)
+        {
             self.wait(id, None, Origin::Other);
         }
     }
@@ -612,6 +637,10 @@ impl Trees {
 
     pub(crate) fn resends(&self) -> &BTreeSet<NodeId> {
         &self.resends
+    }
+
+    pub(crate) fn end_resend(&mut self, id: &str) {
+        self.resends.remove(id);
     }
 
     fn local_chain<'a>(&'a self, id: &'a str) -> impl Iterator<Item = &'a str> + 'a {

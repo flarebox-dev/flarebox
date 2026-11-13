@@ -66,6 +66,7 @@ fn remote(shape: Shape) -> RemoteNode {
         trashed: false,
         content_rev: 1,
         meta_rev: 1,
+        meta_edit_rev: 1,
         trash_group: String::new(),
         version_id: String::new(),
         edit_rev: 1,
@@ -76,6 +77,7 @@ fn remote(shape: Shape) -> RemoteNode {
 fn remote_at(shape: Shape, rev: u64) -> RemoteNode {
     RemoteNode {
         meta_rev: rev,
+        meta_edit_rev: rev,
         ..remote(shape)
     }
 }
@@ -147,6 +149,7 @@ fn mv(node: &str, parent: &str, name: &str) -> op::Op {
         node_id: node.into(),
         new_parent_id: parent.into(),
         new_name: name.into(),
+        from: None,
     })
 }
 
@@ -246,6 +249,7 @@ fn deleted_at_5_then_lost(rows: &[Row]) -> (Commits, Trees, IdGen, Vec<op::Op>) 
         content_rev: 2,
         edit_rev: 2,
         meta_rev: 2,
+        meta_edit_rev: 2,
         ..remote(file(ROOT, "pad", 9))
     };
     trees.set_remote("pad".into(), pad);
@@ -262,6 +266,7 @@ fn deleted_at_5_then_lost(rows: &[Row]) -> (Commits, Trees, IdGen, Vec<op::Op>) 
     for (id, _, shape, _) in rows {
         let trashed = RemoteNode {
             meta_rev: 5,
+            meta_edit_rev: 5,
             trash_group: "5:0".into(),
             ..trashed(shape.clone().unwrap())
         };
@@ -296,6 +301,7 @@ fn edited_at_5_then_lost() -> (Commits, Trees, IdGen) {
         content_rev: 2,
         edit_rev: 2,
         meta_rev: 2,
+        meta_edit_rev: 2,
         ..remote(file(ROOT, "pad", 9))
     };
     trees.set_remote("pad".into(), pad);
@@ -436,6 +442,7 @@ fn a_move_and_edit_whose_s_update_waits_lost_at_5() -> (Trees, Commits, IdGen) {
         content_rev: 2,
         edit_rev: 2,
         meta_rev: 2,
+        meta_edit_rev: 2,
         ..remote(file(ROOT, "pad", 7))
     };
     trees.set_remote("pad".into(), pad);
@@ -451,6 +458,7 @@ fn a_move_and_edit_whose_s_update_waits_lost_at_5() -> (Trees, Commits, IdGen) {
         content_rev: 5,
         edit_rev: 5,
         meta_rev: 5,
+        meta_edit_rev: 5,
         ..remote(file(ROOT, "x", 1))
     };
     trees.set_remote("n".into(), moved);
@@ -609,6 +617,7 @@ fn commit_file(trees: &mut Trees, commits: &mut Commits, ids: &mut IdGen, id: &s
         content_rev: seq,
         edit_rev: seq,
         meta_rev: seq,
+        meta_edit_rev: seq,
         ..remote(file(ROOT, id, 7))
     };
     trees.set_remote(id.into(), created);
@@ -1189,4 +1198,16 @@ fn reparent_a_folder_at_its_pending_name(answer_first: bool) {
             .map(|n| (n.shape.parent.as_str(), n.shape.name.as_str())),
         Some(("x", "A (pending)"))
     );
+}
+
+fn owed_mv(node: &str, parent: &str, name: &str, from: &str) -> op::Op {
+    op::Op::Move(proto::Move {
+        node_id: node.into(),
+        new_parent_id: parent.into(),
+        new_name: name.into(),
+        from: Some(proto::Place {
+            parent_id: parent.into(),
+            name: from.into(),
+        }),
+    })
 }

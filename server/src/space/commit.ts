@@ -8,6 +8,7 @@ import {
   type Move,
   type Op,
   type OpResult,
+  type Place,
   OpResult_Code,
   OpResultSchema,
   type Restore,
@@ -24,6 +25,8 @@ import {
   encodeChunkList,
   getNode,
   getVersion,
+  metaEditDev,
+  metaEditRev,
   type NodeRow,
   nodeState,
   PAGE_CHUNKS,
@@ -200,7 +203,7 @@ export class CommitApplier {
   }
 
   private unseenMeta(node: NodeRow): boolean {
-    return node.meta_rev > this.ctx.baseSeq && node.meta_dev !== this.dev;
+    return metaEditRev(node) > this.ctx.baseSeq && metaEditDev(node) !== this.dev;
   }
 
   private unseenParent(node: NodeRow): boolean {
@@ -269,12 +272,14 @@ export class CommitApplier {
     const picked = this.pickName(parentId, desiredName, node.node_id);
     this.sql.exec(
       `UPDATE nodes SET status = 1, parent_id = ?, parent_rev = ?, parent_dev = ?, name = ?, name_key = ?, trash_group = NULL,
-         trashed_at_ms = NULL, meta_rev = ?, meta_dev = ? WHERE node_id = ?`,
+         trashed_at_ms = NULL, meta_rev = ?, meta_dev = ?, meta_edit_rev = ?, meta_edit_dev = ? WHERE node_id = ?`,
       parentId,
       this.ctx.seq,
       parentDev,
       picked.name,
       nameKey(picked.name),
+      this.ctx.seq,
+      this.dev,
       this.ctx.seq,
       this.dev,
       node.node_id,
@@ -322,7 +327,7 @@ export class CommitApplier {
   private insertNode(nodeId: string, parentId: string, name: string, kind: number, versionId: string | null, parentDev: string): void {
     this.sql.exec(
       `INSERT INTO nodes (node_id, parent_id, parent_rev, parent_dev, name, name_key, kind, status, content_rev, content_dev, edit_rev,
-         edit_dev, meta_rev, meta_dev, cur_version_id) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)`,
+         edit_dev, meta_rev, meta_dev, meta_edit_rev, meta_edit_dev, cur_version_id) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       nodeId,
       parentId,
       this.ctx.seq,
@@ -330,6 +335,8 @@ export class CommitApplier {
       name,
       nameKey(name),
       kind,
+      this.ctx.seq,
+      this.dev,
       this.ctx.seq,
       this.dev,
       this.ctx.seq,
@@ -461,8 +468,20 @@ export class CommitApplier {
     if (target.kind !== NodeKindValue.DIR) return rejected("PARENT_NOT_DIR");
     if (this.isSelfOrDescendant(target, found.node_id)) return rejected("CYCLE");
     if (!target.parent_id && isReservedAtRoot(name)) return rejected("INVALID_NAME");
+    if (op.from && !this.isAt(found, op.from, target)) return result(OpResult_Code.SUPERSEDED);
     if (found.status === NodeStatusValue.LIVE && found.parent_id === target.node_id && found.name === name) {
-      if (this.unseenParent(found)) {
+      if (op.from) return result(OpResult_Code.APPLIED, "", name);
+      if (metaEditRev(found) < found.meta_rev) {
+        this.sql.exec(
+          "UPDATE nodes SET parent_rev = ?, parent_dev = ?, meta_edit_rev = ?, meta_edit_dev = ? WHERE node_id = ?",
+          this.ctx.seq,
+          this.dev,
+          this.ctx.seq,
+          this.dev,
+          found.node_id,
+        );
+        this.touch(found.node_id);
+      } else if (this.unseenParent(found)) {
         this.sql.exec("UPDATE nodes SET parent_rev = ?, parent_dev = ? WHERE node_id = ?", this.ctx.seq, this.dev, found.node_id);
       }
       return result(OpResult_Code.APPLIED, "", name);
@@ -476,9 +495,10 @@ export class CommitApplier {
       return result(picked.renamed ? OpResult_Code.APPLIED_RENAMED : OpResult_Code.APPLIED, "", picked.name);
     }
     const picked = this.pickName(parent.node_id, name, found.node_id);
-    const placed = found.parent_id !== parent.node_id || this.unseenParent(found);
+    const placed = found.parent_id !== parent.node_id || (!op.from && this.unseenParent(found));
     this.sql.exec(
-      "UPDATE nodes SET parent_id = ?, parent_rev = ?, parent_dev = ?, name = ?, name_key = ?, meta_rev = ?, meta_dev = ? WHERE node_id = ?",
+      `UPDATE nodes SET parent_id = ?, parent_rev = ?, parent_dev = ?, name = ?, name_key = ?, meta_rev = ?, meta_dev = ?, meta_edit_rev = ?,
+         meta_edit_dev = ? WHERE node_id = ?`,
       parent.node_id,
       placed ? this.ctx.seq : found.parent_rev,
       placed ? this.dev : found.parent_dev,
@@ -486,10 +506,21 @@ export class CommitApplier {
       nameKey(picked.name),
       this.ctx.seq,
       this.dev,
+      op.from ? metaEditRev(found) : this.ctx.seq,
+      op.from ? metaEditDev(found) : this.dev,
       found.node_id,
     );
     this.touch(found.node_id, found.parent_id);
     return result(picked.renamed ? OpResult_Code.APPLIED_RENAMED : OpResult_Code.APPLIED, "", picked.name);
+  }
+
+  private isAt(node: NodeRow, from: Place, target: NodeRow): boolean {
+    return (
+      node.status === NodeStatusValue.LIVE &&
+      target.status === NodeStatusValue.LIVE &&
+      node.parent_id === this.id(from.parentId) &&
+      node.name === normalizeName(from.name)
+    );
   }
 
   private trashSubtree(node: NodeRow, group: string): boolean {
@@ -499,9 +530,11 @@ export class CommitApplier {
     for (const child of children) keep = this.trashSubtree(child, group) || keep;
     if (keep) return true;
     this.sql.exec(
-      "UPDATE nodes SET status = 2, trash_group = ?, trashed_at_ms = ?, meta_rev = ?, meta_dev = ? WHERE node_id = ?",
+      "UPDATE nodes SET status = 2, trash_group = ?, trashed_at_ms = ?, meta_rev = ?, meta_dev = ?, meta_edit_rev = ?, meta_edit_dev = ? WHERE node_id = ?",
       group,
       this.ctx.nowMs,
+      this.ctx.seq,
+      this.dev,
       this.ctx.seq,
       this.dev,
       node.node_id,

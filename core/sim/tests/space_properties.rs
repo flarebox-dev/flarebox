@@ -148,6 +148,7 @@ fn run(actions: &[Action]) -> Vec<NodeState> {
                 node_id: pick(a.target),
                 new_parent_id: pick(a.parent),
                 new_name: name,
+                from: None,
             }),
             Kind::Delete => op::Op::Delete(Delete {
                 node_id: pick(a.target),

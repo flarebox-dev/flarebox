@@ -48,6 +48,7 @@ fn space(loose: usize, inside: usize) -> Trees {
                 trashed: false,
                 content_rev: 1,
                 meta_rev: 1,
+                meta_edit_rev: 1,
                 trash_group: String::new(),
                 version_id: String::new(),
                 edit_rev: 1,
@@ -492,6 +493,7 @@ fn a_held_file_changed_on_the_server_leaves_the_question_and_is_downloaded() {
             trashed: false,
             content_rev: 2,
             meta_rev: 1,
+            meta_edit_rev: 1,
             trash_group: String::new(),
             version_id: String::new(),
             edit_rev: 2,
@@ -751,6 +753,7 @@ fn a_restore_answer_holds_a_node_deleted_under_its_folder_since() {
             trashed: false,
             content_rev: 1,
             meta_rev: 1,
+            meta_edit_rev: 1,
             trash_group: String::new(),
             version_id: String::new(),
             edit_rev: 1,
@@ -824,6 +827,7 @@ fn trash_remotely(trees: &mut Trees, ids: &[&str]) {
             trashed: true,
             content_rev: 2,
             meta_rev: 2,
+            meta_edit_rev: 2,
             trash_group: top.into(),
             version_id: String::new(),
             edit_rev: 2,
@@ -1010,6 +1014,7 @@ fn a_folder_restored_after_its_notice_was_dismissed_is_noticed_when_deleted_agai
                 trashed,
                 content_rev: rev,
                 meta_rev: rev,
+                meta_edit_rev: rev,
                 version_id: String::new(),
                 trash_group: if trashed {
                     "later".into()
@@ -1234,6 +1239,7 @@ fn a_folder_trashed_again_after_a_dismissal_without_its_record_is_noticed() {
     for (id, node) in trashed {
         let node = RemoteNode {
             meta_rev: 4,
+            meta_edit_rev: 4,
             trash_group: "again".into(),
             ..node
         };
@@ -1262,6 +1268,7 @@ fn a_folder_restored_after_a_dismissal_without_its_record_is_noticed_when_delete
                 trashed,
                 content_rev: rev,
                 meta_rev: rev,
+                meta_edit_rev: rev,
                 version_id: String::new(),
                 trash_group: if trashed {
                     "later".into()
@@ -1347,6 +1354,7 @@ fn nested() -> Trees {
             trashed: false,
             content_rev: 1,
             meta_rev: 1,
+            meta_edit_rev: 1,
             trash_group: String::new(),
             version_id: String::new(),
             edit_rev: 1,

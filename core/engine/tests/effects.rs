@@ -62,6 +62,7 @@ fn remote(shape: Shape) -> RemoteNode {
         trashed: false,
         content_rev: 1,
         meta_rev: 1,
+        meta_edit_rev: 1,
         trash_group: String::new(),
         version_id: String::new(),
         edit_rev: 1,

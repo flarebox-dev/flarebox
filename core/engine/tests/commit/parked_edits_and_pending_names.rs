@@ -474,6 +474,7 @@ fn a_rename_of_a_node_whose_update_waits_is_kept_from_an_effect_planned_before_i
     let (mut trees, commits, mut ids) = a_move_and_edit_whose_s_update_waits();
     let moved = RemoteNode {
         meta_rev: 3,
+        meta_edit_rev: 3,
         ..remote(file(ROOT, "z", 1))
     };
     trees.set_remote("n".into(), moved);
@@ -509,7 +510,7 @@ fn a_rename_the_person_makes_while_the_owed_name_is_sent_is_kept() {
     let (mut commits, mut trees, mut ids) =
         owing_its_name(&[synced("a", dir(ROOT, "a (pending)"))]);
     let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
-    assert_eq!(ops(&sent), [mv("a", ROOT, "a")]);
+    assert_eq!(ops(&sent), [owed_mv("a", ROOT, "a", "a (pending)")]);
     trees.set_local("a".into(), local(dir(ROOT, "c"), 1));
     trees.set_remote("a".into(), remote(dir(ROOT, "a")));
     acknowledge(
@@ -528,7 +529,7 @@ fn a_move_the_person_makes_while_the_owed_name_is_sent_is_kept() {
         synced("a", dir(ROOT, "a (pending)")),
     ]);
     let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
-    assert_eq!(ops(&sent), [mv("a", ROOT, "a")]);
+    assert_eq!(ops(&sent), [owed_mv("a", ROOT, "a", "a (pending)")]);
     trees.set_local("a".into(), local(dir("d", "a (pending)"), 2));
     trees.set_remote("a".into(), remote(dir(ROOT, "a")));
     acknowledge(
@@ -609,7 +610,7 @@ fn an_owed_rename_that_lands_is_not_sent_again_once_another_device_names_the_nod
     let (mut commits, mut trees, mut ids) =
         owing_its_name(&[synced("a", dir(ROOT, "a (pending)"))]);
     let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
-    assert_eq!(ops(&sent), [mv("a", ROOT, "a")]);
+    assert_eq!(ops(&sent), [owed_mv("a", ROOT, "a", "a (pending)")]);
     trees.set_remote("a".into(), remote_at(dir(ROOT, "a"), 1));
     trees.set_remote("a".into(), remote_at(dir(ROOT, "a (pending)"), 2));
     acknowledge(
@@ -984,7 +985,7 @@ fn a_file_another_device_deletes_while_this_device_edits_it_takes_its_owed_name_
     assert!(!commits.acknowledge(&mut trees, 1));
     trees.settle();
     let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
-    assert!(!ops(&sent).contains(&mv("a", ROOT, "a")));
+    assert!(!ops(&sent).contains(&owed_mv("a", ROOT, "a", "a (pending)")));
     trees.set_remote("a".into(), remote_at(file(ROOT, "a (pending)", 2), 2));
     acknowledge(
         &mut commits,
@@ -993,7 +994,7 @@ fn a_file_another_device_deletes_while_this_device_edits_it_takes_its_owed_name_
     );
     trees.settle();
     let next = build(&mut commits, &mut trees, &mut ids);
-    assert_eq!(next.as_ref().map(ops), Some(vec![mv("a", ROOT, "a")]));
+    assert_eq!(next.as_ref().map(ops), Some(vec![owed_mv("a", ROOT, "a", "a (pending)")]));
 }
 
 #[test]
@@ -1043,5 +1044,37 @@ fn a_folder_another_device_deletes_takes_its_owed_name_once_an_unsent_edit_below
     assert!(commits.acknowledge(&mut trees, 8));
     trees.settle();
     let rename = build(&mut commits, &mut trees, &mut ids).unwrap();
-    assert_eq!(ops(&rename), [mv("a", ROOT, "a")]);
+    assert_eq!(ops(&rename), [owed_mv("a", ROOT, "a", "a (pending)")]);
+}
+
+#[test]
+fn a_superseded_owed_rename_ends_the_debt_and_leaves_the_change_it_met_to_reach_the_disk() {
+    let (mut commits, mut trees, mut ids) =
+        owing_its_name(&[synced("a", dir(ROOT, "a (pending)"))]);
+    let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&sent), [owed_mv("a", ROOT, "a", "a (pending)")]);
+    trees.set_remote("a".into(), remote_at(dir(ROOT, "b"), 2));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Superseded)],
+    );
+    assert!(!commits.state().pending.contains_key("a"));
+    assert_eq!(trees.synced().live("a"), Some(&dir(ROOT, "a (pending)")));
+    assert_eq!(trees.class("a"), Class::Remote);
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+}
+
+#[test]
+fn a_superseded_owed_rename_of_a_node_another_device_deleted_keeps_the_debt() {
+    let (mut commits, mut trees, mut ids) =
+        owing_its_name(&[synced("a", dir(ROOT, "a (pending)"))]);
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    trees.set_remote("a".into(), trashed(dir(ROOT, "a (pending)")));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Superseded)],
+    );
+    assert!(commits.state().pending.contains_key("a"));
 }

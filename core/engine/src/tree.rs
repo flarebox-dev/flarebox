@@ -89,6 +89,7 @@ pub struct RemoteNode {
     pub trashed: bool,
     pub content_rev: u64,
     pub meta_rev: u64,
+    pub meta_edit_rev: u64,
     pub trash_group: String,
     pub version_id: String,
     pub edit_rev: u64,
@@ -144,6 +145,10 @@ impl RemoteNode {
             trashed,
             content_rev: state.content_rev,
             meta_rev: state.meta_rev,
+            meta_edit_rev: match state.meta_edit_rev {
+                0 => state.meta_rev,
+                rev => rev,
+            },
             trash_group: state.trash_group.clone(),
             version_id: (state.current.as_ref())
                 .map(|version| version.version_id.clone())

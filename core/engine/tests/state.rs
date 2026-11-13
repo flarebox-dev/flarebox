@@ -34,6 +34,7 @@ fn remote(shape: Shape) -> RemoteNode {
         trashed: false,
         content_rev: 1,
         meta_rev: 1,
+        meta_edit_rev: 1,
         trash_group: String::new(),
         version_id: String::new(),
         edit_rev: 1,
@@ -64,6 +65,7 @@ fn trees() -> Trees {
     let deleted = RemoteNode {
         trashed: true,
         meta_rev: 5,
+        meta_edit_rev: 5,
         trash_group: "5:0".into(),
         ..remote(dir(ROOT, "t"))
     };
@@ -224,6 +226,7 @@ fn commits_state() -> CommitsState {
         node_id: "m".into(),
         new_parent_id: ROOT.into(),
         new_name: "n".into(),
+        from: None,
     };
     let ops = vec![
         Op {

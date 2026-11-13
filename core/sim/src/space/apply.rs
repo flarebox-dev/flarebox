@@ -6,7 +6,7 @@ use koidrive_engine::names::{conflict_name, is_reserved_at_root, name_key, norma
 use koidrive_engine::tree::same_content;
 use koidrive_proto::v1::{
     ChangeRecord, ChunkRef, Content, CreateDir, CreateFile, Delete, Error, Move, NodeKind,
-    NodeStatus, Op, OpResult, Restore, change_record, error, op, op_result,
+    NodeStatus, Op, OpResult, Place, Restore, change_record, error, op, op_result,
 };
 
 use super::{ChunkState, Node, Session, State, Version, fail};
@@ -133,7 +133,7 @@ impl<'a> Applier<'a> {
     }
 
     fn unseen_meta(&self, node: &Node) -> bool {
-        node.meta_rev > self.ctx.base_seq && node.meta_dev != self.dev()
+        node.meta_edit_rev > self.ctx.base_seq && node.meta_edit_dev != self.dev()
     }
 
     /// RFC 0002 section 9.
@@ -266,6 +266,8 @@ impl<'a> Applier<'a> {
         node.name = name.clone();
         node.trash_group = None;
         node.meta_rev = seq;
+        node.meta_edit_rev = seq;
+        node.meta_edit_dev = dev.clone();
         node.meta_dev = dev;
         self.touch(node_id);
         (name, renamed)
@@ -351,6 +353,8 @@ impl<'a> Applier<'a> {
             edit_dev: self.dev().into(),
             meta_rev: self.ctx.seq,
             meta_dev: self.dev().into(),
+            meta_edit_rev: self.ctx.seq,
+            meta_edit_dev: self.dev().into(),
             parent_rev: self.ctx.seq,
             parent_dev: parent_dev.into(),
             cur_version_id: version_id,
@@ -555,11 +559,20 @@ impl<'a> Applier<'a> {
         if target.parent_id.is_none() && is_reserved_at_root(&name) {
             return Ok(rejected("INVALID_NAME"));
         }
+        if let Some(from) = &op.from
+            && !self.is_at(&found, from, &target)
+        {
+            return Ok(result(op_result::Code::Superseded, "", ""));
+        }
         if found.status == NodeStatus::Live
             && found.parent_id.as_deref() == Some(target.node_id.as_str())
             && found.name == name
         {
-            if self.unseen_parent(&found) {
+            if op.from.is_some() {
+                return Ok(result(op_result::Code::Applied, "", &name));
+            }
+            let authored = found.meta_edit_rev < found.meta_rev;
+            if authored || self.unseen_parent(&found) {
                 let (seq, dev) = (self.ctx.seq, self.dev().to_string());
                 let stored = self
                     .st
@@ -567,7 +580,12 @@ impl<'a> Applier<'a> {
                     .get_mut(&found.node_id)
                     .expect("moved node exists");
                 stored.parent_rev = seq;
-                stored.parent_dev = dev;
+                stored.parent_dev = dev.clone();
+                if authored {
+                    stored.meta_edit_rev = seq;
+                    stored.meta_edit_dev = dev;
+                    self.touch(&found.node_id);
+                }
             }
             return Ok(result(op_result::Code::Applied, "", &name));
         }
@@ -587,7 +605,7 @@ impl<'a> Applier<'a> {
         }
         let (name, renamed) = self.pick_name(&parent.node_id, &name, &found.node_id);
         let placed = found.parent_id.as_deref() != Some(parent.node_id.as_str())
-            || self.unseen_parent(&found);
+            || (op.from.is_none() && self.unseen_parent(&found));
         let (seq, dev) = (self.ctx.seq, self.dev().to_string());
         let stored = self
             .st
@@ -602,9 +620,20 @@ impl<'a> Applier<'a> {
         stored.name_key = name_key(&name);
         stored.name = name.clone();
         stored.meta_rev = seq;
+        if op.from.is_none() {
+            stored.meta_edit_rev = seq;
+            stored.meta_edit_dev = dev.clone();
+        }
         stored.meta_dev = dev;
         self.touch(&found.node_id);
         Ok(applied(renamed, &name))
+    }
+
+    fn is_at(&self, node: &Node, from: &Place, target: &Node) -> bool {
+        node.status == NodeStatus::Live
+            && target.status == NodeStatus::Live
+            && node.parent_id.as_deref() == Some(self.id(&from.parent_id).as_str())
+            && normalize_name(&from.name).is_some_and(|name| node.name == name)
     }
 
     fn trash_subtree(&mut self, node: &Node, group: &str) -> bool {
@@ -627,6 +656,8 @@ impl<'a> Applier<'a> {
         stored.status = NodeStatus::Trashed;
         stored.trash_group = Some(group.to_string());
         stored.meta_rev = seq;
+        stored.meta_edit_rev = seq;
+        stored.meta_edit_dev = dev.clone();
         stored.meta_dev = dev;
         self.touch(&node.node_id);
         false

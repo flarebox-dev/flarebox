@@ -1301,7 +1301,7 @@ impl Commits {
                         && target != *id
                     {
                         let shape = Shape {
-                            parent: target,
+                            parent: target.clone(),
                             name: name(&moved.new_name),
                             ..shape
                         };
@@ -1324,7 +1324,31 @@ impl Commits {
                     {
                         self.pending.remove(id);
                     }
-                    (id, applied || cycle)
+                    let superseded = code == Code::Superseded && moved.from.is_some();
+                    if superseded {
+                        let local = (trees.local().get(id))
+                            .filter(|local| !local.parked)
+                            .map(|local| &local.shape)
+                            .filter(|local| {
+                                local.parent == target && nfc(&local.name) == nfc(&moved.new_name)
+                            });
+                        match (local, synced.get(trees, id)) {
+                            (Some(local), Some(shape)) => synced.set(
+                                id,
+                                Some(Shape {
+                                    parent: local.parent.clone(),
+                                    name: local.name.clone(),
+                                    ..shape
+                                }),
+                            ),
+                            (Some(local), None) if trees.resends().contains(id) => {
+                                synced.set(id, Some(local.clone()))
+                            }
+                            _ => {}
+                        }
+                        trees.end_resend(id);
+                    }
+                    (id, applied || cycle || superseded)
                 }
                 Some(op::Op::Delete(delete)) => {
                     let done = applied || code == Code::Superseded;
@@ -2332,6 +2356,7 @@ enum Want {
         id: NodeId,
         parent: NodeId,
         name: String,
+        guarded: bool,
     },
     Content {
         id: NodeId,
@@ -2468,6 +2493,13 @@ fn plan(
                 id: id.clone(),
                 parent: local.parent.clone(),
                 name: local.name.clone(),
+                guarded: trees.resends().contains(id)
+                    || owed.get(id).is_some_and(|pending| {
+                        nfc(&local.name) == nfc(&pending.name)
+                            && (synced.or(remote)).is_some_and(|held| {
+                                held.parent == local.parent && nfc(&held.name) == nfc(&pending.sent)
+                            })
+                    }),
             });
         }
         let differs = |shape: Option<&Shape>, content: &Content| {
@@ -2492,6 +2524,7 @@ fn plan(
             id: id.clone(),
             parent: remote.parent.clone(),
             name: pending.name.clone(),
+            guarded: true,
         });
     }
     let mut scratch = Scratch::new(trees);
@@ -2587,13 +2620,24 @@ fn plan(
                     }),
                 }
             }
-            Want::Move { id, parent, name } => {
+            Want::Move {
+                id,
+                parent,
+                name,
+                guarded,
+            } => {
                 moving.remove(&id);
-                scratch.place(&id, &parent, &name, scratch.nodes[&id].kind);
+                let held = &scratch.nodes[&id];
+                let from = guarded.then(|| proto::Place {
+                    parent_id: held.parent.clone(),
+                    name: held.name.clone(),
+                });
+                scratch.place(&id, &parent, &name, held.kind);
                 op::Op::Move(proto::Move {
                     node_id: id,
                     new_parent_id: parent,
                     new_name: name,
+                    from,
                 })
             }
             Want::Content { id, content } => {
@@ -2704,7 +2748,13 @@ fn plan(
             continue;
         }
         if let Some(cycle) = name_cycle(&wants, &scratch, &moving) {
-            let Some(Want::Move { id, parent, name }) = &wants[cycle[0]] else {
+            let Some(Want::Move {
+                id,
+                parent,
+                name,
+                guarded,
+            }) = &wants[cycle[0]]
+            else {
                 unreachable!("a name cycle holds moves");
             };
             let sent = scratch.free_name(parent, name);
@@ -2720,6 +2770,7 @@ fn plan(
                 id: id.clone(),
                 parent: parent.clone(),
                 name: sent,
+                guarded: *guarded,
             };
             let all: usize = (cycle.iter())
                 .filter_map(|at| wants[*at].as_ref())
@@ -2867,7 +2918,10 @@ fn name_cycle(
         while seen.insert(node) {
             if let Some(&at) = blocked.get(node) {
                 cycle.push(at);
-                let Some(Want::Move { id, parent, name }) = &wants[at] else {
+                let Some(Want::Move {
+                    id, parent, name, ..
+                }) = &wants[at]
+                else {
                     unreachable!("indexed from the moves");
                 };
                 let holders: Vec<&NodeId> = (scratch.children.get(parent))
@@ -2930,6 +2984,7 @@ fn return_cycle(
 
 struct Entry {
     parent: NodeId,
+    name: String,
     key: String,
     kind: Kind,
     live: bool,
@@ -2971,6 +3026,7 @@ impl Scratch {
         for (id, node) in trees.remote().iter() {
             let entry = Entry {
                 parent: node.shape.parent.clone(),
+                name: node.shape.name.clone(),
                 key: name_key(&node.shape.name),
                 kind: node.shape.kind,
                 live: false,
@@ -3018,7 +3074,9 @@ impl Scratch {
     fn placement(&self, want: &Want, moving: &BTreeSet<NodeId>) -> Fit {
         match want {
             Want::Create { id, shape } => self.fit_at(id, &shape.parent, &shape.name),
-            Want::Move { id, parent, name } => self.fit_at(id, parent, name),
+            Want::Move {
+                id, parent, name, ..
+            } => self.fit_at(id, parent, name),
             Want::Content { id, .. } if moving.contains(id) => Fit::Wait,
             Want::Content { .. } => Fit::Valid,
             Want::Delete { id, members } => {
@@ -3140,6 +3198,7 @@ impl Scratch {
         self.unlink(id);
         let entry = Entry {
             parent: parent.to_owned(),
+            name: name.to_owned(),
             key: name_key(name),
             kind,
             live: false,

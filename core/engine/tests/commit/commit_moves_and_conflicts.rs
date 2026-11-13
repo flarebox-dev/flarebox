@@ -1071,3 +1071,42 @@ fn a_create_into_a_trashed_folder_that_moves_out_of_a_live_one_goes_first() {
         "{commit:?}"
     );
 }
+
+#[test]
+fn a_delete_made_after_a_move_was_sent_goes_out_after_the_moves_own_record() {
+    let mut trees = trees(&[synced("n", dir(ROOT, "pending"))]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    trees.set_local("n".into(), local(dir(ROOT, "a"), 1));
+    trees.settle();
+    let sent = commits
+        .build(&mut trees, &mut ids, NOW, HISTORY, 1)
+        .unwrap();
+    assert_eq!(ops(sent), [mv("n", ROOT, "a")]);
+    trees.remove_local("n");
+    trees.set_remote(
+        "n".into(),
+        RemoteNode {
+            meta_rev: 2,
+            meta_edit_rev: 1,
+            ..remote(dir(ROOT, "a"))
+        },
+    );
+    trees.settle();
+    trees.set_remote_made_here(
+        "n".into(),
+        RemoteNode {
+            meta_rev: 2,
+            meta_edit_rev: 3,
+            ..remote(dir(ROOT, "a"))
+        },
+    );
+    commits
+        .received(result(3, vec![outcome(op_result::Code::Applied)]))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 3));
+    trees.settle();
+    let next = commits
+        .build(&mut trees, &mut ids, NOW, HISTORY, 3)
+        .cloned();
+    assert_eq!(next.as_ref().map(ops), Some(vec![delete("n")]));
+}
