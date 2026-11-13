@@ -18,7 +18,7 @@ use koidrive_sim::world::disk::Place;
 use koidrive_sim::world::{Action, Cut, Failure, NAMES, Outcome, Reply, Step, TEXTS, World};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
-use proptest::test_runner::{RngSeed, TestRunner};
+use proptest::test_runner::{FileFailurePersistence, RngSeed, TestRunner};
 
 #[path = "devices/restore_write_history.rs"]
 mod restore_write_history;
@@ -197,11 +197,21 @@ fn keep(devices: usize, phases: &[Vec<(usize, Step)>]) -> Result<World, Failure>
 const REWIND_SEED: u64 = 501;
 
 fn converges_from(seed: u64, cases: u32) {
-    let config = ProptestConfig {
+    converges_with(ProptestConfig {
         rng_seed: RngSeed::Fixed(seed),
         failure_persistence: None,
         ..ProptestConfig::with_cases(cases)
-    };
+    });
+}
+
+fn converges_from_saved_cases(file: &'static str) {
+    converges_with(ProptestConfig {
+        failure_persistence: Some(Box::new(FileFailurePersistence::Direct(file))),
+        ..ProptestConfig::with_cases(0)
+    });
+}
+
+fn converges_with(config: ProptestConfig) {
     let mut runner = TestRunner::new(config);
     let result = runner.run(
         &(2..=3usize, phases(Losses::Rewinds)),
@@ -303,6 +313,36 @@ fn rewinds_converge_from_seed_313() {
 #[test]
 fn rewinds_converge_from_seed_319() {
     converges_from(319, 4096);
+}
+
+#[test]
+#[ignore = "a device goes quiet out of sync after a rewind (GUN-551)"]
+fn rewinds_converge_from_seed_824() {
+    converges_from(824, 4096);
+}
+
+#[test]
+#[ignore = "a device goes quiet out of sync after a rewind (GUN-551)"]
+fn rewinds_converge_from_seed_1316() {
+    converges_from(1316, 4096);
+}
+
+#[test]
+#[ignore = "a device goes quiet out of sync after a rewind (GUN-551)"]
+fn rewinds_converge_from_seed_3413() {
+    converges_from(3413, 4096);
+}
+
+#[test]
+#[ignore = "a device goes quiet out of sync after a rewind (GUN-551)"]
+fn rewinds_converge_from_seed_3417() {
+    converges_from(3417, 4096);
+}
+
+#[test]
+#[ignore = "a device goes quiet out of sync after a rewind, or keeps a write off the server while it waits (GUN-551)"]
+fn rewinds_converge_from_the_saved_gun_551_cases() {
+    converges_from_saved_cases("tests/gun-551.proptest-regressions");
 }
 
 /// A fixed sample of the schedules reaches every fault and every way back from one that the
