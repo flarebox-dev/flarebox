@@ -1,154 +1,92 @@
 # Releasing the macOS app
 
-The [macOS release](../.github/workflows/release-macos.yml) workflow builds the app from `apps/macos` as a disk image (DMG), signs and notarizes it. For a version tag, the [CLI distribution](../.github/workflows/release-cli.yml) workflow runs it as one of its jobs and publishes the DMG on the tag's GitHub release, next to the CLI tarballs and in the same `SHA256SUMS`.
+A version tag on `main` builds the app from `apps/macos`, signs and notarizes it, and publishes `Koidrive-<version>-arm64.dmg` on the tag's GitHub release, next to the CLI tarballs and in the same `SHA256SUMS`. The [CLI distribution](../.github/workflows/release-cli.yml) workflow does this for the tag and runs the [macOS release](../.github/workflows/release-macos.yml) workflow as one of its jobs. The DMG requires macOS 26 or later on Apple silicon.
 
-| Trigger | What it builds |
-|---|---|
-| A tag like `v0.1.0`, `v0.1.0-alpha.2` or `v0.1.0-rc.1` on a commit that is on `main` | The CLI distribution workflow builds the app at that version, signed and notarized, and attaches `Koidrive-<version>-arm64.dmg` to the release, for example `Koidrive-0.1.0-alpha.2-arm64.dmg`. If the app does not build, sign, notarize or verify, or a signing secret is missing, the run fails and publishes nothing, not even the CLI tarballs. |
-| **Run workflow** (manual) on the macOS release workflow from `main` | The app at the version you enter (`0.1.0` or `0.1.0-alpha.2`), or at the version in `[workspace.package]` of `Cargo.toml` when you leave it empty. It is signed and notarized if the signing secrets are set, and it is only a workflow artifact on the run's page. |
-| Pull requests, the merge queue and pushes to `main` | An unsigned DMG, to check that the build, packaging and verification still work. The `macos app` job of [CI](../.github/workflows/ci.yml) builds it after testing the app's Swift bindings. A pull request or merge queue run builds it only when the change touches `core/`, `apps/macos/`, `.cargo/`, the Cargo files (including `cli/Cargo.toml`, which Cargo loads as a workspace member), `rust-toolchain.toml` or the workflow. A push to `main` always builds it, and `ci-report` fails the push if it did not run and pass. For a pull request from a fork it runs on GitHub-hosted `xcode-27` runners with Xcode 27.2. For a pull request from a branch of this repository, the `pick-macos` job of CI puts it on a self-hosted Mac runner or on `xcode-27`. In the merge queue and on `main` it runs on the self-hosted Mac runners with the Xcode installed there, or on `xcode-27` when the `MACOS_RUNS_ON` variable is set (see the [runner README](../.github/runner/README.md), which also describes the hook that keeps fork pull requests off the self-hosted runners). These runs never see the signing secrets. |
+Signing needs a Developer ID certificate, an App Store Connect API key and a protected `macos-release` environment. The repository has all three. [Set up release signing](release-macos-signing.md) describes them and how to replace them.
+
+## Release a version
+
+1. Set `version` in `[workspace.package]` of `Cargo.toml` to the release's version, such as `0.1.0-alpha.2`, run `cargo update --workspace` to update `Cargo.lock`, and merge the change to `main`. The release run fails when `koi --version` doesn't match the tag.
+2. Tag the latest commit on `main` and push the tag:
+
+   ```sh
+   git fetch origin main && git tag v0.1.0-alpha.2 origin/main && git push origin v0.1.0-alpha.2
+   ```
+
+   A tag is `v` and three numbers, optionally followed by `-alpha.N` or `-rc.N`. Only repository admins can create `v*` tags. An `-alpha.N` or `-rc.N` tag publishes a normal release, not a prerelease, so unless a higher version is published it becomes Latest, which `install.sh` installs by default.
+3. Open the CLI distribution run that the tag started. Once the CLI tarballs are built, the app and the CLI signing jobs both wait for the `macos-release` environment. Click **Review deployments**, select `macos-release` and **Approve and deploy**. One approval covers both jobs. Approve only a run for a commit and version you meant to release.
+4. The `publish` job runs once `release-ref` and `checksums` pass, and `scripts/publish-release.sh` attaches the CLI tarballs, the DMG and `SHA256SUMS` to the release in one step. Jobs that don't feed `checksums`, such as `homebrew-install`, can fail after the release is out, so when a run fails, check the `publish` job and the release page.
+
+If the app does not build, sign, notarize or verify, the run fails and publishes nothing, not even the CLI tarballs. `publish-release.sh` also refuses when the DMG is missing, when any other file is present (an unsigned DMG included), or when `SHA256SUMS` does not list exactly those files with matching hashes. A tag on a commit that is not on `main` fails in the "commit on main" jobs.
+
+## Build a DMG without releasing
+
+Open **Actions**, **macOS release**, **Run workflow**, keep `main` under "Use workflow from", and leave the version empty to use the one in `[workspace.package]` of `Cargo.toml`. A version you enter must be that same version, because `build-release.sh` stops when `koi --version` reports another. Approve the deployment when the run page asks. The signed DMG is a workflow artifact under **Artifacts** on the run's page, and nothing is published. A run from any other branch fails in the "commit on main" job.
+
+To check a DMG on your Mac:
+
+```sh
+mnt=$(mktemp -d)
+hdiutil attach Koidrive-0.1.0-arm64.dmg -nobrowse -readonly -mountpoint "$mnt" || exit 1
+codesign --verify --deep --strict --verbose=2 "$mnt/Koidrive.app"
+xcrun stapler validate "$mnt/Koidrive.app"
+spctl --assess --type execute --verbose=2 "$mnt/Koidrive.app"   # expect "source=Notarized Developer ID"
+hdiutil detach "$mnt"
+```
 
 ## What a signed run does
 
-1. Checks, in a job without access to the secrets, that the tagged or dispatched commit is on `main` and that a manual run started from `main`. Otherwise the run stops before the signing job starts.
-2. Waits for a required reviewer to approve the `macos-release` environment, which releases the secrets to the signing job.
-3. Builds the Release app with Xcode 27.2 on an `xcode-27` runner, without signing, with `koi` in `Contents/Helpers/koi`. `koi` embeds the server bundle, as the CLI release does. `xcode-27` is a GitHub [preview image](https://github.com/actions/runner-images/issues/14404) with macOS 27.
-4. Creates a temporary keychain with a random password, imports the Developer ID certificate into it, and writes the notary key to a file readable only by the runner user.
-5. Signs `Contents/Helpers/koi` and then the app with the Developer ID Application identity, the hardened runtime and a secure timestamp, the app also with [`apps/macos/Koidrive.entitlements`](../apps/macos/Koidrive.entitlements).
-6. Notarizes the app with `notarytool` and the App Store Connect API key, then staples the ticket to the app. It submits the app without waiting, prints the submission id, and then asks Apple for the submission's status every minute for up to 2.5 hours. When a request fails with a network error, it tries again after 15 seconds, doubling the wait up to 5 minutes.
-7. Packages the stapled app in a DMG, signs the DMG, notarizes it the same way and staples it.
-8. Verifies the DMG and the app inside it with `codesign --verify --deep --strict`, `xcrun stapler validate` and `spctl --assess`, and checks for the hardened runtime, the Developer ID authority and the absence of `get-task-allow`. It also checks that `Contents/Helpers/koi` carries the same kind of signature and reports the app's `KoidriveVersion`.
-9. Uploads `Koidrive-<version>-arm64.dmg` as an artifact and writes its SHA-256 to the run summary.
-10. Deletes the keychain and the key files, even when a step failed.
+1. A job without the secrets checks that the commit is on `main`, and that a manual run started from `main`.
+2. The signing job waits for approval of the `macos-release` environment, which releases the secrets.
+3. It builds the Release app with Xcode 27.2 on an `xcode-27` runner, with `koi` in `Contents/Helpers/koi`. `koi` embeds the server bundle, as the CLI release does. `xcode-27` is a GitHub [preview image](https://github.com/actions/runner-images/issues/14404) with macOS 27.
+4. It imports the Developer ID certificate into a temporary keychain with a random password, and writes the notary key to a file only the runner user can read.
+5. It signs `Contents/Helpers/koi` and then the app with the Developer ID Application identity, the hardened runtime and a secure timestamp, and the app also with [`apps/macos/Koidrive.entitlements`](../apps/macos/Koidrive.entitlements).
+6. It notarizes the app with `notarytool` and staples the ticket. `scripts/notarize.sh` submits without waiting, prints the submission id, and asks Apple for the status every minute for up to 2.5 hours. After a network error it tries again after 15 seconds, doubling the wait up to 5 minutes.
+7. It packages the stapled app in a DMG, then signs, notarizes and staples the DMG the same way.
+8. `scripts/verify-release.sh` checks the DMG and the app with `codesign --verify --deep --strict`, `xcrun stapler validate` and `spctl --assess`, and checks for the hardened runtime, the Developer ID authority and no `get-task-allow`. It also checks that `Contents/Helpers/koi` carries the same kind of signature, and reports the app's `KoidriveVersion`.
+9. It uploads `Koidrive-<version>-arm64.dmg` as an artifact and writes its SHA-256 to the run summary.
+10. It deletes the keychain and the key files, even when a step failed.
 
-For a tag, the CLI distribution workflow then writes one `SHA256SUMS` for the CLI tarballs and the DMG, and [`scripts/publish-release.sh`](../scripts/publish-release.sh) attaches all of them to the release in one step. It refuses to publish when the DMG for the tag's version is missing, when any other file is present (an unsigned DMG included), or when `SHA256SUMS` does not list exactly those files with matching hashes.
+When none of the signing secrets are set, a manual run signs the app ad hoc only, names the DMG `Koidrive-<version>-arm64-unsigned.dmg`, and says "Signing skipped" in a warning and in the summary. Gatekeeper blocks that DMG on other Macs.
 
-If Apple reports a submission as Invalid or Rejected, the log shows Apple's notarization log for it. If Apple gives no final answer within 2.5 hours, the step fails and names the submission id.
+## When a run fails
 
-When none of the signing secrets are set, a manual run still builds the DMG but signs it ad hoc only, names it `Koidrive-<version>-arm64-unsigned.dmg`, and says "Signing skipped" in a warning and in the run summary. Gatekeeper blocks such a DMG on other Macs. When only some of the secrets are set, the run fails and names the missing ones. A tag run fails when any of them is missing.
+- **"Only some signing secrets are set"** or **"these signing secrets are missing"**. Set all five secrets in the `macos-release` environment ([Set up release signing](release-macos-signing.md#the-five-secrets)). A tag run fails when any one is missing.
+- **"Could not import MACOS_DEVELOPER_ID_P12_BASE64"** or **"Expected one valid Developer ID Application identity"**. The `.p12` is not base64-encoded, its password is wrong, or it lacks the private key. Export it again.
+- **Apple reports the submission as Invalid or Rejected.** The log shows Apple's notarization log for it.
+- **Apple gives no final answer within 2.5 hours**, or a network error ends the run while Apple is still working. The step names the submission id. See the next section.
+
+### Resume an interrupted notarization of the app
+
+Each notarization prints its submission id in the log and as a notice on the run page. `xcrun notarytool info <id>` with the team's API key shows its status. To wait for that submission instead of submitting again, start a new manual run with:
+
+- the same version,
+- the failed run's build number as **build-number**. Its "Decide the version" step prints `Version <version>, build <number>.`
+- the submission id as **app-submission-id**.
+
+The new run rebuilds the same app, waits for that submission and staples its ticket. If the rebuilt app differs from the submitted one, stapling fails and the step says so. Run again with **app-submission-id** empty to submit the app again. This works only for manual runs. A tag run submits again when you rerun its failed jobs. The DMG always gets a new submission, because a rebuilt disk image is never identical to an earlier one.
 
 ## Versions
 
-The app carries the version in three `Info.plist` keys. For the tag `v0.1.0-alpha.2`:
+The app carries its version in three `Info.plist` keys. For the tag `v0.1.0-alpha.2`:
 
 | Key | Value | Set from |
 |---|---|---|
 | `CFBundleShortVersionString` | `0.1.0` | The `X.Y.Z` part of the version, because macOS expects three numbers here |
-| `CFBundleVersion` | The build number, for example `412` | The run number of the workflow run: the CLI distribution run for a tag, or the macOS release run (or the **build-number** input) for a manual run |
-| `KoidriveVersion` | `0.1.0-alpha.2` | The full version, including `-alpha.N` or `-rc.N` |
+| `CFBundleVersion` | The build number, for example `412` | The run number: of the CLI distribution run for a tag, or of the macOS release run (or the **build-number** input) for a manual run |
+| `KoidriveVersion` | `0.1.0-alpha.2` | The full version |
 
-`apps/macos/scripts/build-release.sh` takes the full version in `VERSION` and sets the first and third keys; `KoidriveVersion` comes from the `KOIDRIVE_VERSION` build setting in `apps/macos/project.yml`. `koi --version` must report the same version, so set the version in `[workspace.package]` of `Cargo.toml` before you tag. Without `VERSION`, the script uses the version `koi` reports. Read `KoidriveVersion` to compare two builds, because it orders `0.1.0-alpha.2` before `0.1.0-rc.1` and `0.1.0`, which `CFBundleShortVersionString` cannot.
+`apps/macos/scripts/build-release.sh` takes the full version in `VERSION` and sets the first and third keys. `KoidriveVersion` comes from the `KOIDRIVE_VERSION` build setting in `apps/macos/project.yml`. `koi --version` must report the same version, and without `VERSION` the script uses the version `koi` reports. Compare two builds by `KoidriveVersion`, which orders `0.1.0-alpha.2` before `0.1.0-rc.1` and `0.1.0`.
 
-## Before you add any secret
+## CI builds an unsigned DMG
 
-A Developer ID certificate signs software as you, so the secrets must reach only code that was reviewed and merged to `main`, and only when you approve. Set up these three things first. They are repository settings; the workflow cannot apply them itself.
+The `macos app` job of [CI](../.github/workflows/ci.yml) builds the app, tests its Swift bindings, signs it ad hoc and verifies an unsigned DMG, so a change that breaks packaging fails before a release. It runs on a pull request that changes a file that builds or behaves differently on macOS, in the merge queue, and on a push to `main` that the merge queue did not already cover. It runs on a GitHub-hosted `xcode-27` runner, or on the self-hosted Mac runners when `MACOS_RUNS_ON` selects them ([runner README](../.github/runner/README.md)). These runs never see the signing secrets.
 
-The trust boundary is your approval of the environment. A deployment rule like `v*` only checks a tag's name, not whether its commit was reviewed, and the workflow's own check that the commit is on `main` runs code from that same commit, so it is a second line of defense, not the boundary ([Deployment branches and tags](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments#deployment-branches-and-tags)).
+## The app needs no entitlements
 
-### 1. Restrict who can create version tags
-
-1. Open the repository on GitHub and click **Settings**.
-2. In the left sidebar, under "Code, planning, and automation", click **Rules**, then **Rulesets**.
-3. Click **New ruleset**, then **New tag ruleset**.
-4. Under "Ruleset name", type `Release tags`.
-5. Set "Enforcement status" to **Active**.
-6. Under "Bypass list", click **Add bypass**, select **Repository admin**, and click **Add selected**.
-7. Under "Target tags", click **Add target**, choose **Include by pattern**, type `v*`, and add the pattern.
-8. Under "Tag protections", select **Restrict creations**, **Restrict updates** and **Restrict deletions**, and keep **Block force pushes** selected.
-9. Click **Create**.
-
-Only repository admins can then create, move or delete `v*` tags; everyone else, including apps with write access, is refused ([Available rules for rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)).
-
-### 2. Create the `macos-release` environment with a required reviewer
-
-1. In **Settings**, click **Environments** in the left sidebar, then **New environment**.
-2. Type `macos-release` and click **Configure environment**.
-3. Select **Required reviewers**, add `gunwooterry`, and leave **Prevent self-review** unselected, because you both start and approve release runs. Click **Save protection rules**.
-4. Deselect **Allow administrators to bypass configured protection rules** and click **Save protection rules**.
-5. Under "Deployment branches and tags", choose **Selected branches and tags**. Click **Add deployment branch or tag rule**, choose **Branch** as the ref type, type `main` and click **Add rule**. Click it again, choose **Tag**, type `v*` and click **Add rule**.
-
-Each signed run then waits on its run page until you click **Review deployments**, select `macos-release` and **Approve and deploy**. On a tag run of the CLI distribution workflow, the app and the CLI signing jobs both start once the CLI tarballs are built, so one approval covers both. Approve only runs for a commit and version you meant to release ([Managing environments for deployment](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)).
-
-### 3. Keep the secrets in the environment only
-
-Add the five secrets below under **Environment secrets** of `macos-release` (**Add secret**), or from a terminal with `gh secret set <NAME> --env macos-release`, which reads the value from standard input. Never add them as repository or organization secrets: workflows that run for a pull request from a branch of this repository receive those, so anyone who can push a branch could change a workflow to read them. Environment secrets reach a job only after the environment's rules pass.
-
-## Secrets
-
-Five secrets, all required for a signed build:
-
-| Secret | Holds |
-|---|---|
-| `MACOS_DEVELOPER_ID_P12_BASE64` | The Developer ID Application certificate with its private key, exported as a `.p12` file and base64-encoded |
-| `MACOS_DEVELOPER_ID_P12_PASSWORD` | The password you chose when exporting the `.p12` |
-| `APP_STORE_CONNECT_API_KEY_ID` | The key ID of an App Store Connect team API key |
-| `APP_STORE_CONNECT_API_ISSUER_ID` | The issuer ID of your team's App Store Connect API keys |
-| `APP_STORE_CONNECT_API_KEY_P8_BASE64` | The API key's private key, the `.p8` file, base64-encoded |
-
-The keychain password is generated for each run, so it is not a secret you set.
-
-### Create the Developer ID certificate and its `.p12`
-
-Creating a Developer ID certificate needs the Account Holder role ([Developer ID certificates](https://developer.apple.com/help/account/certificates/create-developer-id-certificates/)).
-
-1. On a Mac, open **Keychain Access** and choose **Keychain Access**, **Certificate Assistant**, **Request a Certificate From a Certificate Authority**. Enter your email address, choose **Saved to disk**, and save the `.certSigningRequest` file ([Create a certificate signing request](https://developer.apple.com/help/account/certificates/create-a-certificate-signing-request/)).
-2. In [Certificates, Identifiers & Profiles](https://developer.apple.com/account/resources/certificates/list), click the add button, choose **Developer ID**, then **Developer ID Application**, upload the request and download the `.cer` file.
-3. Double-click the `.cer` file. It appears under **My Certificates** in Keychain Access, together with the private key created in step 1.
-4. In **My Certificates**, select the certificate "Developer ID Application: …" (it must show the private key under it), choose **File**, **Export Items**, save it as a `.p12`, and set a strong password.
-5. Store both secrets:
-   ```sh
-   base64 -i DeveloperIDApplication.p12 | gh secret set MACOS_DEVELOPER_ID_P12_BASE64 --env macos-release
-   gh secret set MACOS_DEVELOPER_ID_P12_PASSWORD --env macos-release   # prompts for the password
-   ```
-6. Delete the `.p12` and the `.certSigningRequest` files, and delete the certificate and its private key from Keychain Access. The signing key is not kept on any Mac; the environment secret is its only copy.
-
-GitHub never shows a secret again after you save it. If the secret is lost, create a new certificate; a team can have up to five Developer ID Application certificates. Revoke the old certificate only if its private key leaked: apps signed with a revoked Developer ID certificate can no longer be installed or launched ([Developer ID certificates](https://developer.apple.com/help/account/certificates/create-developer-id-certificates/)).
-
-### Create the App Store Connect API key
-
-`notarytool` needs a team API key; individual API keys cannot use it ([Creating API Keys for App Store Connect API](https://developer.apple.com/documentation/appstoreconnectapi/creating-api-keys-for-app-store-connect-api)). Generating team keys needs the Admin role in App Store Connect, and the Account Holder must first request access to the App Store Connect API ([Role permissions](https://developer.apple.com/help/app-store-connect/reference/account-management/role-permissions/)).
-
-1. In [App Store Connect](https://appstoreconnect.apple.com/), open **Users and Access**, **Integrations**, **App Store Connect API**. If the page asks you to request access, do that first.
-2. On **Team Keys**, click **Generate API Key**, name it, for example, "Koidrive notarization", and choose the **Developer** role. That is the least privileged role commonly used for notarization; *unverified*: Apple's role table does not render as text, so if `notarytool` reports that the key is not authorized, generate a key with the **App Manager** role instead and revoke the first one.
-3. Click **Download API Key**. Apple offers the `.p8` file only once and keeps no copy.
-4. Copy the key's **Key ID** from its row and the **Issuer ID** shown above the list of keys.
-5. Store the three secrets:
-   ```sh
-   gh secret set APP_STORE_CONNECT_API_KEY_ID --env macos-release      # prompts for the key ID
-   gh secret set APP_STORE_CONNECT_API_ISSUER_ID --env macos-release   # prompts for the issuer ID
-   base64 -i AuthKey_<key ID>.p8 | gh secret set APP_STORE_CONNECT_API_KEY_P8_BASE64 --env macos-release
-   ```
-6. Delete the `.p8` file. If the secret is lost or leaks, revoke the key on the same page and generate a new one.
-
-## Run a release build
-
-- **Manually:** open **Actions**, **macOS release**, **Run workflow**, keep `main` under "Use workflow from", and enter a version such as `0.1.0` or leave it empty. A run from any other branch fails in the "commit on main" job.
-- **From a tag:** merge the release to `main`, then tag a commit on `main`, for example `git fetch origin main && git tag v0.1.0-alpha.2 origin/main && git push origin v0.1.0-alpha.2`, so the tag lands on the latest merged commit. The tag is `v` and three numbers, optionally followed by `-alpha.N` or `-rc.N`. The tag starts the CLI distribution workflow, and a tag on a commit that is not on `main` fails in its "commit on main" jobs.
-
-Either way, approve the deployment to `macos-release` on the run page when it asks.
-
-Download the DMG from the tag's release, or from the **Artifacts** section of a manual run's page. To check it on your Mac:
-
-```sh
-hdiutil attach Koidrive-0.1.0-arm64.dmg -nobrowse -readonly
-codesign --verify --deep --strict --verbose=2 /Volumes/Koidrive/Koidrive.app
-xcrun stapler validate /Volumes/Koidrive/Koidrive.app
-spctl --assess --type execute --verbose=2 /Volumes/Koidrive/Koidrive.app   # expect "source=Notarized Developer ID"
-hdiutil detach /Volumes/Koidrive
-```
-
-### If the app's notarization was interrupted
-
-Each notarization step prints its submission id in the log and as a notice on the run's page. If the run failed while Apple was still processing the app, for example after a network error or at the deadline, you can wait for that submission instead of submitting the app again. `xcrun notarytool info <id>` with the team's API key shows its status. This works for manual runs only; a tag run submits again when you rerun its failed jobs. Start a new manual run with the same version, enter the failed run's build number as **build-number** (its "Decide the version" step prints `Version <version>, build <number>.`), and enter the id as **app-submission-id**. The new run rebuilds the same app, waits for that submission and staples its ticket. If the rebuilt app differs from the submitted one, stapling fails, and the step says so; run again with **app-submission-id** empty to submit the app again.
-
-The disk image always goes through a new submission, because a rebuilt disk image is never identical to the one submitted before.
-
-## Entitlements
-
-`apps/macos/Koidrive.entitlements` is deliberately empty. The app is distributed with Developer ID, not through the Mac App Store, so it is not sandboxed: it syncs folders the person chooses anywhere in their home folder. The hardened runtime needs an entitlement only to turn off one of its protections ([Hardened Runtime](https://developer.apple.com/documentation/security/hardened-runtime)), and the app needs none of them: the Rust core is linked statically, and the app uses no JIT, unsigned executable memory, DYLD environment variables or libraries signed by someone else. Open at login uses `SMAppService.mainApp`, which needs no entitlement outside the sandbox. Apple recommends leaving false entitlements out rather than listing them as false. The File Provider extension planned for a later version will need the sandbox and an app group, and with them a Developer ID provisioning profile, which this workflow does not handle yet.
+`apps/macos/Koidrive.entitlements` is empty on purpose. The app ships with Developer ID, not through the Mac App Store, so it is not sandboxed and can sync any folder the person picks in their home folder. The hardened runtime needs an entitlement only to turn off one of its protections ([Hardened Runtime](https://developer.apple.com/documentation/security/hardened-runtime)), and the app needs none: the Rust core is linked statically, and the app uses no JIT, unsigned executable memory, DYLD environment variables or libraries signed by someone else. Open at login uses `SMAppService.mainApp`, which needs no entitlement outside the sandbox.
 
 ## Limits
 
-- The DMG requires macOS 26 or later on Apple silicon.
 - There is no update feed and no Homebrew cask.
 - A run cannot wait for an earlier submission of the disk image. Every run builds a new disk image and submits it.

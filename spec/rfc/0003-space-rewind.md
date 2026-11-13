@@ -1,6 +1,6 @@
 # RFC 0003: Space rewind
 
-Status: proposed. Applies to spec v0 (format_version 1). Tracks GUN-268.
+Status: proposed. Applies to spec v0 (format_version 1).
 
 The owner of a space can rewind it to an earlier point in time. The rewind restores the Space DO's SQLite database with point-in-time recovery (PITR) and starts a new history (§7.4). Devices then recover as RFC 0002 §6 describes. Section numbers refer to spec v0.
 
@@ -22,7 +22,7 @@ PITR behaves as [the SQLite storage API documentation](https://developers.cloudf
 
 ## 1. API (§15.1)
 
-`POST /v1/spaces/{space_id}/rewind` takes a `RewindRequest` and returns a `RewindResult`. The body is protobuf, like the other endpoints of §15.1. The CLI command `koi space rewind` calls this endpoint and nothing else, so this request and response are the CLI's stable interface.
+`POST /v1/spaces/{space_id}/rewind` takes a `RewindRequest` and returns a `RewindResult`. The body is protobuf, like the other endpoints of §15.1. The client call is `Api::rewind` in `core/net`. `koi` has no command for it.
 
 `rewind_id` is a UUIDv7 that the caller chooses once per intended rewind and reuses on every retry. The Account DO looks it up before checking anything else:
 
@@ -51,7 +51,7 @@ At admission, `restore_point_ms` (P) must meet all of these:
 - it is at least one minute and at most 29 days before the request;
 - it is not before the space was created;
 - it is not inside the interval during which an earlier rewind of the space held the space closed (§3);
-- PITR has a bookmark for it. PITR's history of a new Space DO begins some time after the object is created, and `getBookmarkForTime` refuses an earlier time with "Requested time is before this database existed." A point 30 s after creation was refused on Cloudflare (deploy-test run 43346942764); the documentation states no bound.
+- PITR has a bookmark for it. PITR's history of a new Space DO begins some time after the object is created, and `getBookmarkForTime` refuses an earlier time with "Requested time is before this database existed." In a deploy test, a point 30 s after creation was refused. The documentation states no bound.
 
 The Account DO checks the PITR condition through the Space DO at admission, and refuses with `INVALID_ARGUMENT` like the others, since no retry can make PITR serve that point.
 
@@ -59,7 +59,9 @@ The 29-day bound keeps P inside the 30-day PITR range, with a day for the rewind
 
 P is the requested point. The restored state is the one at the bookmark that PITR selects for P, which is approximately P. `RewindResult.restore_seq`, `Welcome.restore_seq` and `ResyncRequired.restore_seq` give the exact `head_seq` of the restored state, and `restore_point_ms` is always the requested P.
 
-## 3. Phases
+## 3. A rewind resumes from its recorded phase after a crash
+
+A failed rewind leaves the space unchanged. After a crash or a call with an unknown outcome, the rewind resumes from its recorded phase, and it never arms a second restore before it has settled the first.
 
 The Account DO directs the rewind and keeps a record of it in its own storage, which PITR on the Space DO does not touch. The record holds:
 - the request;
@@ -104,7 +106,9 @@ An Account DO alarm drives the phases with backoff from one second up to ten min
 
    Once step 4 has found the marker gone, the rewind can only complete. If completion keeps failing, the space stays closed: reopening a restored database under its old history would let devices treat it as that history. This can only happen through a server bug. A retried request with the same `rewind_id` reports `RETRY_LATER` and the last error.
 
-## 4. Closed space
+## 4. A closed space serves no client and runs no work
+
+While a rewind runs, no client and no alarm work reaches the space, so nothing reads the restored database before it carries its new history.
 
 From admission until the record is `completed` or `failed`, the space is closed:
 - every HTTP RPC and WebSocket upgrade gets `RETRY_LATER`;
@@ -118,7 +122,7 @@ A closed alarm sets the alarm again for at most ten minutes later. Work that com
 
 The Account DO decides whether the space is closed. The Worker asks it about every request, the Space DO asks it about every request and message or uses a lease that admission drops (RFC 0014 §3), and the alarm handler also asks it before it runs any work. So the restored database cannot run GC before completion has applied §5, and no client reaches the restored state before it carries its new history.
 
-## 5. Chunk retention
+## 5. Chunks outlive every state a rewind can restore
 
 Two invariants protect chunk objects:
 - **Retention.** No chunk object is deleted earlier than `chunk_grace_days` after the last moment at which any history referenced it.
@@ -144,14 +148,16 @@ Rules 5 to 10 keep delete isolation with key incarnations:
 
 A delete, however late R2 applies it, removes only the object of a retired incarnation (rule 8). No `pending` or `live` row of the current history holds a retired incarnation: rows take only fresh incarnations (rules 5 and 6), GC retires a row's incarnation only after marking the row `deleting`, and completion strips retired incarnations from restored rows (rule 9), using a set that cannot change during the rewind. Delete isolation therefore holds whatever order R2 applies overlapping requests in, and it needs no assumption about requests sent by an object instance that has ended. The cost is that a chunk whose incarnation a rewind strips is uploaded and stored again, and the old object stays until the orphan sweep removes it.
 
-## 6. What a rewind restores, keeps and loses
+## 6. A rewind restores the Space DO and keeps the Account DO
 
-- **Restored to the restore point:** everything in the Space DO. That includes:
+A rewind replaces the space's whole Space DO state with the state at the restore point and changes nothing in the Account DO. Devices keep only what is on their disks.
+
+- Everything in the Space DO is restored to the restore point. That includes:
   - the tree, every node's versions and the trash;
   - the commit log, chunk rows, members, the space's name and settings;
   - `device_commits` (RFC 0002 §2).
-- **Kept:** the Account DO's state, including devices, revocations, spaces, share links, rewind records and chunk retirement records. A share link that points to a node absent after the rewind finds nothing.
-- **Removed from the current history:** every commit that the previous history held and the restored state does not. `restore_seq` and `previous_head_seq` each count in their own history, and those differ when the restore point lies in an earlier history, so the two numbers do not bound these commits. They include:
+- The Account DO's state is kept. That includes devices, revocations, spaces, share links, rewind records and chunk retirement records. A share link that points to a node absent after the rewind finds nothing.
+- Every commit that the previous history held and the restored state does not is removed from the current history. `restore_seq` and `previous_head_seq` each count in their own history, and those differ when the restore point lies in an earlier history, so the two numbers do not bound these commits. They include:
   - every intermediate version written after the restore point, not only the latest one;
   - nodes trashed after the restore point, and their trash state;
   - changes that no device downloaded before the rewind.
@@ -163,7 +169,7 @@ A delete, however late R2 applies it, removes only the object of a retired incar
   - No device is guaranteed to have a copy of a version it never had on disk, such as an intermediate version B in A → B → C after the restore point. Such a version exists only where the previous bullet allows, until it expires.
 - **Undo.** There is no undo operation, and this RFC does not guarantee one. A later rewind to a point before this one began restores the state at that point like any other admissible target (§2 and §5), as yet another history. It does not reverse what devices did during their recovery.
 
-## 7. R2 metadata export (§11)
+## 7. Each history exports to its own prefix (§11)
 
 Each history keeps its own export files, and a new history starts from a full baseline:
 

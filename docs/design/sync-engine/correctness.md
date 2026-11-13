@@ -1,68 +1,65 @@
-## 3. Correctness properties
+# 3. Correctness properties
 
-### 3.1 Vocabulary
+These properties are claims about this design, checked by the tests of §7.
 
-Pierce and Vouillon describe a synchronizer run as a tuple `(o, a, b, a', b')`: the archive `o` (the last synchronized state), the two replicas `a` and `b` before the run, and the replicas after it. A path has changed in `a` if the root sort of `a@p` differs from `o@p` ([2004](references.md#ref-unison), §5). Balasubramaniam and Pierce split a synchronizer into update detection, which computes a predicate `dirty` that may over-report but must never miss an update (`¬dirty(p) ⟹ o(p) = a(p)`), and reconciliation ([1998](references.md#ref-bp), Definition 3.1.2).
+## 3.1 Unison's terms map to nodes
 
-The mapping to Koidrive is per node rather than per path, and one replica is the server:
+The terms follow Pierce and Vouillon ([2004](https://www.cis.upenn.edu/~bcpierce/papers/unisonspec.pdf)) and Balasubramaniam and Pierce ([1998](https://doi.org/10.1145/288235.288261)), applied per node instead of per path, with the server as one replica:
 
-| Unison / B&P | Koidrive |
+| Unison, B&P | Koidrive |
 |---|---|
 | archive `o` | S |
-| replica `a` | L (and the disk it observes) |
-| replica `b` | R (the server state this device knows; the server merges all devices) |
-| `dirty_a(p)` | L(n) ≠ S(n). Update detection is the fs rescans; it must be safe in the B&P sense, so a lossy watcher triggers a rescan rather than a guess (§5.1) |
-| run | one planner step: an effect, a commit, or a tree update |
+| replica `a` | L and the disk it observes |
+| replica `b` | R, the server state this device knows |
+| `dirty_a(p)` | L(n) ≠ S(n). Update detection is the fs rescans. It may over-report but never miss a change, so a lossy watcher triggers a rescan, never a guess (§5.1) |
+| run | one planner step: an effect, a commit or a tree update |
 
-This is an adaptation: B&P and Unison prove their properties for path-keyed replicas, and nothing here inherits those proofs. The properties below are claims about this design, checked by the tests of §7.
+## 3.2 Safety holds after every step
 
-### 3.2 Safety
+Both conditions hold after every step, since a crash can end a run anywhere:
 
-The engine satisfies Unison's two change-propagation conditions at every step, not only at the end of a run, because a crash can end a run anywhere ([Pierce and Vouillon 2004](references.md#ref-unison), §10):
+- Preserve user changes: if L(n) ≠ S(n), no effect changes n on disk. The only disk operations on a locally changed node are those the user's own change implies after the server answers: renaming a fork to its conflict name (§2.7), or giving a recovered file a free name (§5.2). Both keep the content.
+- Propagate only user changes: every effect makes L(n) equal to R(n), and every op makes R(n) equal to L(n). The two exceptions are conflict names, which the server chooses (spec §6.1), and parked locations (§2.5), which are hidden and never uploaded.
 
-- **Preserve user changes**: if L(n) ≠ S(n), no effect changes n on disk. The only disk operation on a locally changed node is the one the user's own change implies after the server answers: renaming a fork to its conflict name (§2.7) or giving a recovered file a free name (§5.2), both of which keep its content.
-- **Propagate only user changes**: every effect makes L(n) equal to R(n), and every op makes R(n) equal to L(n). Nothing is made up, with two deliberate exceptions: conflict names, which the server chooses (spec §6.1), and parked locations (§2.5), which are not visible in the synced folder and never uploaded.
+The engine resolves every conflict deterministically and keeps both sides (spec §1 principle 4). It never stops at a conflict to ask; §3.3 states what that must preserve.
 
-Unison's third condition, **stop at conflicts**, is replaced on purpose. Unison asks a person; its authors note that systems with many replicas, such as the Windows 2000 file service, overwrite instead, because there may be nobody to ask ([Pierce and Vouillon 2004](references.md#ref-unison), footnote 3). Koidrive runs unattended on N devices, so it resolves every conflict deterministically and keeps both sides (spec §1 principle 4). The no-data-loss property below is what replaces "stop at conflicts".
+## 3.3 No write is lost
 
-### 3.3 No data loss
+The property counts writes, not contents:
 
-**[changed]** The property is stated per write, not per content digest, so that two files with identical bytes count separately (review B6).
+- A write is one user action that leaves a file with some bytes: a create or an overwrite on some device. Two writes are different even when their bytes are identical.
+- A write's home is the node it was written to, or the node the server put it in instead: the conflict copy for `CONFLICT_COPY`, the surviving directory's child for `MERGED_INTO`.
+- A replica, a device's disk or the server's live tree, holds a write if the live file at its home has the write's bytes.
+- A write is published once it reached the server in an applied commit.
 
-A **write** is one user action that leaves a file with some bytes: a create or an overwrite on some device. Two writes are different writes even when their bytes are identical. Each write has a **home**: the node it was written to, or the node the server put it in instead (a conflict copy for `CONFLICT_COPY`, the surviving directory's child for `MERGED_INTO`). A replica (a device's disk or the server's live tree) **holds** a write if the live file at its home has the write's bytes.
+A write w is superseded only by a user action on w itself:
 
-A write w is **superseded** only by a user action on w itself, and how depends on whether w was ever published, that is, reached the server in an applied commit:
+- An unpublished write is superseded when the user of the device that wrote it overwrites or deletes the file holding it before it is published. An offline create followed by a delete, or a temporary file that lives between two rescans, leaves nothing to publish.
+- A published write is superseded when, on some device whose disk showed w at its home, the user overwrote or deleted that file and the server accepted the change: an overwrite applied rather than turned into a conflict copy, or a delete applied rather than superseded under R7.
+- An action on another node never supersedes w, including the other side of the same conflict. One device's action never supersedes another device's unpublished write. Sync effects never supersede.
 
-- an **unpublished** write is superseded when the user of the device that wrote it overwrites or deletes the file holding it before it is published. An offline create followed by a delete, or a temporary file that lives between two rescans, leaves nothing to publish, and the engine correctly sends nothing (review R3-3);
-- a **published** write is superseded when, on some device whose disk showed w at its home, the user overwrote or deleted that file and the server accepted the change (an overwrite applied rather than turned into a conflict copy, a delete applied rather than superseded under R7).
-- **[changed]** a rewind of the space by its owner (GUN-268) retires, on the server, every write published only after the restore point. The obligation for those bytes moves to the devices that still hold them: a copy held by recovery (§6.4) must be conserved until it is answered, published again if the answer is Publish or Keep, and found in the local trash if it is Discard. A retired write is not superseded: the property below exempts it until it is published again, when it becomes an ordinary published write, and until then it is checked against this obligation instead.
+A rewind of the space by its owner (RFC 0003) retires, on the server, every write published only after the restore point. A retired write is not superseded. Until it is published again, the devices that hold it carry the obligation: a copy held by recovery (§6.4) is conserved until answered, published again if the answer is Publish or Keep, and in the device's local trash if it is Discard.
 
-**[changed]** An action on another node never supersedes w, including the other side of the same conflict: overwriting n does not supersede a write that lives on in n's conflict copy (review D5), and one device's action never supersedes another device's unpublished write. Sync effects never supersede.
+Property: for writers within the contract of §5.2, once the system is quiescent (§3.4), every write that was neither superseded nor retired is held by the server and by every device on which its home is eligible. On a device where its home is excluded (§5.10), the obligation is conservation: if that device held the write when the home became excluded, it still holds it there.
 
-**Property (no data loss).** For writers within the contract of §5.2, once the system is quiescent (§3.4), every write that was neither superseded nor retired by a rewind is held by the server and by every device on which its home is eligible. On a device where its home is excluded (§5.10), the obligation is conservation, not materialization: if that device held the write when the home became excluded, it still holds it there.
+A superseded write stays recoverable from the server for the retention period, as a version or in the trash (spec §12.2).
 
-This holds through all the conflict rules: concurrent edits keep both contents (R3), an edit concurrent with a delete keeps the edit (R7, R8), and a fork keeps the local write in a new node. A write that was superseded is still recoverable from the server for the retention period, as a previous version or in the trash (spec §12.2); that is a separate property of the server.
+## 3.4 Quiescent devices converge
 
-### 3.4 Convergence and termination
+Quiescence means no user actions, every device online and connected, every message delivered, no injected faults, every question (§6.1) answered, a fair scheduler, and completion of every effect the driver starts.
 
-**Quiescence**: no user actions, every device online and connected, the network delivers every message, no faults are injected, every question the engine asks (§6.1) is answered, the scheduler is fair (every enabled action runs eventually) and every effect the driver starts completes.
+A node is eligible unless it or an ancestor is a problem (unreadable, a name the local file system cannot hold, an ignored file occupying the name), is held for a decision nobody gives, or belongs to a space in recovery (§6.4) or paused after a failed root check.
 
-**[changed]** The property is conditional (review B6). Some states legitimately persist under quiescence: a node reported as a problem (unreadable, a name the local file system cannot hold, an ignored file occupying the name), a node held for a decision nobody gives, or a space in recovery (§6.4) or paused after a failed root check. A node is **eligible** when none of these applies to it or to an ancestor.
+Property: from any reachable state, after quiescence starts, every device eventually reaches L = S = R for every eligible node, every eligible node on every disk matches the server's live tree (path, kind, content), no parked node remains, and nothing is in flight. Ineligible nodes stay unchanged on disk and are reported. The property promises eventual convergence, not a bound. Tests use a step budget, and exceeding it is reported as a likely livelock.
 
-**Property (convergence).** From any reachable state, after quiescence starts, every device eventually reaches L = S = R for every eligible node, every eligible node on every disk matches the server's live tree (path, kind, content), no parked node remains, and nothing is in flight. Ineligible nodes stay unchanged on disk and are reported.
+## 3.5 No resurrection
 
-This is the analogue of Unison's maximality (a maximal run propagates every non-conflicting change, [Pierce and Vouillon 2004](references.md#ref-unison), §5): with conflicts resolved instead of left alone, nothing eligible remains unpropagated. The property promises eventual convergence, not a proven bound. CanopyCheck checks termination with a cutoff on planning iterations ([Goldberg 2020](references.md#ref-trinity)); the simulation does the same with a step budget after quiescence starts, which is a test heuristic: exceeding it is reported as a likely livelock, to be confirmed from the trace.
+Property: a node trashed by a delete whose author had seen its latest state stays trashed unless a later op revives it. Every op a device sends derives from one specific user action on that device that has not been propagated yet (an edit, move, rename, create or delete it observed on disk), or from a user's restore request.
 
-### 3.5 No resurrection
+The engine sends ops only for L ≠ S, L changes only through observations, and S moves only toward what was sent or what R says. Two paths could make a known file look new, and both are guarded: a crash, handled by effect recovery (§2.8, §5.3), and a lost store, handled as a first link that matches local files against R before anything is uploaded (§6.4).
 
-**Property (no resurrection).** A node trashed by a delete whose author had seen its latest state stays trashed unless a later op revives it, and every op a device sends derives from one specific user action on that device that has not been propagated yet (an edit, move, rename, create or delete it observed on disk) or from a user restore request. **[changed]** "Specific and not yet propagated" is new: it rules out an op that re-sends an old, already propagated edit of a node the user once touched (review B6).
+## 3.6 Moves
 
-The two rules that keep a node alive, R7 and R8, both need a change the deleter had not seen. The engine cannot fabricate one: it sends ops only for L ≠ S, L changes only through observations, and S only moves toward what was sent or what R says. Two engine paths could break this and are guarded: a crash that makes a known file look new (handled by adoption, §2.8), and a lost store that makes the whole folder look new (handled like a first link: local files are matched against R by path and content before anything is uploaded).
-
-### 3.6 Moves
-
-Kleppmann et al. show that concurrent moves either duplicate subtrees (Dropbox at the time) or must pick one winner, and that a move which creates a cycle in combination with another must be ignored ([2021](references.md#ref-move), §2). Their CRDT orders moves by timestamp and undoes and redoes to apply them in that order. Koidrive has the simpler setting they describe as state machine replication: one leader orders every operation, so a move "still needs to check for cycles, but it never needs to undo or redo" ([2021](references.md#ref-move), §5.2). The properties:
-
-- **No duplication**: a node is in exactly one place in every tree at every step (Nucleus has the same invariant, "any moved folder is visible in exactly one location", [Goldberg 2020](references.md#ref-trinity)). A move is one op and one `rename` on disk.
-- **No cycles**: R, S and L are trees at every step. The server rejects a cycle-creating move (R6), the client reverts it locally, and parking (§2.5) avoids transient cycles on disk.
-- **Last commit wins** between concurrent moves of one node (R5), which is last writer wins with the commit seq as the timestamp.
+- No duplication: a node is in exactly one place in every tree at every step. A move is one op and one `rename` on disk.
+- No cycles: R, S and L are trees at every step. The server rejects a cycle-creating move (R6), the client reverts it (§2.6), and parking (§2.5) avoids transient cycles on disk.
+- Last commit wins between concurrent moves of one node (R5).

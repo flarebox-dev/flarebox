@@ -20,7 +20,7 @@ koi telemetry preview   # prints the waiting reports as the daemon would send th
 koi telemetry reset     # draws a new install id and deletes the reports not sent yet
 ```
 
-Other commands ask only to finish an unanswered setup question. They send reports only when this profile already chose to send them, or when `KOIDRIVE_TELEMETRY` turns them on. `koi setup`, `koi join`, `koi server deploy`, `koi server add-device` and `koi server claim` also take `--telemetry on` or `--telemetry off`, which stores the choice without asking. Questions need a terminal on stdin and stderr and never appear with `--json`. CI suppresses them; with `--interactive`, setup can ask when `CI` is `0` or `false`.
+Other commands ask only to finish an unanswered setup question. They send reports only when this profile already chose to send them, or when `KOIDRIVE_TELEMETRY` turns them on. `koi setup`, `koi join`, `koi server deploy`, `koi server add-device` and `koi server claim` also take `--telemetry on` or `--telemetry off`, which stores the choice without asking. Questions need a terminal on stdin and stderr and never appear with `--json`. The `CI` environment variable suppresses them, but with `--interactive`, setup can ask when `CI` is `0` or `false`.
 
 A running daemon notices `koi telemetry off` and `reset` at its next ten-minute tick. A daemon that started while reports were off records nothing of its own until it restarts, but it still sends what later commands queue. When the daemon stops, it writes what it holds to disk and leaves the sending to its next run.
 
@@ -51,8 +51,6 @@ On top of that, reports hold:
 - Where Koidrive panicked: the source file and line in Koidrive's own code. Never the panic's message.
 - Exact daily totals from the daemon: commits sent and received, bytes of file content uploaded and downloaded, and the day's highest number of linked spaces and of the files and folders they hold, trash included. Only totals over all your spaces, never a count per space or per file.
 - How many times each kind of error happened in a day: why a folder stopped syncing, how an upload or download failed, the code of a server refusal and of each item a refused commit left out, each commit too large to send and each item it left out, which kind of question a folder asked, and why the daemon could not start. Never the error's message.
-
-Later versions add sync timings to this page as they add them to the reports.
 
 ## What a report never holds
 

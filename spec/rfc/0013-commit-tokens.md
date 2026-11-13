@@ -2,7 +2,7 @@
 
 Status: proposed. Applies to spec v0 (format_version 1). Amends spec v0 §7.3 and §7.5, and RFC 0002 §3.
 
-A client tells the server where it stands in the log by a seq alone: `Resume.since_seq` and `Commit.base_seq`. A server that loses commits within one history, as after a storage loss, gives their seqs to later commits. Once other devices have brought the head back up to a device's `since_seq`, the server answers that device's `Resume` with the log after it, and the device's R silently forks from the server: it keeps the lost commits and never receives the ones that took their seqs (GUN-423). A commit built on such a seq passes the base check, and R7 then treats every revision at or below `base_seq` as seen, so a resent `Delete` can trash a node another device moved in at a reused seq (GUN-454).
+A client tells the server where it stands in the log by a seq alone: `Resume.since_seq` and `Commit.base_seq`. A server that loses commits within one history, as after a storage loss, gives their seqs to later commits. Once other devices have brought the head back up to a device's `since_seq`, the server answers that device's `Resume` with the log after it, and the device's remote tree R ([sync-engine design §2.2](../../docs/design/sync-engine/state-model.md#22-three-trees-keyed-by-node-id)) silently forks from the server: it keeps the lost commits and never receives the ones that took their seqs. A commit built on such a seq passes the base check, and R7 then treats every revision at or below `base_seq` as seen, so a resent `Delete` can trash a node another device moved in at a reused seq.
 
 This RFC names the commit a client stands at by its token as well as its seq. A bare section number such as §2 refers to this RFC; sections of spec v0 are written as spec v0 §N.
 
@@ -35,7 +35,7 @@ A token claims nothing when its `commit_id` is empty, its seq is 0, or its seq i
 
 ## 4. Truncation
 
-`log_floor_seq` is the oldest seq a `Resume` can start after, so the token at the floor stays checkable. A server that truncates its log keeps the floor commit's token, written in the same transaction that moves `log_floor_seq`, and checks a `Resume` or a `Commit` at the floor against it. A `Resume` below the floor gets `LOG_TRUNCATED` before the token check. A `Commit` based below the floor is not checked: its token claims nothing (§3), so a truncated log is not read as a loss. The server does not truncate yet; the sim does, and keeps the floor token.
+`log_floor_seq` is the oldest seq a `Resume` can start after, so the token at the floor stays checkable. A server that truncates its log keeps the floor commit's token, written in the same transaction that moves `log_floor_seq`, and checks a `Resume` or a `Commit` at the floor against it. A `Resume` below the floor gets `LOG_TRUNCATED` before the token check. A `Commit` based below the floor is not checked: its token claims nothing (§3), so a truncated log is not read as a loss. The server does not truncate its log in 0.1.0 (RFC 0006 §9). The simulation in `core/sim` does, and keeps the floor token.
 
 ## 5. Clients
 

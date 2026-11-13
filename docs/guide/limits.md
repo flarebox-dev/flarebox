@@ -2,7 +2,7 @@
 
 Your server runs on your Cloudflare account, so Cloudflare's plan limits apply to it. Koidrive works on the Workers Free plan. The figures below are Cloudflare's, as its documentation stated them on 2026-11-11. Check the linked pages for current values.
 
-## Workers Free plan
+## The Workers Free plan has daily allowances
 
 | What | Free allowance | Source |
 |---|---|---|
@@ -17,9 +17,11 @@ Daily allowances reset at 00:00 UTC. On the Free plan, an operation past an allo
 
 Each space is one Durable Object. It stores the space's file tree, its history and its change log, but not file contents. A sync session is a WebSocket to that object, and Cloudflare bills 20 incoming WebSocket messages as one request ([Durable Objects pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/)).
 
-**What Koidrive does at a limit.** When a space's Durable Object reports a daily limit, the server tells devices to wait until the next 00:00 UTC, or 5 minutes in the first half hour after it, and each folder shows the wait in its status. See [Quota waits](status.md#quota-waits). When the limit hits while the server checks the device, the server only says to retry later, so the folder retries without showing a reset time. When the Worker itself is over its daily request limit, Cloudflare answers with error 1027 before Koidrive's code runs ([Workers limits](https://developers.cloudflare.com/workers/platform/limits/#daily-requests)). The folders can't reach the server then, and keep retrying.
+## Koidrive waits at a daily limit
 
-## R2
+When a space's Durable Object reports a daily limit, the server tells devices to wait until the next 00:00 UTC, or 5 minutes in the first half hour after it, and each folder shows the wait in its status. See [Quota waits](status-reference.md#quota-waits). When the limit hits while the server checks the device, the server only says to retry later, so the folder retries without showing a reset time. When the Worker itself is over its daily request limit, Cloudflare answers with error 1027 before Koidrive's code runs ([Workers limits](https://developers.cloudflare.com/workers/platform/limits/#daily-requests)). The folders can't reach the server then, and keep retrying.
+
+## R2 bills storage and requests past a monthly allowance
 
 R2 includes free usage each month. Beyond it, Cloudflare bills your account ([R2 pricing](https://developers.cloudflare.com/r2/pricing/)):
 
@@ -32,7 +34,7 @@ R2 includes free usage each month. Beyond it, Cloudflare bills your account ([R2
 
 R2 holds the contents of your files, of the files in each space's trash and of old versions. `koi space usage` shows how much each space stores. R2 also holds the server's own exports of each space's file tree, which `koi space usage` doesn't count. The R2 page of the Cloudflare dashboard shows what you are billed for.
 
-## Koidrive's own limits
+## Koidrive limits names, depth and codes
 
 | What | Limit |
 |---|---|
@@ -43,6 +45,6 @@ R2 holds the contents of your files, of the files in each space's trash and of o
 | Pairing code | works once, for 10 minutes |
 | Claim code | works for one hour |
 
-## Known issues
+## A hard-linked file can reach the server twice
 
-A file with a hard link inside an ignored folder can end up on the server twice. This happens when you move the file out of a folder and remove the folder, and Koidrive picks up the file's new place before it sees the removal. The server then keeps the old copy as well as the new one. Nothing is lost (GUN-483).
+A file with a hard link inside an ignored folder can end up on the server twice. This happens when you move the file out of a folder and remove the folder, and Koidrive picks up the file's new place before it sees the removal. The server then keeps the old copy as well as the new one. Nothing is lost.

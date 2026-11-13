@@ -2,7 +2,7 @@
 
 Status: proposed. Applies to spec v0 (format_version 1). Amends RFC 0006 §3.
 
-The owner of a deployment pays for its R2 bucket. This RFC defines a read that tells the owner how many bytes of chunks a space holds, split by what holds them: live files, the trash and old versions. The trash and old versions are what the owner can free by waiting out their retention. The read changes nothing and adds no schema. A bare section number such as §2 refers to this RFC; sections of spec v0 are written as spec v0 §N.
+The owner of a deployment pays for its R2 bucket. This RFC defines a read that tells the owner how many bytes of chunks a space holds, split by what holds them: live files, the trash and old versions. The trash and old versions are what the owner can free by waiting out their retention. It counts chunk objects only, not the R2 export or the Durable Objects' own storage (§3). The read changes nothing and adds no schema. A bare section number such as §2 refers to this RFC; sections of spec v0 are written as spec v0 §N.
 
 ## 1. The endpoint
 

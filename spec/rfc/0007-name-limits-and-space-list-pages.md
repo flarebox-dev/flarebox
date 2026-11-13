@@ -34,7 +34,7 @@ The cursor is opaque to clients. The server orders by a sequence number it assig
 
 ## 3. Answer sizes
 
-With sections 1 and 2, the answers of these endpoints have fixed upper bounds in binary protobuf, as long as every stored name follows section 1:
+With sections 1 and 2, the answers of these endpoints have fixed upper bounds in binary protobuf:
 
 | Answer | At most |
 |---|---|
@@ -46,4 +46,4 @@ The largest fixed-shape answer is `DeviceCredentials`. Its access token carries 
 
 The bounds are for binary protobuf only. The server also answers in JSON when a request asks for it, and a JSON answer is larger. JSON writes each control character in a name as six bytes, and every field carries its name. This RFC sets no bound for JSON answers, so a client that reads JSON must not use these caps.
 
-A client that caps its reads at these bounds cannot read an answer that carries an older, longer name. It reports such an answer as too large and does not misread it. Until deployments from before this rule are gone, a client that must still list their spaces keeps a larger cap.
+A client that caps its reads at these bounds cannot read an answer that carries an older, longer name (section 1). It reports such an answer as too large and does not misread it. A client that must still list the spaces of such a deployment keeps a larger cap.

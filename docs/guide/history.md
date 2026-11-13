@@ -5,7 +5,7 @@ The server keeps what you delete and the earlier contents of files you change, f
 - A deleted file or folder stays in the space's trash for 30 days.
 - When a file's content changes, the earlier version stays for 30 days after it was replaced. The current version of a file never expires.
 
-After that, the server removes them the next time it cleans up, so don't count on restoring them later. These commands read the server, so the device must be online. They don't need the daemon.
+After that, the server removes them the next time it cleans up. These commands read the server, so the device must be online. They don't need the daemon.
 
 ## See what is in the trash
 
@@ -42,12 +42,12 @@ When several deletions had the same path, the command lists them and asks you to
 ## Restore an earlier version
 
 ```sh
-koi history restore ~/Koidrive/notes.txt --version 019a...7c
+koi history restore ~/Koidrive/notes.txt --version <version-id>
 ```
 
-Take the version ID from `koi history versions`. The old content becomes the file's current content, as a new version. The content it replaces stays as an earlier version for 30 days.
+Take the full version ID from the last column of `koi history versions`. The old content becomes the file's current content, as a new version. The content it replaces stays as an earlier version for 30 days.
 
-## How a restore goes
+## Follow a restore
 
 `koi history restore` checks the request against the server, records it, and returns the request's ID. The daemon sends it with the folder's next change to the server, after any changes to the same file that this device hasn't sent yet. The restored file then arrives in the folder like a change from another device. If the daemon isn't running, the request waits until it starts.
 
@@ -57,12 +57,14 @@ koi history requests ~/Koidrive
 
 This lists the restores asked for in the folder's space and how each went:
 
-- **restored**: the file or folder is back.
-- **restored as `<name>`, since its name was taken**: something else now has its name, so it came back under a conflict name.
-- **restored as a new file `<name>`, since another device changed the file meanwhile**: the earlier version came back as a [conflict copy](conflicts.md#two-edits-of-one-file) next to the file.
-- **refused**: the server said why. For example, the item was deleted for good after 30 days.
-- **not sent**: it brings back more files and folders than one change can hold.
-- **pending**: it hasn't been sent yet. The list says what the folder is waiting for, such as a stopped daemon or a [problem](status.md).
+| Result | Meaning |
+|---|---|
+| restored | The file or folder is back |
+| restored as `<name>`, since its name was taken | Something else now has its name, so it came back under a conflict name |
+| restored as a new file `<name>`, since another device changed the file meanwhile | The earlier version came back as a [conflict copy](conflicts.md#two-edits-of-one-file) next to the file |
+| refused | The server said why. For example, the item was deleted for good after 30 days |
+| not sent | It brings back more files and folders than one change can hold |
+| pending | It hasn't been sent yet. The list says what the folder is waiting for, such as a stopped daemon or a [problem](status.md) |
 
 ## See what each space stores
 

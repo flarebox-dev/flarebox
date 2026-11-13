@@ -2,7 +2,7 @@
 
 Status: proposed. Applies to spec v0 (format_version 1). Amends spec v0 §4.1.
 
-Spec v0 §4.1 names the trash group of a `Delete` op `<seq>:<op index>`. A server restored from a backup loses the commits after the backup and gives their seqs to later commits. A `Delete` in such a later commit can then get the trash group of a lost `Delete`. A client that identifies deletions by trash group, as the mass-delete guard does (design §6.1), takes the two deletions for one. A dismissed deletion then takes the removals of the new one, and no notice opens. A lost deletion that is still being counted keeps counting through the new one's tombstones, and the two can cross a limit together that neither crosses alone.
+Spec v0 §4.1 names the trash group of a `Delete` op `<seq>:<op index>`. A server restored from a backup loses the commits after the backup and gives their seqs to later commits. A `Delete` in such a later commit can then get the trash group of a lost `Delete`. A client that identifies deletions by trash group, as the mass-delete guard does ([sync-engine design §6.1](../../docs/design/sync-engine/mass-deletion.md#61-a-large-delete-waits-for-confirmation)), takes the two deletions for one. A dismissed deletion then takes the removals of the new one, and no notice opens. A lost deletion that is still being counted keeps counting through the new one's tombstones, and the two can cross a limit together that neither crosses alone.
 
 This RFC names a trash group after its commit instead of the commit's seq. A bare section number such as §2 refers to this RFC; sections of spec v0 are written as spec v0 §N.
 
@@ -12,7 +12,7 @@ Every node a `Delete` op trashes gets the trash group `<commit_id>:<i>`, where `
 
 No two commits share a `commit_id`, also across a loss:
 
-- Within a history, the server applies a `commit_id` at most once. A second commit with a stored `commit_id` gets the stored result, or `INVALID_ARGUMENT` when it differs (RFC 0002 §3).
+- Within a history, the server applies a `commit_id` at most once. A second commit with a stored `commit_id` gets the stored result, or `INVALID_ARGUMENT` when it differs (RFC 0002 §3, RFC 0006 §8).
 - Every client mints a new UUIDv7 for each commit it plans (RFC 0002 §2), and the server refuses a `commit_id` of any other form. After a loss, the only commit that carries a lost `commit_id` is that same commit, sent again.
 - The server's own commits mint their own UUIDv7 and hold only purges, so they make no group.
 

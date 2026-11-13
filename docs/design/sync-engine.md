@@ -1,257 +1,35 @@
 # Sync engine design
 
-[Design index](sync-engine/README.md)
+The sync engine (`core/engine`) decides, for one space on one device, what to download, what to upload and what to ask the person. It is a pure state machine: `handle(now_ms, input)` takes an observation or a server message and queues outputs, and the driver stores the new state in one transaction before running them. It does no I/O, so the same code runs on a disk and in the simulator.
 
-## Summary
+This page explains why. The numbered sections that code and RFCs cite are in the [sync engine reference](sync-engine/README.md): [1 interface](sync-engine/context.md), [2 state model](sync-engine/state-model.md), [3 correctness properties](sync-engine/correctness.md), [4 server order](sync-engine/server-order.md), [5 local file system](sync-engine/filesystem.md), [6 mass-deletion safety](sync-engine/mass-deletion.md), [7 testing](sync-engine/testing.md), [8 server guarantees](sync-engine/server-guarantees.md), [9 other crates](sync-engine/interfaces.md) and [10 protocol RFCs](sync-engine/protocol-rfcs.md).
 
-[Read section](sync-engine/summary.md#summary)
+## Three trees tell the engine which side changed
 
-## Changes from the approved draft
+The engine keeps three trees keyed by node ID: R, the server state this device has applied; L, the disk as last observed; and S, the shape on which both last agreed. A node whose L differs from S changed here, one whose R differs from S changed elsewhere, and one that differs on both sides is a conflict ([§2.3](sync-engine/state-model.md#23-classification-decides-the-direction-of-each-change)).
 
-[Read section](sync-engine/approved-draft-changes.md#changes-from-the-approved-draft)
+The engine stores observations, not a queue of work. Dropbox found that a work queue drifts from the disk after a lost event or a crash, and that a move queued as a delete plus an add loses the file when only the delete runs ([Jayakar 2020](https://dropbox.tech/infrastructure/rewriting-the-heart-of-our-sync-engine)). With three trees a restart needs only a rescan, and sync is done when all three agree. Node IDs instead of paths make a rename one move on every device.
 
-## 1. Context
+## The server's commit order decides conflicts
 
-[Read section](sync-engine/context.md#1-context)
+Each space's Durable Object orders every commit, so moves need no CRDT: the server rejects a move that would close a cycle, and the later commit wins between two moves ([Kleppmann et al. 2021](https://martin.kleppmann.com/papers/move-op.pdf), §5.2).
 
-## 2. State model
+A device sends one commit at a time, built against the last server state it applied. Before sending, it resolves the conflicts it has seen with the rules the server would apply, and the server resolves the ones it had not seen. Both sides survive: a concurrent edit becomes a conflict copy, and an edit beats a delete ([§2.4](sync-engine/state-model.md#24-the-client-rebases-the-conflicts-it-has-seen)). Koidrive runs unattended, so it keeps both sides and states its no-data-loss property per write ([§3.3](sync-engine/correctness.md#33-no-write-is-lost)).
 
-[Read section](sync-engine/state-model.md#2-state-model)
+## Effects never destroy bytes a user wrote
 
-### 2.1 Options
+A disk change never overwrites or unlinks an entry. The driver renames the entry it replaces or removes into `.koidrive/quarantine/`, compares it with what the engine expected, and moves it to the local trash only if it is the synced content the server also holds. Anything else goes back to the user. Renames never replace their target, so a write that races an effect ends in place, in quarantine or as a recovered file ([§5.2](sync-engine/filesystem.md#52-effects-never-destroy-user-bytes)). A process that keeps a file open across a sync change writes into the trashed copy, which is reclaimed after up to seven days. A write that lands between the reclaim's check and its unlink is lost.
 
-[Read section](sync-engine/state-model.md#21-options)
+## A crash leaves state that explains itself
 
-### 2.2 The trees
+The engine records each effect, with every path it touches, before the disk changes, and each commit before sending it. After a crash the driver finishes or undoes the recorded effect, then rescans. A commit with an unknown outcome is resent under the same ID, and the server returns its stored result. The engine never infers an outcome from the current tree, because a wrong guess can revive a file another device deleted ([§4.2](sync-engine/server-order.md#42-errors-and-retries)).
 
-[Read section](sync-engine/state-model.md#22-the-trees)
+The server counts each device's accepted commits and the root marker counts disk effects. When the space was rewound, or a counter shows the store came from a backup, the folder stops and keeps its trees as evidence. It neither uploads stale files nor resends a commit ([§2.8](sync-engine/state-model.md#28-persistence-and-crash-recovery)). The recovery of [§6.4](sync-engine/mass-deletion.md#64-recovery-after-a-rewind-or-a-rolled-back-store), which reconciles by node ID and asks about every file this device changed, is built only for a first link; otherwise the folder stays stopped.
 
-### 2.3 Classifying a node
+## A large delete waits for confirmation
 
-[Read section](sync-engine/state-model.md#23-classifying-a-node)
+A local deletion is held, and the person is asked before it leaves the device, when it brings the last ten minutes past 1,000 deletions or past half of the files in a space of at least 20. A deletion is one topmost deleted node, so a deleted folder counts once, and deletions sent earlier in the window stay sent. The count is stored, so a restart does not reset it, and an answer covers exactly the files it listed ([§6.1](sync-engine/mass-deletion.md#61-a-large-delete-waits-for-confirmation)). A root that disappears, loses its `.koidrive/space.json` marker or sits on another volume pauses the space instead of reading as "everything was deleted" ([§6.2](sync-engine/mass-deletion.md#62-a-missing-root-pauses-the-space)). Deletions from other devices are applied and counted the same way, and their files stay in both trashes ([§6.3](sync-engine/mass-deletion.md#63-restoring-after-a-bad-delete)).
 
-### 2.4 Concurrent changes the client resolves
+## Tests check properties, not code paths
 
-[Read section](sync-engine/state-model.md#24-concurrent-changes-the-client-resolves)
-
-### 2.5 Applying remote changes to disk
-
-[Read section](sync-engine/state-model.md#25-applying-remote-changes-to-disk)
-
-### 2.6 Building a commit
-
-[Read section](sync-engine/state-model.md#26-building-a-commit)
-
-### 2.7 After a commit result
-
-[Read section](sync-engine/state-model.md#27-after-a-commit-result)
-
-### 2.8 Persistence and crash recovery
-
-[Read section](sync-engine/state-model.md#28-persistence-and-crash-recovery)
-
-## 3. Correctness properties
-
-[Read section](sync-engine/correctness.md#3-correctness-properties)
-
-### 3.1 Vocabulary
-
-[Read section](sync-engine/correctness.md#31-vocabulary)
-
-### 3.2 Safety
-
-[Read section](sync-engine/correctness.md#32-safety)
-
-### 3.3 No data loss
-
-[Read section](sync-engine/correctness.md#33-no-data-loss)
-
-### 3.4 Convergence and termination
-
-[Read section](sync-engine/correctness.md#34-convergence-and-termination)
-
-### 3.5 No resurrection
-
-[Read section](sync-engine/correctness.md#35-no-resurrection)
-
-### 3.6 Moves
-
-[Read section](sync-engine/correctness.md#36-moves)
-
-## 4. The server's total order
-
-[Read section](sync-engine/server-order.md#4-the-servers-total-order)
-
-### 4.1 Commit
-
-[Read section](sync-engine/server-order.md#41-commit)
-
-### 4.2 Errors and retries
-
-[Read section](sync-engine/server-order.md#42-errors-and-retries)
-
-### 4.3 Rebase
-
-[Read section](sync-engine/server-order.md#43-rebase)
-
-### 4.4 Receiving changes
-
-[Read section](sync-engine/server-order.md#44-receiving-changes)
-
-### 4.5 What is not a CRDT
-
-[Read section](sync-engine/server-order.md#45-what-is-not-a-crdt)
-
-## 5. Local file system edge cases
-
-[Read section](sync-engine/filesystem.md#5-local-file-system-edge-cases)
-
-### 5.1 Lossy watcher events and rescans
-
-[Read section](sync-engine/filesystem.md#51-lossy-watcher-events-and-rescans)
-
-### 5.2 Applying effects without losing user bytes
-
-[Read section](sync-engine/filesystem.md#52-applying-effects-without-losing-user-bytes)
-
-### 5.3 Recovery, partial downloads and uploads
-
-[Read section](sync-engine/filesystem.md#53-recovery-partial-downloads-and-uploads)
-
-### 5.4 Case sensitivity
-
-[Read section](sync-engine/filesystem.md#54-case-sensitivity)
-
-### 5.5 Unicode normalization
-
-[Read section](sync-engine/filesystem.md#55-unicode-normalization)
-
-### 5.6 Symbolic links, special files and hard links
-
-[Read section](sync-engine/filesystem.md#56-symbolic-links-special-files-and-hard-links)
-
-### 5.7 Permissions and the executable bit
-
-[Read section](sync-engine/filesystem.md#57-permissions-and-the-executable-bit)
-
-### 5.8 Files that change while being chunked or uploaded
-
-[Read section](sync-engine/filesystem.md#58-files-that-change-while-being-chunked-or-uploaded)
-
-### 5.9 Very large directories and trees
-
-[Read section](sync-engine/filesystem.md#59-very-large-directories-and-trees)
-
-### 5.10 `.koiignore`
-
-[Read section](sync-engine/filesystem.md#510-koiignore)
-
-## 6. Mass-deletion safety
-
-[Read section](sync-engine/mass-deletion.md#6-mass-deletion-safety)
-
-### 6.1 Mass-delete guard
-
-[Read section](sync-engine/mass-deletion.md#61-mass-delete-guard)
-
-### 6.2 Missing-root detection
-
-[Read section](sync-engine/mass-deletion.md#62-missing-root-detection)
-
-### 6.3 Restoring after a bad mass delete
-
-[Read section](sync-engine/mass-deletion.md#63-restoring-after-a-bad-mass-delete)
-
-### 6.4 Recovery after a rewind or a rolled-back store
-
-[Read section](sync-engine/mass-deletion.md#64-recovery-after-a-rewind-or-a-rolled-back-store)
-
-## 7. Testing
-
-[Read section](sync-engine/testing.md#7-testing)
-
-### 7.1 Reference model
-
-[Read section](sync-engine/testing.md#71-reference-model)
-
-### 7.2 Property tests
-
-[Read section](sync-engine/testing.md#72-property-tests)
-
-### 7.3 Deterministic simulation
-
-[Read section](sync-engine/testing.md#73-deterministic-simulation)
-
-### 7.4 Native contract tests
-
-[Read section](sync-engine/testing.md#74-native-contract-tests)
-
-### 7.5 Named scenarios
-
-[Read section](sync-engine/testing.md#75-named-scenarios)
-
-## 8. Is a TLA+ model worth it?
-
-[Read section](sync-engine/formal-model.md#8-is-a-tla-model-worth-it)
-
-## 9. Interfaces with other tracks
-
-[Read section](sync-engine/interfaces.md#9-interfaces-with-other-tracks)
-
-## 10. Spec changes and questions
-
-[Read section](sync-engine/spec-questions.md#10-spec-changes-and-questions)
-
-## References
-
-[Read section](sync-engine/references.md#references)
-
-<a id="ref-bp"></a>[ref-bp](sync-engine/references.md#ref-bp)
-
-<a id="ref-unison"></a>[ref-unison](sync-engine/references.md#ref-unison)
-
-<a id="ref-move"></a>[ref-move](sync-engine/references.md#ref-move)
-
-<a id="ref-nucleus"></a>[ref-nucleus](sync-engine/references.md#ref-nucleus)
-
-<a id="ref-trinity"></a>[ref-trinity](sync-engine/references.md#ref-trinity)
-
-<a id="ref-fdb"></a>[ref-fdb](sync-engine/references.md#ref-fdb)
-
-<a id="ref-aws"></a>[ref-aws](sync-engine/references.md#ref-aws)
-
-<a id="ref-stateright"></a>[ref-stateright](sync-engine/references.md#ref-stateright)
-
-<a id="ref-pillai"></a>[ref-pillai](sync-engine/references.md#ref-pillai)
-
-<a id="ref-inotify"></a>[ref-inotify](sync-engine/references.md#ref-inotify)
-
-<a id="ref-fsevents"></a>[ref-fsevents](sync-engine/references.md#ref-fsevents)
-
-<a id="ref-rename"></a>[ref-rename](sync-engine/references.md#ref-rename)
-
-<a id="ref-openat2"></a>[ref-openat2](sync-engine/references.md#ref-openat2)
-
-<a id="ref-fsync-apple"></a>[ref-fsync-apple](sync-engine/references.md#ref-fsync-apple)
-
-<a id="ref-gitignore"></a>[ref-gitignore](sync-engine/references.md#ref-gitignore)
-
-<a id="ref-renamex"></a>[ref-renamex](sync-engine/references.md#ref-renamex)
-
-<a id="ref-apfs"></a>[ref-apfs](sync-engine/references.md#ref-apfs)
-
-<a id="ref-casefold"></a>[ref-casefold](sync-engine/references.md#ref-casefold)
-
-<a id="ref-unison-manual"></a>[ref-unison-manual](sync-engine/references.md#ref-unison-manual)
-
-<a id="ref-rclone"></a>[ref-rclone](sync-engine/references.md#ref-rclone)
-
-<a id="ref-onedrive"></a>[ref-onedrive](sync-engine/references.md#ref-onedrive)
-
-<a id="ref-syncthing"></a>[ref-syncthing](sync-engine/references.md#ref-syncthing)
-
-<a id="ref-syncthing-ignore"></a>[ref-syncthing-ignore](sync-engine/references.md#ref-syncthing-ignore)
-
-<a id="ref-ds-store"></a>[ref-ds-store](sync-engine/references.md#ref-ds-store)
-
-<a id="ref-pitr"></a>[ref-pitr](sync-engine/references.md#ref-pitr)
+A deterministic simulator in `core/sim` runs several devices against a reference server through lost messages, crashes inside effects, server losses and rewinds, and checks from its own records that no write is lost and that devices converge ([§7](sync-engine/testing.md)). [Testing](../testing.md) explains how to run them.

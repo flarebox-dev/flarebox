@@ -59,7 +59,7 @@ A proposal lost before it reaches the server does not stall the rotation either.
 
 In every order, the slots the client keeps include the one credential the server accepts.
 
-**Reading the stored credential.** Every process that reads the two slots reads them as one state that the owning process stored at some moment, even while that process is changing them. How a store achieves that is a client matter; the design note describes it for the Rust clients.
+**Reading the stored credential.** Every process that reads the two slots reads them as one state that the owning process stored at some moment, even while that process is changing them. How a store achieves that is a client matter. The [credential rotation design](../../docs/design/credential-rotation.md) describes it for the Rust clients.
 
 **Processes that only read.** A process that only reads the stored credential, such as a CLI command that calls the server directly while the daemon runs, never sets `rotation` or `next_refresh_credential`. The owning process may rotate while such a process still holds the old credential. So when a process that only reads gets `UNAUTHENTICATED` from `POST /v1/token`, it reads the stored credential again, once. It presents the current credential and then the staged one, skipping a credential it has already presented, and treats the device as signed out only if every one of them is refused. Presenting a credential without a proposal never changes the server's state, so this cannot interfere with the owning process.
 
@@ -91,9 +91,6 @@ In this repository:
 
 So the server and the clients can be released in either order.
 
-## 5. Changes to RFC 0006 §7
+## 5. RFC 0006 §7 holds the rotation changes
 
-In RFC 0006 §7, "**Credential expiry.**" paragraph:
-
-- "A refresh credential stops working when its principal is revoked or its `expires_at_ms` passes." is replaced by "A refresh credential stops working when its principal is revoked, when its `expires_at_ms` passes, or when the device replaces it with a new one (RFC 0011 §1)."
-- "It does not retry the request." is replaced by "It does not retry the request, except that a process that does not rotate the credential first reads the stored credential again once and presents what it holds, and the process that rotates presents its staged credential (RFC 0011 §2)."
+RFC 0006 §7's **Credential expiry** paragraph already carries this RFC's two changes to it: a replaced credential stops working (§1), and a process presents the stored or staged credential again before it treats the device as signed out (§2).

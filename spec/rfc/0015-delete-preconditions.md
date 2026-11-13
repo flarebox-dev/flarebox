@@ -2,7 +2,7 @@
 
 Status: proposed. Applies to spec v0 (format_version 1). Amends the `Delete` op of spec v0 §6.
 
-An answer to a conflict question (design §2.7) removes one file of the pair and keeps the other. Keep the original sends `Delete(copy)`. The server checks only the copy against the commit's `base_seq` (R7), so a `Delete(copy)` still applies when another device renamed or deleted the original after the person answered. Both files then leave the live tree, which is the opposite of the answer (GUN-464). `require_head` (RFC 0002 §4) would refuse such a commit, but it also refuses one when any other commit lands in the space between build and arrival. Spaces that take 100 or more commits a second would refuse the answer every time.
+An answer to a conflict question ([sync-engine design §2.7](../../docs/design/sync-engine/state-model.md#27-after-a-commit-result)) removes one file of the pair and keeps the other. Keep the original sends `Delete(copy)`. The server checks only the copy against the commit's `base_seq` (R7), so a `Delete(copy)` still applies when another device renamed or deleted the original after the person answered. Both files then leave the live tree, which is the opposite of the answer. `require_head` (RFC 0002 §4) would refuse such a commit, but it also refuses one when any other commit lands in the space between build and arrival. Spaces that take 100 or more commits a second would refuse the answer every time.
 
 This RFC lets a `Delete` name the node the client keeps, at the revisions it saw. A bare section number such as §2 refers to this RFC; sections of spec v0 are written as spec v0 §N.
 
@@ -24,6 +24,8 @@ The check reads the named node only. A rename of a folder above it changes none 
 A `Delete` with `requires` whose precondition held and that trashed its target also places the required node, by the committing device, under the parent it already has (RFC 0002 §9). Nothing a client sees changes: the node's `NodeState` stays as it was, and the result lists no change for it. It is the answer's own record that the person kept that node, and R7 reads it: a `Delete` of the node built before the answer, against a `base_seq` below the answer's seq, has not seen that placement, so the node stays live with its ancestors. Without it, a `Delete(original)` that another device built while the copy was live, and that arrives after the answer, would trash the file the answer kept, and both files would leave the live tree again. A precondition that fails, a target that R7 keeps, and a target already in the trash, which is answered `APPLIED` before the check, place nothing.
 
 ## 3. Clients
+
+R is the engine's remote tree, the server state the device has applied (design §2.2).
 
 A conflict answer that removes one file of the pair sends its `Delete` with `requires` set to the file it keeps, at the revisions R holds for it when the commit is built. That covers Keep the original's `Delete(copy)` and Keep the copy's final `Delete(copy)`, after the original took the copy's content. The engine builds the answer only while the original is live in R at the meta revision the question was asked with, so the precondition holds exactly when the server's original is still the one the answer was built against.
 

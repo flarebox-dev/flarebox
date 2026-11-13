@@ -2,7 +2,7 @@
 
 Status: proposed. Applies to spec v0 (format_version 1).
 
-These are the protocol changes that the sync engine design ([`docs/design/sync-engine.md`](../../docs/design/sync-engine.md) §10, koidrive#7) needs. Section and rule numbers refer to spec v0 unless they name the design. Sections 6 and 7 support recovery (design §6.4). Recovery is a draft, and it has to pass the simulation scenarios of design §7.5 before 0.1.0, so those two sections may still change.
+These are the protocol changes that the [sync-engine design §10](../../docs/design/sync-engine/protocol-rfcs.md#10-protocol-rules-this-design-depends-on) needs. Section and rule numbers refer to spec v0 unless they name the design. Sections 6 and 7 support recovery (design §6.4).
 
 The schema changes add fields and enum values only:
 
@@ -13,7 +13,7 @@ The schema changes add fields and enum values only:
 | `Welcome` | `device_seq = 10` | 2 |
 | `ResyncRequired` | `restore_seq = 2`, `restore_point_ms = 3` | 8 |
 
-RFC 0001 already covers design §10 items 5 to 7: the Unicode 18.0.0 pin for NFC and case folding (RFC 0001 §1), the reject reason `NOT_FILE` (§3) and the reserved `.koidrive` name (§2). It also covers two of the design's open questions: `CreateDir` onto a live file (§4) and conflict names longer than 255 bytes (§5). This RFC does not repeat them.
+RFC 0001 covers part of what the design needs from the protocol: the Unicode 18.0.0 pin for NFC and case folding (RFC 0001 §1), the reserved `.koidrive` name (§2), the reject reason `NOT_FILE` (§3), `CreateDir` onto a live file (§4) and conflict names longer than 255 bytes (§5). This RFC does not repeat them. The other protocol rules the design depends on are in RFCs 0012, 0013, 0015, 0016 and 0018 ([sync-engine design §10](../../docs/design/sync-engine/protocol-rfcs.md#10-protocol-rules-this-design-depends-on)).
 
 ## 1. History fence (§8)
 
@@ -74,7 +74,7 @@ Step 2 comes before steps 3 and 4. So a retry of a commit that was already accep
 
 ## 6. Recovery after a history change or a stale store (§7.3 step 4)
 
-Draft, to be verified by simulation (design §6.4, §7.5).
+This section and §7 are a draft. Recovery has to pass the simulation scenarios of design §7.5 before 0.1.0, so these two sections may still change.
 
 Step 4 of §7.3 keeps its v0 meaning for `LOG_TRUNCATED` and `AHEAD_OF_SERVER`. That covers both the `ResyncRequired` reason and a commit refused with the `AHEAD_OF_SERVER` error code: the client bootstraps, then plans its local changes again against the new tree. The refused commit was not applied, so it is dropped and its slot stays free (§2). If the server lost this device's own commits too, `Welcome.device_seq` shows it on reconnect, and the last case below applies.
 
