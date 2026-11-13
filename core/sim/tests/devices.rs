@@ -3617,3 +3617,67 @@ fn a_second_loss_before_the_download_moves_the_file_keeps_the_authors_name() {
         assert_eq!(names, ["b"], "device {device}");
     }
 }
+
+fn owe_a_folder_its_name_while_another_device_changes_it(lose_answer: bool, change: Step) -> World {
+    let mut world = converge(2, &[vec![(0, file("a"))]]).unwrap();
+    let mut steps = vec![(0, folder("A")), (0, rename(0, 1, "a"))];
+    steps.extend([(0, SCAN), (0, COMMIT), (0, COMMIT)]);
+    steps.push((0, if lose_answer { Step::Drop } else { DELIVER }));
+    steps.extend([(1, Step::Work(0)); 8]);
+    steps.extend([(1, change), (1, SCAN)]);
+    steps.extend([(1, Step::Work(0)); 8]);
+    if lose_answer {
+        steps.push((0, Step::Connect));
+    }
+    steps.extend([(0, Step::Work(0)); 16]);
+    world.phase(1, &steps).unwrap();
+    world
+}
+
+fn names(world: &World) -> Vec<Vec<&str>> {
+    (world.devices.iter())
+        .map(|device| {
+            let mut names: Vec<&str> = (device.disk.entries().values())
+                .map(|entry| entry.name.as_str())
+                .collect();
+            names.sort();
+            names
+        })
+        .collect()
+}
+
+#[test]
+fn a_folder_deleted_before_its_creator_hears_it_landed_stays_deleted() {
+    let world = owe_a_folder_its_name_while_another_device_changes_it(true, delete(1));
+    assert_eq!(names(&world), [Vec::<&str>::new(), vec![]]);
+}
+
+#[test]
+fn a_folder_deleted_before_it_takes_its_own_name_stays_deleted() {
+    let world = owe_a_folder_its_name_while_another_device_changes_it(false, delete(1));
+    assert_eq!(names(&world), [Vec::<&str>::new(), vec![]]);
+}
+
+#[test]
+fn a_folder_renamed_before_it_takes_its_own_name_keeps_that_name() {
+    let world = owe_a_folder_its_name_while_another_device_changes_it(false, rename(1, 0, "b"));
+    assert_eq!(names(&world), [["a", "b"], ["a", "b"]]);
+}
+
+#[test]
+fn a_folder_renamed_before_its_creator_hears_it_landed_keeps_that_name() {
+    let world = owe_a_folder_its_name_while_another_device_changes_it(true, rename(1, 0, "b"));
+    assert_eq!(names(&world), [["a", "b"], ["a", "b"]]);
+}
+
+#[test]
+fn a_folder_deleted_while_its_creator_writes_into_it_takes_its_own_name() {
+    let mut world = converge(2, &[vec![(0, file("a"))]]).unwrap();
+    let mut steps = vec![(0, folder("A")), (0, rename(0, 1, "a"))];
+    steps.extend([(0, Step::Work(0)); 3]);
+    steps.extend([(0, user(1, 0, 1, "c.txt")), (0, SCAN)]);
+    steps.extend([(1, Step::Work(0)); 10]);
+    steps.extend([(1, delete(1)), (1, SCAN)]);
+    world.phase(1, &steps).unwrap();
+    assert_eq!(names(&world), [["A", "c.txt"], ["A", "c.txt"]]);
+}

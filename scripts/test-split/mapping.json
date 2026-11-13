@@ -598,7 +598,17 @@
     "fn:a_move_recorded_by_the_store_upgrade_is_not_sent_over_a_move_made_after_its_commit": "lost_changes_and_reverted_nodes",
     "fn:a_lost_folder_move_keeps_its_childs_remote_move_when_its_old_name_is_held_in_s": "lost_changes_and_reverted_nodes",
     "fn:r_keeps_the_newest_positions_a_node_held": "lost_changes_and_reverted_nodes",
-    "fn:a_lost_move_is_sent_again_when_the_loss_also_took_a_delete_made_after_it": "lost_changes_and_reverted_nodes"
+    "fn:a_lost_move_is_sent_again_when_the_loss_also_took_a_delete_made_after_it": "lost_changes_and_reverted_nodes",
+    "fn:a_folder_another_device_moves_at_its_pending_name_keeps_that_name": "parked_edits_and_pending_names",
+    "fn:a_folder_another_device_moves_at_its_pending_name_before_the_answer_keeps_that_name": "parked_edits_and_pending_names",
+    "fn:a_folder_another_device_moves_while_its_owed_name_is_still_taken_keeps_that_place": "parked_edits_and_pending_names",
+    "fn:a_folder_the_user_moves_elsewhere_under_its_owed_name_is_still_moved": "parked_edits_and_pending_names",
+    "fn:a_file_another_device_deletes_while_this_device_edits_it_takes_its_owed_name_once_the_edit_brings_it_back": "parked_edits_and_pending_names",
+    "fn:a_folder_another_device_deletes_takes_its_owed_name_once_an_unsent_edit_below_it_brings_it_back": "parked_edits_and_pending_names",
+    "fn:reparent_a_folder_at_its_pending_name": "common",
+    "fn:a_folder_another_device_moves_takes_that_place_once_the_node_on_its_owed_name_stays": "parked_edits_and_pending_names",
+    "fn:a_folder_another_device_deletes_is_deleted_once_the_node_on_its_owed_name_stays": "parked_edits_and_pending_names",
+    "fn:a_folder_another_device_deletes_keeps_its_owed_name_while_a_parked_file_in_it_holds_an_edit": "parked_edits_and_pending_names"
   },
   "core/sim/tests/engine_sync.rs": {
     "use:std :: collections :: { BTreeMap , BTreeSet }": "common",
