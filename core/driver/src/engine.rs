@@ -577,6 +577,7 @@ impl Engine {
                         size,
                         mtime_ns,
                         executable,
+                        linked: kind == EntryKind::File,
                     },
                 );
                 pending.push((at, child.clone()));

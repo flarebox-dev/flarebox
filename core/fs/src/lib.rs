@@ -149,14 +149,39 @@ pub struct FileId {
 
 /// One file or folder. For folders, `size`, `mtime_ns` and `executable` are
 /// always zero: a folder changes only through its children.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct Entry {
     pub kind: EntryKind,
     pub id: FileId,
     pub size: u64,
     pub mtime_ns: i128,
     pub executable: bool,
+    /// Whether the file may have another link: it had one when it was
+    /// scanned, or it was not scanned. Two entries that differ only here are
+    /// equal, since a link made or removed elsewhere changes nothing at this
+    /// path.
+    pub linked: bool,
 }
+
+impl PartialEq for Entry {
+    fn eq(&self, other: &Self) -> bool {
+        (
+            self.kind,
+            self.id,
+            self.size,
+            self.mtime_ns,
+            self.executable,
+        ) == (
+            other.kind,
+            other.id,
+            other.size,
+            other.mtime_ns,
+            other.executable,
+        )
+    }
+}
+
+impl Eq for Entry {}
 
 /// An entry a caller of [`Snapshot::reset`] believes exists: its kind and
 /// identity, and nothing about what a file holds.
@@ -180,6 +205,7 @@ struct Stat {
     /// When the entry's metadata last changed; no process can set it back.
     ctime_ns: i128,
     mode: u32,
+    nlink: u64,
 }
 
 impl Stat {
@@ -191,6 +217,7 @@ impl Stat {
                 size: 0,
                 mtime_ns: 0,
                 executable: false,
+                linked: false,
             },
             FileType::RegularFile => Entry {
                 kind: EntryKind::File,
@@ -198,6 +225,7 @@ impl Stat {
                 size: self.size,
                 mtime_ns: self.mtime_ns,
                 executable: self.mode & 0o111 != 0,
+                linked: self.nlink > 1,
             },
             _ => return None,
         })
@@ -232,6 +260,7 @@ fn statx(dir: BorrowedFd<'_>, name: &OsStr, flags: rustix::fs::AtFlags) -> io::R
         mtime_ns: nanos(st.stx_mtime.tv_sec, st.stx_mtime.tv_nsec),
         ctime_ns: nanos(st.stx_ctime.tv_sec, st.stx_ctime.tv_nsec),
         mode: u32::from(st.stx_mode),
+        nlink: u64::from(st.stx_nlink),
     })
 }
 
@@ -270,6 +299,7 @@ fn from_stat(st: rustix::fs::Stat) -> Stat {
         mtime_ns: nanos(st.st_mtime, st.st_mtime_nsec),
         ctime_ns: nanos(st.st_ctime, st.st_ctime_nsec),
         mode: u32::from(st.st_mode),
+        nlink: u64::from(st.st_nlink),
     }
 }
 
@@ -662,6 +692,7 @@ impl Snapshot {
                         size: 0,
                         mtime_ns,
                         executable: false,
+                        linked: kind == EntryKind::File,
                     };
                     (path, entry)
                 }),
@@ -1527,6 +1558,7 @@ fn hold_back(
     }
     rules.hold(kept);
     let mut swapped: Wanted = (replaced.iter())
+        .filter(|path| !old[*path].linked)
         .map(|path| (key(path), None))
         .filter(|(id, _)| !wanted.contains_key(id))
         .collect();
