@@ -337,7 +337,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         tx.pragma_update(None, "user_version", NAMED)?;
     }
     tx.commit()?;
-    for migration in MIGRATIONS.iter().filter(|m| !applied.contains(m.name)) {
+    for migration in MIGRATIONS {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let done: bool = tx.query_row(
             "SELECT EXISTS (SELECT 1 FROM migrations WHERE name = ?1)",

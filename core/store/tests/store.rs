@@ -210,6 +210,26 @@ fn a_store_a_migration_branch_build_wrote_is_refused_with_what_to_do() {
 }
 
 #[test]
+fn stores_opened_at_once_apply_each_migration_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    Connection::open(&path)
+        .unwrap()
+        .pragma_update(None, "journal_mode", "WAL")
+        .unwrap();
+    let opened: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| scope.spawn(|| Store::open(&path).map(drop)))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for result in opened {
+        result.unwrap();
+    }
+    assert_eq!(applied(&path), all_migrations());
+}
+
+#[test]
 fn an_upgraded_store_carries_a_version_no_positional_build_supports() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
@@ -385,7 +405,7 @@ fn named_migrations_give_the_same_store_in_any_order() {
         permutations(named.len())
     } else {
         let shuffled = Just((0..named.len()).collect::<Vec<_>>()).prop_shuffle();
-        let mut runner = TestRunner::default();
+        let mut runner = TestRunner::deterministic();
         (0..64)
             .map(|_| shuffled.new_tree(&mut runner).unwrap().current())
             .collect()
