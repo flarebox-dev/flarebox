@@ -99,6 +99,8 @@ def render(executable, mapping, sources):
                 raise ValueError(f"invalid scenario: {scenario}")
             if item["kind"] == "property" and scenario != "root":
                 raise ValueError("keep proptest macros in root to preserve regression-file lookup")
+            if item["kind"] == "module" and scenario != "root":
+                raise ValueError("keep modules in root to preserve relative paths")
             prefix = source[previous:item["start"]].strip(b"\n")
             text = (prefix + b"\n" if prefix else b"") + source[item["start"]:item["end"]]
             scenarios.setdefault(scenario, []).append(text)
