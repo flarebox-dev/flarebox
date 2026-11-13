@@ -140,7 +140,7 @@ private struct FolderRow: View {
                 Button("Show in Finder") {
                     NSWorkspace.shared.open(URL(filePath: folder.path, directoryHint: .isDirectory))
                 }
-                Button("Unlink…", role: .destructive, action: unlink)
+                Button("Unlink…", action: unlink)
             }
             .controlSize(.small)
         }
