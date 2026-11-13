@@ -1293,6 +1293,10 @@ fn a_discarded_entry_stays_discarded_when_the_server_merges_its_folder_into_anot
             )
             .unwrap();
     }
+    assert_eq!(ops(&mut commits, &mut trees, &mut ids), []);
+    let again = question(&commits);
+    assert!(again.answer.is_none());
+    assert!(commits.decide(&again.id, Answer::Publish));
     assert_eq!(
         ops(&mut commits, &mut trees, &mut ids),
         [
@@ -1383,6 +1387,10 @@ fn a_file_the_user_took_back_from_a_discard_is_sent_again_once_the_server_loses_
             .collect::<Vec<_>>()
     };
     edit(&mut trees, 7);
+    assert_eq!(sent(&mut commits, &mut trees, &mut ids, 1), []);
+    let again = question(&commits);
+    assert!(again.answer.is_none());
+    assert!(commits.decide(&again.id, Answer::Publish));
     assert_eq!(
         sent(&mut commits, &mut trees, &mut ids, 1),
         [("create file", "l-b".into())]
