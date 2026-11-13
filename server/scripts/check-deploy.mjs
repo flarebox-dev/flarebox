@@ -6,6 +6,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { releaseVersion } from "./release-version.mjs";
 
 const MIGRATION_TAGS = ["v1"];
 const DURABLE_OBJECTS = { ACCOUNT: "AccountDO", SPACE: "SpaceDO" };
@@ -16,6 +17,7 @@ const REQUEST_MS = 5_000;
 const WHOLE_CHECK_MS = 9 * 60_000;
 
 const server = join(dirname(fileURLToPath(import.meta.url)), "..");
+const version = releaseVersion(server);
 const root = mkdtempSync(join(tmpdir(), "koidrive-deploy-"));
 const env = { ...process.env, WRANGLER_SEND_METRICS: "false", CI: "true" };
 let dev;
@@ -123,6 +125,7 @@ async function claimLocally() {
     STARTUP_MS,
   );
   if (before.claimed) fail("a fresh deployment reports that it already has an owner");
+  if (before.serverVersion !== version) fail("the standalone Worker reports " + before.serverVersion + " instead of " + version);
   const setup = await request(base + "/setup");
   const page = await setup.text();
   if (!setup.ok || !page.includes("claim code")) fail("/setup did not issue a claim code (HTTP " + setup.status + "): " + page.slice(0, 200));

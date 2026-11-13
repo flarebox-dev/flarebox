@@ -192,8 +192,6 @@ fn this_mode(json: bool, interactive: bool) -> Result<Mode, CliError> {
     Ok(mode)
 }
 
-/// Whether `koi setup` guides on this process, which main asks before the command runs so that the usage-report
-/// question comes first. It records the mode for [`prompt`] as [`this_mode`] does.
 pub fn guided(json: bool, login: &LoginArgs) -> bool {
     this_mode(json, login.interactive).is_ok_and(|mode| mode == Mode::Guided)
 }

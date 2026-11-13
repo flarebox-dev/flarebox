@@ -63,12 +63,9 @@ fn var(name: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(name)
 }
 
-/// Applies `--telemetry`, asks the `koi setup` question when `ask` (a guided setup) and nobody decided yet, and
-/// starts recording this run when telemetry is on. A failure here never stops the command.
 pub async fn start(
     paths: &Paths,
     switch: Option<Switch>,
-    ask: bool,
     command: schema::Command,
     flow: Option<SetupFlow>,
 ) {
@@ -77,19 +74,6 @@ pub async fn start(
         && let Err(error) = store.set(switch == Switch::On)
     {
         tracing::warn!(%error, "the telemetry choice could not be stored");
-    }
-    if ask {
-        match store.settings() {
-            Ok(settings) if should_ask(var, settings.enabled) => {
-                if let Some(on) = question().await
-                    && let Err(error) = store.set(on)
-                {
-                    tracing::warn!(%error, "the telemetry choice could not be stored");
-                }
-            }
-            Ok(_) => {}
-            Err(error) => tracing::warn!(%error, "the telemetry settings cannot be read"),
-        }
     }
     let on = matches!(
         store.status(var).map(|status| status.mode),
@@ -115,6 +99,21 @@ pub async fn start(
         id: Mutex::new(id),
         flow: Mutex::new(flow),
     });
+}
+
+pub async fn ask(paths: &Paths) {
+    let store = Store::new(&paths.state_dir);
+    match store.settings() {
+        Ok(settings) if should_ask(var, settings.enabled) => {
+            if let Some(on) = question().await
+                && let Err(error) = store.set(on)
+            {
+                tracing::warn!(%error, "the telemetry choice could not be stored");
+            }
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "the telemetry settings cannot be read"),
+    }
 }
 
 /// Sets the flow this run's setup steps belong to, for `koi setup` once the person chose one.

@@ -356,12 +356,14 @@ fn main() -> ExitCode {
     };
     let daemon_run = matches!(command_args, Command::Daemon { .. });
     let pending_paths = paths.clone();
+    let telemetry_paths = paths.clone();
     let (name, flow, switch) = telemetry_of(&command_args);
     let ask = match &command_args {
         Command::Setup { login, .. } => setup::guided(json, login),
         _ => false,
     };
-    let (outcome, pending) = runtime.block_on(async {
+    let command_name = command.as_str();
+    runtime.block_on(async {
         let sigint = (!daemon_run).then(|| signal(SignalKind::interrupt()));
         let interrupt = async move {
             let Some(Ok(mut sigint)) = sigint else {
@@ -378,14 +380,23 @@ fn main() -> ExitCode {
         };
         tokio::select! {
             done = async move {
-                telemetry::start(&paths, switch, ask, name, flow).await;
+                telemetry::start(&paths, switch, name, flow).await;
                 let outcome = run(paths, command_args, json).await;
-                telemetry::finish().await;
                 let pending = match reports_pending && (json || shows_banner) {
                     true => pending_questions(&pending_paths).await,
                     false => Vec::new(),
                 };
-                (outcome, pending)
+                let succeeded = outcome.is_ok();
+                if json && daemon_run && succeeded {
+                    telemetry::finish().await;
+                    return ExitCode::SUCCESS;
+                }
+                let exit = finish(command_name, json, outcome, pending);
+                if ask && succeeded {
+                    telemetry::ask(&telemetry_paths).await;
+                }
+                telemetry::finish().await;
+                exit
             } => done,
             Ok(()) = interrupt => {
                 let error = CliError::new(
@@ -398,11 +409,7 @@ fn main() -> ExitCode {
                 std::process::exit(Code::Interrupted.exit().into());
             }
         }
-    });
-    if json && daemon_run && outcome.is_ok() {
-        return ExitCode::SUCCESS;
-    }
-    finish(&command, json, outcome, pending)
+    })
 }
 
 /// How a command shows in usage reports: its name, the setup flow it runs when that is known before it starts, and

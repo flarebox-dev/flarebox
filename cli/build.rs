@@ -22,6 +22,16 @@ fn main() {
                 )
             });
             println!("cargo::rerun-if-changed={}", dir.display());
+            let manifest: serde_json::Value = serde_json::from_slice(
+                &fs::read(dir.join("manifest.json"))
+                    .expect("the server bundle needs manifest.json"),
+            )
+            .expect("the server bundle manifest must be JSON");
+            assert_eq!(
+                manifest["version"].as_str(),
+                Some(env!("CARGO_PKG_VERSION")),
+                "the server bundle must match the CLI release version; repack it with server/scripts/pack-bundle.mjs"
+            );
             bundle_files::bundle_files(&dir)
                 .unwrap_or_else(|error| panic!("KOIDRIVE_SERVER_BUNDLE={}: {error}", dir.display()))
         }
