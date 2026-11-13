@@ -56,6 +56,8 @@ pub(crate) enum Report {
         path: PathBuf,
         version: String,
         change: Change,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        committed: Vec<app_install::CommitFact>,
         launch: Launch,
         #[serde(skip_serializing_if = "Option::is_none")]
         problem: Option<String>,
@@ -68,6 +70,12 @@ pub(crate) enum Report {
     },
     Failed {
         problem: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        committed: Vec<app_install::CommitFact>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        retired: Vec<PathBuf>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        preserved: Vec<PathBuf>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         residue: Vec<PathBuf>,
     },
@@ -98,6 +106,13 @@ impl Report {
 
     pub(crate) fn failed(&self) -> bool {
         self.problem().is_some()
+    }
+
+    pub(crate) fn committed(&self) -> &[app_install::CommitFact] {
+        match self {
+            Self::Present { committed, .. } | Self::Failed { committed, .. } => committed,
+            Self::Skipped { .. } => &[],
+        }
     }
 
     pub(crate) fn problem(&self) -> Option<&str> {
@@ -136,10 +151,32 @@ impl Report {
                     None => installed,
                 }
             }
-            Self::Failed { problem, .. } => format!(
-                "The Koidrive app could not be installed: {}\nRetry: koi setup\n",
-                crate::printable(problem)
-            ),
+            Self::Failed {
+                problem, committed, ..
+            } => {
+                let mut text = String::new();
+                for commit in committed {
+                    let action = match commit.change {
+                        app_install::CommitChange::Installed => "installation",
+                        app_install::CommitChange::Replaced => "replacement",
+                    };
+                    text.push_str(&format!(
+                        "Koidrive {} {action} committed in {}. Its current state could not be verified.\n",
+                        commit.version,
+                        crate::printable(&commit.path.display().to_string()),
+                    ));
+                }
+                let failure = if committed.is_empty() {
+                    "The Koidrive app could not be installed"
+                } else {
+                    "The Koidrive app setup did not complete"
+                };
+                text.push_str(&format!(
+                    "{failure}: {}\nRetry: koi setup\n",
+                    crate::printable(problem)
+                ));
+                text
+            }
         }
     }
 }
@@ -171,7 +208,7 @@ pub(crate) async fn prepare(target: &Version, launch: AppLaunch, deadline: Insta
 }
 
 impl Prepared {
-    fn from_install(result: Result<AppInstall, app_install::AppInstallError>) -> Self {
+    pub(crate) fn from_install(result: Result<AppInstall, app_install::AppInstallError>) -> Self {
         #[cfg(target_os = "macos")]
         let mut retained = Vec::new();
         let report = match result {
@@ -183,6 +220,7 @@ impl Prepared {
             #[cfg(target_os = "macos")]
             Ok(AppInstall::Present {
                 change,
+                committed,
                 path,
                 version,
                 launch,
@@ -202,6 +240,7 @@ impl Prepared {
                 let retired_paths = retired.iter().map(|old| old.bundle.clone()).collect();
                 retained = retired;
                 Report::Present {
+                    committed,
                     path,
                     version: version.to_string(),
                     change: match change {
@@ -224,6 +263,9 @@ impl Prepared {
             Err(error) => Report::Failed {
                 problem: error.to_string(),
                 residue: error.residue,
+                committed: error.committed,
+                retired: error.retired,
+                preserved: error.preserved,
             },
             #[cfg(not(target_os = "macos"))]
             Err(error) => match error {},
@@ -244,11 +286,53 @@ impl Prepared {
         }
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn helper(&self) -> Option<PathBuf> {
         match &self.report {
             Report::Present { path, .. } => Some(path.join("Contents/Helpers/koi")),
             _ => None,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn verified_helper(
+        &self,
+        deadline: Instant,
+    ) -> Result<Option<app_install::VerifiedHelper>, app_install::AppInstallError> {
+        let Report::Present { path, version, .. } = &self.report else {
+            return Ok(None);
+        };
+        let helper =
+            app_install::verify_existing(&path.join("Contents/Helpers/koi"), deadline).await?;
+        helper.require_version(version)?;
+        Ok(Some(helper))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn skipped_in_ci(&self) -> bool {
+        matches!(&self.report, Report::Skipped { reason } if reason == "ci")
+    }
+
+    pub(crate) fn committed(&self) -> &[app_install::CommitFact] {
+        self.report.committed()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn invalidate(self, mut error: app_install::AppInstallError) -> Self {
+        if let Report::Present {
+            committed,
+            retired,
+            residue,
+            preserved,
+            ..
+        } = self.report
+        {
+            error.committed.extend(committed);
+            error.retired.extend(retired);
+            error.residue.extend(residue);
+            error.preserved.extend(preserved);
+        }
+        Self::from_install(Err(error))
     }
 
     fn needs_handoff(&self) -> bool {
@@ -397,6 +481,57 @@ mod tests {
     }
 
     #[test]
+    fn committed_failure_is_historical_and_never_selects_a_helper() {
+        let value = serde_json::json!({
+            "state": "failed", "problem": "source changed",
+            "committed": [{"path": "/Applications/Koidrive.app", "version": "99.0.0", "change": "replaced"}],
+            "retired": ["/Applications/.koidrive-retired-owned/Koidrive.app"],
+            "residue": ["/cache/receipt-owned.json"], "preserved": ["/other/Koidrive.app"]
+        });
+        let report: Report = serde_json::from_value(value.clone()).unwrap();
+        let prepared = Prepared::fixture(report);
+        assert!(prepared.helper().is_none());
+        assert_eq!(prepared.committed().len(), 1);
+        assert!(prepared.report.failed());
+        assert!(
+            prepared
+                .report
+                .text()
+                .contains("current state could not be verified")
+        );
+        assert!(!prepared.report.text().contains("is installed"));
+        assert_eq!(serde_json::to_value(prepared.report).unwrap(), value);
+        let old = serde_json::json!({"state":"failed", "problem":"offline"});
+        assert_eq!(
+            serde_json::to_value(serde_json::from_value::<Report>(old.clone()).unwrap()).unwrap(),
+            old
+        );
+    }
+
+    #[test]
+    fn historical_commit_versions_reject_malformed_json_and_keep_the_string_wire_shape() {
+        for state in ["failed", "present"] {
+            let mut value = serde_json::json!({
+                "state":state, "problem":"source changed", "path":"/Applications/Koidrive.app",
+                "version":"99.0.0", "change":"replaced", "launch":"not_requested",
+                "committed":[{"path":"/Applications/Koidrive.app", "version":"99.0.0-beta.1+build", "change":"replaced"}],
+            });
+            let report: Report = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(report).unwrap()["committed"],
+                value["committed"]
+            );
+            for invalid in ["", "latest", "99.0", "v99.0.0", "99.0.0\nforged"] {
+                value["committed"][0]["version"] = serde_json::json!(invalid);
+                assert!(
+                    serde_json::from_value::<Report>(value.clone()).is_err(),
+                    "{state}: {invalid:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn only_a_bundled_helper_skips_lifecycle_installation() {
         assert!(bundled(Path::new(
             "/Applications/Koidrive.app/Contents/Helpers/koi"
@@ -420,6 +555,9 @@ mod tests {
             Report::skipped("platform"),
             Report::skipped("architecture"),
             Report::Failed {
+                committed: Vec::new(),
+                retired: Vec::new(),
+                preserved: Vec::new(),
                 problem: "checksum mismatch".into(),
                 residue: vec![home.path().join("mount")],
             },
@@ -447,6 +585,7 @@ mod tests {
         .unwrap();
         for change in [AppChange::Installed, AppChange::Unchanged] {
             let prepared = Prepared::from_install(Ok(AppInstall::Present {
+                committed: Vec::new(),
                 path: path.clone(),
                 version: Version::parse("99.0.0").unwrap(),
                 change,
@@ -501,6 +640,7 @@ mod tests {
                 Vec::new()
             };
             let prepared = Prepared::from_install(Ok(AppInstall::Present {
+                committed: Vec::new(),
                 path: home.path().join("user/Koidrive.app"),
                 version: Version::parse("99.0.0").unwrap(),
                 change: AppChange::Installed,
@@ -537,6 +677,7 @@ mod tests {
         std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
         std::fs::write(&binary, "must not execute").unwrap();
         let prepared = Prepared::fixture(Report::Present {
+            committed: Vec::new(),
             path,
             version: "99.0.0".into(),
             change: Change::Replaced,
@@ -571,6 +712,7 @@ mod tests {
         ] {
             let pending = !retired.is_empty();
             let prepared = Prepared::fixture(Report::Present {
+                committed: Vec::new(),
                 path: home.path().join("Koidrive.app"),
                 version: "99.0.0".into(),
                 change: Change::Unchanged,
@@ -670,6 +812,7 @@ mod tests {
             });
             let prepared = Prepared {
                 report: Report::Present {
+                    committed: Vec::new(),
                     path: path.clone(),
                     version: TARGET.into(),
                     change: Change::Unchanged,
@@ -926,6 +1069,9 @@ mod tests {
         let value = serde_json::to_value(crate::report::WithApp {
             data: serde_json::json!({"service":service}),
             app: Report::Failed {
+                committed: Vec::new(),
+                retired: Vec::new(),
+                preserved: Vec::new(),
                 problem: "offline".into(),
                 residue: Vec::new(),
             },

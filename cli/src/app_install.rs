@@ -1,13 +1,55 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(target_os = "macos")]
 use std::path::PathBuf;
 
+#[cfg(target_os = "macos")]
+pub(crate) use macos::VerifiedHelper;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use macos::tests::pending_retirements_fixture;
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use macos::tests::verified_helper_fixture;
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use macos::tests::verified_helper_fixture_with_metadata;
 
 use semver::Version;
 use tokio::time::Instant;
+
+#[derive(
+    Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
+pub(crate) struct CommitFact {
+    pub(crate) path: PathBuf,
+    #[serde(
+        serialize_with = "serialize_version",
+        deserialize_with = "deserialize_version"
+    )]
+    #[schemars(with = "String")]
+    pub(crate) version: Version,
+    pub(crate) change: CommitChange,
+}
+
+fn serialize_version<S: serde::Serializer>(
+    version: &Version,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(version)
+}
+
+fn deserialize_version<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Version, D::Error> {
+    let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+    Version::parse(&text).map_err(serde::de::Error::custom)
+}
+
+#[derive(
+    Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CommitChange {
+    Installed,
+    Replaced,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AppLaunch {
@@ -21,6 +63,7 @@ pub(crate) enum AppInstall {
     #[cfg(target_os = "macos")]
     Present {
         change: AppChange,
+        committed: Vec<CommitFact>,
         path: PathBuf,
         version: Version,
         launch: AppLaunchResult,
@@ -72,11 +115,17 @@ impl RetiredApp {
 pub(crate) type AppInstallError = std::convert::Infallible;
 
 #[cfg(target_os = "macos")]
+pub(crate) type AppInstallError = Box<AppInstallErrorDetails>;
+
+#[cfg(target_os = "macos")]
 #[derive(Debug)]
-pub(crate) struct AppInstallError {
+pub(crate) struct AppInstallErrorDetails {
     pub(crate) kind: AppInstallFailure,
     pub(crate) message: String,
     pub(crate) residue: Vec<PathBuf>,
+    pub(crate) committed: Vec<CommitFact>,
+    pub(crate) retired: Vec<PathBuf>,
+    pub(crate) preserved: Vec<PathBuf>,
 }
 
 #[cfg(target_os = "macos")]
@@ -95,22 +144,25 @@ pub(crate) enum AppInstallFailure {
 }
 
 #[cfg(target_os = "macos")]
-impl std::fmt::Display for AppInstallError {
+impl std::fmt::Display for AppInstallErrorDetails {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.message)
     }
 }
 
 #[cfg(target_os = "macos")]
-impl std::error::Error for AppInstallError {}
+impl std::error::Error for AppInstallErrorDetails {}
 
 #[cfg(target_os = "macos")]
 fn failure(kind: AppInstallFailure, message: impl ToString) -> AppInstallError {
-    AppInstallError {
+    Box::new(AppInstallErrorDetails {
         kind,
         message: message.to_string(),
         residue: Vec::new(),
-    }
+        committed: Vec::new(),
+        retired: Vec::new(),
+        preserved: Vec::new(),
+    })
 }
 
 fn skip_reason(ci: bool, macos: bool, arm64: bool) -> Option<AppSkip> {
@@ -158,6 +210,14 @@ pub(crate) async fn ensure(
 pub(crate) async fn cancel_active() {
     #[cfg(target_os = "macos")]
     macos::active().cancel().await;
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) async fn verify_existing(
+    helper: &std::path::Path,
+    deadline: Instant,
+) -> Result<VerifiedHelper, AppInstallError> {
+    macos::verify_helper(macos::Config::production()?, helper, deadline).await
 }
 
 #[cfg(target_os = "macos")]
@@ -955,6 +1015,104 @@ function run(args) {
         identity: Identity,
     }
 
+    pub(crate) struct VerifiedHelper {
+        config: Config,
+        app: VerifiedBundle,
+        binary: PathBuf,
+        root: PinnedDirectory,
+        bundle: PinnedDirectory,
+        helper_file: File,
+    }
+
+    impl VerifiedHelper {
+        pub(crate) fn path(&self) -> &Path {
+            &self.binary
+        }
+
+        pub(crate) fn version(&self) -> Option<&Version> {
+            self.app.version.as_ref()
+        }
+
+        pub(crate) fn require_version(&self, expected: &str) -> Result<(), AppInstallError> {
+            if self.version().map(ToString::to_string).as_deref() != Some(expected) {
+                return Err(failure(
+                    AppInstallFailure::ConcurrentChange,
+                    "App version changed since installation verification",
+                ));
+            }
+            Ok(())
+        }
+
+        pub(crate) async fn check(&self, deadline: Instant) -> Result<(), AppInstallError> {
+            let (_tx, cancel) = watch::channel(false);
+            let control = Control { deadline, cancel };
+            unchanged_directory(self.app.path.parent().unwrap(), &self.root.file)?;
+            unchanged_directory(&self.app.path, &self.bundle.file)?;
+            unchanged_bundle(&self.config, &self.app, &control).await?;
+            let helper = File::from(
+                rustix::fs::open(
+                    &self.binary,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(io_error)?,
+            );
+            if identity(&helper.metadata().map_err(io_error)?)
+                != identity(&self.helper_file.metadata().map_err(io_error)?)
+            {
+                return Err(failure(
+                    AppInstallFailure::ConcurrentChange,
+                    "App helper changed since verification",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    pub(super) async fn verify_helper(
+        config: Config,
+        helper: &Path,
+        deadline: Instant,
+    ) -> Result<VerifiedHelper, AppInstallError> {
+        if !helper.is_absolute() || !crate::app::bundled(helper) {
+            return Err(failure(
+                AppInstallFailure::UnsafePath,
+                "Not an absolute app helper path",
+            ));
+        }
+        let path = helper.ancestors().nth(3).unwrap();
+        let root = PinnedDirectory::new(directory(path.parent().unwrap(), false)?)?;
+        let bundle = PinnedDirectory::new(directory(path, false)?)?;
+        let helper_file = File::from(
+            rustix::fs::open(
+                helper,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(io_error)?,
+        );
+        let metadata = helper_file.metadata().map_err(io_error)?;
+        if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
+            return Err(failure(
+                AppInstallFailure::UnsafePath,
+                "App helper is not an executable regular file",
+            ));
+        }
+        let (_tx, cancel) = watch::channel(false);
+        let control = Control { deadline, cancel };
+        let app = verify(&config, path, None, &control).await?;
+        let verified = VerifiedHelper {
+            config,
+            app,
+            binary: helper.to_path_buf(),
+            root,
+            bundle,
+            helper_file,
+        };
+        verified.check(deadline).await?;
+        Ok(verified)
+    }
+
     async fn verify(
         config: &Config,
         path: &Path,
@@ -1594,7 +1752,7 @@ function run(args) {
                 )
                 .map_err(io_error)?,
             );
-            let result = (|| {
+            let result: Result<(), AppInstallError> = (|| {
                 file.write_all(&bytes).map_err(io_error)?;
                 file.sync_all().map_err(io_error)?;
                 if let Some(previous) = &state.1 {
@@ -2320,6 +2478,7 @@ function run(args) {
         config: &Config,
         root: &File,
         control: &Control,
+        attempt: &mut Attempt,
     ) -> Result<Vec<RetiredApp>, AppInstallError> {
         let mut receipts = Vec::new();
         let mut entries = Vec::new();
@@ -2434,7 +2593,10 @@ function run(args) {
         for receipt in receipts {
             let path = receipt.path();
             match recover_receipt(receipt, config, control).await {
-                Ok(Some(token)) => retired.push(token),
+                Ok(Some(token)) => {
+                    attempt.retain(&token);
+                    retired.push(token);
+                }
                 Ok(None) => (),
                 Err(mut error) => {
                     error.residue.push(path);
@@ -2717,6 +2879,37 @@ function run(args) {
         parent_fd: File,
     }
 
+    #[derive(Default)]
+    struct Attempt {
+        committed: Vec<CommitFact>,
+        retired: Vec<PathBuf>,
+        preserved: Vec<PathBuf>,
+        receipts: Vec<PathBuf>,
+    }
+
+    impl Attempt {
+        fn retain(&mut self, token: &RetiredApp) {
+            self.retired.push(token.bundle.clone());
+            self.receipts.push(token.ownership.receipt.path());
+        }
+
+        fn fail(self, mut error: AppInstallError) -> AppInstallError {
+            error.committed.extend(self.committed);
+            error.retired.extend(self.retired);
+            error.preserved.extend(self.preserved);
+            error.residue.extend(
+                self.receipts
+                    .into_iter()
+                    .filter(|path| fs::symlink_metadata(path).is_ok()),
+            );
+            for paths in [&mut error.residue, &mut error.retired, &mut error.preserved] {
+                paths.sort();
+                paths.dedup();
+            }
+            error
+        }
+    }
+
     async fn stage_copy(
         config: &Config,
         receipt: &Receipt,
@@ -2776,18 +2969,20 @@ function run(args) {
     async fn exchange(
         config: &Config,
         receipt: &Receipt,
-        root_fd: &File,
         staged: Staged,
         installed: &[VerifiedBundle],
         requested: bool,
         control: &Control,
+        attempt: &mut Attempt,
     ) -> Result<AppLaunchResult, AppInstallError> {
         let mut data = receipt.data();
+        let version = Version::parse(&data.target).map_err(io_error)?;
         let stage = data
             .stage
             .as_mut()
             .ok_or_else(|| io_error("Missing app stage"))?;
         let root = stage.root.path.clone();
+        let root_fd = stage.root.directory()?;
         let destination = root.join(BUNDLE);
         let previous = installed.iter().find(|app| app.path == destination);
         if previous.is_some() {
@@ -2818,7 +3013,7 @@ function run(args) {
         if !paths.contains(&destination.as_path()) {
             paths.push(&destination);
         }
-        unchanged_directory(&root, root_fd)?;
+        unchanged_directory(&root, &root_fd)?;
         for app in installed {
             if identity(&directory(&app.path, false)?.metadata().map_err(io_error)?) != app.identity
             {
@@ -2831,7 +3026,7 @@ function run(args) {
         ui.requested |= quiesce(config, &paths, control).await?;
         data.lifecycle = Lifecycle::Swapping(ui);
         receipt.save(&data)?;
-        unchanged_directory(&root, root_fd)?;
+        unchanged_directory(&root, &root_fd)?;
         unchanged_directory(&staged.parent, &staged.parent_fd)?;
         unchanged_directory(&receipt.root, &receipt.root_handle.file)?;
         control.check()?;
@@ -2846,7 +3041,7 @@ function run(args) {
         rustix::fs::renameat_with(
             &staged.parent_fd,
             BUNDLE,
-            root_fd,
+            &root_fd,
             BUNDLE,
             if previous.is_some() {
                 RenameFlags::EXCHANGE
@@ -2855,6 +3050,15 @@ function run(args) {
             },
         )
         .map_err(io_error)?;
+        attempt.committed.push(CommitFact {
+            path: destination,
+            version,
+            change: if previous.is_some() {
+                CommitChange::Replaced
+            } else {
+                CommitChange::Installed
+            },
+        });
         root_fd.sync_all().map_err(io_error)?;
         staged.parent_fd.sync_all().map_err(io_error)?;
         complete_lifecycle(receipt, config, control).await
@@ -2867,6 +3071,7 @@ function run(args) {
         chosen: &VerifiedBundle,
         control: &Control,
         cleanup_deadline: Instant,
+        attempt: &mut Attempt,
     ) -> Result<(Vec<RetiredApp>, Vec<PathBuf>, bool), AppInstallError> {
         let installed = inventory(config, control).await?;
         let mut tokens = Vec::new();
@@ -2902,11 +3107,13 @@ function run(args) {
                     .map_err(preserve)?;
                 unchanged_directory(root_path, &root).map_err(preserve)?;
                 preserved.push(app.path.clone());
+                attempt.preserved.push(app.path.clone());
                 continue;
             }
             let _root_lock = lock(&root, &work).await.map_err(preserve)?;
             let receipt = begin_receipt(config, work_root, chosen.version.as_ref().unwrap())
                 .map_err(preserve)?;
+            attempt.receipts.push(receipt.path());
             let result = async {
                 let staged =
                     stage_copy(config, &receipt, root_path, &root, &chosen.path, &work).await?;
@@ -2919,11 +3126,11 @@ function run(args) {
                 exchange(
                     config,
                     &receipt,
-                    &root,
                     staged,
                     std::slice::from_ref(app),
                     false,
                     &work,
+                    attempt,
                 )
                 .await
             }
@@ -2935,6 +3142,9 @@ function run(args) {
                 cancel,
             };
             let recovered = recover_receipt(receipt, config, &cleanup).await;
+            if let Ok(Some(token)) = &recovered {
+                attempt.retain(token);
+            }
             match (result, recovered) {
                 (Ok(launch), Ok(Some(token))) if !matches!(launch, AppLaunchResult::Failed(_)) => {
                     reopened |= launch == AppLaunchResult::Requested;
@@ -2961,8 +3171,37 @@ function run(args) {
         config: Config,
         target: Version,
         launch: AppLaunch,
+        control: Control,
+        cleanup_deadline: Instant,
+    ) -> Result<AppInstall, AppInstallError> {
+        let mut attempt = Attempt::default();
+        match transaction_inner(
+            config,
+            target,
+            launch,
+            control,
+            cleanup_deadline,
+            &mut attempt,
+        )
+        .await
+        {
+            Ok(mut result) => {
+                if let AppInstall::Present { committed, .. } = &mut result {
+                    *committed = attempt.committed;
+                }
+                Ok(result)
+            }
+            Err(error) => Err(attempt.fail(error)),
+        }
+    }
+
+    async fn transaction_inner(
+        config: Config,
+        target: Version,
+        launch: AppLaunch,
         mut control: Control,
         cleanup_deadline: Instant,
+        attempt: &mut Attempt,
     ) -> Result<AppInstall, AppInstallError> {
         control.check()?;
         match fs::symlink_metadata(&config.work) {
@@ -2979,6 +3218,7 @@ function run(args) {
                     }
                     return Ok(AppInstall::Present {
                         change: AppChange::Unchanged,
+                        committed: Vec::new(),
                         path: app.path.clone(),
                         version: app.version.clone().unwrap(),
                         launch: launch_result,
@@ -2994,7 +3234,7 @@ function run(args) {
         let work_root = private_work(&config.work, true)?;
         let _user_lock = lock(&work_root, &control).await?;
         unchanged_directory(&config.work, &work_root)?;
-        let mut retired = recover(&config, &work_root, &control).await?;
+        let mut retired = recover(&config, &work_root, &control, attempt).await?;
         let installed = inventory(&config, &control).await?;
         if let Some(app) = current(&installed, &target) {
             let (pending, preserved, reopened) = upgrade_alternatives(
@@ -3004,6 +3244,7 @@ function run(args) {
                 app,
                 &control,
                 cleanup_deadline,
+                attempt,
             )
             .await?;
             retired.extend(pending);
@@ -3017,6 +3258,7 @@ function run(args) {
             unchanged_bundle(&config, app, &control).await?;
             return Ok(AppInstall::Present {
                 change: AppChange::Unchanged,
+                committed: Vec::new(),
                 path: app.path.clone(),
                 version: app.version.clone().unwrap(),
                 launch: launch_result,
@@ -3040,6 +3282,7 @@ function run(args) {
         };
         let _root_lock = lock(&root_fd, &control).await?;
         let receipt = begin_receipt(&config, &work_root, &target)?;
+        attempt.receipts.push(receipt.path());
         let mut data = receipt.data();
         let work = data.work.path.clone();
         let result: Result<AppInstall, AppInstallError> = async {
@@ -3062,6 +3305,7 @@ function run(args) {
                 unchanged_bundle(&config, app, &control).await?;
                 return Ok(AppInstall::Present {
                     change: AppChange::Unchanged,
+                    committed: Vec::new(),
                     path: app.path.clone(),
                     version: app.version.clone().unwrap(),
                     launch: open(&config, &app.path, launch == AppLaunch::Open, &control).await,
@@ -3075,14 +3319,15 @@ function run(args) {
             let launch_result = exchange(
                 &config,
                 &receipt,
-                &root_fd,
                 staged,
                 &installed,
                 launch == AppLaunch::Open,
                 &control,
+                attempt,
             )
             .await?;
             Ok(AppInstall::Present {
+                committed: Vec::new(),
                 change: if previous.is_some() {
                     AppChange::Replaced
                 } else {
@@ -3105,7 +3350,10 @@ function run(args) {
         let receipt_path = receipt.path();
         let mut residue = Vec::new();
         match recover_receipt(receipt, &config, &cleanup_control).await {
-            Ok(Some(token)) => retired.push(token),
+            Ok(Some(token)) => {
+                attempt.retain(&token);
+                retired.push(token);
+            }
             Ok(None) => (),
             Err(_) => residue.push(if work.exists() { work } else { receipt_path }),
         }
@@ -3131,6 +3379,7 @@ function run(args) {
                         app,
                         &control,
                         cleanup_deadline,
+                        attempt,
                     )
                     .await?;
                     retired.extend(pending);
@@ -3140,6 +3389,7 @@ function run(args) {
                         launch = AppLaunchResult::Requested;
                     }
                     Ok(AppInstall::Present {
+                        committed: Vec::new(),
                         change,
                         path: app.path.clone(),
                         version: app.version.clone().unwrap(),

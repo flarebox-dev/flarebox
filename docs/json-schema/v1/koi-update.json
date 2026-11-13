@@ -227,6 +227,32 @@
       ],
       "type": "object"
     },
+    "CommitChange": {
+      "enum": [
+        "installed",
+        "replaced"
+      ],
+      "type": "string"
+    },
+    "CommitFact": {
+      "properties": {
+        "change": {
+          "$ref": "#/$defs/CommitChange"
+        },
+        "path": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "version",
+        "change"
+      ],
+      "type": "object"
+    },
     "ConflictData": {
       "oneOf": [
         {
@@ -733,6 +759,12 @@
             "change": {
               "$ref": "#/$defs/Change"
             },
+            "committed": {
+              "items": {
+                "$ref": "#/$defs/CommitFact"
+              },
+              "type": "array"
+            },
             "launch": {
               "$ref": "#/$defs/Launch"
             },
@@ -782,10 +814,28 @@
         },
         {
           "properties": {
+            "committed": {
+              "items": {
+                "$ref": "#/$defs/CommitFact"
+              },
+              "type": "array"
+            },
+            "preserved": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "problem": {
               "type": "string"
             },
             "residue": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "retired": {
               "items": {
                 "type": "string"
               },

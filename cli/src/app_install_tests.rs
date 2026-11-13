@@ -1,6 +1,223 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #[tokio::test]
+async fn malformed_receipt_version_is_rejected_before_namespace_replacement() {
+    let f = Fixture::new(None, DMG.to_vec(), 200).await;
+    f.old();
+    let work = private_work(&f.config.work, true).unwrap();
+    let root = directory(&f.config.system, false).unwrap();
+    let receipt = begin_receipt(&f.config, &work, &Version::parse(TARGET).unwrap()).unwrap();
+    let (_tx, cancel) = watch::channel(false);
+    let control = Control {
+        deadline: Instant::now() + Duration::from_secs(30),
+        cancel,
+    };
+    let staged = stage_copy(
+        &f.config,
+        &receipt,
+        &f.config.system,
+        &root,
+        &f.incoming(),
+        &control,
+    )
+    .await
+    .unwrap();
+    let installed = inventory(&f.config, &control).await.unwrap();
+    let mut data = receipt.data();
+    data.target = "not-a-version".into();
+    receipt.save(&data).unwrap();
+    let mut attempt = Attempt::default();
+    let error = exchange(
+        &f.config,
+        &receipt,
+        staged,
+        &installed,
+        false,
+        &control,
+        &mut attempt,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind, AppInstallFailure::Io);
+    assert!(attempt.committed.is_empty());
+    f.preserved();
+    assert!(!f.base().join("quit.log").exists());
+    assert!(!f.base().join("open.log").exists());
+}
+
+#[tokio::test]
+async fn primary_commit_facts_survive_a_failed_alternative_upgrade() {
+    let mut f = Fixture::new(None, DMG.to_vec(), 200).await;
+    f.old();
+    bundle(&f.config.user.join(BUNDLE), Some("0.1.0"));
+    f.config.ditto = f.base().join("fail-alternative-copy");
+    script(
+        &f.config.ditto,
+        &format!(
+            "[ \"$1\" != '{}' ] || exit 73\nexec /usr/bin/ditto \"$@\"",
+            f.installed().display()
+        ),
+    );
+    let error = f.run().await.unwrap_err();
+    assert_eq!(error.kind, AppInstallFailure::Command);
+    assert_eq!(
+        fs::read(f.installed().join("Contents/Helpers/koi")).unwrap(),
+        TARGET.as_bytes()
+    );
+    assert_eq!(
+        error.committed,
+        vec![CommitFact {
+            path: f.installed(),
+            version: Version::parse(TARGET).unwrap(),
+            change: CommitChange::Replaced,
+        }]
+    );
+    assert_eq!(error.retired.len(), 1);
+    assert_eq!(
+        fs::read(error.retired[0].join("Contents/Helpers/koi")).unwrap(),
+        b"0.1.0"
+    );
+    assert!(
+        error
+            .residue
+            .iter()
+            .any(|path| path.extension().is_some_and(|ext| ext == "json") && path.exists())
+    );
+    let prepared = crate::app::Prepared::from_install(Err(error));
+    assert!(prepared.helper().is_none());
+    let retry = {
+        f.config.ditto = "/usr/bin/ditto".into();
+        f.run().await.unwrap()
+    };
+    assert!(
+        matches!(retry, AppInstall::Present { committed, .. } if committed.len() == 1 && committed[0].path == f.config.user.join(BUNDLE))
+    );
+}
+
+#[tokio::test]
+async fn alternative_commit_survives_a_later_verification_failure() {
+    let f = Fixture::new(None, DMG.to_vec(), 200).await;
+    f.old();
+    let user = f.config.user.join(BUNDLE);
+    bundle(&user, Some("0.4.0"));
+    let accepting = f.base().join("accepting-codesign");
+    fs::copy(&f.config.codesign, &accepting).unwrap();
+    script(
+        &f.config.codesign,
+        &format!(
+            "'{}' \"$@\" || exit $?\nfor last do :; done\nif [ \"$last\" = '{}' ] && [ \"$(/bin/cat '{}/Contents/Helpers/koi')\" = '0.4.0' ]; then printf OTHERTEAM > '{}/Signer'; fi",
+            accepting.display(),
+            user.display(),
+            f.installed().display(),
+            user.display()
+        ),
+    );
+    let error = f.run().await.unwrap_err();
+    assert_eq!(
+        error.committed,
+        vec![CommitFact {
+            path: f.installed(),
+            version: Version::parse("0.4.0").unwrap(),
+            change: CommitChange::Replaced
+        }]
+    );
+    assert!(!error.residue.is_empty());
+    assert!(!f.base().join("open.log").exists());
+    let prepared = crate::app::Prepared::from_install(Err(error));
+    assert!(prepared.helper().is_none());
+}
+
+#[tokio::test]
+async fn refresh_and_final_verification_errors_preserve_attempt_effects() {
+    for refresh in [true, false] {
+        let f = Fixture::new(None, DMG.to_vec(), 200).await;
+        f.old();
+        let AppInstall::Present {
+            committed, retired, ..
+        } = f.run().await.unwrap()
+        else {
+            panic!()
+        };
+        let expected = committed.clone();
+        let mut attempt = Attempt {
+            committed,
+            ..Default::default()
+        };
+        for token in &retired {
+            attempt.retain(token);
+        }
+        let (_tx, cancel) = watch::channel(false);
+        let control = Control {
+            deadline: Instant::now() + Duration::from_secs(30),
+            cancel,
+        };
+        let installed = inventory(&f.config, &control).await.unwrap();
+        let current = current(&installed, &Version::parse(TARGET).unwrap()).unwrap();
+        fs::write(current.path.join("Signer"), "OTHERTEAM").unwrap();
+        let error = if refresh {
+            refresh_tokens(retired, &f.config, &control)
+                .await
+                .unwrap_err()
+        } else {
+            unchanged_bundle(&f.config, current, &control)
+                .await
+                .unwrap_err()
+        };
+        let error = attempt.fail(error);
+        assert_eq!(error.committed, expected);
+        assert_eq!(error.retired.len(), 1);
+        assert_eq!(
+            fs::read(error.retired[0].join("Contents/Helpers/koi")).unwrap(),
+            b"0.1.0"
+        );
+        assert!(
+            error
+                .residue
+                .iter()
+                .any(|path| path.extension().is_some_and(|ext| ext == "json") && path.exists())
+        );
+        assert!(
+            crate::app::Prepared::from_install(Err(error))
+                .helper()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn verifying_an_existing_helper_is_read_only_even_with_pending_work() {
+    let f = Fixture::new(None, DMG.to_vec(), 200).await;
+    f.old();
+    fs::create_dir(&f.config.work).unwrap();
+    let receipt = f.config.work.join("receipt-pending.json");
+    fs::write(&receipt, "must not recover or remove this receipt").unwrap();
+    let helper = f.installed().join("Contents/Helpers/koi");
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+    let verified = verify_helper(
+        f.config.clone(),
+        &helper,
+        Instant::now() + Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert_eq!(verified.version().unwrap().to_string(), "0.1.0");
+    verified.require_version("0.1.0").unwrap();
+    assert_eq!(
+        verified.require_version(TARGET).unwrap_err().kind,
+        AppInstallFailure::ConcurrentChange
+    );
+    assert_eq!(
+        fs::read(&receipt).unwrap(),
+        b"must not recover or remove this receipt"
+    );
+    assert_eq!(fs::read_dir(&f.config.work).unwrap().count(), 1);
+    for log in ["open.log", "quit.log", "hdi.log"] {
+        assert!(!f.base().join(log).exists());
+    }
+    assert!(f.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn review_retry_after_detach_failure_must_finish_cleanup() {
     let f = Fixture::new(None, DMG.to_vec(), 200).await;
     f.flag("detach-fail");
@@ -35,12 +252,16 @@ async fn review_retry_after_handoff_interruption_must_recover_retired() {
         b"0.1.0"
     );
     let AppInstall::Present {
-        retired, residue, ..
+        retired,
+        residue,
+        committed,
+        ..
     } = retry
     else {
         panic!()
     };
     assert!(residue.is_empty());
+    assert!(committed.is_empty());
     assert_eq!(retired.len(), 1);
     assert_eq!(retired[0].bundle, old_path);
     retired[0].discard().unwrap();
@@ -922,6 +1143,7 @@ async fn failed_swap_restores_running_ui_even_when_detach_also_fails() {
     let error = result.unwrap_err();
     assert_eq!(error.kind, AppInstallFailure::Io);
     assert!(!error.residue.is_empty());
+    assert!(error.committed.is_empty());
     f.preserved();
     assert!(f.base().join("mounted").exists());
     assert!(
@@ -1073,6 +1295,14 @@ echo stopped
     assert!(!error.residue.is_empty());
     assert!(!f.base().join("open.log").exists());
     assert!(!f.base().join("foreign-helper-ran").exists());
+    assert_eq!(
+        error.committed,
+        vec![CommitFact {
+            path: f.installed(),
+            version: Version::parse(TARGET).unwrap(),
+            change: CommitChange::Replaced
+        }]
+    );
     assert_eq!(
         fs::read(f.installed().join("Signer")).unwrap(),
         b"OTHERTEAM"
@@ -1774,6 +2004,33 @@ async fn recovery_reports_unowned_application_staging_without_deletion() {
     assert!(!f.base().join("hdi.log").exists());
 }
 const DMG: &[u8] = b"A real byte fixture, not a fake digest.\x00\x01\xff";
+
+pub(crate) async fn verified_helper_fixture(version: &str) -> (impl Drop, VerifiedHelper) {
+    verified_helper_fixture_with_metadata(version, Some(version)).await
+}
+
+pub(crate) async fn verified_helper_fixture_with_metadata(
+    version: &str,
+    metadata: Option<&str>,
+) -> (impl Drop, VerifiedHelper) {
+    let f = Fixture::versioned(version, None, DMG.to_vec(), 200).await;
+    bundle(&f.installed(), metadata);
+    let binary = f.installed().join("Contents/Helpers/koi");
+    script(
+        &binary,
+        &format!(
+            "printf '%s\\n' \"$*\" >> \"$0.calls\"\ncase \"$1\" in\n--version) echo 'koi {version}' ;;\n_reconcile) echo '{{\"data\":{{\"service\":{{\"manager\":\"launchd\",\"name\":\"fixture\",\"state\":\"running\"}}}}}}' ;;\nesac"
+        ),
+    );
+    let verified = verify_helper(
+        f.config.clone(),
+        &binary,
+        Instant::now() + Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    (f, verified)
+}
 
 fn digest() -> String {
     Sha256::digest(DMG)
