@@ -195,3 +195,38 @@ fn a_rename_back_to_s_while_its_acknowledgement_waits_stays_a_change() {
     trees.settle();
     assert!(trees.state().local_changes.contains("n"));
 }
+
+#[test]
+fn a_rename_back_to_s_is_no_change_once_a_listing_and_a_loss_take_its_acknowledgement_back() {
+    let mut trees = trees(&[
+        (
+            "h",
+            Some(file(ROOT, "x", 9)),
+            Some(file(ROOT, "x", 9)),
+            Some(remote(file(ROOT, "y", 9))),
+        ),
+        synced("n", file(ROOT, "old", 0)),
+    ]);
+    trees.set_local(
+        "h".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "x", 9), 1)
+        },
+    );
+    trees.set_local_changed("n".into(), local(file(ROOT, "x", 0), 2));
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    trees.set_remote("n".into(), remote(file(ROOT, "x", 0)));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    trees.set_local_changed("n".into(), local(file(ROOT, "old", 0), 2));
+    trees.set_listed_remote("n".into(), remote(file(ROOT, "old", 0)));
+    trees.forget_lost(vec![], vec![], vec![], vec![], vec![], Default::default(), 0, 0);
+    assert!(trees.waiting().get("n").is_none());
+    assert_eq!(trees.check(), Ok(()));
+    assert!(trees.state().local_changes.is_empty());
+}

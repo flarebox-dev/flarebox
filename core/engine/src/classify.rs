@@ -431,18 +431,15 @@ impl Trees {
     }
 
     pub fn set_remote(&mut self, id: NodeId, node: RemoteNode) {
-        self.apply_remote(id.clone(), node, false, false);
-        self.end_change_all_trees_hold(&id);
+        self.apply_remote(id, node, false, false);
     }
 
     pub fn set_remote_made_here(&mut self, id: NodeId, node: RemoteNode) {
-        self.apply_remote(id.clone(), node, true, false);
-        self.end_change_all_trees_hold(&id);
+        self.apply_remote(id, node, true, false);
     }
 
     pub fn set_remote_edited_here(&mut self, id: NodeId, node: RemoteNode) {
-        self.apply_remote(id.clone(), node, true, true);
-        self.end_change_all_trees_hold(&id);
+        self.apply_remote(id, node, true, true);
     }
 
     fn all_trees_hold(&self, id: &str) -> bool {
@@ -604,6 +601,7 @@ impl Trees {
         self.count_trashed(&id, true);
         self.note_position(&id);
         self.record_edit_in_trash(&id);
+        self.end_change_all_trees_hold(&id);
         if trashed {
             self.yield_resends();
         }
