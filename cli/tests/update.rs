@@ -172,6 +172,27 @@ fn koi_update_on_the_newest_release_changes_nothing() {
 }
 
 #[test]
+fn koi_update_text_hides_the_reconcile_envelope_but_keeps_it_in_the_log() {
+    let home = tempfile::tempdir().unwrap();
+    let github = github("v99.0.0");
+    homebrew(home.path(), "99.0.0");
+    let output = koi(home.path(), &github, &["update"]).output().unwrap();
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success(), "{text}");
+    assert!(
+        text.contains("Koidrive 99.0.0 is the newest release."),
+        "{text}"
+    );
+    assert!(!text.contains("schema_version"), "{text}");
+    let log = if cfg!(target_os = "macos") {
+        home.path().join("Library/Logs/Koidrive/update.log")
+    } else {
+        home.path().join("state/koidrive/update.log")
+    };
+    assert!(std::fs::read_to_string(log).unwrap().contains(REPORT));
+}
+
+#[test]
 fn koi_update_rejects_a_successful_brew_that_leaves_the_old_binary_installed() {
     let home = tempfile::tempdir().unwrap();
     let github = github("v99.0.0");

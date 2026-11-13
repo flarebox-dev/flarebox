@@ -163,9 +163,9 @@ struct Echo {
 }
 
 #[derive(Clone, Copy)]
-enum Lifetime {
-    Cancellable,
-    Independent,
+enum Child {
+    Progress,
+    Reconcile,
 }
 
 impl Echo {
@@ -189,15 +189,15 @@ impl Echo {
         &mut self,
         mut command: Command,
         within: Duration,
-        lifetime: Lifetime,
+        kind: Child,
     ) -> io::Result<Option<(ExitStatus, Vec<u8>, String)>> {
         let shown = format!("{:?}", command.as_std());
         if let Some(log) = &mut self.log {
             let _ = writeln!(log, "$ {shown}");
         }
-        let kill_on_drop = match lifetime {
-            Lifetime::Cancellable => true,
-            Lifetime::Independent => {
+        let kill_on_drop = match kind {
+            Child::Progress => true,
+            Child::Reconcile => {
                 command.process_group(0);
                 false
             }
@@ -217,7 +217,14 @@ impl Echo {
                 tokio::select! {
                     line = stdout.next_line(), if out_open => match line? {
                         Some(line) => {
-                            self.line(&line, false);
+                            match kind {
+                                Child::Progress => self.line(&line, false),
+                                Child::Reconcile => {
+                                    if let Some(log) = &mut self.log {
+                                        let _ = writeln!(log, "{line}");
+                                    }
+                                }
+                            }
                             printed.extend_from_slice(line.as_bytes());
                             printed.push(b'\n');
                         }
@@ -278,7 +285,7 @@ async fn homebrew(prefix: &Path, echo: &mut Echo) -> Result<(), CliError> {
             .env("HOMEBREW_NO_ENV_HINTS", "1")
             .env("HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK", "1");
         let shown = format!("brew {}", args.join(" "));
-        let (status, _, errors) = (echo.run(command, BREW, Lifetime::Cancellable).await)
+        let (status, _, errors) = (echo.run(command, BREW, Child::Progress).await)
             .map_err(|error| failed(format!("{shown} did not run: {error}")))?
             .ok_or_else(|| {
                 failed(format!(
@@ -352,7 +359,7 @@ async fn installer(
         .arg(file.path())
         .env("KOIDRIVE_INSTALL_DIR", dir)
         .env("KOIDRIVE_VERSION", format!("v{version}"));
-    let (status, _, _) = (echo.run(command, INSTALLER, Lifetime::Cancellable).await)
+    let (status, _, _) = (echo.run(command, INSTALLER, Child::Progress).await)
         .map_err(|error| failed(format!("install.sh did not run: {error}")))?
         .ok_or_else(|| {
             failed(format!(
@@ -443,7 +450,7 @@ pub async fn run(paths: &Paths, json: bool) -> Result<Done, CliError> {
     let args = ["_reconcile", "--json"];
     let mut command = Command::new(&koi);
     command.args(args);
-    let output = (echo.run(command, RECONCILE, Lifetime::Independent).await)
+    let output = (echo.run(command, RECONCILE, Child::Reconcile).await)
         .map(|output| output.map(|(status, printed, _)| (status, printed)));
     let report =
         service::delegated_report(manager.as_ref(), &service, &koi, &args, RECONCILE, output);
@@ -717,7 +724,7 @@ echo "==> brew $1"
                 assert!(
                     tokio::time::timeout(
                         Duration::from_millis(100),
-                        echo.run(command, Duration::from_secs(10), Lifetime::Independent)
+                        echo.run(command, Duration::from_secs(10), Child::Reconcile)
                     )
                     .await
                     .is_err()
@@ -728,10 +735,7 @@ echo "==> brew $1"
                 } else {
                     Duration::from_secs(10)
                 };
-                let result = echo
-                    .run(command, within, Lifetime::Independent)
-                    .await
-                    .unwrap();
+                let result = echo.run(command, within, Child::Reconcile).await.unwrap();
                 assert!(result.is_none());
             }
         });
@@ -818,7 +822,7 @@ echo "==> brew $1"
             .args(["-c", "echo $$ > \"$1\"; exec sleep 30", "sh"])
             .arg(&pid_file);
         let result = echo(dir.path())
-            .run(command, Duration::from_millis(100), Lifetime::Cancellable)
+            .run(command, Duration::from_millis(100), Child::Progress)
             .await
             .unwrap();
         assert!(result.is_none());
