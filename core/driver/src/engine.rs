@@ -1305,6 +1305,14 @@ pub(crate) struct Staging {
     nodes: BTreeMap<String, NodeState>,
 }
 
+fn edit_revs(node: &NodeState) -> (u64, u64) {
+    let or = |rev, before| if rev == 0 { before } else { rev };
+    (
+        or(node.edit_rev, node.content_rev),
+        or(node.meta_edit_rev, node.meta_rev),
+    )
+}
+
 impl Staging {
     /// The listing of a bootstrap. The log is replayed from the first page's `head_seq` (spec v0 section 7.5). The
     /// pages of the trash, read after the tree when the server lost commits, carry no `head_seq`: a trashed node
@@ -1334,15 +1342,13 @@ impl Staging {
 
     /// Holds `state` unless the node it holds is as new.
     fn take(&mut self, state: NodeState) {
-        let meta_edit_rev = |node: &NodeState| match node.meta_edit_rev {
-            0 => node.meta_rev,
-            rev => rev,
-        };
         let newer = self.nodes.get(&state.node_id).is_none_or(|held| {
+            let ((edit, meta_edit), (held_edit, held_meta_edit)) =
+                (edit_revs(&state), edit_revs(held));
             state.content_rev > held.content_rev
                 || state.meta_rev > held.meta_rev
-                || state.edit_rev > held.edit_rev
-                || meta_edit_rev(&state) > meta_edit_rev(held)
+                || edit > held_edit
+                || meta_edit > held_meta_edit
         });
         if newer {
             self.nodes.insert(state.node_id.clone(), state);
@@ -3563,5 +3569,26 @@ mod tests {
         };
         let staging = Staging::new("h".into(), vec![page], vec![trash]);
         assert_eq!(staging.nodes.get("d").map(|d| d.meta_rev), Some(10));
+    }
+
+    #[test]
+    fn a_listed_node_from_a_server_before_edit_revisions_outranks_an_older_trashed_one() {
+        let at = |content_rev, edit_rev, status: NodeStatus| NodeState {
+            content_rev,
+            edit_rev,
+            status: status as i32,
+            ..node("d", "d")
+        };
+        let page = TreePage {
+            nodes: vec![at(10, 0, NodeStatus::Live)],
+            head_seq: 10,
+            ..Default::default()
+        };
+        let trash = TrashPage {
+            nodes: vec![at(8, 8, NodeStatus::Trashed)],
+            ..Default::default()
+        };
+        let staging = Staging::new("h".into(), vec![page], vec![trash]);
+        assert_eq!(staging.nodes.get("d").map(|d| d.content_rev), Some(10));
     }
 }
