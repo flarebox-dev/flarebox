@@ -510,9 +510,9 @@ impl Folder {
         Ok(work)
     }
 
-    /// The staging of `pending` ended. A staged effect is applied here, in the effect section. A transfer that
+    /// The staging of `pending` ended. A staged batch is applied here, in the effect section. A transfer that
     /// failed for now is staged again from the same `pending` after its wait, since nothing else can stage the
-    /// effect in flight.
+    /// batch in flight.
     pub fn staged(
         &mut self,
         pending: Pending,
@@ -529,27 +529,21 @@ impl Folder {
             }
             Err(Stall::Halt(stop)) => return Err(stop),
         };
-        let node = self
-            .engine
-            .effects
-            .in_flight()
-            .map(|record| record.node.clone());
-        let effect_id = self
-            .engine
-            .effects
-            .in_flight()
+        let effect_ids: Vec<String> = (self.engine.effects.in_flight().iter())
             .filter(|_| self.timing.is_on())
-            .map(|record| record.effect_id.clone());
+            .map(|record| record.effect_id.clone())
+            .collect();
         let settled = self.disk.apply(staged, &mut self.engine, &mut self.store)?;
-        if let Some(effect_id) = effect_id {
+        let at = Time::now();
+        for (effect_id, (_, settled)) in effect_ids.iter().zip(&settled) {
             self.timing
-                .applied(&effect_id, settled == Settled::Done, Time::now());
+                .applied(effect_id, *settled == Settled::Done, at);
         }
         if self.engine.asked {
             self.questions = self.store.transaction(unanswered)?;
         }
         let mut work = Vec::new();
-        if let Some(node) = node {
+        for (node, settled) in settled {
             match settled {
                 Settled::Done => {
                     self.effect_failures.remove(&node);
@@ -820,7 +814,7 @@ impl Folder {
             self.engine.effects.in_flight(),
             self.engine.commits.in_flight(),
         ) {
-            (None, None) => effects::stuck(trees, &self.engine.effects, None),
+            ([], None) => effects::stuck(trees, &self.engine.effects, None),
             _ => BTreeMap::new(),
         };
         let state = match &self.stream {
@@ -984,7 +978,7 @@ impl Folder {
         self.caught_up()
             && self.scanned
             && !self.disk.awaits_rules()
-            && self.engine.effects.in_flight().is_none()
+            && self.engine.effects.in_flight().is_empty()
             && matches!(self.flight, Flight::Idle)
             && self.engine.commits.in_flight().is_none()
             && self.engine.trees.dirty().iter().all(stuck)
@@ -1423,7 +1417,7 @@ impl Folder {
 
     fn drive(&mut self, work: &mut Vec<Work>) -> Result<(), Stop> {
         self.publish_remote()?;
-        let staging = self.engine.effects.in_flight().is_some();
+        let staging = !self.engine.effects.in_flight().is_empty();
         let held = !self.scanned || staging || self.disk.awaits_rules();
         if held || !matches!(self.stream, Stream::Following { .. }) {
             return Ok(());
@@ -1465,19 +1459,18 @@ impl Folder {
         Ok(())
     }
 
-    /// Plans the next effect, if there is one, and asks for its staging.
+    /// Plans the next batch of effects, if there is one, and asks for its staging.
     fn plan_effect(&mut self, work: &mut Vec<Work>) -> Result<bool, Stop> {
         let Some(mut pending) = self.disk.next(&mut self.engine, &mut self.store)? else {
             return Ok(false);
         };
-        if self.timing.is_on()
-            && let Some(record) = self.engine.effects.in_flight()
-        {
-            pending.timing_bytes = self.timing.planned(
-                record,
-                self.engine.trees.remote().get(&record.node),
-                Time::now(),
-            );
+        if self.timing.is_on() {
+            let at = Time::now();
+            for record in self.engine.effects.in_flight() {
+                let remote = self.engine.trees.remote().get(&record.node);
+                let bytes = self.timing.planned(record, remote, at);
+                pending.timing_bytes = pending.timing_bytes.take().or(bytes);
+            }
         }
         work.push(Work::Stage(pending));
         Ok(true)

@@ -59,6 +59,7 @@ fn dismissing_the_notice_while_the_folder_is_removed_opens_no_new_one() {
     let mut remote = Remote::new();
     let (site_a, mut a) = linked(&mut remote, "a");
     let (site_b, mut b) = linked(&mut remote, "b");
+    b.folder.disk.set_batch(BatchLimit::ONE);
     fs::create_dir(site_a.root.join("d")).unwrap();
     for i in 0..50 {
         fs::write(site_a.root.join(format!("d/{i}.txt")), format!("kept {i}")).unwrap();
@@ -148,6 +149,7 @@ fn a_dismissed_folder_stays_dismissed_after_a_truncated_log_and_a_rollback() {
     let mut remote = Remote::new();
     let (site_a, mut a) = linked(&mut remote, "a");
     let (site_b, mut b) = linked(&mut remote, "b");
+    b.folder.disk.set_batch(BatchLimit::ONE);
     fs::create_dir(site_a.root.join("d")).unwrap();
     for i in 0..50 {
         fs::write(site_a.root.join(format!("d/{i}.txt")), format!("kept {i}")).unwrap();
@@ -201,6 +203,7 @@ fn a_folder_restored_and_deleted_again_while_the_log_was_truncated_is_noticed() 
     let mut remote = Remote::new();
     let (site_a, mut a) = linked(&mut remote, "a");
     let (site_b, mut b) = linked(&mut remote, "b");
+    b.folder.disk.set_batch(BatchLimit::ONE);
     fs::create_dir(site_a.root.join("d")).unwrap();
     for i in 0..50 {
         fs::write(site_a.root.join(format!("d/{i}.txt")), format!("kept {i}")).unwrap();

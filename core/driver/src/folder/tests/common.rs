@@ -7,6 +7,7 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 
 use koidrive_engine::commit::Lift;
+use koidrive_engine::effects::BatchLimit;
 
 use koidrive_engine::restore::{Outcome, RestoreIntent};
 

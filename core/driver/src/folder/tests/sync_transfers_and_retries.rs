@@ -208,6 +208,7 @@ fn a_download_that_fails_for_now_stages_the_same_effect_again() {
         .engine
         .effects
         .in_flight()
+        .first()
         .unwrap()
         .effect_id
         .clone();
@@ -218,7 +219,13 @@ fn a_download_that_fails_for_now_stages_the_same_effect_again() {
     b.settle();
     assert!(matches!(b.work.make_contiguous(), [Work::StageAfter(..)]));
     assert_eq!(
-        b.folder.engine.effects.in_flight().first().unwrap().effect_id,
+        b.folder
+            .engine
+            .effects
+            .in_flight()
+            .first()
+            .unwrap()
+            .effect_id,
         planned
     );
 
@@ -283,7 +290,7 @@ fn a_remote_change_is_applied_only_after_the_commit_in_flight() {
         a.work.is_empty(),
         "no effect is planned while the commit is in flight"
     );
-    assert!(a.folder.engine.effects.in_flight().first().is_none());
+    assert!(a.folder.engine.effects.in_flight().is_empty());
 
     a.work.push_back(send);
     let ran = a.run(&mut remote);
@@ -498,7 +505,7 @@ fn a_bootstrap_whose_pages_were_read_at_two_heads_replaces_r_after_the_replay() 
     assert_eq!(b.folder.engine.cursor, None);
     assert!(b.folder.engine.trees.remote().is_empty());
 
-    assert_eq!(b.run(&mut remote), ["subscribe", "stage", "stage"]);
+    assert_eq!(b.run(&mut remote), ["subscribe", "stage"]);
     assert_eq!(b.folder.view().last_seq, Some(last_head));
     assert_eq!(names(&site.root), ["one.txt", "two.txt"]);
     assert_eq!(b.state(), FolderState::UpToDate);
@@ -518,7 +525,7 @@ fn a_truncated_log_reads_the_tree_again_and_keeps_what_is_synced() {
     remote.space.truncate_log(remote.space.head_seq());
     b.pull(&remote);
     assert_eq!(b.state(), FolderState::Bootstrapping);
-    assert_eq!(b.run(&mut remote), ["list", "subscribe", "stage", "stage"]);
+    assert_eq!(b.run(&mut remote), ["list", "subscribe", "stage"]);
     assert_eq!(names(&site.root), ["one.txt", "three.txt", "two.txt"]);
     assert_eq!(b.folder.engine.effects.cleared(), 3);
     assert_eq!(b.state(), FolderState::UpToDate);
