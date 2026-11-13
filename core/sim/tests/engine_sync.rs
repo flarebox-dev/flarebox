@@ -953,10 +953,12 @@ fn blocked_by_a_folder_kept_for_an_excluded_entry(
     id: &str,
     discarded: &Discarded,
 ) -> bool {
-    let blocked = |node: &RemoteNode| {
+    let blocked = |id: &str, node: &RemoteNode| {
         let key = name_key(&node.shape.name);
         (trees.local().iter()).any(|(other, held)| {
-            held.shape.parent == node.shape.parent
+            other != id
+                && held.shape.kind == Kind::Dir
+                && held.shape.parent == node.shape.parent
                 && name_key(&held.shape.name) == key
                 && kept_for_an_excluded_entry(trees, other, discarded)
         })
@@ -964,7 +966,7 @@ fn blocked_by_a_folder_kept_for_an_excluded_entry(
     let mut at = id;
     for _ in 0..=trees.remote().len() {
         match trees.remote().get(at) {
-            Some(node) if blocked(node) => return true,
+            Some(node) if blocked(at, node) => return true,
             Some(node) => at = &node.shape.parent,
             None => return false,
         }
@@ -4416,4 +4418,59 @@ fn a_server_entry_below_a_folder_moved_out_of_what_the_rules_include_here_is_lef
         )
         .unwrap();
     }
+}
+
+#[test]
+fn the_gun_526_exemption_covers_only_a_server_node_another_kept_folder_blocks() {
+    use koidrive_engine::tree::Shape;
+    let dir = |name: &str| Shape {
+        parent: "root".into(),
+        name: name.into(),
+        kind: Kind::Dir,
+        content: None,
+    };
+    let file = |parent: &str, name: &str| Shape {
+        parent: parent.into(),
+        name: name.into(),
+        kind: Kind::File,
+        content: Some(content(1, 1)),
+    };
+    let remote = |shape| RemoteNode {
+        shape,
+        trashed: false,
+        meta_rev: 1,
+        content_rev: 1,
+        trash_group: String::new(),
+        version_id: String::new(),
+    };
+    let mut trees = Trees::new("root");
+    for (ino, (id, shape)) in [
+        ("kept", dir("ss")),
+        ("kept-tmp", file("kept", "keep.tmp")),
+        ("shared", dir("private")),
+        ("shared-tmp", file("shared", "keep.tmp")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let node = LocalNode {
+            shape,
+            identity: identity(ino as u64 + 1),
+            parked: false,
+        };
+        trees.set_local(id.into(), node);
+    }
+    trees.set_remote("shared".into(), remote(dir("private")));
+    trees.set_remote("shared-new".into(), remote(file("shared", "target.txt")));
+    trees.set_remote("sharp-s".into(), remote(dir("\u{df}")));
+    trees.set_remote("sharp-s-c".into(), remote(file("sharp-s", "c.txt")));
+    trees.set_rules(&[] as &[&str], Some(RuleFile::parse(b"*.tmp\n")));
+    trees.settle();
+    let discarded = BTreeMap::from([
+        ("kept".into(), dir("ss")),
+        ("shared".into(), dir("private")),
+    ]);
+    let blocked = |id| blocked_by_a_folder_kept_for_an_excluded_entry(&trees, id, &discarded);
+    assert!(blocked("sharp-s") && blocked("sharp-s-c"));
+    assert!(!blocked("shared") && !blocked("shared-new"));
 }
