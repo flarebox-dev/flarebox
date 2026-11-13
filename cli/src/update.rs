@@ -18,10 +18,11 @@ use url::Url;
 
 use crate::error::CliError;
 use crate::report::{Done, UpdateResult, UpdatedData, Via};
-use crate::service::{self, DELEGATED};
+use crate::service;
 
 const BREW: Duration = Duration::from_secs(15 * 60);
 const INSTALLER: Duration = Duration::from_secs(5 * 60);
+const RECONCILE: Duration = Duration::from_secs(7 * 60);
 const SCAN: Duration = Duration::from_secs(60 * 60);
 const INSTALL_SCRIPT: &str = "https://koidrive.com/install.sh";
 const INSTALL_SCRIPT_VARIABLE: &str = "KOIDRIVE_INSTALL_SCRIPT_URL";
@@ -407,10 +408,10 @@ pub async fn run(paths: &Paths, json: bool) -> Result<Done, CliError> {
     let args = ["_reconcile", "--json"];
     let mut command = Command::new(&koi);
     command.args(args);
-    let output = (echo.run(command, DELEGATED).await)
+    let output = (echo.run(command, RECONCILE).await)
         .map(|output| output.map(|(status, printed, _)| (status, printed)));
     let report =
-        service::delegated_report(manager.as_ref(), &service, &koi, &args, DELEGATED, output);
+        service::delegated_report(manager.as_ref(), &service, &koi, &args, RECONCILE, output);
     let text = format!(
         "Updated Koidrive from {from} to {to}.\n{}",
         match report.text() {
@@ -467,7 +468,7 @@ fn take_service(koi: &Path) {
     tracing::info!(koi = %koi.display(), "a newer koi is installed; it takes the background service");
     let koi = koi.to_path_buf();
     tokio::spawn(async move {
-        match tokio::time::timeout(DELEGATED, child.wait()).await {
+        match tokio::time::timeout(RECONCILE, child.wait()).await {
             Ok(Ok(status)) if status.success() => {}
             Ok(Ok(status)) => {
                 tracing::warn!(koi = %koi.display(), %status, "the newer koi did not take the background service")
@@ -476,7 +477,7 @@ fn take_service(koi: &Path) {
                 tracing::warn!(koi = %koi.display(), %error, "the newer koi did not take the background service")
             }
             Err(_) => {
-                tracing::warn!(koi = %koi.display(), "the newer koi did not take the background service within a minute")
+                tracing::warn!(koi = %koi.display(), "the newer koi did not take the background service within seven minutes")
             }
         }
     });
