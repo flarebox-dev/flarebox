@@ -8484,3 +8484,150 @@ fn a_lost_keep_original_whose_original_only_other_devices_deleted_keeps_the_copy
     assert_eq!(restored.names(), [COPY]);
     assert_eq!(names(&site_b.root), [COPY]);
 }
+
+#[test]
+fn a_file_moved_over_another_out_of_a_removed_folder_leaves_the_server_across_a_restart_during_a_bounded_search()
+ {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    let settled = |a: &mut Device, remote: &mut Remote| {
+        for _ in 0..3 {
+            a.settle();
+            a.run(remote);
+        }
+    };
+    a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
+    fs::create_dir(site.root.join("d")).unwrap();
+    a.create(&mut remote, &site.root.join("d/f"), b"kept");
+    a.create(&mut remote, &site.root.join("x"), b"other");
+    fs::create_dir_all(site.root.join("ignored/zzz")).unwrap();
+    for n in 0..240 {
+        let dir = site.root.join(format!("ignored/d{n:03}"));
+        fs::create_dir(&dir).unwrap();
+        for m in 0..100 {
+            fs::write(dir.join(format!("{m}")), b"x").unwrap();
+        }
+    }
+    fs::hard_link(site.root.join("d/f"), site.root.join("ignored/zzz/l")).unwrap();
+    settled(&mut a, &mut remote);
+
+    fs::rename(site.root.join("d/f"), site.root.join("x")).unwrap();
+    fs::remove_dir(site.root.join("d")).unwrap();
+    a.scan(Duration::from_millis(300));
+    a.run(&mut remote);
+    drop(a);
+    let mut a = site.start();
+    a.connect(&remote);
+    a.scan_until(|a| a.folder.scanned);
+    settled(&mut a, &mut remote);
+    settled(&mut a, &mut remote);
+    let after = server_nodes(&remote);
+    assert!(
+        !(after.iter()).any(|(name, _, live)| (name == "d" || name == "f") && *live),
+        "{after:?}"
+    );
+    assert_eq!(a.folder.engine.trees.check(), Ok(()));
+}
+
+#[test]
+fn a_file_moved_into_an_ignored_folder_while_its_overwrite_is_held_stays_on_the_other_device() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    let settled = |a: &mut Device, remote: &mut Remote| {
+        for _ in 0..3 {
+            a.settle();
+            a.run(remote);
+        }
+    };
+    a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
+    fs::create_dir(site.root.join("d")).unwrap();
+    a.create(&mut remote, &site.root.join("d/f"), b"kept");
+    a.create(&mut remote, &site.root.join("x"), b"other");
+    fs::create_dir_all(site.root.join("ignored/zzz")).unwrap();
+    for n in 0..240 {
+        let dir = site.root.join(format!("ignored/d{n:03}"));
+        fs::create_dir(&dir).unwrap();
+        for m in 0..100 {
+            fs::write(dir.join(format!("{m}")), b"x").unwrap();
+        }
+    }
+    fs::hard_link(site.root.join("d/f"), site.root.join("ignored/zzz/l")).unwrap();
+    settled(&mut a, &mut remote);
+    let (site_b, mut b) = linked(&mut remote, "b");
+    let caught_up = |b: &mut Device, remote: &mut Remote| {
+        for _ in 0..30 {
+            match b.work.pop_front() {
+                Some(work) => b.perform(work, remote).unwrap(),
+                None => b.pull(remote),
+            }
+            b.settle();
+        }
+    };
+    caught_up(&mut b, &mut remote);
+
+    fs::rename(site.root.join("d/f"), site.root.join("x")).unwrap();
+    fs::remove_dir(site.root.join("d")).unwrap();
+    a.scan(Duration::from_millis(300));
+    a.run(&mut remote);
+    fs::rename(site.root.join("x"), site.root.join("ignored/zzz/x")).unwrap();
+    for _ in 0..3 {
+        settled(&mut a, &mut remote);
+    }
+    caught_up(&mut b, &mut remote);
+    let on_b = files(&site_b.root);
+    assert!(
+        on_b.iter().any(|(_, text)| text == "kept"),
+        "{:?} {on_b:?}",
+        server_nodes(&remote)
+    );
+}
+
+#[test]
+fn a_bulk_delete_with_a_file_moved_over_another_keeps_the_file_at_its_path() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    let settled = |a: &mut Device, remote: &mut Remote| {
+        for _ in 0..3 {
+            a.settle();
+            a.run(remote);
+        }
+    };
+    a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
+    for s in 0..4 {
+        fs::create_dir_all(site.root.join(format!("d/s{s}"))).unwrap();
+        for n in 0..10 {
+            a.create(&mut remote, &site.root.join(format!("d/s{s}/g{n}")), b"g");
+        }
+    }
+    a.create(&mut remote, &site.root.join("d/s2/f"), b"kept");
+    a.create(&mut remote, &site.root.join("x"), b"other");
+    fs::create_dir_all(site.root.join("ignored/zzz")).unwrap();
+    for n in 0..240 {
+        let dir = site.root.join(format!("ignored/d{n:03}"));
+        fs::create_dir(&dir).unwrap();
+        for m in 0..100 {
+            fs::write(dir.join(format!("{m}")), b"x").unwrap();
+        }
+    }
+    fs::hard_link(site.root.join("d/s2/f"), site.root.join("ignored/zzz/l")).unwrap();
+    settled(&mut a, &mut remote);
+
+    fs::rename(site.root.join("d/s2/f"), site.root.join("x")).unwrap();
+    fs::remove_dir_all(site.root.join("d")).unwrap();
+    for _ in 0..4 {
+        settled(&mut a, &mut remote);
+    }
+    answer(&site, Answer::Delete);
+    let step = a.folder.requested();
+    a.take(step).unwrap();
+    a.run(&mut remote);
+    for _ in 0..4 {
+        settled(&mut a, &mut remote);
+    }
+    assert_eq!(
+        fs::read(site.root.join("x")).ok(),
+        Some(b"kept".to_vec()),
+        "{:?}",
+        server_nodes(&remote)
+    );
+}
