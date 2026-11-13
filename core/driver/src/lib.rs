@@ -28,6 +28,7 @@ mod failures;
 mod folder;
 pub mod ignore;
 mod leave;
+mod lifecycle;
 mod observe;
 mod paths;
 pub mod policy;

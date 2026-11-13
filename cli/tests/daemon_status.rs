@@ -46,10 +46,246 @@ impl Profile {
     }
 
     fn json(&self, args: &[&str]) -> (Output, Value) {
-        let output = self.command(args).output().unwrap();
+        let mut child = self
+            .command(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "{args:?} did not finish within fifteen seconds: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
         let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
         schema::check(&envelope);
         (output, envelope)
+    }
+
+    fn link(&self) {
+        let path = self
+            .paths
+            .store("0190f0a0-0000-7000-8000-000000000001")
+            .unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        koidrive_store::Store::open(&path)
+            .unwrap()
+            .transaction(|tx| {
+                tx.set_link(&koidrive_store::Link {
+                    space_id: "0190f0a0-0000-7000-8000-000000000001".into(),
+                    space_name: "Work".into(),
+                    root: self.home.path().join("Work"),
+                    root_dev: 1,
+                    server_url: "https://files.example.com/".into(),
+                    device_id: "d1".into(),
+                    linked_at_ms: 1,
+                })
+            })
+            .unwrap();
+    }
+}
+
+struct LiveDaemon(std::process::Child);
+
+impl LiveDaemon {
+    fn start(profile: &Profile) -> Self {
+        let child = profile
+            .command(&["_daemon"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut daemon = Self(child);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            assert!(
+                daemon.0.try_wait().unwrap().is_none(),
+                "the daemon exited before binding"
+            );
+            if profile.paths.socket().exists() {
+                return daemon;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the daemon did not bind within five seconds");
+    }
+
+    fn terminate(&mut self) {
+        assert!(
+            Command::new("/bin/kill")
+                .args(["-TERM", &self.0.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Some(status) = self.0.try_wait().unwrap() {
+                assert!(status.success());
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the daemon did not stop within five seconds");
+    }
+}
+
+impl Drop for LiveDaemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn a_real_daemon_keeps_a_paused_halt_visible_after_sigterm_and_reopen() {
+    let profile = Profile::new("[service]\nbackground = false\n");
+    profile.link();
+    koidrive_driver::Credential {
+        server: "https://files.example.com/".into(),
+        user_id: "u1".into(),
+        user_name: None,
+        device_id: "d2".into(),
+        device_name: "Mac".into(),
+        refresh_credential: "test-only".into(),
+    }
+    .save_new(&profile.paths.credential())
+    .unwrap();
+
+    let mut daemon = LiveDaemon::start(&profile);
+    let (output, before) = profile.json(&["status", "--check", "--json"]);
+    assert_eq!(output.status.code(), Some(5), "{before:#}");
+    assert_eq!(before["data"]["folders"][0]["state"], "halted");
+    assert!(profile.json(&["pause", "--json"]).0.status.success());
+    daemon.terminate();
+    drop(daemon);
+
+    let (output, local) = profile.json(&["status", "--check", "--json"]);
+    assert_eq!(output.status.code(), Some(5), "{local:#}");
+    assert_eq!(
+        local["data"]["folders"][0]["problem"],
+        before["data"]["folders"][0]["problem"]
+    );
+    let _daemon = LiveDaemon::start(&profile);
+    let (output, reopened) = profile.json(&["status", "--check", "--json"]);
+    assert_eq!(output.status.code(), Some(5), "{reopened:#}");
+    assert_eq!(reopened["data"]["paused"], true);
+    assert_eq!(reopened["data"]["folders"][0]["state"], "halted");
+    assert_eq!(
+        reopened["data"]["folders"][0]["problem"],
+        before["data"]["folders"][0]["problem"]
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn reconcile_reports_a_bootstrap_error_even_when_the_service_is_not_installed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let profile = Profile::new("");
+    profile.link();
+    let bin = profile.home.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let launchctl = bin.join("launchctl");
+    std::fs::write(&launchctl, "#!/bin/sh\ncase \"$1:$2\" in\nprint:gui/*/*) exit 1;;\nprint:gui/*) exit 0;;\nprint-disabled:*) echo '{}';;\n*) echo 'bootstrap failed' >&2; exit 1;;\nesac\n").unwrap();
+    std::fs::set_permissions(&launchctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = profile
+        .command(&["_reconcile", "--json"])
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    schema::check(&envelope);
+    assert_eq!(output.status.code(), Some(1), "{envelope:#}");
+    assert_eq!(envelope["data"]["service"]["state"], "not_installed");
+    assert!(
+        envelope["data"]["service"]["problem"]
+            .as_str()
+            .unwrap()
+            .contains("bootstrap failed")
+    );
+    assert_eq!(envelope["error"]["code"], "failed");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn reconcile_reports_a_systemd_enable_error_even_when_the_service_is_not_installed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let profile = Profile::new("");
+    profile.link();
+    let bin = profile.home.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let systemctl = bin.join("systemctl");
+    std::fs::write(&systemctl, "#!/bin/sh\ncase \"$2\" in\nshow-environment) exit 0;;\nis-active) exit 1;;\n*) echo 'user unit disabled or masked' >&2; exit 1;;\nesac\n").unwrap();
+    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = profile
+        .command(&["_reconcile", "--json"])
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    schema::check(&envelope);
+    assert_eq!(output.status.code(), Some(1), "{envelope:#}");
+    assert!(
+        envelope["data"]["service"]["problem"]
+            .as_str()
+            .unwrap()
+            .contains("user unit disabled or masked")
+    );
+    assert_eq!(envelope["error"]["code"], "failed");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn reconcile_reports_delegated_errors_and_a_service_that_stays_stopped() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let profile = Profile::new("");
+    let bin = profile.home.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let launchctl = bin.join("launchctl");
+    std::fs::write(&launchctl, "#!/bin/sh\ncase \"$1:$2\" in\nprint:gui/*/*) exit 1;;\nprint:gui/*) exit 0;;\nprint-disabled:*) echo '{}';;\n*) exit 1;;\nesac\n").unwrap();
+    std::fs::set_permissions(&launchctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = profile
+        .command(&["status", "--json"])
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let label = envelope["data"]["service"]["name"].as_str().unwrap();
+    let newer = bin.join("newer");
+    let agents = profile.home.path().join("Library/LaunchAgents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(agents.join(format!("{label}.plist")), format!("<plist><dict><key>ProgramArguments</key><array><string>{}</string></array></dict></plist>", newer.display())).unwrap();
+    for (state, problem) in [("running", Some("restart failed")), ("stopped", None)] {
+        let response = json!({"data":{"service":{
+            "manager":"launchd", "name":"koi", "state":state, "problem":problem,
+        }}});
+        std::fs::write(&newer, format!("#!/bin/sh\n[ \"$1\" = --version ] && echo 'koi 99.0.0' && exit 0\necho '{response}'\n")).unwrap();
+        std::fs::set_permissions(&newer, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = profile
+            .command(&["_reconcile", "--json"])
+            .env("PATH", &bin)
+            .output()
+            .unwrap();
+        let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+        schema::check(&envelope);
+        assert_eq!(output.status.code(), Some(1), "{envelope:#}");
+        assert_eq!(envelope["data"]["service"]["state"], state);
+        assert_eq!(envelope["error"]["code"], "failed");
+        if let Some(problem) = problem {
+            assert_eq!(envelope["data"]["service"]["problem"], problem);
+            assert_eq!(envelope["error"]["message"], problem);
+        }
     }
 }
 
