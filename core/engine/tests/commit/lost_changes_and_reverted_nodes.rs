@@ -1252,8 +1252,16 @@ fn a_file_another_device_edited_before_a_loss_follows_a_delete_made_after_it() {
     };
     let held = Some(file(ROOT, "a", 1));
     let mut trees = trees(&[("a", held.clone(), held, Some(edited.clone()))]);
-    let untaken = trees.untaken_edits(|seq| seq == 4);
-    assert_eq!(untaken, [("a".to_owned(), false)]);
+    let untaken = trees.untaken_changes(|seq| seq == 4);
+    assert_eq!(
+        untaken,
+        [(
+            "a".to_owned(),
+            Untaken::Edit {
+                moved_in_lost_commit: false
+            }
+        )]
+    );
     trees.forget_lost(
         Vec::new(),
         Vec::new(),
@@ -1295,7 +1303,7 @@ fn an_untaken_edit_then(listed: RemoteNode) -> (Trees, Option<proto::Commit>) {
         ),
         ("a", held.clone(), held, Some(edited)),
     ]);
-    let untaken = trees.untaken_edits(|seq| seq == 4);
+    let untaken = trees.untaken_changes(|seq| seq == 4);
     trees.set_listed_remote("a".into(), listed.clone());
     trees.forget_lost(
         Vec::new(),
@@ -1361,7 +1369,7 @@ fn an_untaken_edit_below_a_lost_folder_follows_a_later_delete() {
         ),
         ("a", held.clone(), held, Some(edited.clone())),
     ]);
-    let untaken = trees.untaken_edits(|seq| seq == 4);
+    let untaken = trees.untaken_changes(|seq| seq == 4);
     trees.set_listed_remote("a".into(), remote(file(ROOT, "a", 2)));
     trees.remove_remote("f");
     trees.forget_lost(
@@ -1410,8 +1418,16 @@ fn an_untaken_edit_renamed_in_a_lost_commit_is_renamed_again() {
     };
     let held = Some(file(ROOT, "b", 1));
     let mut trees = trees(&[("a", held.clone(), held, Some(edited))]);
-    let untaken = trees.untaken_edits(|seq| seq == 4);
-    assert_eq!(untaken, [("a".to_owned(), true)]);
+    let untaken = trees.untaken_changes(|seq| seq == 4);
+    assert_eq!(
+        untaken,
+        [(
+            "a".to_owned(),
+            Untaken::Edit {
+                moved_in_lost_commit: true
+            }
+        )]
+    );
     let listed = RemoteNode {
         content_rev: 3,
         version_id: "v2".into(),
@@ -1452,8 +1468,16 @@ fn an_untaken_edit_another_device_moved_before_the_loss_stays_where_it_moved() {
         ),
         ("a", held.clone(), held, Some(moved.clone())),
     ]);
-    let untaken = trees.untaken_edits(|seq| seq == 4);
-    assert_eq!(untaken, [("a".to_owned(), false)]);
+    let untaken = trees.untaken_changes(|seq| seq == 4);
+    assert_eq!(
+        untaken,
+        [(
+            "a".to_owned(),
+            Untaken::Edit {
+                moved_in_lost_commit: false
+            }
+        )]
+    );
     trees.set_listed_remote("a".into(), moved);
     trees.forget_lost(
         Vec::new(),
@@ -1530,7 +1554,7 @@ fn content_l_went_back_to_while_an_acknowledged_edit_waits_is_sent_after_a_loss(
     assert_eq!(commits.connected(&welcome(1)), Reconnect::AheadOfServer);
     let (trashed, edited) = (trees.trashed_here(), trees.edited_here());
     let synced = trees.taken_from_others(|seq| commits.lost_here(seq));
-    let untaken = trees.untaken_edits(|seq| commits.lost_here(seq));
+    let untaken = trees.untaken_changes(|seq| commits.lost_here(seq));
     let theirs = RemoteNode {
         content_rev: 6,
         edit_rev: 6,
@@ -1581,7 +1605,7 @@ fn content_l_went_back_to_while_its_edit_was_in_flight_is_sent_after_a_loss() {
     assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
     let (trashed, edited) = (trees.trashed_here(), trees.edited_here());
     let synced = trees.taken_from_others(|seq| commits.lost_here(seq));
-    let untaken = trees.untaken_edits(|seq| commits.lost_here(seq));
+    let untaken = trees.untaken_changes(|seq| commits.lost_here(seq));
     trees.set_listed_remote("n".into(), remote_at(file(ROOT, "n", 7), 1));
     trees.remove_remote("p");
     trees.forget_lost(
@@ -1621,8 +1645,16 @@ fn an_untaken_edit_another_device_moved_after_the_loss_stays_where_it_moved() {
         synced("c", dir(ROOT, "c")),
         ("a", held.clone(), held, Some(lost_move)),
     ]);
-    let untaken = trees.untaken_edits(|seq| seq == 4);
-    assert_eq!(untaken, [("a".to_owned(), true)]);
+    let untaken = trees.untaken_changes(|seq| seq == 4);
+    assert_eq!(
+        untaken,
+        [(
+            "a".to_owned(),
+            Untaken::Edit {
+                moved_in_lost_commit: true
+            }
+        )]
+    );
     let moved_after = RemoteNode {
         meta_rev: 6,
         ..remote(file("c", "A", 1))
@@ -1669,7 +1701,7 @@ fn content_l_went_back_to_while_its_equal_edit_was_in_flight_is_sent_after_a_los
     assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
     let (trashed, edited) = (trees.trashed_here(), trees.edited_here());
     let synced = trees.taken_from_others(|seq| commits.lost_here(seq));
-    let untaken = trees.untaken_edits(|seq| commits.lost_here(seq));
+    let untaken = trees.untaken_changes(|seq| commits.lost_here(seq));
     trees.set_listed_remote("n".into(), remote_at(file(ROOT, "n", 7), 1));
     trees.remove_remote("p");
     trees.forget_lost(
@@ -1711,7 +1743,7 @@ fn content_this_devices_restore_set_is_not_kept_beside_it_after_a_loss() {
     assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
     let (trashed, edited) = (trees.trashed_here(), trees.edited_here());
     let synced = trees.taken_from_others(|seq| commits.lost_here(seq));
-    let untaken = trees.untaken_edits(|seq| commits.lost_here(seq));
+    let untaken = trees.untaken_changes(|seq| commits.lost_here(seq));
     trees.set_listed_remote("n".into(), restored);
     trees.remove_remote("p");
     trees.forget_lost(
@@ -1773,7 +1805,7 @@ fn a_lost_move_and_edit_are_sent_again_when_another_file_held_the_old_name() {
         let edited = trees.edited_here();
         let synced = trees.taken_from_others(|seq| commits.lost_here(seq));
         let moved = trees.moved_here();
-        let untaken = trees.untaken_edits(|seq| commits.lost_here(seq));
+        let untaken = trees.untaken_changes(|seq| commits.lost_here(seq));
         let records = trees.remote_records();
         trees.set_listed_remote("n".into(), version(remote(file(ROOT, "x", 1)), "v1"));
         trees.set_listed_remote("q".into(), version(remote(file(ROOT, "z", 2)), "vq"));
@@ -1801,4 +1833,81 @@ fn a_lost_move_and_edit_are_sent_again_when_another_file_held_the_old_name() {
             "occupied {occupied}: {sent:?}"
         );
     }
+}
+
+#[test]
+fn a_file_another_device_edited_and_deleted_before_a_loss_stays_deleted() {
+    let held = Some(file(ROOT, "a", 1));
+    let deleted = RemoteNode {
+        content_rev: 4,
+        meta_rev: 5,
+        version_id: "v3".into(),
+        ..trashed(file(ROOT, "a", 2))
+    };
+    let mut trees = trees(&[("a", held.clone(), held, Some(deleted))]);
+    let untaken = trees.untaken_changes(|seq| seq > 2);
+    assert_eq!(untaken, [("a".to_owned(), Untaken::Delete)]);
+    let records = trees.remote_records();
+    trees.set_listed_remote("a".into(), remote(file(ROOT, "a", 0)));
+    trees.forget_lost(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        untaken,
+        records,
+        2,
+        0,
+    );
+    trees.settle();
+    assert!(trees.unsent_edits().is_empty());
+    assert_eq!(trees.class("a"), Class::Remote);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+}
+
+#[test]
+fn a_folder_another_device_deleted_before_a_loss_that_took_it_stays_deleted() {
+    let mut trees = trees(&[
+        (
+            "d",
+            Some(dir(ROOT, "d")),
+            Some(dir(ROOT, "d")),
+            Some(trashed(dir(ROOT, "d"))),
+        ),
+        (
+            "a",
+            Some(file("d", "a", 1)),
+            Some(file("d", "a", 1)),
+            Some(trashed(file("d", "a", 1))),
+        ),
+    ]);
+    let untaken = trees.untaken_changes(|_| false);
+    assert_eq!(
+        untaken,
+        [
+            ("a".to_owned(), Untaken::Delete),
+            ("d".to_owned(), Untaken::Delete)
+        ]
+    );
+    let records = trees.remote_records();
+    trees.remove_remote("a");
+    trees.remove_remote("d");
+    trees.forget_lost(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        untaken,
+        records,
+        0,
+        0,
+    );
+    trees.settle();
+    assert_eq!(
+        (trees.class("d"), trees.class("a")),
+        (Class::Remote, Class::Remote)
+    );
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
 }

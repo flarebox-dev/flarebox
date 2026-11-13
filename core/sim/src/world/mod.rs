@@ -1382,7 +1382,7 @@ impl World {
                 let edited = trees.edited_here();
                 let synced = trees.taken_from_others(|seq| commits.lost_here(seq));
                 let moved = trees.moved_here();
-                let untaken = trees.untaken_edits(|seq| commits.lost_here(seq));
+                let untaken = trees.untaken_changes(|seq| commits.lost_here(seq));
                 let records = trees.remote_records();
                 let root = trees.remote().root.clone();
                 let mut listed = BTreeMap::new();

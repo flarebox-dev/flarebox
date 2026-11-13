@@ -4150,3 +4150,222 @@ fn an_observers_rename_survives_when_a_restore_takes_it_with_the_edit_it_downloa
         assert_eq!(names, ["b"], "device {device}: {files:?}");
     }
 }
+
+#[test]
+fn a_file_another_device_edited_and_deleted_stays_deleted_after_a_restore() {
+    let u = |kind, target, parent, name, text| {
+        Step::User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text,
+        })
+    };
+    let phases: Vec<Vec<(usize, Step)>> = vec![
+        vec![
+            (2, u(1, 0, 0, 2, 0)),
+            (0, u(1, 0, 0, 3, 0)),
+            (1, u(1, 0, 0, 0, 0)),
+            (0, u(1, 0, 0, 4, 0)),
+            (0, u(0, 0, 0, 0, 0)),
+            (0, BACKUP),
+        ],
+        vec![
+            (0, BACKUP),
+            (0, u(2, 0, 0, 0, 0)),
+            (0, SCAN),
+            (0, COMMIT),
+            (0, COMMIT),
+            (0, u(2, 0, 0, 0, 0)),
+            (0, u(0, 0, 2844692439453172141, 0, 0)),
+            (0, RESTORE),
+        ],
+        vec![
+            (0, u(2, 0, 0, 0, 0)),
+            (0, SCAN),
+            (0, COMMIT),
+            (0, COMMIT),
+            (0, DELIVER),
+            (0, u(2, 0, 0, 0, 0)),
+            (1, Step::Work(0)),
+            (0, u(4, 5916588535269142056, 0, 0, 0)),
+            (2, Step::Work(0)),
+            (2, Step::Work(0)),
+            (0, Step::Work(0)),
+            (1, Step::Work(8005512575619858474)),
+            (0, RESTORE),
+        ],
+    ];
+    converge(2, &phases).unwrap();
+}
+
+#[test]
+fn a_folder_another_device_deleted_stays_deleted_after_a_restore_that_lost_it() {
+    let u = |kind, target, parent, name, text| {
+        Step::User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text,
+        })
+    };
+    let phases: Vec<Vec<(usize, Step)>> = vec![
+        vec![
+            (2, u(1, 0, 0, 2, 0)),
+            (0, u(1, 0, 0, 3, 0)),
+            (1, u(1, 0, 0, 0, 0)),
+            (0, u(1, 0, 0, 4, 0)),
+            (0, u(0, 0, 0, 0, 0)),
+            (0, BACKUP),
+        ],
+        vec![
+            (0, BACKUP),
+            (0, u(2, 0, 0, 0, 0)),
+            (0, SCAN),
+            (0, COMMIT),
+            (0, COMMIT),
+            (0, u(2, 0, 0, 0, 0)),
+            (0, u(0, 0, 2844692439453172141, 0, 0)),
+            (0, RESTORE),
+        ],
+        vec![
+            (0, u(2, 0, 0, 0, 0)),
+            (0, SCAN),
+            (0, COMMIT),
+            (0, COMMIT),
+            (0, DELIVER),
+            (0, u(2, 0, 0, 0, 0)),
+            (1, Step::Work(0)),
+            (0, u(4, 5919481429929157707, 0, 0, 0)),
+            (2, Step::Work(0)),
+            (2, Step::Work(0)),
+            (0, Step::Work(0)),
+            (1, Step::Work(8005512575619858474)),
+            (0, RESTORE),
+        ],
+    ];
+    converge(2, &phases).unwrap();
+}
+
+#[test]
+fn a_rename_inside_a_lost_folder_its_creator_deleted_converges() {
+    let made = vec![(0, user(1, 0, 0, "a"))];
+    let moved = vec![
+        (0, Step::Backup),
+        (0, user(0, 0, 0, "b")),
+        (0, Step::Scan),
+        (0, COMMIT),
+        (0, COMMIT),
+        (0, Step::Deliver(0)),
+        (0, Step::Deliver(0)),
+        (0, user(3, 0, 1, "a")),
+    ];
+    let racing = vec![
+        (1, user(3, 0, 1, "A")),
+        (0, user(4, 1, 0, "a")),
+        (0, Step::Restore),
+    ];
+    converge(2, &[made, moved, racing]).unwrap();
+}
+
+#[test]
+fn a_lost_folder_is_not_created_again_inside_a_folder_deleted_while_it_waited() {
+    let u = |kind, target, parent, name, text| {
+        Step::User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text,
+        })
+    };
+    let phases: Vec<Vec<(usize, Step)>> = vec![
+        vec![
+            (0, u(1, 0, 0, 4, 0)),
+            (1, u(1, 0, 0, 0, 0)),
+            (1, u(0, 0, 0, 3, 0)),
+        ],
+        vec![
+            (0, Step::Backup),
+            (2, u(0, 0, 0, 6, 0)),
+            (2, u(0, 0, 1, 0, 0)),
+            (2, u(3, 1809843479218423697, 3, 2, 0)),
+        ],
+        vec![
+            (0, u(4, 23960249537131406, 7340898669396870823, 6, 2)),
+            (0, Step::Restore),
+            (1, Step::Connect),
+            (1, Step::Work(11631325315051589583)),
+            (1, COMMIT),
+            (2, u(4, 6786950160668269581, 8740926674541383984, 4, 2)),
+        ],
+    ];
+    converge(3, &phases).unwrap();
+}
+
+#[test]
+fn a_kept_child_of_a_lost_folder_stays_deleted_after_a_crash_mid_effect() {
+    let u = |kind, target, parent, name, text| {
+        Step::User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text,
+        })
+    };
+    let phases: Vec<Vec<(usize, Step)>> = vec![
+        vec![
+            (1, u(1, 0, 0, 1, 0)),
+            (0, u(1, 0, 0, 0, 0)),
+            (1, u(1, 0, 0, 3, 0)),
+            (1, u(1, 0, 0, 6, 0)),
+        ],
+        vec![
+            (0, Step::Backup),
+            (2, u(0, 0, 1, 4, 0)),
+            (2, u(3, 10565563719318406587, 1, 3, 0)),
+            (2, u(3, 8511544876117996999, 2, 1, 0)),
+        ],
+        vec![
+            (0, u(4, 17295685281375005034, 6989454378278442494, 6, 2)),
+            (0, Step::Restore),
+            (1, Step::Connect),
+            (1, Step::Work(6048236135531082776)),
+            (1, CRASH),
+        ],
+    ];
+    converge(2, &phases).unwrap();
+}
+
+#[test]
+fn a_kept_child_of_a_lost_folder_stays_deleted_across_a_second_restore() {
+    let u = |kind, target, parent, name, text| {
+        Step::User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text,
+        })
+    };
+    let phases: Vec<Vec<(usize, Step)>> = vec![
+        vec![(1, u(0, 0, 0, 3, 0)), (1, u(1, 0, 0, 4, 0))],
+        vec![
+            (0, Step::Backup),
+            (1, u(0, 0, 0, 2, 0)),
+            (1, u(3, 11736929676757859842, 2, 5, 0)),
+        ],
+        vec![
+            (1, u(4, 1080863262105148645, 1490760445408345681, 2, 2)),
+            (0, Step::Restore),
+            (2, Step::Connect),
+            (2, Step::Work(17783959944508942500)),
+            (0, Step::Restore),
+            (2, Step::Work(16535215316277980988)),
+        ],
+    ];
+    converge(3, &phases).unwrap();
+}
