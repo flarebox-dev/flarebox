@@ -4085,6 +4085,21 @@ fn a_file_deleted_after_its_lost_edit_was_sent_again_stays_deleted_after_a_secon
 }
 
 #[test]
+fn a_lost_delete_is_not_sent_again_over_an_edit_another_device_made_after_the_restore() {
+    let mut world = converge(2, &[vec![(0, file("a"))]]).unwrap();
+    let mut steps = vec![(0, BACKUP), (0, delete(0))];
+    steps.extend(commit(0));
+    steps.extend([(0, RESTORE), (1, Step::Connect)]);
+    steps.extend([(1, DELIVER); 8]);
+    steps.push((1, overwrite(0)));
+    steps.extend(commit(1));
+    world.phase(1, &steps).unwrap();
+    for device in 0..2 {
+        assert_eq!(files_on(&world, device).len(), 1, "device {device}");
+    }
+}
+
+#[test]
 fn an_observers_rename_survives_when_a_restore_takes_it_with_the_edit_it_downloaded() {
     let mut lost = vec![(0, BACKUP), (0, overwrite(0))];
     lost.extend(commit(0));
