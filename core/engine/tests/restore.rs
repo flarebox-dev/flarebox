@@ -1130,6 +1130,43 @@ fn a_move_onto_the_name_of_a_folder_moving_into_a_folder_restored_into_it_goes_t
 }
 
 #[test]
+fn a_folder_renamed_onto_a_held_name_and_restored_into_a_folder_restored_into_it_is_planned() {
+    let (p, x, h, r) = (id(1), id(2), id(3), id(4));
+    let rows = [
+        in_trash(p.clone(), dir(&root(), "p")),
+        (
+            x.clone(),
+            Some(dir(&root(), "n")),
+            Some(dir(&root(), "x")),
+            Some(trashed(dir(&p, "x"))),
+        ),
+        (
+            h.clone(),
+            Some(dir(&root(), "n")),
+            Some(dir(&root(), "n")),
+            Some(remote(dir(&root(), "n"))),
+        ),
+        in_trash(r.clone(), dir(&p, "r")),
+    ];
+    let mut trees = trees(&rows);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let into_r = RestoreIntent::from_trash(x.clone(), Some(r.clone()), None).unwrap();
+    let into_x = RestoreIntent::from_trash(r.clone(), Some(x.clone()), None).unwrap();
+    commits.restore(id(100), into_r.clone());
+    commits.restore(id(101), into_x.clone());
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    let moved = op::Op::Move(proto::Move {
+        node_id: x.clone(),
+        new_parent_id: root(),
+        new_name: "n".into(),
+    });
+    assert_eq!(
+        ops(&commit),
+        [restore_op(&into_x), moved, restore_op(&into_r)]
+    );
+}
+
+#[test]
 fn two_trashed_folders_restored_into_each_other_are_both_sent() {
     let (a, b) = (id(1), id(2));
     let mut trees = trees(&[

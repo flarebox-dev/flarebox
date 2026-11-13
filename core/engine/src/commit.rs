@@ -2856,33 +2856,29 @@ fn name_cycle(
         let mut seen = BTreeSet::new();
         let mut node = start;
         while seen.insert(node) {
-            if let Some(&returning) = returns.get(node) {
+            if let Some(&at) = blocked.get(node) {
+                cycle.push(at);
+                let Some(Want::Move { id, parent, name }) = &wants[at] else {
+                    unreachable!("indexed from the moves");
+                };
+                let holders: Vec<&NodeId> = (scratch.children.get(parent))
+                    .and_then(|keys| keys.get(&name_key(name)))
+                    .into_iter()
+                    .flatten()
+                    .filter(|holder| *holder != id)
+                    .collect();
+                let [holder] = holders.as_slice() else {
+                    break;
+                };
+                node = holder;
+            } else if let Some(&returning) = returns.get(node) {
                 node = returning;
-                if node == start {
-                    return Some(cycle);
-                }
-                continue;
+            } else {
+                break;
             }
-            let Some(&at) = blocked.get(node) else {
-                break;
-            };
-            cycle.push(at);
-            let Some(Want::Move { id, parent, name }) = &wants[at] else {
-                unreachable!("indexed from the moves");
-            };
-            let holders: Vec<&NodeId> = (scratch.children.get(parent))
-                .and_then(|keys| keys.get(&name_key(name)))
-                .into_iter()
-                .flatten()
-                .filter(|holder| *holder != id)
-                .collect();
-            let [holder] = holders.as_slice() else {
-                break;
-            };
-            if holder.as_str() == start {
+            if node == start {
                 return Some(cycle);
             }
-            node = holder;
         }
     }
     None
