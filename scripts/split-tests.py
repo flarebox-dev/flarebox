@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+
+import argparse
+from collections import Counter
+import json
+from pathlib import Path
+import re
+import subprocess
+import tempfile
+
+
+ROOT = Path(__file__).resolve().parent.parent
+MAPPING = ROOT / "scripts/test-split/mapping.json"
+LICENSE = b"// SPDX-License-Identifier: Apache-2.0\n\n"
+
+
+def git_source(revision, path):
+    return subprocess.check_output(["git", "show", f"{revision}:{path}"], cwd=ROOT)
+
+
+def load_source(path, revision=None):
+    def read(name):
+        return git_source(revision, name) if revision else (ROOT / name).read_bytes()
+
+    source = read(path)
+
+    def expand(match):
+        included = Path(path).parent / match[1].decode()
+        return read(str(included)).removeprefix(LICENSE).rstrip()
+
+    return re.sub(rb'include!\("([^"]+)"\);', expand, source)
+
+
+def parser():
+    manifest = ROOT / "scripts/test-split/Cargo.toml"
+    subprocess.run(
+        ["nice", "-n", "10", "cargo", "build", "--quiet", "--locked", "--manifest-path", str(manifest)],
+        cwd=ROOT,
+        check=True,
+    )
+    metadata = json.loads(subprocess.check_output(
+        ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1", "--manifest-path", str(manifest)],
+        cwd=ROOT,
+    ))
+    return Path(metadata["target_directory"]) / "debug/test-split"
+
+
+def items(executable, source):
+    found = json.loads(subprocess.check_output([str(executable)], input=source))
+    names = [item["name"] for item in found]
+    if len(names) != len(set(names)):
+        raise ValueError(f"duplicate item names: {names}")
+    return found
+
+
+def output_path(source, scenario):
+    path = Path(source)
+    return ROOT / path.parent / path.stem / f"{scenario}.rs"
+
+
+def render(executable, mapping, sources):
+    planned = {}
+    for path, assignments in mapping.items():
+        source = sources[path]
+        if b'include!("' in source:
+            raise ValueError(f"{path} is already split; use --source-ref with an unsplit revision")
+        found = items(executable, source)
+        unknown = [item["name"] for item in found if item["name"] not in assignments]
+        if unknown:
+            raise ValueError(f"assign these items in {MAPPING.relative_to(ROOT)} for {path}: {unknown}")
+        scenarios = {}
+        header = source[:found[0]["start"]]
+        root = header.rstrip() + b"\n\n"
+        previous = found[0]["start"]
+        for item in found:
+            scenario = assignments[item["name"]]
+            if not re.fullmatch(r"[a-z][a-z0-9_]*", scenario):
+                raise ValueError(f"invalid scenario: {scenario}")
+            if item["kind"] == "property" and scenario != "root":
+                raise ValueError("keep proptest macros in root to preserve regression-file lookup")
+            prefix = source[previous:item["start"]].strip(b"\n")
+            text = (prefix + b"\n" if prefix else b"") + source[item["start"]:item["end"]]
+            scenarios.setdefault(scenario, []).append(text)
+            previous = item["end"]
+        tail = source[previous:].strip()
+        if tail:
+            raise ValueError(f"unassigned trailing text in {path}")
+        for scenario in sorted(set(scenarios) - {"root"}):
+            root += f'include!("{Path(path).stem}/{scenario}.rs");\n'.encode()
+            planned[output_path(path, scenario)] = LICENSE + b"\n\n".join(scenarios[scenario]) + b"\n"
+        if "root" in scenarios:
+            root += b"\n" + b"\n\n".join(scenarios["root"]) + b"\n"
+        planned[ROOT / path] = root
+        print(f"{path}: {len(found)} unchanged items, {len(scenarios)} files")
+    return planned
+
+
+def write(planned):
+    obsolete = set()
+    for path in planned:
+        if path.exists():
+            for included in re.findall(rb'include!\("([^"]+)"\);', path.read_bytes()):
+                old = path.parent / included.decode()
+                if old.parent != path.parent / path.stem:
+                    raise ValueError(f"unexpected include path: {old}")
+                if old not in planned:
+                    if not old.read_bytes().startswith(LICENSE):
+                        raise ValueError(f"not a generated scenario file: {old}")
+                    obsolete.add(old)
+    for path, source in planned.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(source)
+    for path in obsolete:
+        path.unlink()
+
+
+def split(executable, mapping, revision):
+    sources = {path: load_source(path, revision) for path in mapping}
+    write(render(executable, mapping, sources))
+
+
+def records(executable, source):
+    found = items(executable, source)
+    header = source[:found[0]["start"]] if found else b""
+    previous = len(header)
+    result = {}
+    for item in found:
+        prefix = source[previous:item["start"]].strip(b"\n")
+        result[item["name"]] = (prefix + b"\n" if prefix else b"") + source[item["start"]:item["end"]]
+        previous = item["end"]
+    return header, result
+
+
+def merge(base, branch, current, name):
+    if branch == base:
+        return current
+    if current == base or branch == current:
+        return branch
+    if None in (base, branch, current):
+        raise ValueError(f"concurrent addition or deletion of {name}; resolve it before porting")
+    with tempfile.TemporaryDirectory(prefix="test-split-") as directory:
+        paths = [Path(directory) / suffix for suffix in ("current", "base", "branch")]
+        for path, text in zip(paths, (current, base, branch)):
+            path.write_bytes(text)
+        result = subprocess.run(["git", "merge-file", "-p", *map(str, paths)], capture_output=True)
+    if result.returncode:
+        raise ValueError(f"overlapping edits in {name}:\n{result.stdout.decode()}")
+    return result.stdout
+
+
+def port(executable, mapping, base_ref, branch_ref):
+    sources = {}
+    for path in mapping:
+        base_header, base = records(executable, load_source(path, base_ref))
+        branch_header, branch = records(executable, load_source(path, branch_ref))
+        current_header, current = records(executable, load_source(path))
+        order = list(current) + [name for name in branch if name not in current]
+        merged = []
+        for name in order:
+            text = merge(base.get(name), branch.get(name), current.get(name), name)
+            if text is not None:
+                merged.append(text)
+        header = merge(base_header, branch_header, current_header, f"{path} header")
+        sources[path] = header.rstrip() + b"\n\n" + b"\n\n".join(merged) + b"\n"
+    write(render(executable, mapping, sources))
+
+
+def verify(executable, mapping, revision):
+    total = 0
+    for path, assignments in mapping.items():
+        original = load_source(path, revision)
+        expected_includes = Counter(f'{Path(path).stem}/{scenario}.rs'
+                                    for scenario in set(assignments.values()) - {"root"}
+                                    if output_path(path, scenario).exists())
+        actual_includes = Counter(re.findall(r'include!\("([^"]+)"\);', (ROOT / path).read_text()))
+        if actual_includes != expected_includes:
+            raise ValueError(f"{path}: include list differs from the mapping")
+        before = {item["name"]: original[item["start"]:item["end"]]
+                  for item in items(executable, original)}
+        after = {}
+        paths = [ROOT / path] + sorted(output_path(path, "common").parent.glob("*.rs"))
+        for moved in paths:
+            source = moved.read_bytes()
+            for item in items(executable, source):
+                name = item["name"]
+                if name in after:
+                    raise ValueError(f"duplicated item in {path}: {name}")
+                expected = ROOT / path if assignments[name] == "root" else output_path(path, assignments[name])
+                if moved != expected:
+                    raise ValueError(f"wrong scenario for {name}: {moved}")
+                after[name] = source[item["start"]:item["end"]]
+        if before != after:
+            missing = set(before) - set(after)
+            extra = set(after) - set(before)
+            changed = [name for name in before.keys() & after.keys() if before[name] != after[name]]
+            raise ValueError(f"{path}: missing={missing}, extra={extra}, changed={changed}")
+        total += len(before)
+        print(f"PASS {path}: {len(before)} items byte-identical, including attributes and function bodies")
+    print(f"PASS {total} items, no additions, deletions, duplicates, or changed bodies")
+
+
+def compare_lists(before, after):
+    def tests(path):
+        return Counter(line for line in Path(path).read_text().splitlines()
+                       if line.endswith(": test") or line.endswith(": benchmark"))
+
+    old, new = tests(before), tests(after)
+    if not old or old != new:
+        raise ValueError(f"test inventory differs: removed={old - new}, added={new - old}")
+    print(f"PASS cargo --list: {sum(old.values())} tests before and after, identical names and multiplicities")
+
+
+def main():
+    cli = argparse.ArgumentParser()
+    commands = cli.add_subparsers(dest="command", required=True)
+    apply = commands.add_parser("split")
+    apply.add_argument("--source-ref")
+    check = commands.add_parser("verify")
+    check.add_argument("--source-ref", required=True)
+    replay = commands.add_parser("port")
+    replay.add_argument("--base-ref", required=True)
+    replay.add_argument("--branch-ref", required=True)
+    replay.add_argument("--assign", action="append", default=[], metavar="PATH::ITEM=SCENARIO")
+    listing = commands.add_parser("compare-lists")
+    listing.add_argument("before")
+    listing.add_argument("after")
+    args = cli.parse_args()
+    if args.command == "compare-lists":
+        compare_lists(args.before, args.after)
+        return
+    executable = parser()
+    mapping = json.loads(MAPPING.read_text())
+    if args.command == "split":
+        split(executable, mapping, args.source_ref)
+    elif args.command == "port":
+        for assignment in args.assign:
+            key, scenario = assignment.rsplit("=", 1)
+            path, name = key.split("::", 1)
+            mapping[path][name] = scenario
+        port(executable, mapping, args.base_ref, args.branch_ref)
+        MAPPING.write_text(json.dumps(mapping, indent=2) + "\n")
+    else:
+        verify(executable, mapping, args.source_ref)
+
+
+if __name__ == "__main__":
+    main()

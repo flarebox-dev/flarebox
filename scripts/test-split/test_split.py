@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+
+import importlib.util
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+
+SPEC = importlib.util.spec_from_file_location("split_tests", Path(__file__).parents[1] / "split-tests.py")
+sys.dont_write_bytecode = True
+split = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(split)
+
+
+class SplitTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.executable = split.parser()
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.addCleanup(patch.stopall)
+        patch.object(split, "ROOT", self.root).start()
+        patch.object(split, "MAPPING", self.root / "mapping.json").start()
+        self.source = (
+            split.LICENSE
+            + b'const WORD: &str = "\xc3\x9f";\n\n'
+            + b'fn helper() -> usize { 1 }\n\n'
+            + b'#[test]\n#[ignore]\nfn one() { assert_eq!(helper(), 1); }\n'
+        )
+        self.mapping = {"tests.rs": {"const:WORD": "common", "fn:helper": "common", "fn:one": "scenario"}}
+        self.path = self.root / "tests.rs"
+        self.path.write_bytes(self.source)
+
+    def generate(self):
+        split.write(split.render(self.executable, self.mapping, {"tests.rs": self.source}))
+
+    def test_unicode_offsets_are_byte_offsets(self):
+        found = split.items(self.executable, self.source)
+        word = found[0]
+        self.assertEqual(self.source[word["start"]:word["end"]], b'const WORD: &str = "\xc3\x9f";')
+
+    def test_split_is_byte_identical_and_repeatable(self):
+        self.generate()
+        first = {path: path.read_bytes() for path in self.root.rglob("*.rs")}
+        with patch.object(split, "git_source", return_value=self.source):
+            split.verify(self.executable, self.mapping, "base")
+            split.split(self.executable, self.mapping, "base")
+        split.split(self.executable, self.mapping, None)
+        self.assertEqual(first, {path: path.read_bytes() for path in self.root.rglob("*.rs")})
+
+    def test_unmapped_items_do_not_write(self):
+        del self.mapping["tests.rs"]["fn:one"]
+        with self.assertRaisesRegex(ValueError, "assign these items"):
+            split.render(self.executable, self.mapping, {"tests.rs": self.source})
+        self.assertEqual(self.path.read_bytes(), self.source)
+
+    def test_changed_body_fails_identity(self):
+        self.generate()
+        path = self.root / "tests/scenario.rs"
+        path.write_bytes(path.read_bytes().replace(b"helper(), 1", b"helper(), 2"))
+        with patch.object(split, "git_source", return_value=self.source):
+            with self.assertRaisesRegex(ValueError, "changed=.*fn:one"):
+                split.verify(self.executable, self.mapping, "base")
+
+    def test_missing_include_fails_identity(self):
+        self.generate()
+        self.path.write_bytes(self.path.read_bytes().replace(b'include!("tests/scenario.rs");', b""))
+        with patch.object(split, "git_source", return_value=self.source):
+            with self.assertRaisesRegex(ValueError, "include list"):
+                split.verify(self.executable, self.mapping, "base")
+
+    def test_test_lists_keep_duplicates(self):
+        old, new = self.root / "old", self.root / "new"
+        old.write_text("one: test\none: test\n")
+        new.write_text("one: test\n")
+        with self.assertRaisesRegex(ValueError, "inventory differs"):
+            split.compare_lists(old, new)
+        new.write_text(old.read_text())
+        split.compare_lists(old, new)
+
+    def test_port_moves_changed_and_added_tests(self):
+        self.generate()
+        branch = self.source.replace(b"helper(), 1", b"helper(), 2") + b"\n#[test]\nfn two() {}\n"
+        self.mapping["tests.rs"]["fn:two"] = "scenario"
+        with patch.object(split, "git_source", side_effect=lambda ref, path: self.source if ref == "base" else branch):
+            split.port(self.executable, self.mapping, "base", "branch")
+        with patch.object(split, "git_source", return_value=branch):
+            split.verify(self.executable, self.mapping, "branch")
+
+    def test_port_refuses_overlapping_edits_without_writes(self):
+        self.generate()
+        scenario = self.root / "tests/scenario.rs"
+        scenario.write_bytes(scenario.read_bytes().replace(b"helper(), 1", b"helper(), 3"))
+        before = scenario.read_bytes()
+        branch = self.source.replace(b"helper(), 1", b"helper(), 2")
+        with patch.object(split, "git_source", side_effect=lambda ref, path: self.source if ref == "base" else branch):
+            with self.assertRaisesRegex(ValueError, "overlapping edits"):
+                split.port(self.executable, self.mapping, "base", "branch")
+        self.assertEqual(scenario.read_bytes(), before)
+
+    def test_port_removes_an_empty_scenario(self):
+        self.generate()
+        branch = self.source[:self.source.index(b"#[test]")]
+        with patch.object(split, "git_source", side_effect=lambda ref, path: self.source if ref == "base" else branch):
+            split.port(self.executable, self.mapping, "base", "branch")
+        self.assertFalse((self.root / "tests/scenario.rs").exists())
+        with patch.object(split, "git_source", return_value=branch):
+            split.verify(self.executable, self.mapping, "branch")
+
+
+if __name__ == "__main__":
+    unittest.main()
