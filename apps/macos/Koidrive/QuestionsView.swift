@@ -204,7 +204,7 @@ struct QuestionDetail: View {
                         .font(.callout)
                         .foregroundStyle(Color.text2)
                     Text(verbatim: fullPath(selectedItem))
-                        .font(.caption)
+                        .font(.subheadline)
                         .foregroundStyle(Color.text)
                         .textSelection(.enabled)
                         .lineLimit(1)

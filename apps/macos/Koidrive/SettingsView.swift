@@ -139,6 +139,7 @@ private struct FolderRow: View {
                 Button("Unlink…", action: unlink)
             }
             .controlSize(.small)
+            .fixedSize()
         }
         .padding(.horizontal, 12)
         .frame(height: 44)
@@ -358,7 +359,7 @@ private struct DeviceRow: View {
                     }
                 }
                 Text("\(device.platformName), added \(Date(milliseconds: device.addedAtMs), format: .dateTime.day().month(.abbreviated).year())")
-                    .font(.caption)
+                    .font(.callout)
                     .foregroundStyle(Color.text2)
             }
             Spacer()
@@ -390,7 +391,7 @@ private struct PairingCodeLabel: View {
     var body: some View {
         HStack(spacing: 8) {
             Text("Pairing code")
-                .font(.caption)
+                .font(.callout)
                 .foregroundStyle(Color.text2)
             Text(verbatim: code)
                 .font(.body.monospaced().weight(.semibold))
@@ -446,7 +447,7 @@ struct StorageSettings: View {
                         }
                         HStack(spacing: 12) {
                             Text("Each chunk counts once. Unreferenced: uploads in progress and chunks awaiting deletion.")
-                                .font(.caption)
+                                .font(.callout)
                                 .foregroundStyle(Color.text2)
                                 .fixedSize(horizontal: false, vertical: true)
                             Spacer()
@@ -588,7 +589,7 @@ private struct ProblemRow: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
                 Text("Since \(Date(milliseconds: problem.sinceMs), format: .dateTime.day().month(.abbreviated).hour().minute())")
-                    .font(.caption)
+                    .font(.callout)
                     .foregroundStyle(Color.text3)
             }
             Spacer()
@@ -642,12 +643,12 @@ struct GeneralSettings: View {
                         .foregroundStyle(Color.text)
                     if loginItemStatus == .requiresApproval {
                         Text("Allow Koidrive in Login Items.")
-                            .font(.caption)
+                            .font(.callout)
                             .foregroundStyle(Color.text2)
                     }
                     if let loginItemError {
                         Text(loginItemError)
-                            .font(.caption)
+                            .font(.callout)
                             .foregroundStyle(Color.statusRed)
                     }
                 }
@@ -669,21 +670,25 @@ struct GeneralSettings: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
+            Rectangle()
+                .fill(Color.line)
+                .frame(height: 1)
+                .padding(.horizontal, 12)
             HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Send anonymous usage reports")
                         .foregroundStyle(Color.text)
                     Text("It never shares file names, paths or contents.")
-                        .font(.caption)
+                        .font(.callout)
                         .foregroundStyle(Color.text2)
                     if app.usageReportsTurnedOffByVariable {
                         Text("Turned off by an environment variable.")
-                            .font(.caption)
+                            .font(.callout)
                             .foregroundStyle(Color.text2)
                     }
                     if let telemetryError {
                         Text(telemetryError)
-                            .font(.caption)
+                            .font(.callout)
                             .foregroundStyle(Color.statusRed)
                     }
                 }
@@ -702,7 +707,7 @@ struct GeneralSettings: View {
                 Text(verbatim: "Koidrive " + (Bundle.main.object(forInfoDictionaryKey: "KoidriveVersion") as? String ?? KoidriveFFI.version()))
                     .foregroundStyle(Color.text)
                 Text("Command-line tool: koi")
-                    .font(.caption)
+                    .font(.callout.monospaced())
                     .foregroundStyle(Color.text2)
             }
             .padding(.horizontal, 12)
