@@ -4,11 +4,13 @@
 //! holds, and the connection to the server.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt::Debug;
 
 use koidrive_engine::classify::Trees;
 use koidrive_engine::commit::{Base, Commits};
 use koidrive_engine::effects::Effects;
 use koidrive_engine::ids::IdGen;
+use koidrive_engine::state::{CommitsChanges, EffectsChanges, TreesChanges};
 use koidrive_engine::tree::{Kind, LocalNode, NodeId, RemoteNode, Shape};
 use koidrive_proto::v1::{
     ChangeRecord, CommitRecord, CommitResult, Error, NodeState, change_record,
@@ -220,6 +222,33 @@ impl Device {
     /// to the store in one transaction.
     pub fn persist(&mut self) -> Result<(), Failure> {
         self.engine.trees.settle();
+        let (engine, store) = (&mut self.engine, &self.store);
+        let differences: Vec<String> = [
+            differences(
+                "trees",
+                &engine.trees.take_changes(),
+                &TreesChanges::between(&store.trees.state(), &engine.trees.state()),
+            ),
+            differences(
+                "commits",
+                &engine.commits.take_changes(),
+                &CommitsChanges::between(&store.commits.state(), &engine.commits.state()),
+            ),
+            differences(
+                "effects",
+                &engine.effects.take_changes(),
+                &EffectsChanges::between(&store.effects.state(), &engine.effects.state()),
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !differences.is_empty() {
+            return Err(Failure::Broken(format!(
+                "the tracked changes differ from the state diff: {}",
+                differences.join("; ")
+            )));
+        }
         self.store = self.engine.reload()?;
         Ok(())
     }
@@ -233,5 +262,65 @@ impl Device {
             self.engine.commits.clear_problem(node);
         }
         problems.len()
+    }
+}
+
+fn differences<T: PartialEq + Debug>(part: &str, tracked: &T, diff: &T) -> Option<String> {
+    if tracked == diff {
+        return None;
+    }
+    let fields = |changes: &T| {
+        let mut fields: Vec<(String, String)> = Vec::new();
+        for line in format!("{changes:#?}").lines() {
+            let Some(line) = line.strip_prefix("    ") else {
+                continue;
+            };
+            match line.split_once(": ").filter(|_| !line.starts_with(' ')) {
+                Some((name, value)) => fields.push((name.to_owned(), value.to_owned())),
+                None => {
+                    if let Some((_, value)) = fields.last_mut() {
+                        value.push_str(line.trim_start());
+                    }
+                }
+            }
+        }
+        fields
+    };
+    let fields: Vec<String> = (fields(tracked).into_iter())
+        .zip(fields(diff))
+        .filter(|(tracked, diff)| tracked != diff)
+        .map(|((name, tracked), (_, diff))| format!("{part}.{name}: tracked {tracked} diff {diff}"))
+        .collect();
+    Some(match fields.is_empty() {
+        true => format!("{part}: tracked {tracked:?} diff {diff:?}"),
+        false => fields.join("; "),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unequal_changes_differ_whatever_their_debug_text() {
+        let shape = |name: &str| Shape {
+            parent: "root".into(),
+            name: name.into(),
+            kind: Kind::Dir,
+            content: None,
+        };
+        let tracked = TreesChanges {
+            discarded: vec![("node".into(), Some(shape("a,)")))],
+            ..TreesChanges::default()
+        };
+        let diff = TreesChanges {
+            discarded: vec![("node".into(), Some(shape("a)")))],
+            ..TreesChanges::default()
+        };
+        let message = differences("trees", &tracked, &diff).expect("unequal changes differ");
+        assert!(message.starts_with("trees.discarded: "), "{message}");
+        assert!(message.contains(r#"name: "a,)""#), "{message}");
+        assert!(message.contains(r#"name: "a)""#), "{message}");
+        assert_eq!(differences("trees", &tracked, &tracked), None);
     }
 }
