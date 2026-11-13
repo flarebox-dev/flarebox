@@ -1,0 +1,1 @@
+cc 891b36c4f5a5674a134cba2d0a517e7d0b9f00bfc08e200633858f6b0f113274 # shrinks to a restore that never ends: it and the rename of a trashed folder holding a removed member wait for each other (GUN-666)
