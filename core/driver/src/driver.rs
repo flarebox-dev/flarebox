@@ -14,7 +14,7 @@ use koidrive_engine::guard::Window;
 use koidrive_engine::ignore::LocalRules;
 use koidrive_fs::{Marker, probe_no_replace, read_marker, write_marker};
 use koidrive_ignore::LocalRulesError;
-use koidrive_net::{ApiError, Auth, ROTATION_PERIOD, UploadGate};
+use koidrive_net::{ApiError, Auth, ROTATION_PERIOD, ServerError, UploadGate};
 use koidrive_proto::v1::{ClaimRequest, DeviceCredentials, PairCompleteRequest, SpaceInfo};
 use koidrive_store::{EngineState, GivenAnswer, Link, Store, StoredQuestion};
 use tokio::sync::{Notify, watch};
@@ -143,6 +143,27 @@ pub enum DriverError {
     InvalidRestore(&'static str),
     #[error("the folder holds no changes the server refused")]
     NothingToLift,
+    #[error("{} is not an absolute path", koidrive_fs::quoted(.0))]
+    RelativePath(PathBuf),
+    #[error("{} is not in a linked folder; koi status lists them", koidrive_fs::quoted(.0))]
+    OutsideLinkedFolders(PathBuf),
+    #[error("{} does not exist", koidrive_fs::quoted(.0))]
+    PathNotFound(PathBuf),
+    #[error(
+        "{} is not on the server: it has not synced yet, or the folder's rules leave it out",
+        koidrive_fs::quoted(.0)
+    )]
+    NotOnServer(PathBuf),
+    #[error("a link's password has 8 to 256 characters")]
+    PasswordLength,
+    #[error("that is not a share link's ID or URL")]
+    NotAShareLink,
+    #[error("no share link of this account matches that ID or URL")]
+    ShareLinkNotFound,
+    #[error("several share links have the ID {0}; name the one to revoke by its URL")]
+    ShareLinkAmbiguous(String),
+    #[error("the server refused: {}", .0.message())]
+    Refused(ServerError),
     #[error(
         "the server waits for the space's owner to confirm the folder's changes, and Koidrive cannot ask for that yet"
     )]
@@ -163,7 +184,7 @@ fn io_error(path: &Path) -> impl FnOnce(io::Error) -> DriverError + '_ {
     }
 }
 
-fn store_error(path: &Path) -> impl FnOnce(koidrive_store::Error) -> DriverError + '_ {
+pub(crate) fn store_error(path: &Path) -> impl FnOnce(koidrive_store::Error) -> DriverError + '_ {
     move |error| DriverError::Store {
         path: path.to_path_buf(),
         error,
@@ -1599,7 +1620,7 @@ fn absolute(path: &Path) -> PathBuf {
         .unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as i64)

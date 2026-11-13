@@ -174,6 +174,20 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
                 "only a running daemon can be watched, over a connection of its own",
             ));
         }
+        Request::Share {
+            path,
+            expiry,
+            password,
+        } => (driver.share(&path, expiry, password).await).map(|link| Response::Shared { link }),
+        Request::ShareLinks => {
+            (driver.share_links().await).map(|links| Response::ShareLinks { links })
+        }
+        Request::RevokeShareLink { link } => {
+            (driver.revoke_share_link(&link).await).map(|revoked| Response::ShareLinkRevoked {
+                link: revoked.link,
+                already: revoked.already,
+            })
+        }
         Request::Once {
             request_id,
             key,

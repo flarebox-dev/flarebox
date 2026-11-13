@@ -16,8 +16,8 @@ use bytes::Bytes;
 use koidrive_chunk::{ChunkerConfig, chunk_hash};
 use koidrive_net::{Api, Auth, Credentials, Event, Session, SessionConfig, Transfer};
 use koidrive_proto::v1::{
-    ChunkRef, Commit, Content, CreateDir, CreateFile, CreateSpaceRequest, Delete, Op,
-    PairCompleteRequest, TokenRequest, UpdateContent, op, op_result,
+    ChunkRef, Commit, Content, CreateDir, CreateFile, CreateShareLinkRequest, CreateSpaceRequest,
+    Delete, Op, PairCompleteRequest, TokenRequest, UpdateContent, op, op_result,
 };
 use serde_json::Value;
 use tokio::sync::OnceCell;
@@ -1761,4 +1761,264 @@ async fn a_linked_folder_syncs_in_the_systemd_user_service_until_the_last_unlink
     assert!(!systemctl(&["cat", &unit]).status.success());
     assert!(!machine.path("state/koidrive/systemd").join(&unit).exists());
     assert_eq!(machine.status()["service"]["state"], "not_installed");
+}
+
+async fn shared(link_id: &str) -> (u16, Value) {
+    let reply = reqwest::Client::new()
+        .get(server_url().join(&format!("v1/share/{link_id}")).unwrap())
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    let status = reply.status().as_u16();
+    let body = reply.text().await.unwrap();
+    (
+        status,
+        serde_json::from_str(&body).unwrap_or(Value::String(body)),
+    )
+}
+
+fn link_id(url: &str) -> String {
+    url.rsplit_once("/s/").unwrap().1.to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Worker; run cli/scripts/integration-test.sh"]
+async fn a_share_link_opens_what_it_shares_until_it_is_revoked() {
+    let owner = Arc::new(Auth::new(api(), owner().await));
+    let create = |name: String| {
+        let owner = owner.clone();
+        async move {
+            (owner.api())
+                .create_space(&owner, &CreateSpaceRequest { name })
+                .await
+                .unwrap()
+        }
+    };
+    let space_name = format!("share {}", uuidv7());
+    let space = create(space_name.clone()).await;
+    let elsewhere = create(format!("share elsewhere {}", uuidv7())).await;
+    let pairing = owner.api().pair_start(&owner).await.unwrap();
+    let machine = Machine::new();
+    let server = server_url().to_string();
+    machine.run(&["join", &pairing.code, "--server", &server, "--name", "desk"]);
+    let folder = machine.path("Sync");
+    fs::create_dir_all(&folder).unwrap();
+    let folder = folder.canonicalize().unwrap();
+    machine.run(&[
+        "folder",
+        "link",
+        folder.to_str().unwrap(),
+        "--space",
+        &space_name,
+    ]);
+    let log = machine.path("daemon.log");
+    let daemon = machine
+        .command(&["_daemon"])
+        .env("KOIDRIVE_LOG", "debug")
+        .stdout(Stdio::null())
+        .stderr(File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let socket = machine.socket();
+    eventually("the daemon's socket", || socket.exists()).await;
+    machine
+        .status_until("the first sync", |status| {
+            status["folders"][0]["state"] == "up_to_date"
+        })
+        .await;
+
+    let docs = uuidv7();
+    commit_as_owner(
+        &owner,
+        &space.space_id,
+        &[b"the plan"],
+        vec![
+            op::Op::CreateDir(CreateDir {
+                node_id: docs.clone(),
+                parent_id: space.space_id.clone(),
+                name: "Docs".into(),
+            }),
+            op::Op::CreateFile(CreateFile {
+                node_id: uuidv7(),
+                parent_id: docs.clone(),
+                name: "plan.txt".into(),
+                content: Some(file_content(b"the plan")),
+            }),
+        ],
+    )
+    .await;
+    let away = uuidv7();
+    commit_as_owner(
+        &owner,
+        &elsewhere.space_id,
+        &[b"away"],
+        vec![op::Op::CreateFile(CreateFile {
+            node_id: away.clone(),
+            parent_id: elsewhere.space_id.clone(),
+            name: "away.txt".into(),
+            content: Some(file_content(b"away")),
+        })],
+    )
+    .await;
+    let plan = folder.join("Docs/plan.txt");
+    eventually("the shared file on this device", || plan.exists()).await;
+
+    let created = machine.data(&["share", "create", plan.to_str().unwrap()]);
+    let url = created["url"].as_str().unwrap().to_owned();
+    let file_link = link_id(&url);
+    assert!(url.starts_with(&format!("{server}s/")), "{created:#}");
+    assert_eq!(created["path"], "Docs/plan.txt", "{created:#}");
+    assert_eq!(created["kind"], "file", "{created:#}");
+    assert_eq!(created["state"], "active", "{created:#}");
+    assert_eq!(created["folder"], folder.to_str().unwrap(), "{created:#}");
+    let week =
+        created["expires_at_ms"].as_i64().unwrap() - created["created_at_ms"].as_i64().unwrap();
+    assert_eq!(week, 7 * 24 * 3600 * 1000, "{created:#}");
+    let (status, info) = shared(&file_link).await;
+    assert_eq!(status, 200, "{info:#}");
+    assert_eq!(info["name"], "plan.txt", "{info:#}");
+
+    let printed = machine.output(&[
+        "share",
+        "create",
+        folder.join("Docs").to_str().unwrap(),
+        "--expires",
+        "2h",
+    ]);
+    assert!(printed.status.success(), "{printed:?}");
+    let stdout = String::from_utf8(printed.stdout).unwrap();
+    let stderr = String::from_utf8(printed.stderr).unwrap();
+    let folder_link = link_id(stdout.trim_end());
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert!(
+        stderr.contains("browse and download") && stderr.contains("for 2 hours"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(&folder_link), "{stderr}");
+    assert_eq!(shared(&folder_link).await.1["kind"], "NODE_KIND_DIR");
+
+    let mut protected = machine
+        .command(&[
+            "share",
+            "create",
+            plan.to_str().unwrap(),
+            "--password",
+            "--expires",
+            "never",
+            "--json",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(protected.stdin.as_mut().unwrap(), b"correct horse\n").unwrap();
+    let protected = protected.wait_with_output().unwrap();
+    assert!(protected.status.success(), "{protected:?}");
+    let protected: Value = serde_json::from_slice(&protected.stdout).unwrap();
+    schema::check(&protected);
+    assert_eq!(protected["data"]["has_password"], true, "{protected:#}");
+    assert_eq!(
+        protected["data"]["expires_at_ms"],
+        Value::Null,
+        "{protected:#}"
+    );
+    let password_link = link_id(protected["data"]["url"].as_str().unwrap());
+    let (status, info) = shared(&password_link).await;
+    assert_eq!(
+        (status, &info["passwordRequired"]),
+        (401, &Value::Bool(true)),
+        "{info:#}"
+    );
+
+    let away_link = (owner.api())
+        .create_share_link(
+            &owner,
+            &elsewhere.space_id,
+            &CreateShareLinkRequest {
+                node_id: away,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .link_id;
+
+    let secrets = [&file_link, &folder_link, &password_link, &away_link];
+    let listed = machine.envelope(&["share", "list"]);
+    let links = listed["data"]["links"].as_array().unwrap();
+    assert_eq!(links.len(), 4, "{listed:#}");
+    let away_listed = links
+        .iter()
+        .find(|link| link["space_id"] == elsewhere.space_id.as_str())
+        .unwrap();
+    assert_eq!(away_listed["path"], "away.txt", "{listed:#}");
+    assert_eq!(away_listed["folder"], Value::Null, "{listed:#}");
+    let table = machine.run(&["share", "list"]);
+    for text in [listed.to_string(), table.clone()] {
+        assert!(
+            secrets.iter().all(|secret| !text.contains(secret.as_str())),
+            "{text}"
+        );
+    }
+    assert!(
+        table.contains(&format!("{}/Docs/plan.txt", folder.display())),
+        "{table}"
+    );
+    assert!(
+        table.contains("away.txt in the space share elsewhere"),
+        "{table}"
+    );
+
+    let id = created["id"].as_str().unwrap();
+    let revoked = machine.envelope(&["share", "revoke", id]);
+    assert_eq!(revoked["outcome"], "ok", "{revoked:#}");
+    assert_eq!(revoked["data"]["state"], "revoked", "{revoked:#}");
+    assert_eq!(shared(&file_link).await.0, 404);
+    assert_eq!(
+        machine.envelope(&["share", "revoke", id])["outcome"],
+        "unchanged"
+    );
+    machine.data(&["share", "revoke", &format!("{server}s/{folder_link}")]);
+    assert_eq!(shared(&folder_link).await.0, 404);
+    assert_eq!(shared(&password_link).await.0, 401);
+
+    let active = machine.data(&["share", "list"])["links"]
+        .as_array()
+        .unwrap()
+        .len();
+    let all = machine.data(&["share", "list", "--all"]);
+    let states: Vec<&str> = (all["links"].as_array().unwrap().iter())
+        .map(|link| link["state"].as_str().unwrap())
+        .collect();
+    assert_eq!(active, 2, "{all:#}");
+    assert_eq!(
+        states.iter().filter(|state| **state == "revoked").count(),
+        2,
+        "{all:#}"
+    );
+
+    let missing = machine.fails(&[
+        "share",
+        "create",
+        folder.join("Docs/missing.txt").to_str().unwrap(),
+    ]);
+    assert!(missing.contains("does not exist"), "{missing}");
+    let unknown = machine.fails(&["share", "revoke", "0123456789"]);
+    assert!(unknown.contains("no share link"), "{unknown}");
+
+    assert!(stop(daemon).success());
+    let logged = fs::read_to_string(&log).unwrap();
+    assert!(logged.contains("DEBUG"), "the daemon logged at debug level");
+    for secret in secrets
+        .iter()
+        .map(|secret| secret.as_str())
+        .chain(["correct horse"])
+    {
+        assert!(
+            !logged.contains(secret),
+            "the daemon's log holds a link's secret"
+        );
+    }
 }

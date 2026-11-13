@@ -24,10 +24,11 @@ This guide covers the `koi` command on macOS and Linux, version 0.1.0.
 3. [Folders](folders.md): link a folder, choose what syncs with `.koiignore`, and what Koidrive doesn't sync.
 4. [Conflicts](conflicts.md): what happens when two devices change the same file.
 5. [Trash, versions and restore](history.md): get back a deleted file or an earlier version.
-6. [Status and problems](status.md): read `koi status`, pause sync, wait out a quota, restart a folder, send refused changes again and write a file for a problem report.
-7. [Devices](devices.md): list and revoke devices, and get back in after losing every device.
-8. [Limits](limits.md): what the Workers Free plan allows, and Koidrive's own limits.
-9. [Back up the server](backup.md): copy the R2 bucket outside Cloudflare, and what the copy can restore.
-10. [Uninstall](uninstall.md): remove a device, or remove everything.
-11. [Agents and scripts](agents.md): the JSON envelope, the exit codes and `koi status --check`.
-12. [Usage reports](telemetry.md): what the anonymous usage reports hold, and how to turn them off.
+6. [Share links](sharing.md): let anyone with a link open a file or folder, with an expiry and a password.
+7. [Status and problems](status.md): read `koi status`, pause sync, wait out a quota, restart a folder, send refused changes again and write a file for a problem report.
+8. [Devices](devices.md): list and revoke devices, and get back in after losing every device.
+9. [Limits](limits.md): what the Workers Free plan allows, and Koidrive's own limits.
+10. [Back up the server](backup.md): copy the R2 bucket outside Cloudflare, and what the copy can restore.
+11. [Uninstall](uninstall.md): remove a device, or remove everything.
+12. [Agents and scripts](agents.md): the JSON envelope, the exit codes and `koi status --check`.
+13. [Usage reports](telemetry.md): what the anonymous usage reports hold, and how to turn them off.

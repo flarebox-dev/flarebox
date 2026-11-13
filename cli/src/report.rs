@@ -773,6 +773,50 @@ pub struct RevokedData {
     pub device_id: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareState {
+    Active,
+    Expired,
+    Revoked,
+}
+
+/// A share link without its URL, which only `koi share create` shows.
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
+pub struct ShareLinkData {
+    /// What `koi share revoke` takes. It does not reveal the link.
+    pub id: String,
+    pub space_id: String,
+    pub space_name: String,
+    /// The linked folder that syncs the space on this device.
+    pub folder: Option<String>,
+    pub node_id: String,
+    /// The path of the shared file or folder in its space, empty for the whole space, or null once it is in the trash
+    /// or gone.
+    pub path: Option<String>,
+    pub kind: Option<NodeType>,
+    pub created_at_ms: i64,
+    /// Null for a link that never expires.
+    pub expires_at_ms: Option<i64>,
+    pub revoked_at_ms: Option<i64>,
+    pub has_password: bool,
+    pub state: ShareState,
+}
+
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
+pub struct SharedData {
+    /// The link. Anyone who has it can open what it shares.
+    pub url: String,
+    #[serde(flatten)]
+    pub link: ShareLinkData,
+}
+
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
+pub struct ShareLinksData {
+    /// Newest first.
+    pub links: Vec<ShareLinkData>,
+}
+
 #[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct InvitationData {
     /// The arguments of `koi join` on the new device.

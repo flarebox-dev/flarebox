@@ -13,7 +13,12 @@ fn auth(command: &str) -> Auth {
             Auth::Cloudflare
         }
         "folder link" | "history trash" | "history versions" | "history restore" => Auth::Device,
-        _ if command.starts_with("space ") || command.starts_with("device ") => Auth::Device,
+        _ if ["space ", "device ", "share "]
+            .iter()
+            .any(|group| command.starts_with(group)) =>
+        {
+            Auth::Device
+        }
         _ => Auth::None,
     }
 }

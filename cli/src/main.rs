@@ -20,6 +20,7 @@ mod request;
 mod schema;
 mod service;
 mod setup;
+mod share;
 mod telemetry;
 mod terminal;
 mod update;
@@ -162,6 +163,12 @@ enum Command {
     History {
         #[command(subcommand)]
         action: history::HistoryAction,
+    },
+    /// Make, list, or revoke read-only links to files and folders that anyone with the link can open.
+    #[command(arg_required_else_help = true)]
+    Share {
+        #[command(subcommand)]
+        action: share::ShareAction,
     },
     /// Show, turn on or off, preview or reset the anonymous usage reports this machine sends.
     #[command(arg_required_else_help = true)]
@@ -502,6 +509,7 @@ fn telemetry_of(
         Command::Service { .. } | Command::Reconcile => (Name::Service, None, None),
         Command::Pause => (Name::Pause, None, None),
         Command::Resume => (Name::Resume, None, None),
+        Command::Share { .. } => (Name::Share, None, None),
         Command::Telemetry { .. } => (Name::Telemetry, None, None),
         Command::Diagnose => (Name::Diagnose, None, None),
         Command::Update => (Name::Update, None, None),
@@ -624,6 +632,7 @@ async fn execute(
         Command::Resume => resume(&paths).await,
         Command::Device { action } => device(paths, action).await,
         Command::History { action } => history::run(&paths, action).await,
+        Command::Share { action } => share::run(&paths, action).await,
         Command::Telemetry { action } => telemetry::command(&paths, action),
     }
 }

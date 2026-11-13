@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use koidrive_proto::v1::{
-    AccessToken, ClaimRequest, CreateSpaceRequest, DeviceCredentials, DeviceList,
-    PairCompleteRequest, PairStartResponse, RewindRequest, RewindResult, RpcRequest, RpcResponse,
-    ServerInfo, SpaceInfo, SpaceList, SpaceUsage, TokenRequest, rpc_request,
+    AccessToken, ClaimRequest, CreateShareLinkRequest, CreateSpaceRequest, DeviceCredentials,
+    DeviceList, PairCompleteRequest, PairStartResponse, RewindRequest, RewindResult, RpcRequest,
+    RpcResponse, ServerInfo, ShareLink, ShareLinkList, SpaceInfo, SpaceList, SpaceUsage,
+    TokenRequest, rpc_request,
 };
 use std::time::Duration;
 
@@ -25,6 +26,7 @@ const MAX_ANSWER: usize = 4 << 10;
 const MAX_SPACE_PAGE: usize = 32 << 10;
 /// The most bytes read of one `DeviceList` page (RFC 0007 section 3).
 const MAX_DEVICE_PAGE: usize = 64 << 10;
+const MAX_SHARE_LINK_PAGE: usize = 64 << 10;
 const MAX_SPACE_LISTING: usize = 128 << 20;
 const MAX_ERROR: usize = 1 << 20;
 
@@ -292,6 +294,64 @@ impl Api {
         let url = self.url(&["v1", "devices", device_id])?;
         self.authed(auth, Method::DELETE, url, None, "empty reply", MAX_ANSWER)
             .await
+    }
+
+    /// `POST /v1/spaces/{space_id}/links`, owner only (RFC 0005 section 2). The answer holds the link's secret.
+    pub async fn create_share_link(
+        &self,
+        auth: &Auth,
+        space_id: &str,
+        request: &CreateShareLinkRequest,
+    ) -> Result<ShareLink, ApiError> {
+        self.authed(
+            auth,
+            Method::POST,
+            self.url(&["v1", "spaces", space_id, "links"])?,
+            Some(request.encode_to_vec()),
+            "ShareLink",
+            MAX_ANSWER,
+        )
+        .await
+    }
+
+    /// `GET /v1/spaces/{space_id}/links`, owner only: one page of the space's links, ended ones included, newest first
+    /// (RFC 0005 section 2). Pass an empty `cursor` for the first page and the previous page's `next_cursor` for the next.
+    pub async fn list_share_links(
+        &self,
+        auth: &Auth,
+        space_id: &str,
+        cursor: &str,
+    ) -> Result<ShareLinkList, ApiError> {
+        let mut url = self.url(&["v1", "spaces", space_id, "links"])?;
+        if !cursor.is_empty() {
+            url.query_pairs_mut().append_pair("cursor", cursor);
+        }
+        self.authed(
+            auth,
+            Method::GET,
+            url,
+            None,
+            "ShareLinkList",
+            MAX_SHARE_LINK_PAGE,
+        )
+        .await
+    }
+
+    /// `DELETE /v1/spaces/{space_id}/links/{link_id}`, owner only (RFC 0005 section 2). Revoking a revoked link succeeds.
+    /// The request URL holds the link's secret, so a transport error leaves the URL out.
+    pub async fn revoke_share_link(
+        &self,
+        auth: &Auth,
+        space_id: &str,
+        link_id: &str,
+    ) -> Result<(), ApiError> {
+        let url = self.url(&["v1", "spaces", space_id, "links", link_id])?;
+        self.authed(auth, Method::DELETE, url, None, "empty reply", MAX_ANSWER)
+            .await
+            .map_err(|error| match error {
+                ApiError::Transport(error) => ApiError::Transport(error.without_url()),
+                other => other,
+            })
     }
 
     /// `DELETE /v1/devices/{device_id}` with this device's own ID, as a sign-out sends it (RFC 0009 section 5). If no other
@@ -892,6 +952,28 @@ mod tests {
         }
         let sent = tokio::time::timeout(Duration::from_millis(100), listener.accept()).await;
         assert!(sent.is_err(), "nothing was sent");
+    }
+
+    #[tokio::test]
+    async fn a_failed_revoke_keeps_the_link_out_of_its_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base: Url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        drop(listener);
+        let auth = signed_in(base);
+        let link_id = "AAAAAAAAAAAAAAAAAAAAAA";
+        let outcome = auth.api().revoke_share_link(&auth, "s1", link_id).await;
+        let Err(error @ ApiError::Transport(_)) = outcome else {
+            panic!("{outcome:?}");
+        };
+        let mut shown = format!("{error} {error:?}");
+        let mut source = std::error::Error::source(&error);
+        while let Some(cause) = source {
+            shown.push_str(&format!(" {cause} {cause:?}"));
+            source = cause.source();
+        }
+        assert!(!shown.contains(link_id), "{shown}");
     }
 
     #[tokio::test]

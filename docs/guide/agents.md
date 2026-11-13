@@ -85,6 +85,8 @@ These commands make a new change each time they run: `koi history restore`, `koi
 - A command whose change is known to have failed records nothing, so running it again with its ID tries again.
 - If the first run stopped before it recorded its outcome, still runs, or couldn't tell whether its change happened (for example, the server didn't answer), the command fails with `interrupted` (exit 130). Read the state with `koi status --json` or `koi history requests`. To make the change, use a new ID.
 
+`koi share create` takes no request ID, because its record would keep the link. Each run makes a new link. If a run fails without an answer, `koi share list --json` shows whether it made one, and `koi share revoke` ends a link you don't need.
+
 The records are in `requests/` in the profile's state directory (`~/.local/state/koidrive` by default), readable only by you. A record of `koi device invite` holds the pairing code. Pairing codes never appear in the logs.
 
 ## Exit status
