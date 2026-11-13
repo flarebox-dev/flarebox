@@ -363,7 +363,7 @@ fn a_reverted_move_brings_back_the_folders_l_deleted_on_its_way() {
     assert_eq!(reverted, ["d", "p"]);
     let mut effects = Effects::default();
     while let Some(record) = effects
-        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE).first()
         .cloned()
     {
         let identity = FileIdentity {
@@ -564,7 +564,7 @@ fn a_conflict_survives_an_effect_whose_s_update_waits() {
     assert_eq!(trees.check(), Ok(()));
     let mut effects = Effects::default();
     let record = effects
-        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE).first()
         .unwrap()
         .clone();
     assert_eq!(record.node, "n");
@@ -574,7 +574,7 @@ fn a_conflict_survives_an_effect_whose_s_update_waits() {
     trees.settle();
     for _ in 0..4 {
         let Some(record) = effects
-            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE).first()
             .cloned()
         else {
             break;
@@ -595,7 +595,7 @@ fn a_conflict_survives_an_effect_whose_s_update_waits() {
     }
     assert!(
         effects
-            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE).first()
             .is_none()
     );
     assert!(trees.waiting().contains_key("n"));
@@ -627,7 +627,7 @@ fn a_parked_fork_recovers_after_its_empty_local_parent_is_deleted() {
     let (mut commits, mut ids, mut effects) =
         (Commits::default(), IdGen::new(1), Effects::default());
     let parking = effects
-        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE).first()
         .unwrap()
         .clone();
     assert!(matches!(&parking.effect, Effect::Move { to: Location::Parked(id), .. } if id == "a"));
@@ -642,14 +642,14 @@ fn a_parked_fork_recovers_after_its_empty_local_parent_is_deleted() {
     assert_eq!(trees.check(), Ok(()));
     assert!(
         effects
-            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE).first()
             .is_none()
     );
     for ino in 10..26 {
         trees.settle();
         assert_eq!(trees.check(), Ok(()));
         if let Some(record) = effects
-            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE).first()
             .cloned()
         {
             effects
@@ -779,7 +779,7 @@ fn a_folder_renamed_back_after_its_move_was_renamed_by_the_server_keeps_the_user
         trees.settle();
         assert!(!trees.reverted().contains("n"), "{back_before_the_result}");
         let mut effects = Effects::default();
-        let planned = (effects.plan(&trees, commits.in_flight(), &mut ids, NOW))
+        let planned = (effects.plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE).first())
             .map(|record| record.effect.clone());
         assert_eq!(planned, None, "{back_before_the_result}");
         let commit = build(&mut commits, &mut trees, &mut ids);
@@ -816,7 +816,7 @@ fn a_parked_file_forked_in_a_build_is_created_only_after_the_effects_move_it_bac
     assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
     trees.settle();
     let unparked = effects
-        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE).first()
         .cloned()
         .unwrap();
     assert!(matches!(
@@ -871,19 +871,19 @@ fn a_parked_folder_the_server_lost_is_created_again_after_a_delete_empties_it() 
     );
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    let removed = effects.plan(&trees, None, &mut ids, NOW).cloned().unwrap();
+    let removed = effects.plan(&trees, None, &mut ids, NOW, BatchLimit::ONE).first().cloned().unwrap();
     assert_eq!(removed.node, "one");
     assert!(matches!(removed.effect, Effect::RemoveFile { .. }));
     effects
         .done(&mut trees, None, &removed.effect_id, None)
         .unwrap();
     trees.settle();
-    assert!(effects.plan(&trees, None, &mut ids, NOW).is_none());
+    assert!(effects.plan(&trees, None, &mut ids, NOW, BatchLimit::ONE).first().is_none());
     let mut commits = Commits::default();
     assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
     trees.settle();
     let unparked = effects
-        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE).first()
         .cloned()
         .unwrap();
     assert_eq!(unparked.node, "albums");

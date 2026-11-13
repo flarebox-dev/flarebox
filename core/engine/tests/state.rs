@@ -329,13 +329,13 @@ fn effects_state() -> EffectsState {
         at: Location::Parked("a".into()),
     };
     EffectsState {
-        in_flight: Some(EffectRecord {
+        in_flight: vec![EffectRecord {
             effect_id: "effect".into(),
             node: "a".into(),
             counter: 4,
             effect: create.clone(),
             after: Some(dir(ROOT, "a")),
-        }),
+        }],
         cleared: 3,
         failed: [("b".into(), create)].into(),
     }
@@ -669,7 +669,7 @@ fn an_identity_without_a_birth_time_round_trips() {
     );
 
     let state = EffectsState {
-        in_flight: Some(EffectRecord {
+        in_flight: vec![EffectRecord {
             effect_id: "effect".into(),
             node: "u".into(),
             counter: 1,
@@ -679,7 +679,7 @@ fn an_identity_without_a_birth_time_round_trips() {
                 to: Location::Parked("v".into()),
             },
             after: None,
-        }),
+        }],
         cleared: 0,
         failed: [(
             "w".into(),

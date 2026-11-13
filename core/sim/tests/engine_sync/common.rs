@@ -6,7 +6,7 @@ use koidrive_engine::classify::Trees;
 
 use koidrive_engine::commit::{Commits, Failure, Halt, MAX_OPS, Reconnect};
 
-use koidrive_engine::effects::{Base, Effect, Effects, Location};
+use koidrive_engine::effects::{Base, BatchLimit, Effect, Effects, Location};
 
 use koidrive_engine::ids::IdGen;
 
@@ -1125,7 +1125,8 @@ fn run_ignoring(
                 commits.in_flight(),
                 &mut device.ids,
                 NOW as u64,
-            )
+                BatchLimit::ONE,
+            ).first()
             .cloned()
         {
             let known = device.trees.remote().get(&record.node).is_some()
@@ -1170,7 +1171,7 @@ fn run_ignoring(
             if cut == Cut::Effect {
                 (device.trees, commits, effects) =
                     reload(&device.trees, &commits, &effects, &device.rules)?;
-                prop_assert_eq!(effects.in_flight(), Some(&record));
+                prop_assert_eq!(effects.in_flight().first(), Some(&record));
             }
             let identity = device.identity();
             effects

@@ -218,7 +218,7 @@ fn a_download_that_fails_for_now_stages_the_same_effect_again() {
     b.settle();
     assert!(matches!(b.work.make_contiguous(), [Work::StageAfter(..)]));
     assert_eq!(
-        b.folder.engine.effects.in_flight().unwrap().effect_id,
+        b.folder.engine.effects.in_flight().first().unwrap().effect_id,
         planned
     );
 
@@ -283,7 +283,7 @@ fn a_remote_change_is_applied_only_after_the_commit_in_flight() {
         a.work.is_empty(),
         "no effect is planned while the commit is in flight"
     );
-    assert!(a.folder.engine.effects.in_flight().is_none());
+    assert!(a.folder.engine.effects.in_flight().first().is_none());
 
     a.work.push_back(send);
     let ran = a.run(&mut remote);

@@ -6,6 +6,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
+use koidrive_engine::effects::BatchLimit;
 use koidrive_engine::tree::FileIdentity;
 use koidrive_proto::v1::{Content, NodeKind, NodeState, NodeStatus, VersionInfo};
 use koidrive_store::{Error, Store};
@@ -119,7 +120,11 @@ fn first_sync(files: usize, per_dir: usize) -> u64 {
                     ids,
                     ..
                 } = &mut engine;
-                let Some(record) = effects.plan(trees, None, ids, NOW).cloned() else {
+                let Some(record) = effects
+                    .plan(trees, None, ids, NOW, BatchLimit::ONE)
+                    .first()
+                    .cloned()
+                else {
                     break;
                 };
                 engine.checkpoint(tx)?;

@@ -4,7 +4,7 @@
 
 use koidrive_engine::classify::{Class, Trees};
 use koidrive_engine::commit::Commits;
-use koidrive_engine::effects::Effects;
+use koidrive_engine::effects::{BatchLimit, Effects};
 use koidrive_engine::guard::{WINDOW_MS, Window};
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::question::{Answer, Held, Limit, Question, QuestionKind, RecoveryGroup};
@@ -836,7 +836,11 @@ fn trash_remotely(trees: &mut Trees, ids: &[&str]) {
 /// Does every effect the planner plans at `now`, and has the guard count each removal.
 fn apply_effects(commits: &mut Commits, trees: &mut Trees, ids: &mut IdGen, now: u64) {
     let mut effects = Effects::default();
-    while let Some(record) = effects.plan(trees, commits.in_flight(), ids, now).cloned() {
+    while let Some(record) = effects
+        .plan(trees, commits.in_flight(), ids, now, BatchLimit::ONE)
+        .first()
+        .cloned()
+    {
         if let Some(removal) = effects
             .done(trees, commits.in_flight(), &record.effect_id, None)
             .unwrap()
@@ -951,7 +955,8 @@ fn the_rest_of_a_folder_removed_after_its_notice_was_dismissed_is_not_noticed_ag
     let mut effects = Effects::default();
     while notice(&commits).is_none() {
         let record = effects
-            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+            .first()
             .cloned()
             .expect("a removal");
         if let Some(removal) = effects
@@ -1022,7 +1027,8 @@ fn a_folder_restored_after_its_notice_was_dismissed_is_noticed_when_deleted_agai
     trash_remotely(&mut trees, &["d"]);
     while notice(&commits).is_none() {
         let record = effects
-            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+            .first()
             .cloned()
             .expect("a removal");
         if let Some(removal) = effects
@@ -1039,7 +1045,14 @@ fn a_folder_restored_after_its_notice_was_dismissed_is_noticed_when_deleted_agai
     set_remote(&mut trees, false, 3);
     let mut ino = 1000;
     while let Some(record) = effects
-        .plan(&trees, commits.in_flight(), &mut ids, NOW + 1)
+        .plan(
+            &trees,
+            commits.in_flight(),
+            &mut ids,
+            NOW + 1,
+            BatchLimit::ONE,
+        )
+        .first()
         .cloned()
     {
         ino += 1;
@@ -1106,7 +1119,8 @@ fn a_dismissed_folder_stays_dismissed_when_r_forgets_its_trashed_nodes() {
     trash_remotely(&mut trees, &["d"]);
     while notice(&commits).is_none() {
         let record = effects
-            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+            .first()
             .cloned()
             .expect("a removal");
         if let Some(removal) = effects
@@ -1157,8 +1171,11 @@ fn forget_trashed(trees: &mut Trees) -> Vec<(String, RemoteNode)> {
 fn dismiss_while_removing(commits: &mut Commits, trees: &mut Trees, ids: &mut IdGen) {
     let mut effects = Effects::default();
     while notice(commits).is_none() {
-        let record =
-            (effects.plan(trees, commits.in_flight(), ids, NOW).cloned()).expect("a removal");
+        let record = (effects
+            .plan(trees, commits.in_flight(), ids, NOW, BatchLimit::ONE)
+            .first()
+            .cloned())
+        .expect("a removal");
         if let Some(removal) = effects
             .done(trees, commits.in_flight(), &record.effect_id, None)
             .unwrap()
@@ -1266,7 +1283,14 @@ fn a_folder_restored_after_a_dismissal_without_its_record_is_noticed_when_delete
     let mut effects = Effects::default();
     let mut ino = 1000;
     while let Some(record) = effects
-        .plan(&trees, commits.in_flight(), &mut ids, NOW + 1)
+        .plan(
+            &trees,
+            commits.in_flight(),
+            &mut ids,
+            NOW + 1,
+            BatchLimit::ONE,
+        )
+        .first()
         .cloned()
     {
         ino += 1;
@@ -1361,7 +1385,8 @@ fn a_folder_removal_that_stops_past_the_window_is_noticed() {
     let mut effects = Effects::default();
     for _ in 0..30 {
         let record = (effects
-            .plan(&trees, commits.in_flight(), &mut ids, NOW)
+            .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+            .first()
             .cloned())
         .expect("a removal");
         if let Some(removal) = effects

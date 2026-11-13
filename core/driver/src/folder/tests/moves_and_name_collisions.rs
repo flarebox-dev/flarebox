@@ -492,7 +492,7 @@ fn an_effect_whose_name_l_gave_to_another_node_writes_nothing_and_is_planned_aga
     site.stored();
     assert_eq!(names(&site.root), ["f"], "nothing is written at the name");
     let effects = &b.folder.engine.effects;
-    assert!(effects.in_flight().is_none() && effects.blocked().is_empty());
+    assert!(effects.in_flight().first().is_none() && effects.blocked().is_empty());
     let marker = koidrive_fs::read_marker(&site.root).unwrap().unwrap();
     assert_eq!(marker.effects, effects.cleared());
     let staging = site.root.join(koidrive_fs::PRIVATE_DIR).join("staging");
@@ -528,7 +528,7 @@ fn a_file_placed_at_a_name_l_gave_away_is_not_recorded_by_the_next_start() {
     let Ok(staged) = ready(pending.stage(&remote.chunks)) else {
         panic!("the download is staged");
     };
-    let record = b.folder.engine.effects.in_flight().unwrap().clone();
+    let record = b.folder.engine.effects.in_flight().first().unwrap().clone();
     let marker = Marker {
         space_id: site.link.space_id.clone(),
         effects: record.counter,
@@ -539,7 +539,7 @@ fn a_file_placed_at_a_name_l_gave_away_is_not_recorded_by_the_next_start() {
 
     let mut b = site.start();
     let stored = site.stored();
-    assert!(stored.effects.in_flight().is_none() && stored.effects.blocked().is_empty());
+    assert!(stored.effects.in_flight().first().is_none() && stored.effects.blocked().is_empty());
     assert_eq!(stored.effects.cleared(), record.counter);
     assert!(stored.trees.local().get(&record.node).is_none());
     b.connect(&remote);
@@ -583,7 +583,7 @@ fn a_restart_that_finds_the_users_folder_at_a_planned_folders_name_keeps_l_a_tre
 
     let mut b = site.start();
     let stored = site.stored();
-    assert!(stored.effects.in_flight().is_none() && stored.effects.blocked().is_empty());
+    assert!(stored.effects.in_flight().first().is_none() && stored.effects.blocked().is_empty());
     assert_eq!(stored.trees.local().len(), 2);
     drop(b);
     b = site.start();

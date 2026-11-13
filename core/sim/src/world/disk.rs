@@ -92,10 +92,10 @@ pub fn identity(ino: u128) -> FileIdentity {
 pub struct Disk {
     entries: BTreeMap<u128, Entry>,
     inos: u128,
-    /// The download of the effect in flight is staged and has no name in the folder yet.
-    pub(super) staged: bool,
-    /// The entry that the effect in flight displaced and has not sent to the local trash yet.
-    pub(super) quarantine: Option<Entry>,
+    /// The effects in flight whose download is staged and has no name in the folder yet.
+    pub(super) staged: BTreeSet<String>,
+    /// The entries that effects in flight displaced and have not sent to the local trash yet.
+    pub(super) quarantine: BTreeMap<String, Entry>,
     /// The effects whose displaced entry is in the local trash.
     trash: BTreeSet<String>,
     binned: BTreeSet<i64>,
@@ -173,7 +173,7 @@ impl Disk {
     /// True when some file, parked, in quarantine or neither, holds the write with this tag.
     pub fn holds(&self, write: i64) -> bool {
         (self.entries.values())
-            .chain(&self.quarantine)
+            .chain(self.quarantine.values())
             .any(|entry| entry.content.as_ref().is_some_and(|c| c.mtime_ns == write))
     }
 
@@ -242,11 +242,14 @@ impl Disk {
     /// the local trash also when the new entry finds its name taken.
     pub fn apply(&mut self, record: &EffectRecord, until: Option<Cut>) -> Option<Applied> {
         self.marker = record.counter;
-        let until = until?;
+        let Some(until) = until else {
+            self.staged.remove(&record.effect_id);
+            return None;
+        };
         let mut trashed = None;
-        let outcome = self.change(&record.effect, until, &mut trashed);
+        let outcome = self.change(record, until, &mut trashed);
         if until == Cut::Done {
-            self.staged = false;
+            self.staged.remove(&record.effect_id);
         }
         let removal = matches!(
             record.effect,
@@ -260,13 +263,21 @@ impl Disk {
         Some(Applied { outcome, trashed })
     }
 
+    /// Stages the download of a write before the effect section that applies it.
+    pub fn stage(&mut self, record: &EffectRecord) {
+        if matches!(record.effect, Effect::WriteFile { .. }) {
+            self.staged.insert(record.effect_id.clone());
+        }
+    }
+
     fn change(
         &mut self,
-        effect: &Effect,
+        record: &EffectRecord,
         until: Cut,
         trashed: &mut Option<Content>,
     ) -> Result<Option<FileIdentity>, Refused> {
-        match effect {
+        let id = &record.effect_id;
+        match &record.effect {
             Effect::CreateDir { at } => {
                 let (place, name) = self.locate(at)?;
                 if until == Cut::Quarantined {
@@ -280,19 +291,21 @@ impl Disk {
                 content,
                 replaces,
             } => {
-                self.staged = true;
+                self.staged.insert(id.clone());
                 let displaced = replaces.as_ref().map(|d| self.displaced(d)).transpose()?;
                 let (place, name) = self.locate(at)?;
-                if let Some(ino) = displaced {
-                    self.quarantine = self.entries.remove(&ino);
+                if let Some(entry) = displaced.and_then(|ino| self.entries.remove(&ino)) {
+                    self.quarantine.insert(id.clone(), entry);
                 }
                 if until == Cut::Quarantined {
                     return Ok(None);
                 }
                 let ino = self.create(place, &name, Some(content.clone()));
-                self.staged = ino.is_none();
+                if ino.is_some() {
+                    self.staged.remove(id);
+                }
                 if until == Cut::Done {
-                    *trashed = self.quarantine.take().and_then(|entry| entry.content);
+                    *trashed = self.quarantine.remove(id).and_then(|entry| entry.content);
                 }
                 let refused = match displaced {
                     Some(_) if until == Cut::Done => Refused::Overtaken,
@@ -316,9 +329,11 @@ impl Disk {
             }
             Effect::RemoveFile { displaced } => {
                 let ino = self.displaced(displaced)?;
-                self.quarantine = self.entries.remove(&ino);
+                if let Some(entry) = self.entries.remove(&ino) {
+                    self.quarantine.insert(id.clone(), entry);
+                }
                 if until == Cut::Done {
-                    *trashed = self.quarantine.take().and_then(|entry| entry.content);
+                    *trashed = self.quarantine.remove(id).and_then(|entry| entry.content);
                 }
                 Ok(None)
             }
@@ -331,7 +346,10 @@ impl Disk {
                 if self.children(&Place::In(ino)).next().is_some() {
                     return Err(Refused::NotEmpty);
                 }
-                self.quarantine = self.entries.remove(&ino).filter(|_| until != Cut::Done);
+                let entry = self.entries.remove(&ino);
+                if let Some(entry) = entry.filter(|_| until != Cut::Done) {
+                    self.quarantine.insert(id.clone(), entry);
+                }
                 Ok(None)
             }
         }
@@ -348,8 +366,8 @@ impl Disk {
     /// changed since.
     pub fn recover(&mut self, record: &EffectRecord) -> Applied {
         self.marker = record.counter;
-        let staged = std::mem::take(&mut self.staged);
-        let Some(entry) = self.quarantine.take() else {
+        let staged = self.staged.remove(&record.effect_id);
+        let Some(entry) = self.quarantine.remove(&record.effect_id) else {
             let outcome = match staged {
                 false => self.finished(record),
                 true => Err(Refused::Interrupted),

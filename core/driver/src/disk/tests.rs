@@ -722,7 +722,10 @@ fn cuts(scenario: &Scenario) -> Vec<Cut> {
 /// store, the disk holds the effect's result, the marker equals the effect counter, and nothing is left in
 /// quarantine or staging.
 fn assert_done(scenario: &Scenario, folder: &Folder, running: &Running, context: &str) {
-    assert!(running.engine.effects.in_flight().is_none(), "{context}");
+    assert!(
+        running.engine.effects.in_flight().first().is_none(),
+        "{context}"
+    );
     assert!(running.engine.effects.blocked().is_empty(), "{context}");
     let remote = running.engine.trees.remote().live(NODE);
     let local = running.local(NODE).map(|node| &node.shape);
@@ -780,7 +783,10 @@ fn crash_and_finish(scenario: &Scenario, cut: Cut, cuts: &[Cut]) {
     );
 
     let mut running = folder.start(no_hook()).unwrap();
-    assert!(running.engine.effects.in_flight().is_none(), "{context}");
+    assert!(
+        running.engine.effects.in_flight().first().is_none(),
+        "{context}"
+    );
     assert_eq!(
         folder.marker(),
         running.engine.effects.cleared(),
@@ -990,7 +996,10 @@ fn refuse_and_finish(scenario: &Scenario, refuse: fn(&mut Trees), cut: Option<Cu
         running.engine.trees.local(),
         "{context}"
     );
-    assert!(running.engine.effects.in_flight().is_none(), "{context}");
+    assert!(
+        running.engine.effects.in_flight().first().is_none(),
+        "{context}"
+    );
     assert!(running.engine.effects.blocked().is_empty(), "{context}");
     assert_eq!(running.engine.effects.cleared(), 1, "{context}");
     assert_eq!(folder.marker(), 1, "{context}");
@@ -1092,7 +1101,7 @@ fn three_cleared_and_one_in_flight() -> (Folder, Server, String) {
             .step(&server);
     }));
     let (_, engine) = folder.open();
-    let record = engine.effects.in_flight().unwrap().clone();
+    let record = engine.effects.in_flight().first().unwrap().clone();
     assert_eq!(record.counter, 4);
     (folder, server, record.effect_id)
 }
@@ -1154,7 +1163,11 @@ fn a_marker_above_what_the_store_accounts_for_keeps_every_trace() {
     assert_eq!(tree(&folder.root), before);
     let (_, engine) = folder.open();
     assert_eq!(
-        engine.effects.in_flight().map(|record| &record.effect_id),
+        engine
+            .effects
+            .in_flight()
+            .first()
+            .map(|record| &record.effect_id),
         Some(&effect_id)
     );
 
@@ -1195,7 +1208,13 @@ fn an_interrupted_effect_is_planned_again_after_a_restart() {
             .step(&server);
     }));
     let (_, engine) = folder.open();
-    let interrupted = engine.effects.in_flight().unwrap().effect_id.clone();
+    let interrupted = engine
+        .effects
+        .in_flight()
+        .first()
+        .unwrap()
+        .effect_id
+        .clone();
     let mut running = folder.start(no_hook()).unwrap();
     assert!(running.engine.effects.blocked().is_empty());
     let pending = running
@@ -1207,7 +1226,7 @@ fn an_interrupted_effect_is_planned_again_after_a_restart() {
     assert_ne!(pending.record.effect_id, interrupted);
     assert_eq!(
         pending.record.effect,
-        engine.effects.in_flight().unwrap().effect
+        engine.effects.in_flight().first().unwrap().effect
     );
 }
 
@@ -1505,7 +1524,7 @@ fn a_root_replaced_during_a_download_receives_nothing() {
         other => panic!("{:?}", other.map(|_| ())),
     }
     assert_eq!(tree(&folder.root), BTreeMap::new());
-    assert!(running.engine.effects.in_flight().is_some());
+    assert!(running.engine.effects.in_flight().first().is_some());
     let aside = folder.dir.path().join("moved");
     assert!(!aside.join("report.txt").exists());
 }
@@ -1534,7 +1553,7 @@ fn a_root_replaced_before_an_effect_applies_receives_nothing() {
     assert_eq!(tree(&aside), before);
     drop(running);
     let (_, engine) = folder.open();
-    assert!(engine.effects.in_flight().is_some());
+    assert!(engine.effects.in_flight().first().is_some());
 }
 
 /// Observes until `done` accepts the changes seen so far, and returns them as one batch.
@@ -1702,7 +1721,7 @@ fn a_download_that_fails_for_now_keeps_the_effect_and_stages_again() {
         Err(Stall::Later { wait, .. }) => assert_eq!(wait, STAGE_AGAIN),
         other => panic!("{:?}", other.map(|_| ())),
     }
-    assert!(running.engine.effects.in_flight().is_some());
+    assert!(running.engine.effects.in_flight().first().is_some());
     assert!(!folder.root.join("report.txt").exists());
     let staged = ready(pending.stage(&server)).unwrap();
     assert_eq!(
@@ -1922,7 +1941,7 @@ fn a_record_whose_name_is_not_a_file_name_is_never_committed() {
     ));
     drop(running);
     let (_, engine) = folder.open();
-    assert!(engine.effects.in_flight().is_none());
+    assert!(engine.effects.in_flight().first().is_none());
     assert_eq!(folder.marker(), 0);
 }
 

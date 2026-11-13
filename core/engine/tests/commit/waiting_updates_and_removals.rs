@@ -286,7 +286,7 @@ fn a_waiting_blocker_whose_parking_failed_is_not_parked_again_unchanged() {
     trees.set_remote("h".into(), remote(file(ROOT, "old", 9)));
     trees.settle();
     let mut effects = Effects::default();
-    let first = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
+    let first = effects.plan(&trees, None, &mut ids, NOW, BatchLimit::ONE).first().unwrap().clone();
     assert_eq!(first.node, "n");
     assert!(matches!(
         first.effect,
@@ -296,7 +296,7 @@ fn a_waiting_blocker_whose_parking_failed_is_not_parked_again_unchanged() {
         }
     ));
     effects.failed(&first.effect_id).unwrap();
-    assert_eq!(effects.plan(&trees, None, &mut ids, NOW), None);
+    assert_eq!(effects.plan(&trees, None, &mut ids, NOW, BatchLimit::ONE).first(), None);
     assert!(effects.blocked().contains_key("n"));
 }
 
@@ -429,7 +429,7 @@ fn a_removal_r_undid_whose_s_update_does_not_fit_yet_waits() {
         ("f", Some(file(ROOT, "f", 1)), Some(file("d", "f", 1)), None),
     ]);
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    let record = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
+    let record = effects.plan(&trees, None, &mut ids, NOW, BatchLimit::ONE).first().unwrap().clone();
     assert_eq!(record.node, "d");
     assert!(
         matches!(record.effect, Effect::RemoveDir { .. }),
@@ -540,7 +540,7 @@ fn a_removal_that_waits_after_both_sides_dropped_the_node_is_kept_until_it_fits(
         Reconnect::Idle
     );
     let record = effects
-        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE).first()
         .unwrap()
         .clone();
     assert_eq!(record.node, "d");
@@ -578,7 +578,7 @@ fn a_kept_removal_is_made_once_s_no_longer_holds_anything_under_it() {
         Reconnect::Idle
     );
     let record = effects
-        .plan(&trees, commits.in_flight(), &mut ids, NOW)
+        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE).first()
         .unwrap()
         .clone();
     effects
@@ -707,7 +707,11 @@ fn a_removed_folder_r_restored_behind_a_name_that_differs_only_in_case_is_brough
         synced("h", file(ROOT, "C.TXT", 9)),
     ]);
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    let record = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
+    let record = effects
+        .plan(&trees, None, &mut ids, NOW, BatchLimit::ONE)
+        .first()
+        .unwrap()
+        .clone();
     assert!(
         matches!(record.effect, Effect::RemoveDir { .. }),
         "{record:?}"
