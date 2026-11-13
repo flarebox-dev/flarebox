@@ -1743,8 +1743,14 @@ mod tests {
             store
                 .transaction(|tx| {
                     let mut engine = Engine::load(tx, ROOT)?;
+                    let before = tx.engine_state()?;
                     let mut state = engine.commits.state();
                     state.questions[0].id = "recovery-2".into();
+                    let after = EngineState {
+                        commits: state.clone(),
+                        ..before.clone()
+                    };
+                    tx.update_engine_state(&before, &after)?;
                     engine.commits = Commits::from_state(state).unwrap();
                     engine.ask(tx, ROOT)?;
                     let rows = tx.questions()?;

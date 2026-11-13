@@ -1282,11 +1282,12 @@ impl Trees {
                 let newest_below = (past.iter().map(|position| position.rev))
                     .filter(|&past_rev| past_rev < rev)
                     .max();
-                let kept: Vec<Agreed> = (past.iter())
-                    .filter(|position| position.rev >= rev || Some(position.rev) == newest_below)
-                    .cloned()
-                    .collect();
-                (kept.len() < past.len()).then(|| (id.clone(), kept))
+                let keep =
+                    |position: &&Agreed| position.rev >= rev || Some(position.rev) == newest_below;
+                if past.iter().all(|position| keep(&position)) {
+                    return None;
+                }
+                Some((id.clone(), past.iter().filter(keep).cloned().collect()))
             })
             .collect();
         for (id, kept) in forgotten {
