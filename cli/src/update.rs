@@ -659,25 +659,8 @@ pub async fn run(paths: &Paths, json: bool) -> Result<Done, CliError> {
         reconcile_deadline,
     )
     .await;
-    let (actual, report, app) = finish_reconciliation(
-        paths,
-        prepared_app,
-        UpdatedData {
-            from: from.to_string(),
-            to: to.to_string(),
-            via: Some(install.via()),
-            result: if changed {
-                UpdateResult::Updated
-            } else {
-                UpdateResult::Unchanged
-            },
-            service: None,
-            app: None,
-        },
-        reconciled,
-        app_deadline,
-    )
-    .await?;
+    let (actual, report, app) =
+        finish_reconciliation(paths, prepared_app, &from, reconciled, app_deadline).await?;
     updated(&from, actual, install.via(), report, app, changed)
 }
 
@@ -747,7 +730,7 @@ fn update_problem(report: &service::Report, app: Option<&crate::app::Report>) ->
 async fn finish_reconciliation(
     paths: &Paths,
     prepared: Option<crate::app::Prepared>,
-    mut data: UpdatedData,
+    from: &Version,
     reconciled: Result<(Version, service::Report, Option<crate::app::Report>), ReconcileError>,
     deadline: tokio::time::Instant,
 ) -> Result<(Version, service::Report, Option<crate::app::Report>), CliError> {
@@ -765,29 +748,15 @@ async fn finish_reconciliation(
             let Some(prepared) = prepared else {
                 return Err(error);
             };
-            if let Some(commit) = prepared.committed().last() {
-                data.to = commit.version.to_string();
-                data.result = UpdateResult::Updated;
-            }
             let app = prepared
                 .finish(paths, Err(error.message.clone()), deadline)
                 .await;
-            if let crate::app::Report::Present { version, .. } = &app {
-                data.to = version.clone();
-            }
             let text = format!(
                 "Koidrive update is incomplete: {}\n{}",
                 error.message,
                 app.text()
             );
-            data.app = Some(app);
-            let unchanged = data.result == UpdateResult::Unchanged;
-            let partial = Done::ok(data, text);
-            error.partial = Some(Box::new(if unchanged {
-                partial.unchanged()
-            } else {
-                partial
-            }));
+            error.partial = Some(Box::new(app_partial(from, app, text)));
             return Err(error);
         }
     };
@@ -798,6 +767,33 @@ async fn finish_reconciliation(
     Ok((actual, report, app))
 }
 
+fn app_partial(from: &Version, app: crate::app::Report, text: String) -> Done {
+    let committed = app.committed().last();
+    let to = match &app {
+        crate::app::Report::Present { version, .. } => Version::parse(version).ok(),
+        _ => None,
+    }
+    .or_else(|| committed.map(|commit| commit.version.clone()))
+    .unwrap_or_else(|| from.clone());
+    let changed = committed.is_some() || to.cmp_precedence(from).is_gt();
+    let done = Done::ok(
+        UpdatedData {
+            from: from.to_string(),
+            to: to.to_string(),
+            via: Some(Via::App),
+            result: if changed {
+                UpdateResult::Updated
+            } else {
+                UpdateResult::Unchanged
+            },
+            service: None,
+            app: Some(app),
+        },
+        text,
+    );
+    if changed { done } else { done.unchanged() }
+}
+
 async fn app_not_updated(
     paths: &Paths,
     from: &Version,
@@ -806,11 +802,7 @@ async fn app_not_updated(
     prepared: crate::app::Prepared,
     deadline: tokio::time::Instant,
 ) -> CliError {
-    let committed_version = prepared
-        .committed()
-        .last()
-        .map(|commit| commit.version.to_string());
-    let changed = committed_version.is_some();
+    let changed = !prepared.committed().is_empty();
     let app = prepared
         .finish(
             paths,
@@ -831,28 +823,8 @@ async fn app_not_updated(
     } else {
         format!("Koidrive was not updated.\n{message}\n")
     };
-    let partial = Done::ok(
-        UpdatedData {
-            from: from.to_string(),
-            to: committed_version.unwrap_or_else(|| from.to_string()),
-            via: Some(Via::App),
-            result: if changed {
-                UpdateResult::Updated
-            } else {
-                UpdateResult::Unchanged
-            },
-            service: None,
-            app: Some(app),
-        },
-        text,
-    );
-    let partial = if changed {
-        partial
-    } else {
-        partial.unchanged()
-    };
     CliError {
-        partial: Some(Box::new(partial)),
+        partial: Some(Box::new(app_partial(from, app, text))),
         ..failed(message)
     }
 }
@@ -1325,22 +1297,10 @@ echo "==> brew $1"
                 deadline,
             )
             .await;
-            let (actual, service, app) = finish_reconciliation(
-                &paths,
-                Some(prepared),
-                UpdatedData {
-                    from: version.to_string(),
-                    to: version.to_string(),
-                    via: Some(Via::App),
-                    result: UpdateResult::Unchanged,
-                    service: None,
-                    app: None,
-                },
-                reconciled,
-                deadline,
-            )
-            .await
-            .unwrap();
+            let (actual, service, app) =
+                finish_reconciliation(&paths, Some(prepared), &version, reconciled, deadline)
+                    .await
+                    .unwrap();
             assert_eq!(actual, version);
             assert_eq!(update_problem(&service, app.as_ref()).is_some(), fails);
             assert_eq!(serde_json::to_value(&service).unwrap()["state"], state);
@@ -1520,6 +1480,68 @@ echo "==> brew $1"
 
     #[tokio::test]
     #[cfg(target_os = "macos")]
+    async fn partial_update_versions_require_commits_or_a_verified_target_helper() {
+        for (actual, committed) in [
+            ("invalid", false),
+            ("98.0.0", false),
+            ("99.0.0", false),
+            ("100.0.0", false),
+            ("invalid", true),
+            ("98.0.0", true),
+            ("99.0.0", true),
+            ("100.0.0", true),
+        ] {
+            let (_fixture, helper) = crate::app_install::verified_helper_fixture("99.0.0").await;
+            let binary = helper.path().to_path_buf();
+            let bundle = binary.ancestors().nth(3).unwrap().to_path_buf();
+            fs::write(&binary, format!("#!/bin/sh\necho 'koi {actual}'\n")).unwrap();
+            let committed = if committed {
+                serde_json::json!([{"path":bundle, "version":"99.0.0", "change":"replaced"}])
+            } else {
+                serde_json::json!([])
+            };
+            let prepared = crate::app::Prepared::fixture(serde_json::from_value(serde_json::json!({
+                "state":"present", "path":bundle, "version":"99.0.0", "change":"unchanged", "launch":"not_requested", "committed":committed
+            })).unwrap());
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::under(dir.path());
+            let manager = service::system();
+            let deadline = tokio::time::Instant::now() + RECONCILE;
+            let reconciled = reconcile_updated(
+                &UpdateBinary::App(Box::new(helper)),
+                &Version::parse("99.0.0").unwrap(),
+                manager.as_ref(),
+                Err("The profile cannot construct its service".into()),
+                &mut echo(dir.path()),
+                deadline,
+            )
+            .await;
+            let error = finish_reconciliation(
+                &paths,
+                Some(prepared),
+                &Version::parse("1.0.0").unwrap(),
+                reconciled,
+                deadline,
+            )
+            .await
+            .unwrap_err();
+            let partial = error.partial.unwrap();
+            assert_eq!(partial.data["to"], "99.0.0", "{actual}, {committed}");
+            assert_eq!(partial.data["result"], "updated");
+            assert_eq!(serde_json::to_value(partial.outcome).unwrap(), "ok");
+            assert_eq!(
+                partial.data["app"]["committed"]
+                    .as_array()
+                    .map(Vec::len)
+                    .unwrap_or(0),
+                committed.as_array().unwrap().len()
+            );
+            assert!(partial.data.get("service").is_none());
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
     async fn failed_version_probes_cannot_preserve_a_substituted_app_as_present() {
         for actual in ["invalid", "98.0.0", "99.0.0"] {
             let (_fixture, helper) = crate::app_install::verified_helper_fixture("99.0.0").await;
@@ -1551,14 +1573,7 @@ echo "==> brew $1"
             let error = finish_reconciliation(
                 &paths,
                 Some(prepared),
-                UpdatedData {
-                    from: "1.0.0".into(),
-                    to: "1.0.0".into(),
-                    via: Some(Via::App),
-                    result: UpdateResult::Unchanged,
-                    service: None,
-                    app: None,
-                },
+                &Version::parse("1.0.0").unwrap(),
                 reconciled,
                 deadline,
             )
@@ -1668,14 +1683,7 @@ echo "==> brew $1"
             let error = finish_reconciliation(
                 &paths,
                 Some(prepared),
-                UpdatedData {
-                    from: "1.0.0".into(),
-                    to: "1.0.0".into(),
-                    via: Some(Via::App),
-                    result: UpdateResult::Unchanged,
-                    service: None,
-                    app: None,
-                },
+                &Version::parse("1.0.0").unwrap(),
                 reconciled,
                 deadline,
             )
@@ -1794,21 +1802,14 @@ echo "==> brew $1"
                 )
                 .await;
                 assert!(reconciled.is_err());
-                let data = UpdatedData {
-                    from: if result == UpdateResult::Updated {
-                        "1.0.0"
-                    } else {
-                        "99.0.0"
-                    }
-                    .into(),
-                    to: target.to_string(),
-                    via: Some(Via::App),
-                    result,
-                    service: None,
-                    app: None,
-                };
+                let from = Version::parse(if result == UpdateResult::Updated {
+                    "1.0.0"
+                } else {
+                    "99.0.0"
+                })
+                .unwrap();
                 let error =
-                    finish_reconciliation(&paths, Some(prepared), data, reconciled, deadline)
+                    finish_reconciliation(&paths, Some(prepared), &from, reconciled, deadline)
                         .await
                         .unwrap_err();
                 let partial = error

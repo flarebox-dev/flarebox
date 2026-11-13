@@ -582,46 +582,73 @@ async fn run(
                         | setup::ServerAction::AddDevice { .. }
                 }
         );
-    let mut done = execute(paths.clone(), command, json, terminal).await?;
-    if reconciles {
+    let done = execute(paths.clone(), command, json, terminal).await?;
+    let service = if reconciles {
         let report = service::reconcile(&paths, asked).await;
-        let text = match report.text() {
-            text if text.is_empty() && shows_state => report.status_line(),
-            text => text,
-        };
         let failed = shows_state
             && report.failed()
             && (asked || report.state != service::State::SwitchedOff || report.problem.is_some());
         let failure = failed.then(|| report.failure_message());
-        let data = match done.data.take() {
-            Value::Null => Value::Object(serde_json::Map::new()),
-            data => data,
-        };
-        done.data = serde_json::to_value(WithService {
-            data,
-            service: report,
-        })
-        .expect("the CLI's own types serialize");
         if let Some(message) = failure {
             return Err(CliError {
-                partial: Some(Box::new(done)),
+                partial: Some(Box::new(with_service(done, report))),
                 ..CliError::new(Code::Failed, message)
             });
         }
-        done.text.push_str(&text);
-    }
-    if let Some(policy) = app_policy {
-        let report = match policy {
+        Some(report)
+    } else {
+        None
+    };
+    let app = match app_policy {
+        Some(policy) => Some(match policy {
             Ok(launch) => {
                 let deadline = lifecycle_deadline.unwrap_or_else(|| {
                     tokio::time::Instant::now() + std::time::Duration::from_secs(400)
                 });
-                app::install(&paths, &service::this_version(), launch, deadline)
-                    .await
-                    .0
+                app::install(&paths, &service::this_version(), launch, deadline).await
             }
-            Err(reason) => app::Report::skipped(reason),
+            Err(reason) => (app::Report::skipped(reason), None),
+        }),
+        None => None,
+    };
+    finish_lifecycle(done, service, app, setup_app, shows_state)
+}
+
+fn with_service(mut done: Done, report: service::Report) -> Done {
+    let data = match done.data.take() {
+        Value::Null => Value::Object(serde_json::Map::new()),
+        data => data,
+    };
+    done.data = serde_json::to_value(WithService {
+        data,
+        service: report,
+    })
+    .expect("the CLI's own types serialize");
+    done
+}
+
+fn finish_lifecycle(
+    mut done: Done,
+    service: Option<service::Report>,
+    app: Option<(app::Report, Option<service::Report>)>,
+    setup_app: bool,
+    shows_state: bool,
+) -> Result<Done, CliError> {
+    let (app, handoff) = app.map_or((None, None), |(app, service)| (Some(app), service));
+    let service = if setup_app {
+        handoff.or(service)
+    } else {
+        service
+    };
+    if let Some(report) = service {
+        let text = match report.text() {
+            text if text.is_empty() && shows_state => report.status_line(),
+            text => text,
         };
+        done = with_service(done, report);
+        done.text.push_str(&text);
+    }
+    if let Some(report) = app {
         let failed = setup_app && report.failed();
         done.text.push_str(&report.text());
         done.data = serde_json::to_value(report::WithApp {
@@ -2779,6 +2806,63 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(opened, Err(DriverError::Busy(_))));
+    }
+
+    #[test]
+    fn setup_uses_the_final_service_handoff_without_changing_reconcile_results() {
+        for (initial_state, later_state, app_failed) in [
+            ("unavailable", "running", false),
+            ("running", "unavailable", true),
+        ] {
+            for setup_app in [false, true] {
+                for has_handoff in [false, true] {
+                    let report = |state| -> service::Report {
+                        serde_json::from_value(serde_json::json!({
+                            "manager":"launchd", "name":"fixture", "state":state,
+                            "problem": if state == "unavailable" { Some("fixture service failure") } else { None }
+                        })).unwrap()
+                    };
+                    let initial = report(initial_state);
+                    let later = report(later_state);
+                    let selected = if setup_app && has_handoff {
+                        &later
+                    } else {
+                        &initial
+                    };
+                    let expected_service = serde_json::to_value(selected).unwrap();
+                    let expected_text = match selected.text() {
+                        text if text.is_empty() && !setup_app => selected.status_line(),
+                        text => text,
+                    };
+                    let app: app::Report = serde_json::from_value(serde_json::json!({
+                        "state":"present", "path":"/fixture/Koidrive.app", "version":"99.0.0",
+                        "change":"installed", "launch":"not_requested",
+                        "problem": app_failed.then_some("fixture app failure")
+                    }))
+                    .unwrap();
+                    let expected_app = serde_json::to_value(&app).unwrap();
+                    let app_text = app.text();
+                    let result = finish_lifecycle(
+                        Done::ok(serde_json::json!({"device":"fixture"}), "Connected\n"),
+                        Some(initial),
+                        Some((app, has_handoff.then_some(later))),
+                        setup_app,
+                        !setup_app,
+                    );
+                    let done = if setup_app && app_failed {
+                        let error = result.unwrap_err();
+                        assert_eq!(error.code, Code::Failed);
+                        *error.partial.unwrap()
+                    } else {
+                        result.unwrap()
+                    };
+                    assert_eq!(done.data["service"], expected_service);
+                    assert_eq!(done.data["app"], expected_app);
+                    assert_eq!(done.data["device"], "fixture");
+                    assert_eq!(done.text, format!("Connected\n{expected_text}{app_text}"));
+                }
+            }
+        }
     }
 
     #[test]

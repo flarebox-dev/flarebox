@@ -427,6 +427,7 @@ pub(crate) async fn install(
 
 #[cfg(any(target_os = "macos", test))]
 async fn reconcile(binary: &Path, deadline: Instant) -> Result<service::Report, String> {
+    const MAX_OUTPUT: usize = 16 * 1024 * 1024;
     let mut active = HANDOFF.lock().await;
     let child = Command::new(binary)
         .args(["_reconcile", "--json"])
@@ -440,15 +441,23 @@ async fn reconcile(binary: &Path, deadline: Instant) -> Result<service::Report, 
     *active = Some(child);
     let child = active.as_mut().expect("the handoff child was just started");
     let stdout = child.stdout.take().expect("the helper has piped stdout");
-    let mut output = stdout.take(1024 * 1024 + 1);
+    let mut output = stdout.take((MAX_OUTPUT + 1) as u64);
     let mut printed = Vec::new();
     let result = tokio::time::timeout_at(deadline, async {
         output.read_to_end(&mut printed).await?;
-        child.wait().await
+        if printed.len() > MAX_OUTPUT {
+            return Ok(None);
+        }
+        child.wait().await.map(Some)
     })
     .await;
     let status = match result {
-        Ok(Ok(status)) => status,
+        Ok(Ok(Some(status))) => status,
+        Ok(Ok(None)) => {
+            stop_handoff(child).await;
+            active.take();
+            return Err("The installed app's helper returned too much output.".into());
+        }
         _ => {
             stop_handoff(child).await;
             active.take();
@@ -456,9 +465,6 @@ async fn reconcile(binary: &Path, deadline: Instant) -> Result<service::Report, 
         }
     };
     active.take();
-    if printed.len() > 1024 * 1024 {
-        return Err("The installed app's helper returned too much output.".into());
-    }
     let envelope: serde_json::Value = serde_json::from_slice(&printed)
         .map_err(|_| "The installed app's helper returned no JSON envelope.")?;
     if !status.success() {
@@ -1061,6 +1067,52 @@ mod tests {
             failures.is_empty(),
             "surviving descendants, timeout modes: {failures:?}"
         );
+    }
+
+    #[test]
+    fn large_handoff_envelopes_preserve_the_service_and_enforce_the_output_bound() {
+        if std::env::var_os("KOI_APP_LARGE_HANDOFF_TEST").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "app::tests::large_handoff_envelopes_preserve_the_service_and_enforce_the_output_bound", "--nocapture"])
+                .env("KOI_APP_LARGE_HANDOFF_TEST", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let home = tempfile::tempdir().unwrap();
+            let service = serde_json::json!({"manager":"launchd", "name":"fixture", "state":"running"});
+            let base = serde_json::json!({"data":{"service":service}, "decisions":[]});
+            let mut large = base.clone();
+            large["decisions"] = serde_json::json!([{"items":vec![serde_json::json!({"label":"x".repeat(200)}); 6000]}]);
+            let limit = 16 * 1024 * 1024;
+            let base_len = serde_json::to_vec(&base).unwrap().len();
+            let mut boundary = base.clone();
+            boundary["padding"] = serde_json::json!("x".repeat(limit - base_len - 13));
+            let mut oversized = boundary.clone();
+            oversized["padding"] = serde_json::json!("x".repeat(limit));
+            for (value, succeeds) in [(large, true), (boundary, true), (oversized, false)] {
+                let bytes = serde_json::to_vec(&value).unwrap();
+                assert!(bytes.len() > 1024 * 1024);
+                assert_eq!(bytes.len() <= limit, succeeds);
+                let path = home.path().join("envelope.json");
+                std::fs::write(&path, bytes).unwrap();
+                let binary = helper(home.path(), &format!("exec /bin/cat '{}'", path.display()));
+                let result = reconcile(&binary, Instant::now() + Duration::from_secs(10)).await;
+                if succeeds {
+                    assert_eq!(serde_json::to_value(result.unwrap()).unwrap(), service);
+                } else {
+                    assert!(result.unwrap_err().contains("too much output"));
+                }
+                assert!(HANDOFF.lock().await.is_none());
+            }
+        });
     }
 
     #[test]
