@@ -805,6 +805,7 @@ impl Snapshot {
             );
         }
         let mut was_left_out = Vec::new();
+        let mut unseen_left_out = BTreeSet::new();
         for prefix in &scan.replaced {
             for (path, entry) in (self.left_out.range(prefix.clone()..))
                 .take_while(|(path, _)| path.starts_with(prefix))
@@ -812,10 +813,11 @@ impl Snapshot {
                 was_left_out.push(path.clone());
                 if !scan.new.contains_key(path) {
                     old.insert(path.clone(), *entry);
+                    unseen_left_out.insert(path.clone());
                 }
             }
         }
-        let (left_out, still_left_out) = take_left_out(&mut old, &scan.left_out);
+        let (left_out, mut still_left_out) = take_left_out(&mut old, &scan.left_out);
         let unreadable = std::mem::take(&mut scan.unreadable);
         for blocked in &unreadable {
             scan.new
@@ -827,16 +829,22 @@ impl Snapshot {
                     old.iter()
                         .find(|(_, before)| before.kind == EntryKind::Dir && before.id == now.id)
                 })
-                .map_or(blocked, |(path, _)| path);
-            scan.new.extend(
-                old.range(known.clone()..)
-                    .take_while(|(path, _)| path.starts_with(known))
-                    .filter(|(path, _)| *path != known)
-                    .map(|(path, entry)| {
-                        let below = path.strip_prefix(known).expect("taken below the folder");
-                        (blocked.join(below), *entry)
-                    }),
-            );
+                .map_or(blocked, |(path, _)| path)
+                .clone();
+            let below: Vec<(PathBuf, Entry)> = (old.range(known.clone()..))
+                .take_while(|(path, _)| path.starts_with(&known))
+                .filter(|(path, _)| **path != known)
+                .map(|(path, entry)| (path.clone(), *entry))
+                .collect();
+            for (path, entry) in below {
+                let at = blocked.join(path.strip_prefix(&known).expect("taken below the folder"));
+                if unseen_left_out.remove(&path) {
+                    old.remove(&path);
+                    still_left_out.push((at, entry));
+                } else {
+                    scan.new.insert(at, entry);
+                }
+            }
         }
         let mut unsettled = keep_unconfirmed(
             root,
@@ -846,6 +854,16 @@ impl Snapshot {
             &mut scan.new,
             &mut *scan.cut,
         )?;
+        for kept in &unsettled {
+            for path in
+                (unseen_left_out.range(kept.clone()..)).take_while(|path| path.starts_with(kept))
+            {
+                if let Some(entry) = scan.new.remove(path) {
+                    old.remove(path);
+                    still_left_out.push((path.clone(), entry));
+                }
+            }
+        }
         let stays = match &scan.rules {
             Some(rules) => {
                 let (held, left_out): (BTreeMap<PathBuf, Entry>, BTreeMap<PathBuf, Entry>) =
