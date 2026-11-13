@@ -580,10 +580,19 @@ impl Trees {
         .take(self.l.len() + 1)
     }
 
-    fn holding_changes(&self) -> BTreeSet<NodeId> {
+    fn changes(&self) -> impl Iterator<Item = &NodeId> {
         (self.dirty.iter())
             .filter(|id| !self.resends.contains(*id) && !self.excluded(id))
-            .filter(|id| matches!(self.class(id), Class::Local | Class::Concurrent))
+            .filter(|id| {
+                matches!(
+                    self.acknowledged_class(id),
+                    Class::Local | Class::Concurrent
+                )
+            })
+    }
+
+    fn holding_changes(&self) -> BTreeSet<NodeId> {
+        (self.changes())
             .flat_map(|id| self.local_chain(id).skip(1))
             .map(str::to_owned)
             .collect()
@@ -594,7 +603,7 @@ impl Trees {
             return;
         }
         let holding_changes = self.holding_changes();
-        let yielded: Vec<NodeId> = (self.resends.iter())
+        let mut yielded: Vec<NodeId> = (self.resends.iter())
             .filter(|id| !holding_changes.contains(*id))
             .filter(|id| {
                 self.local_chain(id)
@@ -602,25 +611,25 @@ impl Trees {
             })
             .cloned()
             .collect();
+        yielded.sort_by_key(|id| self.local_chain(id).count());
         for id in yielded {
             self.take_local(id);
         }
     }
 
     pub(crate) fn resend_folders_of_changes(&mut self) {
-        let missing: Vec<NodeId> = (self.holding_changes().into_iter())
-            .filter(|id| self.r.get(id).is_none() && !self.waiting.contains_key(id))
-            .filter(|id| {
-                (self.l.get(id))
-                    .is_some_and(|local| self.s.get(id).is_some_and(|s| s.same(&local.shape)))
-            })
+        let lacking = |id: &NodeId| self.r.get(id).is_none() && self.acknowledged(id).is_some();
+        let changed: Vec<NodeId> = self.changes().filter(|id| lacking(id)).cloned().collect();
+        let mut folders: Vec<NodeId> = (self.holding_changes().into_iter())
+            .filter(|id| lacking(id) && !changed.contains(id))
             .collect();
-        for id in missing {
-            self.resends.insert(id.clone());
+        folders.sort_by_key(|id| std::cmp::Reverse(self.local_chain(id).count()));
+        for id in changed.into_iter().chain(folders.iter().cloned()) {
             if !self.set_synced_if_valid(id.clone(), None) {
                 self.wait(id, None, Origin::Other);
             }
         }
+        self.resends.extend(folders);
         self.yield_resends();
     }
 
@@ -1522,7 +1531,9 @@ impl Trees {
     /// the delete beats the resend (GUN-548), unless L holds a change of this device's user below
     /// the resend: that change beats the delete (R8) and needs the resend as its folder. Once L
     /// holds no such change, the next build gives way. A change L holds below a folder S holds and
-    /// R lacks, also one found after the folder gave way, sends the folder again at the next build.
+    /// R lacks, also one found after the folder gave way, sends the folder again at the next build,
+    /// and a node S holds and R lacks that L changes itself is created again at L's position.
+    /// Resends give way parents first, so S takes each folder before what it holds.
     /// R taking a node it lacked again, live with the content L holds, ends its resend too: another
     /// device sent it first, and its position is a remote move. The device that made the change
     /// sends it again itself, as above.

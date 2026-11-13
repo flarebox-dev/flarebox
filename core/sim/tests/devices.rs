@@ -2475,6 +2475,52 @@ fn a_folder_a_restore_lost_gives_way_to_a_delete_once_the_change_in_it_is_gone()
     }
 }
 
+fn a_file_a_restore_lost_moved_before_a_delete_of_its_folder_lands(
+    parent: usize,
+    name: &str,
+) -> World {
+    let mut world = converge(
+        2,
+        &[
+            vec![(0, folder("a"))],
+            vec![
+                (0, BACKUP),
+                (0, user(0, 0, 1, "b")),
+                (0, user(1, 0, 2, "c.txt")),
+            ],
+        ],
+    )
+    .unwrap();
+    let mut steps = vec![
+        (0, delete(0)),
+        (0, SCAN),
+        (0, RESTORE),
+        (1, user(3, 2, parent, name)),
+    ];
+    steps.extend([(0, Step::Connect), (1, Step::Connect)]);
+    steps.extend([(0, Step::Work(0)); 12]);
+    steps.extend([(1, DELIVER); 8]);
+    steps.push((1, SCAN));
+    world.phase(2, &steps).unwrap();
+    world
+}
+
+#[test]
+fn a_file_a_restore_lost_renamed_before_a_delete_of_its_folder_lands_survives_it() {
+    let world = a_file_a_restore_lost_moved_before_a_delete_of_its_folder_lands(2, "b");
+    for device in 0..2 {
+        assert_eq!(paths_on(&world, device), ["a", "a/b", "a/b/b"]);
+    }
+}
+
+#[test]
+fn a_file_a_restore_lost_moved_out_before_a_delete_of_its_folder_lands_survives_it() {
+    let world = a_file_a_restore_lost_moved_before_a_delete_of_its_folder_lands(0, "c.txt");
+    for device in 0..2 {
+        assert_eq!(paths_on(&world, device), ["c.txt"]);
+    }
+}
+
 #[test]
 fn a_file_a_restore_lost_with_an_edit_not_yet_downloaded_gives_way_to_a_delete_of_its_folder() {
     let world = keep(
