@@ -488,15 +488,37 @@ impl Trees {
             .cloned()
             .collect();
         for id in yielded {
-            self.resends.remove(&id);
-            self.unsent_edits.remove(&id);
-            let Some(local) = self.l.get(&id).map(|node| node.shape.clone()) else {
-                continue;
-            };
-            if !self.set_synced_if_valid(id.clone(), Some(local.clone())) {
-                self.wait(id, Some(local), Origin::Other);
-            }
+            self.take_local(id);
         }
+    }
+
+    pub(crate) fn take_local(&mut self, id: NodeId) {
+        self.resends.remove(&id);
+        self.unsent_edits.remove(&id);
+        let Some(local) = self.l.get(&id).map(|node| node.shape.clone()) else {
+            return;
+        };
+        if !self.set_synced_if_valid(id.clone(), Some(local.clone())) {
+            self.wait(id, Some(local), Origin::Other);
+        }
+    }
+
+    pub(crate) fn write_held_beside(&self, id: &str) -> bool {
+        let (Some(local), Some(remote)) = (self.l.live(id), self.r.live(id)) else {
+            return false;
+        };
+        let Some(write) = local.content.as_ref() else {
+            return false;
+        };
+        local.same_position(remote)
+            && (self.r.iter()).any(|(other, node)| {
+                other != id
+                    && node.is_live()
+                    && node.shape.parent == remote.parent
+                    && (node.shape.content.as_ref()).is_some_and(|held| {
+                        same_content(held, write) && held.mtime_ns == write.mtime_ns
+                    })
+            })
     }
 
     pub fn remove_remote(&mut self, id: &str) {

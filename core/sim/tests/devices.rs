@@ -1261,7 +1261,7 @@ fn an_edit_back_to_the_bytes_a_restore_left_keeps_its_file_and_the_lost_edit_bes
 }
 
 #[test]
-fn a_write_two_downloads_place_after_a_restore_took_it_is_kept_by_both_beside_the_edit_over_it() {
+fn a_write_two_downloads_place_after_a_restore_took_it_is_kept_once_beside_the_edit_over_it() {
     let mut lost = vec![(0, file("a"))];
     lost.extend(commit(0));
     lost.extend([
@@ -1282,7 +1282,7 @@ fn a_write_two_downloads_place_after_a_restore_took_it_is_kept_by_both_beside_th
         assert_eq!(write(&a), Some(2));
         let mut writes: Vec<Option<i64>> = disk.entries().keys().map(write).collect();
         writes.sort();
-        assert_eq!(writes, [Some(1), Some(1), Some(2)]);
+        assert_eq!(writes, [Some(1), Some(2)]);
     }
 }
 
@@ -2214,4 +2214,51 @@ fn an_edit_back_to_the_restored_bytes_beats_another_devices_resend() {
         ],
     ];
     keep(3, &phases).unwrap();
+}
+
+fn send_a_lost_write_again_from_two_devices_after_a_later_edit(author_first: bool) {
+    let edit = |device, text| {
+        let action = Action {
+            kind: 2,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text,
+        };
+        (device, Step::User(action))
+    };
+    let mut world = converge(3, &[vec![(1, file("a"))], vec![edit(0, 1), (0, BACKUP)]]).unwrap();
+    let lost = (world.devices[2].disk.entries().values())
+        .find_map(|entry| entry.content.clone())
+        .unwrap();
+    let mut steps = vec![(0, RESTORE), (1, Step::Connect)];
+    steps.extend([(1, DELIVER); 8]);
+    steps.push(edit(1, 2));
+    steps.extend(commit(1));
+    steps.extend([(1, DELIVER); 4]);
+    let order = if author_first { [0, 2] } else { [2, 0] };
+    for device in order {
+        steps.push((device, Step::Connect));
+        steps.extend([(device, DELIVER); 8]);
+        steps.extend(commit(device));
+        steps.extend([(device, DELIVER); 4]);
+    }
+    world.phase(2, &steps).unwrap();
+    for device in &world.devices {
+        let entries: Vec<_> = device.disk.entries().values().collect();
+        let copies = (entries.iter())
+            .filter(|entry| entry.content.as_ref() == Some(&lost))
+            .count();
+        assert_eq!((entries.len(), copies), (2, 1), "{entries:?}");
+    }
+}
+
+#[test]
+fn a_lost_write_two_devices_send_again_after_a_later_edit_leaves_one_copy() {
+    send_a_lost_write_again_from_two_devices_after_a_later_edit(true);
+}
+
+#[test]
+fn a_lost_write_sent_again_by_another_device_first_leaves_one_copy() {
+    send_a_lost_write_again_from_two_devices_after_a_later_edit(false);
 }

@@ -391,6 +391,66 @@ fn content_edited_on_both_sides_is_forked_into_a_new_node() {
 }
 
 #[test]
+fn an_edit_on_both_sides_whose_write_a_file_beside_it_holds_downloads_r_instead_of_a_fork() {
+    let mut trees = trees(&[
+        (
+            "f",
+            Some(file(ROOT, "f", 2)),
+            Some(file(ROOT, "f", 1)),
+            Some(remote(file(ROOT, "f", 3))),
+        ),
+        synced("c", file(ROOT, "f (conflict from pc 2026-11-09)", 2)),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    assert!(trees.local().get("f").is_some());
+    assert_eq!(trees.class("f"), Class::Remote);
+}
+
+#[test]
+fn an_edit_on_both_sides_is_forked_unless_the_same_write_is_beside_it() {
+    let later = |shape: Shape| Shape {
+        content: Some(Content {
+            mtime_ns: 1,
+            ..content(2)
+        }),
+        ..shape
+    };
+    let cases = [
+        (
+            "same bytes written later",
+            (ROOT, "f"),
+            later(file(ROOT, "g", 2)),
+        ),
+        (
+            "same write in another folder",
+            (ROOT, "f"),
+            file("d", "g", 2),
+        ),
+        ("edit moved away from r", ("d", "f"), file(ROOT, "g", 2)),
+    ];
+    for (case, (parent, name), held) in cases {
+        let mut trees = trees(&[
+            synced("d", dir(ROOT, "d")),
+            (
+                "f",
+                Some(file(parent, name, 2)),
+                Some(file(ROOT, "f", 1)),
+                Some(remote(file(ROOT, "f", 3))),
+            ),
+            synced("c", held),
+        ]);
+        let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+        let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+        let created = (ops(&commit).iter()).any(
+            |op| matches!(op, op::Op::CreateFile(create) if create.content == Some(content(2))),
+        );
+        assert!(created, "{case}: {commit:?}");
+        assert_eq!(trees.local().get("f"), None, "{case}");
+    }
+}
+
+#[test]
 fn an_edit_against_a_remote_move_is_sent_alone() {
     let mut trees = trees(&[(
         "f",
