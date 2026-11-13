@@ -33,7 +33,7 @@ const SPAWN: Duration = Duration::from_secs(5);
 
 const PROBE: Duration = Duration::from_secs(5);
 
-const DELEGATED: Duration = Duration::from_secs(60);
+pub const DELEGATED: Duration = Duration::from_secs(60);
 
 const LOCK_WAIT: Duration = Duration::from_secs(60);
 
@@ -71,9 +71,10 @@ impl Service {
         let default = paths.state_dir == home.join(".local/state/koidrive")
             && paths.config_file == home.join(".config/koidrive/config.toml");
         let suffix = (!default).then(|| paths.state_key());
+        let binary = crate::update::homebrew_link(binary).unwrap_or_else(|| binary.to_path_buf());
         Ok(Service {
             suffix,
-            binary: text(binary)?,
+            binary: text(&binary)?,
             home: home.to_path_buf(),
             state_dir: paths.state_dir.clone(),
             env: vec![
@@ -516,7 +517,7 @@ fn output_within(
     Ok(Some((status, printed)))
 }
 
-fn version_of(binary: &Path) -> Option<Version> {
+pub fn version_of(binary: &Path) -> Option<Version> {
     let mut command = Command::new(binary);
     command.arg("--version").stderr(Stdio::null());
     let (status, printed) = output_within(&mut command, PROBE).ok()??;
@@ -547,6 +548,20 @@ fn delegated(
         true => &["service", "start", "--json"],
         false => &["_reconcile", "--json"],
     };
+    let mut command = Command::new(binary);
+    command.args(args).stderr(Stdio::inherit());
+    let output = output_within(&mut command, within);
+    delegated_report(manager, service, binary, args, within, output)
+}
+
+pub fn delegated_report(
+    manager: &dyn Manager,
+    service: &Service,
+    binary: &Path,
+    args: &[&str],
+    within: Duration,
+    output: io::Result<Option<(ExitStatus, Vec<u8>)>>,
+) -> Report {
     let failed = |why: String| {
         let problem = format!(
             "{} {} {why}",
@@ -555,9 +570,7 @@ fn delegated(
         );
         Report::unavailable(manager, problem)
     };
-    let mut command = Command::new(binary);
-    command.args(args).stderr(Stdio::inherit());
-    let (status, printed) = match output_within(&mut command, within) {
+    let (status, printed) = match output {
         Ok(Some(output)) => output,
         Ok(None) => {
             return failed(format!(
@@ -583,7 +596,7 @@ fn delegated(
     report
 }
 
-fn this_version() -> Version {
+pub fn this_version() -> Version {
     Version::parse(env!("CARGO_PKG_VERSION")).expect("the crate's version is SemVer")
 }
 
@@ -1536,6 +1549,42 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .contains("/usr/local/bin/koi")
+        );
+    }
+
+    #[test]
+    fn a_homebrew_koi_runs_the_service_from_the_link_that_outlives_brew_upgrade() {
+        let cases = [
+            ("/Users/ada", "/opt/homebrew"),
+            ("/Users/ada", "/usr/local"),
+            ("/home/ada", "/home/linuxbrew/.linuxbrew"),
+        ];
+        for (home, prefix) in cases {
+            let keg = format!("{prefix}/Cellar/koidrive/0.1.0/bin/koi");
+            let service =
+                Service::new(&paths(home, &[]), Path::new(home), Path::new(&keg)).unwrap();
+            let link = format!("{prefix}/opt/koidrive/bin/koi");
+            assert!(
+                service
+                    .unit()
+                    .contains(&format!("ExecStart=\"{link}\" _daemon\n")),
+                "{}",
+                service.unit()
+            );
+            assert!(service.plist().contains(&format!(
+                "<string>{link}</string>\n\t\t<string>_daemon</string>"
+            )));
+            assert_eq!(unit_binary(&service.unit()).as_deref(), Some(link.as_str()));
+        }
+        let own = Service::new(
+            &paths("/home/ada", &[]),
+            Path::new("/home/ada"),
+            Path::new("/srv/Cellar/koi"),
+        );
+        assert!(
+            own.unwrap()
+                .unit()
+                .contains("ExecStart=\"/srv/Cellar/koi\" _daemon\n")
         );
     }
 

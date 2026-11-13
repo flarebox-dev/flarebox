@@ -1,0 +1,772 @@
+{
+  "$defs": {
+    "AnswerChoice": {
+      "properties": {
+        "argv": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "consequence": {
+          "type": "string"
+        },
+        "token": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "token",
+        "consequence",
+        "argv"
+      ],
+      "type": "object"
+    },
+    "ArgumentInfo": {
+      "properties": {
+        "about": {
+          "type": "string"
+        },
+        "conflicts": {
+          "description": "What it can't be given with, named as in `requires`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "name": {
+          "type": "string"
+        },
+        "repeated": {
+          "type": "boolean"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "requires": {
+          "description": "What it needs beside it: argument names, and options as `--long`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "required",
+        "repeated",
+        "requires",
+        "conflicts",
+        "about"
+      ],
+      "type": "object"
+    },
+    "Auth": {
+      "description": "What the command signs in with.",
+      "oneOf": [
+        {
+          "enum": [
+            "none"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "device",
+          "description": "This device's credential, from `koi setup`. Without one it fails with `auth_required`.",
+          "type": "string"
+        },
+        {
+          "const": "cloudflare",
+          "description": "A Cloudflare login, which only `--interactive` starts. Without one it fails with `auth_required`.",
+          "type": "string"
+        }
+      ]
+    },
+    "Blocked": {
+      "description": "A folder that the daemon may not read, as its `access` request finds it.",
+      "properties": {
+        "folder": {
+          "type": "string"
+        },
+        "waiting": {
+          "description": "The read still waits after two seconds, usually because macOS is asking the person. Otherwise macOS refused it.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "folder",
+        "waiting"
+      ],
+      "type": "object"
+    },
+    "Code": {
+      "description": "What kind of failure an error is. Each code has one exit status.",
+      "oneOf": [
+        {
+          "const": "failed",
+          "description": "No more specific code applies.",
+          "type": "string"
+        },
+        {
+          "const": "usage",
+          "description": "The arguments are invalid, or input the command needs is missing.",
+          "type": "string"
+        },
+        {
+          "const": "decision_required",
+          "description": "`status --check` found a decision that needs a choice.",
+          "type": "string"
+        },
+        {
+          "const": "auth_required",
+          "description": "Credentials are missing or refused, or a person must log in.",
+          "type": "string"
+        },
+        {
+          "const": "halted",
+          "description": "Sync is halted or stopped, and the command cannot go on until that is fixed.",
+          "type": "string"
+        },
+        {
+          "const": "unavailable",
+          "description": "The server or the network is offline, unavailable or limits the rate at the moment.",
+          "type": "string"
+        },
+        {
+          "const": "stale_decision",
+          "description": "The decision answered no longer exists, or a request ID was used before with other arguments or for a pairing\ncode that has expired.",
+          "type": "string"
+        },
+        {
+          "const": "interrupted",
+          "description": "A signal stopped the command, or an earlier run with the same request ID has no recorded outcome.",
+          "type": "string"
+        }
+      ]
+    },
+    "CommandInfo": {
+      "properties": {
+        "about": {
+          "type": "string"
+        },
+        "aliases": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "arguments": {
+          "items": {
+            "$ref": "#/$defs/ArgumentInfo"
+          },
+          "type": "array"
+        },
+        "auth": {
+          "$ref": "#/$defs/Auth"
+        },
+        "command": {
+          "description": "The subcommand path, as in the envelope's `command`.",
+          "type": "string"
+        },
+        "groups": {
+          "description": "Arguments that are given together or apart, named as in `requires`.",
+          "items": {
+            "$ref": "#/$defs/GroupInfo"
+          },
+          "type": "array"
+        },
+        "options": {
+          "items": {
+            "$ref": "#/$defs/OptionInfo"
+          },
+          "type": "array"
+        },
+        "output": {
+          "$ref": "#/$defs/Output"
+        },
+        "schema": {
+          "description": "The file of the schema of its envelope in docs/json-schema/v1.",
+          "type": "string"
+        },
+        "subcommands": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "usage": {
+          "description": "Clap's usage line, as `--help` shows it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "command",
+        "about",
+        "usage",
+        "aliases",
+        "arguments",
+        "options",
+        "groups",
+        "subcommands",
+        "auth",
+        "output",
+        "schema"
+      ],
+      "type": "object"
+    },
+    "Counts": {
+      "properties": {
+        "affected_files": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "deletions": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exceeded": {
+          "items": {
+            "$ref": "#/$defs/LimitKind"
+          },
+          "type": "array"
+        },
+        "space_files": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "deletions",
+        "affected_files",
+        "space_files",
+        "exceeded"
+      ],
+      "type": "object"
+    },
+    "Decision": {
+      "description": "A decision sync waits on, with every item it holds and the command for each answer.",
+      "properties": {
+        "answers": {
+          "items": {
+            "$ref": "#/$defs/AnswerChoice"
+          },
+          "type": "array"
+        },
+        "asked_at_ms": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "counts": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Counts"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "group": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecisionGroup"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/Item"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "$ref": "#/$defs/DecisionKind"
+        },
+        "requires_choice": {
+          "description": "False for a notice that only takes `dismiss`: it holds nothing and blocks nothing.",
+          "type": "boolean"
+        },
+        "space_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "space_id",
+        "kind",
+        "asked_at_ms",
+        "requires_choice",
+        "items",
+        "answers"
+      ],
+      "type": "object"
+    },
+    "DecisionGroup": {
+      "enum": [
+        "created_after_restore_point",
+        "changed_on_this_device",
+        "created_on_this_device",
+        "deleted_on_this_device",
+        "requested_before_reset"
+      ],
+      "type": "string"
+    },
+    "DecisionKind": {
+      "enum": [
+        "mass_delete",
+        "remote_mass_delete",
+        "ambiguous_disappearance",
+        "conflict",
+        "recovery"
+      ],
+      "type": "string"
+    },
+    "ErrorBody": {
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/Code"
+        },
+        "message": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ],
+      "type": "object"
+    },
+    "GroupInfo": {
+      "properties": {
+        "members": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "multiple": {
+          "description": "More than one member may be given.",
+          "type": "boolean"
+        },
+        "required": {
+          "description": "One of the members must be given.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "members",
+        "required",
+        "multiple"
+      ],
+      "type": "object"
+    },
+    "HelpData": {
+      "properties": {
+        "commands": {
+          "description": "The command asked about and every command under it.",
+          "items": {
+            "$ref": "#/$defs/CommandInfo"
+          },
+          "type": "array"
+        },
+        "help": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "help",
+        "commands"
+      ],
+      "type": "object"
+    },
+    "Item": {
+      "properties": {
+        "files": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "node_id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "node_id",
+        "path",
+        "files"
+      ],
+      "type": "object"
+    },
+    "LimitKind": {
+      "enum": [
+        "deletions",
+        "share"
+      ],
+      "type": "string"
+    },
+    "Next": {
+      "description": "A command to run next, as the arguments to pass.",
+      "properties": {
+        "argv": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "argv"
+      ],
+      "type": "object"
+    },
+    "OptionInfo": {
+      "properties": {
+        "about": {
+          "type": "string"
+        },
+        "conflicts": {
+          "description": "What it can't be given with, named as in `requires`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "global": {
+          "description": "Whether every subcommand takes it too.",
+          "type": "boolean"
+        },
+        "long": {
+          "type": "string"
+        },
+        "require_equals": {
+          "description": "A value follows an equals sign, as in `--json=1`, never as the next argument.",
+          "type": "boolean"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "requires": {
+          "description": "What it needs beside it, named as in the arguments, and options as `--long`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "short": {
+          "maxLength": 1,
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value": {
+          "description": "The name of the value it takes, or null for a flag.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value_optional": {
+          "description": "The value may be left out, as in `--json`.",
+          "type": "boolean"
+        },
+        "values": {
+          "description": "The values it accepts, when it accepts only some.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "long",
+        "short",
+        "value",
+        "value_optional",
+        "require_equals",
+        "values",
+        "required",
+        "requires",
+        "conflicts",
+        "global",
+        "about"
+      ],
+      "type": "object"
+    },
+    "Outcome": {
+      "oneOf": [
+        {
+          "enum": [
+            "error"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "ok",
+          "description": "The command did what it was asked.",
+          "type": "string"
+        },
+        {
+          "const": "accepted",
+          "description": "The work is recorded and happens later; it has not finished.",
+          "type": "string"
+        },
+        {
+          "const": "unchanged",
+          "description": "The state the command asks for already held, or the command repeated an accepted answer, so nothing changed.",
+          "type": "string"
+        }
+      ]
+    },
+    "Output": {
+      "description": "What it prints on stdout with `--json`. It never reads stdin then.",
+      "oneOf": [
+        {
+          "const": "envelope",
+          "description": "One envelope.",
+          "type": "string"
+        },
+        {
+          "const": "lines",
+          "description": "One JSON object per line while it runs.",
+          "type": "string"
+        }
+      ]
+    },
+    "Report": {
+      "description": "The service as a command left it.",
+      "properties": {
+        "blocked": {
+          "items": {
+            "$ref": "#/$defs/Blocked"
+          },
+          "type": "array"
+        },
+        "folders": {
+          "description": "The folders the profile links, as the command that brought the service in line counted them. Left out when it\nlinks none or the command did not count them.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lingers": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "manager": {
+          "$ref": "#/$defs/ServiceManager"
+        },
+        "name": {
+          "type": "string"
+        },
+        "problem": {
+          "description": "Why the service cannot run, or did not change as it should.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/State"
+        }
+      },
+      "required": [
+        "manager",
+        "name",
+        "state"
+      ],
+      "type": "object"
+    },
+    "ServiceManager": {
+      "enum": [
+        "systemd",
+        "launchd"
+      ],
+      "type": "string"
+    },
+    "State": {
+      "description": "What the service manager reports for a service, or what keeps koi from using it.",
+      "oneOf": [
+        {
+          "enum": [
+            "running",
+            "not_installed"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "stopped",
+          "description": "Installed, but not running: it failed.",
+          "type": "string"
+        },
+        {
+          "const": "switched_off",
+          "description": "The launch agent is installed but not loaded: the person switched koi off in Login Items, which unloads it.",
+          "type": "string"
+        },
+        {
+          "const": "unavailable",
+          "description": "This machine has no service manager koi can use, such as a Linux system without a systemd user session.",
+          "type": "string"
+        },
+        {
+          "const": "off",
+          "description": "config.toml turns the service off.",
+          "type": "string"
+        }
+      ]
+    },
+    "UpdateResult": {
+      "enum": [
+        "updated",
+        "unchanged"
+      ],
+      "type": "string"
+    },
+    "UpdatedData": {
+      "description": "What `koi update` did: `updated` from `from` to `to` through `via`, or `unchanged` when this device runs the newest\nrelease. `service` is the background service once the new koi took it.",
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "result": {
+          "$ref": "#/$defs/UpdateResult"
+        },
+        "service": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Report"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "to": {
+          "type": "string"
+        },
+        "via": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Via"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "from",
+        "to",
+        "result"
+      ],
+      "type": "object"
+    },
+    "Via": {
+      "enum": [
+        "homebrew",
+        "installer",
+        "app"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "else": {
+    "properties": {
+      "error": {
+        "type": "null"
+      }
+    }
+  },
+  "if": {
+    "properties": {
+      "outcome": {
+        "const": "error"
+      }
+    }
+  },
+  "properties": {
+    "command": {
+      "const": "update"
+    },
+    "data": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/HelpData"
+        },
+        {
+          "$ref": "#/$defs/UpdatedData"
+        }
+      ]
+    },
+    "decisions": {
+      "items": {
+        "$ref": "#/$defs/Decision"
+      },
+      "type": "array"
+    },
+    "error": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ErrorBody"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "next_commands": {
+      "items": {
+        "$ref": "#/$defs/Next"
+      },
+      "type": "array"
+    },
+    "outcome": {
+      "$ref": "#/$defs/Outcome"
+    },
+    "schema_version": {
+      "const": 1
+    }
+  },
+  "required": [
+    "schema_version",
+    "command",
+    "outcome",
+    "data",
+    "error",
+    "decisions",
+    "next_commands"
+  ],
+  "then": {
+    "properties": {
+      "error": {
+        "type": "object"
+      }
+    }
+  },
+  "title": "koi update --json",
+  "type": "object"
+}

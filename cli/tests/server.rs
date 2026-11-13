@@ -184,7 +184,8 @@ impl Machine {
             .env("HOME", self.home.path())
             .env("XDG_CONFIG_HOME", self.path("config"))
             .env("XDG_STATE_HOME", self.path("state"))
-            .env_remove("KOIDRIVE_LOG");
+            .env_remove("KOIDRIVE_LOG")
+            .env("KOIDRIVE_UPDATE_CHECK", "0");
         if !self.service {
             command.env("XDG_RUNTIME_DIR", self.path("run"));
         }

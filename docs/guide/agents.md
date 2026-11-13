@@ -114,6 +114,8 @@ The `error.code` values match these: `failed`, `usage`, `decision_required`, `au
 
 Connecting and catching up aren't failures, so they exit 0. Neither is a pause: while sync is paused, `data.paused` is true (it's left out otherwise), `data.conditions` holds `paused`, which exits 0, the folders the pause stopped add no `stopped` condition, and `next_commands` names `koi resume`. `data.conditions` lists every condition found, with or without `--check`.
 
+`data.update` says whether a newer release is out: `state` is `available`, `up_to_date`, `unknown` (no check has had an answer yet) or `off`, and `version` is the version this device runs. With `available` it adds `latest`, `url` and `command`, which is `koi update`. `checked_at` is when GitHub last answered. `--check` ignores it.
+
 ## Watch the daemon
 
 `koi _daemon --json` prints one JSON object per line on stdout, each with `schema_version` and `event`: `started` with the version, the socket and the number of folders, `folder_state` with the folder, its space and its new state whenever a folder's state changes, `stopping` with the signal, and `stopped`. Its logs on stderr are JSON lines too. If it can't start, it prints one error envelope on a single line.

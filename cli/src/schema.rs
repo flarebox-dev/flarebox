@@ -8,7 +8,7 @@ use crate::manifest::file_name;
 use crate::report::{
     AccountData, AnsweredData, ChoicesData, DaemonLine, DevicesData, DiagnosticsData, Empty,
     Envelope, FolderData, HelpData, InvitationData, RequestsData, RestoreAskedData, RevokedData,
-    SCHEMA_VERSION, SetupData, SpaceData, SpacesData, StatusData, TrashData, UnlinkedData,
+    SCHEMA_VERSION, SetupData, SpaceData, SpacesData, StatusData, TrashData, UnlinkedData, UpdatedData,
     UsagesData, VersionInfoData, VersionsData, WithService,
 };
 use crate::telemetry::{ChoiceData, TelemetryStatusData};
@@ -53,6 +53,7 @@ fn data(command: &str) -> Option<&'static [Data]> {
         "telemetry on" | "telemetry off" | "telemetry reset" => &[of::<ChoiceData>],
         "telemetry preview" => &[of::<Map<String, Value>>],
         "diagnose" => &[of::<DiagnosticsData>],
+        "update" => &[of::<UpdatedData>],
         _ => return None,
     })
 }

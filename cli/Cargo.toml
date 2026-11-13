@@ -20,6 +20,7 @@ console = "0.16.6"
 koidrive-cloudflare = { path = "../core/cloudflare" }
 koidrive-driver = { path = "../core/driver" }
 koidrive-engine = { path = "../core/engine" }
+koidrive-fs = { path = "../core/fs" }
 koidrive-ipc = { path = "../core/ipc" }
 koidrive-net = { path = "../core/net" }
 koidrive-proto = { path = "../core/proto" }
