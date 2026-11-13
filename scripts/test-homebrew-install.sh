@@ -55,6 +55,7 @@ for each in v1.2.3 v1.2.3-alpha.4 "$tag"; do
 done
 render "$upgrade"
 brew upgrade koidrive
+brew cleanup koidrive
 [ "$(brew list --versions koidrive)" = "koidrive ${upgrade#v}" ] || { echo "FAIL brew upgrade koidrive did not install ${upgrade#v}: $(brew list --versions koidrive)" >&2; exit 1; }
 brew uninstall koidrive
 [ ! -e "$(brew --prefix)/bin/koi" ] || { echo "FAIL koi is still in $(brew --prefix)/bin after brew uninstall" >&2; exit 1; }
