@@ -1,6 +1,6 @@
 # Koidrive for macOS
 
-A menu bar app that links the Rust core through [UniFFI](https://mozilla.github.io/uniffi-rs/). It has a menu bar menu (status, progress, recent changes, notices, pause and resume, open folder), a first-run setup window (server, sign-in, folder), a questions window, and settings (linked folders, account, storage used by each space, problems, open at login). The session runs the sync driver of `core/driver` in-process through `core/ffi`: it signs this Mac in, links folders, follows each space's log and observes the disk. The driver does not run the sync engine yet, so no file is uploaded or downloaded, and progress, recent changes and notices stay empty until it does. There is no File Provider extension.
+A menu bar app over the `koi` command. It has a menu bar menu (status, notices, pause and resume, open folder), a first-run setup window (server, sign-in, folder), a questions window, and settings (linked folders, account, storage used by each space, problems, open at login). The app carries `koi` in `Contents/Helpers/koi` and shows the same device, folders and background service as `koi status`. Through `core/ffi` and [UniFFI](https://mozilla.github.io/uniffi-rs/), it runs each change as a `koi --json` command and follows the state of the sync daemon over its socket. While no daemon runs, it reads the state with `koi status`. There is no File Provider extension.
 
 ## Requirements
 
@@ -14,7 +14,6 @@ A menu bar app that links the Rust core through [UniFFI](https://mozilla.github.
 Run these from `apps/macos`:
 
 ```sh
-# 1. Build core/ffi as a static library and generate the Swift bindings.
 scripts/build-ffi.sh
 
 # 2. Test the bindings and the app's models.
@@ -23,16 +22,23 @@ swift test --package-path KoidriveFFI
 # 3. Generate Koidrive.xcodeproj from project.yml.
 scripts/generate-project.sh
 
-# 4. Build the app without signing it.
 xcodebuild -project Koidrive.xcodeproj -scheme Koidrive -configuration Release \
   -derivedDataPath build/DerivedData -destination "platform=macOS,arch=$(uname -m)" \
   CODE_SIGNING_ALLOWED=NO build
 open build/DerivedData/Build/Products/Release/Koidrive.app
 ```
 
-The app keeps its sync profile in `~/Library/Application Support/Koidrive`: the device credential (`state/credential.json`), one store per linked space (`state/spaces/`) and the pause. One process at a time can open the profile. Time Machine leaves out the credential, so a Mac restored from a backup sets Koidrive up again as a new device, and the files in its folders stay.
+The app syncs the profile of the installed launch agent (`~/Library/LaunchAgents/dev.koidrive.koi*.plist`), or else the profile `koi` uses in the app's environment (`~/.local/state/koidrive` by default). Its `koi` commands run with that profile's `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_RUNTIME_DIR`. When it starts, it runs `koi _reconcile`, which brings the background service in line with the linked folders as `koi folder link` does and leaves a service switched off in Login Items off.
 
-To try it against a local server, start the Worker in `server/` with `pnpm exec wrangler dev` (after `pnpm install`), enter `http://127.0.0.1:8787` in the setup window, open `http://127.0.0.1:8787/setup` in a browser, and claim the server with the code that `wrangler dev` prints. Plain `http` is accepted only on a loopback address.
+To try it against a local server without touching your own profile, give the app a home of its own and start it from a terminal:
+
+```sh
+profile="$(mktemp -d)"
+HOME="$profile" XDG_CONFIG_HOME="$profile/config" XDG_STATE_HOME="$profile/state" \
+	XDG_RUNTIME_DIR="$profile/run" build/DerivedData/Build/Products/Release/Koidrive.app/Contents/MacOS/Koidrive
+```
+
+Then start the Worker in `server/` with `pnpm exec wrangler dev` (after `pnpm install`), enter `http://127.0.0.1:8787` in the setup window, open `http://127.0.0.1:8787/setup` in a browser, and claim the server with the code that `wrangler dev` prints. Plain `http` is accepted only on a loopback address.
 
 To show a state the driver cannot reach yet, start a Debug build on the fake core in `core/ffi` with a scripted scenario. Release builds ignore the `FakeScenario` setting. The fake keeps its state in memory only:
 
@@ -47,9 +53,9 @@ The scenarios are `firstRun`, `upToDate`, `syncing`, `paused`, `offline`, `massD
 
 You can also open `Koidrive.xcodeproj` in Xcode after step 3 and run the Koidrive scheme; the views have SwiftUI previews for these scenarios. Local builds are signed ad hoc, so no Apple developer account is needed.
 
-`core/ffi/scripts/integration-test.sh`, run from anywhere in the repository, tests the session against the Worker under `wrangler dev`: claiming, pairing, linking, status events, the pause, questions and problems.
+`core/ffi/scripts/integration-test.sh`, run from anywhere in the repository, tests the session against the Worker under `wrangler dev` with a debug `koi` and its daemon: claiming, pairing, linking, status events, the pause, questions, problems and signing out.
 
-Run `scripts/build-ffi.sh` again after every change to `core/ffi`. It rebuilds the Rust library and regenerates the Swift API together. UniFFI checksums stop the app at launch when the library and the bindings disagree on the API, but they do not detect a build that is merely out of date: an old library with its matching bindings still launches.
+Run `scripts/build-ffi.sh` again after every change to `core/ffi` or `cli`. It rebuilds the Rust library and regenerates the Swift API together. UniFFI checksums stop the app at launch when the library and the bindings disagree on the API, but they do not detect a build that is merely out of date: an old library with its matching bindings still launches.
 
 ## Layout
 
@@ -59,11 +65,11 @@ Run `scripts/build-ffi.sh` again after every change to `core/ffi`. It rebuilds t
 | `project.yml` | The XcodeGen spec for `Koidrive.xcodeproj`. The generated project is not checked in, so edit `project.yml` and run `scripts/generate-project.sh` again after changing it or adding or removing source files. |
 | `KoidriveFFI/` | A Swift package: the `KoidriveFFI` library wraps the Rust core (the generated bindings and the static library as an XCFramework), and `KoidriveModel` holds the app's view models. Both have tests. |
 | `scripts/generate-project.sh` | Generates `Koidrive.xcodeproj` with the pinned XcodeGen. |
-| `scripts/build-ffi.sh` | Builds the Rust library and fills in `KoidriveFFI/Frameworks` and `KoidriveFFI/Sources`. These generated files are not checked in. |
-| `scripts/build-release.sh`, `sign-app.sh`, `make-dmg.sh`, `notarize.sh`, `verify-release.sh` | Build, sign, package, notarize and verify a release disk image. The macOS release workflow runs them; see [docs/release-macos.md](../../docs/release-macos.md). |
+| `scripts/build-ffi.sh` | Builds the Rust library and `koi`, and fills in `KoidriveFFI/Frameworks`, `KoidriveFFI/Sources` and `build/koi`. These generated files are not checked in. |
+| `scripts/build-release.sh`, `sign-app.sh`, `make-dmg.sh`, `notarize.sh`, `verify-release.sh` | Build, sign, package, notarize and verify a release disk image, with `koi` signed inside the app. The macOS release workflow runs them; see [docs/release-macos.md](../../docs/release-macos.md). |
 | `Koidrive.entitlements` | The entitlements release builds are signed with, deliberately empty. |
 
-The Rust library is built for the architecture of the machine you build on, not as a universal binary.
+The Rust library and `koi` are built for the architecture of the machine you build on, not as universal binaries.
 
 ## License
 

@@ -2196,6 +2196,27 @@ fn a_first_link_with_a_name_clash(remote: &mut Remote, theirs: &str, mine: &str)
 }
 
 #[test]
+fn a_first_link_records_its_proven_cause_with_the_stored_question() {
+    let mut remote = Remote::new();
+    let (site, b) = a_first_link_with_a_name_clash(&mut remote, "notes.txt", "Notes.txt");
+    drop(b);
+    let question = answer(&site, Answer::Publish);
+    assert_eq!(
+        question.recovery_cause,
+        Some(crate::RecoveryCause {
+            trigger: crate::RecoveryTrigger::NoSyncState,
+            restore_point_ms: None,
+        })
+    );
+    assert_eq!(
+        question.kind,
+        crate::QuestionKind::Recovery {
+            group: crate::RecoveryGroup::CreatedOnThisDevice,
+        }
+    );
+}
+
+#[test]
 fn a_first_link_holds_what_the_space_lacks_and_publishing_it_keeps_both_files_of_one_name() {
     // The space's name and the folder's: in another case, in another Unicode form, and where case folding changes
     // the name's length.

@@ -106,12 +106,16 @@ pub enum ServerAction {
     },
     /// Claim a server deployed without koi setup, with the one-time claim code that its /setup page writes to the
     /// Worker's log. This device becomes the owner's first device.
+    #[command(group(clap::ArgGroup::new("code_source").required(true).args(["code", "code_stdin"])))]
     Claim {
         /// The server's address, such as https://koidrive.alice.workers.dev.
         #[arg(value_name = "SERVER_URL")]
         server: String,
         /// The claim code from the Worker's log.
-        code: String,
+        code: Option<String>,
+        /// Read the claim code from one line of stdin rather than an argument.
+        #[arg(long)]
+        code_stdin: bool,
         /// Your name, which the server keeps for its owner, at most 255 bytes.
         #[arg(long, value_parser = crate::short_name)]
         user: String,
@@ -709,7 +713,7 @@ async fn scripted(
         }
     }
     let code = match script.pairing_code_stdin {
-        true => Some(read_code().await?),
+        true => Some(read_invitation().await?),
         false => None,
     };
     let (account, paired) = match (credential, code) {
@@ -764,7 +768,7 @@ async fn scripted(
     )
 }
 
-async fn read_code() -> Result<Invitation, CliError> {
+async fn read_invitation() -> Result<Invitation, CliError> {
     let line = tokio::task::spawn_blocking(|| read_line(std::io::stdin().lock()))
         .await
         .map_err(|error| error.to_string())?
@@ -1071,7 +1075,17 @@ async fn guarded(
     outcome
 }
 
-#[cfg(test)]
+pub(crate) async fn read_code(code: Option<String>, code_stdin: bool) -> Result<String, CliError> {
+    if !code_stdin {
+        return Ok(code.expect("clap requires a code or --code-stdin"));
+    }
+    let code = read_answer(|| read_line(std::io::stdin().lock())).await?;
+    if code.is_empty() {
+        return Err(CliError::usage("stdin contains no code"));
+    }
+    Ok(code)
+}
+
 async fn read_answer(
     read: impl FnOnce() -> std::io::Result<String> + Send + 'static,
 ) -> Result<String, CliError> {

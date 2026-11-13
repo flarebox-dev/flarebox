@@ -8,6 +8,18 @@ use crate::types::{
 };
 
 pub(crate) fn pairing_code<'a>(text: &'a str, server_url: &str) -> Result<&'a str, SessionError> {
+    let unquoted = |word: &'a str| word.trim_matches('\'');
+    let words: Vec<&str> = text.split_whitespace().map(unquoted).collect();
+    if let [code, "--server", url] = words.as_slice() {
+        let server = server_url.trim_end_matches('/');
+        if url.trim_end_matches('/') != server {
+            return Err(SessionError::CodeForOtherServer {
+                host: (*url).to_owned(),
+                server: server.to_owned(),
+            });
+        }
+        return Ok(code);
+    }
     let text = text.trim();
     let text = text
         .strip_prefix('\'')
@@ -182,6 +194,20 @@ mod tests {
             pairing_code("'K7QM-2XPD@[2001:db8::1]'", "https://[2001:db8::1]/"),
             Ok("K7QM-2XPD")
         );
+        assert_eq!(
+            pairing_code(
+                " K7QM-2XPD --server http://127.0.0.1:8787/ ",
+                "http://127.0.0.1:8787"
+            ),
+            Ok("K7QM-2XPD")
+        );
+        assert_eq!(
+            pairing_code(
+                "K7QM-2XPD --server 'http://files.example.com:8080'",
+                "http://files.example.com:8080/"
+            ),
+            Ok("K7QM-2XPD")
+        );
     }
 
     #[test]
@@ -204,6 +230,16 @@ mod tests {
             Err(SessionError::CodeForOtherServer {
                 host: "files.example.com".to_owned(),
                 server: "files.example.com:8443".to_owned(),
+            })
+        );
+        assert_eq!(
+            pairing_code(
+                "K7QM-2XPD --server http://127.0.0.1:8788/",
+                "http://127.0.0.1:8787/"
+            ),
+            Err(SessionError::CodeForOtherServer {
+                host: "http://127.0.0.1:8788/".to_owned(),
+                server: "http://127.0.0.1:8787".to_owned(),
             })
         );
         assert_eq!(

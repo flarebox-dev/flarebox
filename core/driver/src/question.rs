@@ -24,6 +24,30 @@ pub struct Question {
     /// Rows stored before this field read as their own line.
     #[serde(default)]
     pub lineage: String,
+    /// The stored cause of a recovery, absent when an older producer did not record it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_cause: Option<RecoveryCause>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryCause {
+    #[serde(default)]
+    pub trigger: RecoveryTrigger,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_point_ms: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryTrigger {
+    SpaceRewound,
+    StoreRolledBack,
+    StoreOlderThanDisk,
+    SpaceImported,
+    NoSyncState,
+    #[default]
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +97,7 @@ mod tests {
                 device_id: None,
             }],
             lineage: "q1".into(),
+            recovery_cause: None,
         };
         let json = serde_json::to_value(&question).unwrap();
         assert_eq!(json["kind"]["type"], "mass_delete");

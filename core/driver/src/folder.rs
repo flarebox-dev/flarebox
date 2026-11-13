@@ -1230,6 +1230,10 @@ impl Folder {
             engine.replace_remote(tx, staging)?;
             if first_link {
                 (engine.commits).first_link(&mut engine.trees, &mut engine.ids, now_ms);
+                engine.recovery_cause = Some(crate::RecoveryCause {
+                    trigger: crate::RecoveryTrigger::NoSyncState,
+                    restore_point_ms: None,
+                });
             }
             Ok(tx.remote_node_count()?)
         })?;

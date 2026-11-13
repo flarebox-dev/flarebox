@@ -6,8 +6,8 @@
 
 use koidrive_driver::{
     Account, FolderState, FolderStatus, Limit, Question, QuestionKind, RecoveryGroup,
-    RestoreRejection, RestoreRequest, RestoreState, RestoreStatus, RestoreWait, Status, Update,
-    Wait, WaitKind,
+    RecoveryTrigger, RestoreRejection, RestoreRequest, RestoreState, RestoreStatus, RestoreWait,
+    Status, Update, Wait, WaitKind,
 };
 use koidrive_ipc::{Code, Next};
 use koidrive_proto::v1::{DeviceInfo, SpaceInfo, SpaceUsage, device_info::Kind};
@@ -243,6 +243,10 @@ pub struct Decision {
     pub kind: DecisionKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<DecisionGroup>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_cause: Option<RecoveryCauseData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conflict: Option<ConflictData>,
     pub asked_at_ms: i64,
     /// False for a notice that only takes `dismiss`: it holds nothing and blocks nothing.
     pub requires_choice: bool,
@@ -250,6 +254,47 @@ pub struct Decision {
     pub counts: Option<Counts>,
     pub items: Vec<Item>,
     pub answers: Vec<AnswerChoice>,
+}
+
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ConflictData {
+    Conflict {
+        original: ConflictFileData,
+        copy: ConflictFileData,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sent_in: Option<String>,
+    },
+}
+
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
+pub struct ConflictFileData {
+    pub node_id: String,
+    pub revisions: RevisionsData,
+}
+
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
+pub struct RevisionsData {
+    pub content_rev: u64,
+    pub meta_rev: u64,
+}
+
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
+pub struct RecoveryCauseData {
+    pub trigger: RecoveryTriggerData,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restore_point_ms: Option<i64>,
+}
+
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryTriggerData {
+    SpaceRewound,
+    StoreRolledBack,
+    StoreOlderThanDisk,
+    SpaceImported,
+    NoSyncState,
+    Unknown,
 }
 
 #[derive(Debug, PartialEq, Serialize, JsonSchema)]
@@ -329,11 +374,49 @@ impl Decision {
                 None,
             ),
         };
+        let conflict = match &question.kind {
+            QuestionKind::Conflict {
+                original,
+                copy,
+                sent_in,
+            } => {
+                let file = |file: &koidrive_engine::question::ConflictFile| ConflictFileData {
+                    node_id: file.node_id.clone(),
+                    revisions: RevisionsData {
+                        content_rev: file.revisions.content_rev,
+                        meta_rev: file.revisions.meta_rev,
+                    },
+                };
+                Some(ConflictData::Conflict {
+                    original: file(original),
+                    copy: file(copy),
+                    sent_in: sent_in.clone(),
+                })
+            }
+            _ => None,
+        };
         Decision {
             id: question.id.clone(),
             space_id: question.space_id.clone(),
             kind,
             group,
+            conflict,
+            recovery_cause: question
+                .recovery_cause
+                .as_ref()
+                .map(|cause| RecoveryCauseData {
+                    trigger: match cause.trigger {
+                        RecoveryTrigger::SpaceRewound => RecoveryTriggerData::SpaceRewound,
+                        RecoveryTrigger::StoreRolledBack => RecoveryTriggerData::StoreRolledBack,
+                        RecoveryTrigger::StoreOlderThanDisk => {
+                            RecoveryTriggerData::StoreOlderThanDisk
+                        }
+                        RecoveryTrigger::SpaceImported => RecoveryTriggerData::SpaceImported,
+                        RecoveryTrigger::NoSyncState => RecoveryTriggerData::NoSyncState,
+                        RecoveryTrigger::Unknown => RecoveryTriggerData::Unknown,
+                    },
+                    restore_point_ms: cause.restore_point_ms,
+                }),
             asked_at_ms: question.asked_at_ms,
             requires_choice: requires_choice(question),
             counts,
@@ -1070,7 +1153,7 @@ pub enum Auth {
     Cloudflare,
 }
 
-/// What it prints on stdout with `--json`. It reads stdin only when an explicit input flag requests it.
+/// What it prints on stdout with `--json`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Output {
@@ -1130,6 +1213,19 @@ pub struct VersionInfoData {
 
 #[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct Empty {}
+
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
+pub struct LeftData {
+    /// The files and directories that could not be removed after the server revoked this device, such as a folder's
+    /// `.koidrive/device.json` owner record. Running `koi device leave` again removes them.
+    pub not_removed: Vec<NotRemovedData>,
+}
+
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
+pub struct NotRemovedData {
+    pub path: String,
+    pub error: String,
+}
 
 /// The data of a command that brings the background service in line with the profile, with the service's report.
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1241,6 +1337,7 @@ mod tests {
             lineage: id.into(),
             space_id: "space-Work".into(),
             asked_at_ms: 5,
+            recovery_cause: None,
             kind,
             items: vec![
                 HeldItem {
@@ -1378,6 +1475,127 @@ mod tests {
             )
         );
         assert!(!Decision::of(&question("q3", notice())).requires_choice);
+    }
+
+    #[test]
+    fn recovery_causes_reach_decision_json_without_changing_schema_version() {
+        let validator =
+            jsonschema::validator_for(&crate::schema::envelope("resolve").unwrap()).unwrap();
+        for (trigger, expected) in [
+            (RecoveryTrigger::SpaceRewound, "space_rewound"),
+            (RecoveryTrigger::StoreRolledBack, "store_rolled_back"),
+            (RecoveryTrigger::StoreOlderThanDisk, "store_older_than_disk"),
+            (RecoveryTrigger::SpaceImported, "space_imported"),
+            (RecoveryTrigger::NoSyncState, "no_sync_state"),
+            (RecoveryTrigger::Unknown, "unknown"),
+        ] {
+            for restore_point_ms in [Some(1_700_000_000_123), None] {
+                let mut question = question(
+                    "q1",
+                    QuestionKind::Recovery {
+                        group: RecoveryGroup::CreatedAfterRestorePoint,
+                    },
+                );
+                question.recovery_cause = Some(koidrive_driver::RecoveryCause {
+                    trigger,
+                    restore_point_ms,
+                });
+                let mut done = Done::ok(
+                    AnsweredData {
+                        decision_id: "q1".into(),
+                        answer: "keep".into(),
+                    },
+                    "",
+                );
+                done.decisions.push(Decision::of(&question));
+                let envelope = serde_json::to_value(Envelope::of("resolve", done)).unwrap();
+                let cause = &envelope["decisions"][0]["recovery_cause"];
+                assert_eq!(cause["trigger"], expected);
+                match restore_point_ms {
+                    Some(expected) => assert_eq!(cause["restore_point_ms"], expected),
+                    None => assert!(cause.get("restore_point_ms").is_none()),
+                }
+                assert_eq!(envelope["schema_version"], 1);
+                assert!(validator.is_valid(&envelope), "{envelope:#}");
+            }
+        }
+    }
+
+    #[test]
+    fn older_and_future_recovery_causes_remain_compatible() {
+        let question = question(
+            "q1",
+            QuestionKind::Recovery {
+                group: RecoveryGroup::CreatedAfterRestorePoint,
+            },
+        );
+        let mut stored = serde_json::to_value(&question).unwrap();
+        assert!(stored.get("recovery_cause").is_none());
+        let older: Question = serde_json::from_value(stored.clone()).unwrap();
+        assert!(older.recovery_cause.is_none());
+        let decision = serde_json::to_value(Decision::of(&older)).unwrap();
+        assert!(decision.get("recovery_cause").is_none());
+
+        stored["recovery_cause"] = serde_json::json!({
+            "trigger": "a_future_trigger",
+            "restore_point_ms": 123,
+        });
+        let future: Question = serde_json::from_value(stored).unwrap();
+        let decision = serde_json::to_value(Decision::of(&future)).unwrap();
+        assert_eq!(
+            decision["recovery_cause"],
+            serde_json::json!({
+                "trigger": "unknown",
+                "restore_point_ms": 123,
+            })
+        );
+    }
+
+    #[test]
+    fn conflict_payload_preserves_both_files_revisions_and_the_pending_commit() {
+        use koidrive_engine::question::{ConflictFile, Revisions};
+
+        let validator =
+            jsonschema::validator_for(&crate::schema::envelope("resolve").unwrap()).unwrap();
+        for sent_in in [Some("commit-42".to_owned()), None] {
+            let kind = QuestionKind::Conflict {
+                original: ConflictFile {
+                    node_id: "original-node".into(),
+                    revisions: Revisions {
+                        content_rev: 43,
+                        meta_rev: 17,
+                    },
+                },
+                copy: ConflictFile {
+                    node_id: "copy-node".into(),
+                    revisions: Revisions {
+                        content_rev: u64::MAX,
+                        meta_rev: 29,
+                    },
+                },
+                sent_in,
+            };
+            let decision = Decision::of(&question("q1", kind.clone()));
+            let mut done = Done::ok(
+                AnsweredData {
+                    decision_id: "q1".into(),
+                    answer: "keep-both".into(),
+                },
+                "",
+            );
+            done.decisions.push(decision);
+            let envelope = serde_json::to_value(Envelope::of("resolve", done)).unwrap();
+            let conflict = envelope["decisions"][0]["conflict"].clone();
+            assert_eq!(conflict["type"], "conflict");
+            assert_eq!(
+                serde_json::from_value::<QuestionKind>(conflict).unwrap(),
+                kind
+            );
+            assert_eq!(envelope["schema_version"], 1);
+            assert!(validator.is_valid(&envelope), "{envelope:#}");
+        }
+        let decision = serde_json::to_value(Decision::of(&question("q2", notice()))).unwrap();
+        assert!(decision.get("conflict").is_none());
     }
 
     #[test]

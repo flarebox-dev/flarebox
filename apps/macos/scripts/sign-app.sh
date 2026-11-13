@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Signs an app bundle with the hardened runtime and Koidrive.entitlements.
 # Usage: sign-app.sh <app> <identity>
 #   identity  the SHA-1 hash or name of a Developer ID Application identity, or - for an
 #             ad hoc signature (unsigned builds)
@@ -17,7 +16,13 @@ app="$1"
 identity="$2"
 macos_dir="$(cd "$(dirname "$0")/.." && pwd)"
 
-args=(--force --options runtime --entitlements "$macos_dir/Koidrive.entitlements" --sign "$identity")
+helper="$app/Contents/Helpers/koi"
+if [ ! -x "$helper" ]; then
+  echo "error: $helper is missing; build the app with scripts/build-release.sh." >&2
+  exit 1
+fi
+
+args=(--force --options runtime --sign "$identity")
 if [ "$identity" = "-" ]; then
   args+=(--timestamp=none)
 else
@@ -25,5 +30,8 @@ else
 fi
 if [ -n "${KEYCHAIN:-}" ]; then args+=(--keychain "$KEYCHAIN"); fi
 
-codesign "${args[@]}" "$app"
-codesign --display --verbose=2 "$app" 2>&1 | grep -E '^(Identifier|Authority|TeamIdentifier|Timestamp|CodeDirectory)'
+codesign "${args[@]}" "$helper"
+codesign "${args[@]}" --entitlements "$macos_dir/Koidrive.entitlements" "$app"
+for code in "$helper" "$app"; do
+  codesign --display --verbose=2 "$code" 2>&1 | grep -E '^(Identifier|Authority|TeamIdentifier|Timestamp|CodeDirectory)'
+done

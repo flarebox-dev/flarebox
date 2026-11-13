@@ -51,9 +51,9 @@ use koidrive_telemetry::schema::{DaemonStart, Failure, SetupStep};
 use crate::error::CliError;
 use crate::report::{
     AccountData, AnsweredData, Decision, DeviceData, DevicesData, Done, Empty, Envelope,
-    FolderData, HelpData, InvitationData, Lifecycle, RefusedSpace, RevokedData, SpaceData,
-    SpacesData, StatusData, UPDATE_COMMAND, UnlinkedData, UpdateNoticeData, UsageData, UsagesData,
-    VersionInfoData, WithService,
+    FolderData, HelpData, InvitationData, LeftData, Lifecycle, NotRemovedData, RefusedSpace,
+    RevokedData, SpaceData, SpacesData, StatusData, UPDATE_COMMAND, UnlinkedData, UpdateNoticeData,
+    UsageData, UsagesData, VersionInfoData, WithService,
 };
 use crate::request::Begun;
 
@@ -115,9 +115,13 @@ enum Command {
         script: setup::ScriptArgs,
     },
     /// Add this device with a pairing code from a device that is already paired.
+    #[command(group(clap::ArgGroup::new("code_source").required(true).args(["code", "code_stdin"])))]
     Join {
         /// The pairing code, such as K7QM-2XPD@koidrive.alice.workers.dev.
-        code: String,
+        code: Option<String>,
+        /// Read the pairing code from one line of stdin rather than an argument.
+        #[arg(long)]
+        code_stdin: bool,
         /// The server's address, for a code without @host or to replace its host.
         #[arg(long)]
         server: Option<String>,
@@ -297,6 +301,12 @@ enum DeviceAction {
         /// The device's ID, as koi device list shows it.
         #[arg(value_parser = device_id)]
         id: String,
+    },
+    /// Sign this device out: revoke it on the server and unlink every folder. The files stay where they are.
+    Leave {
+        /// Sign out even if this is the account's last active device or the server does not answer.
+        #[arg(long)]
+        last_device: bool,
     },
 }
 
@@ -532,7 +542,10 @@ async fn run(
             command,
             Command::Folder {
                 action: FolderAction::Link { .. } | FolderAction::Unlink { .. }
-            } | Command::Setup { .. }
+            } | Command::Device {
+                action: DeviceAction::Leave { .. }
+            } | Command::Resume
+                | Command::Setup { .. }
                 | Command::Join { .. }
                 | Command::Server {
                     action: setup::ServerAction::Claim { .. }
@@ -588,10 +601,12 @@ async fn execute(
         } => setup::setup(&paths, &device.name(), &login, &script, json, terminal).await,
         Command::Join {
             code,
+            code_stdin,
             server,
             device,
         } => {
             let join = async {
+                let code = setup::read_code(code, code_stdin).await?;
                 let invitation =
                     pairing::parse(&code, server.as_deref()).map_err(CliError::usage)?;
                 let request = Request::Pair {
@@ -608,10 +623,12 @@ async fn execute(
                 setup::ServerAction::Claim {
                     server,
                     code,
+                    code_stdin,
                     user,
                     device,
                 },
         } => {
+            let code = setup::read_code(code, code_stdin).await?;
             let request = Request::Claim {
                 server: pairing::server_url(&server),
                 code: code.trim().to_owned(),
@@ -893,7 +910,7 @@ async fn daemon(paths: Paths, json: bool) -> Result<Done, CliError> {
         }
     };
     let failed = |why| telemetry::failed(Failure::DaemonStart(why));
-    let driver = Driver::open(paths).map_err(|error| match error {
+    let driver = daemon_driver(paths).await.map_err(|error| match error {
         DriverError::Busy(_) => {
             failed(DaemonStart::Busy);
             CliError::from("another Koidrive daemon or command is using this profile")
@@ -957,6 +974,23 @@ async fn daemon(paths: Paths, json: bool) -> Result<Done, CliError> {
     tracing::info!("the daemon stopped");
     emit(Lifecycle::Stopped);
     Ok(Done::printed())
+}
+
+async fn daemon_driver(paths: Paths) -> Result<Driver, DriverError> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match Driver::open(paths.clone()) {
+            Err(DriverError::Busy(_))
+                if tokio::time::Instant::now() < deadline
+                    && tokio::net::UnixStream::connect(paths.socket())
+                        .await
+                        .is_err() =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            opened => return opened,
+        }
+    }
 }
 
 /// Prints a `folder_state` line whenever a folder's state differs from the one last printed for it. `watch` was
@@ -1277,11 +1311,41 @@ fn reading(paths: &Paths, credential: &Credential) -> Result<Auth, String> {
     ))
 }
 
+fn left(not_removed: Vec<koidrive_driver::CleanupFailure>) -> Done {
+    let mut text = "Signed out. This device no longer syncs, and the files in its folders stay where they are.\n".to_owned();
+    for failure in &not_removed {
+        text.push_str(&format!(
+            "{:?} could not be removed ({}). Run koi device leave again to remove it.\n",
+            failure.path,
+            printable(&failure.error),
+        ));
+    }
+    let data = LeftData {
+        not_removed: (not_removed.into_iter())
+            .map(|failure| NotRemovedData {
+                path: failure.path.to_string_lossy().into_owned(),
+                error: failure.error,
+            })
+            .collect(),
+    };
+    Done::ok(data, text)
+}
+
 /// Runs a device command (RFC 0009).
 async fn device(paths: Paths, action: DeviceAction) -> Result<Done, CliError> {
-    let auth = signed_in(&paths)?;
     match action {
+        DeviceAction::Leave { last_device } => {
+            let request = Request::Leave {
+                confirm_last_device: last_device,
+            };
+            let not_removed = match ipc::run(&paths, request).await? {
+                Response::SignedOut { not_removed } => not_removed,
+                other => return Err(unexpected(other)),
+            };
+            Ok(left(not_removed))
+        }
         DeviceAction::List => {
+            let auth = signed_in(&paths)?;
             let devices = devices(&auth).await?;
             let data = DevicesData {
                 devices: devices.iter().map(DeviceData::of).collect(),
@@ -1289,6 +1353,7 @@ async fn device(paths: Paths, action: DeviceAction) -> Result<Done, CliError> {
             Ok(Done::ok(data, device_table(&devices, now_ms())))
         }
         DeviceAction::Invite { request } => {
+            let auth = signed_in(&paths)?;
             let claim = match request.request_id {
                 None => None,
                 Some(id) => {
@@ -1330,6 +1395,7 @@ async fn device(paths: Paths, action: DeviceAction) -> Result<Done, CliError> {
             invited(&invitation, now_ms())
         }
         DeviceAction::Revoke { id } => {
+            let auth = signed_in(&paths)?;
             if id == auth.credentials().device_id {
                 return Err(CliError::usage(
                     "this device cannot revoke itself; revoke it from another device",
@@ -2453,6 +2519,208 @@ mod tests {
     }
 
     #[test]
+    fn codes_from_stdin_replace_but_never_accompany_positional_codes() {
+        for prefix in [
+            vec!["koi", "join"],
+            vec![
+                "koi",
+                "server",
+                "claim",
+                "files.example.com",
+                "--user",
+                "Ada",
+            ],
+        ] {
+            let mut args = prefix.clone();
+            args.push("--code-stdin");
+            assert!(parse(&args).is_ok(), "{args:?}");
+            args.push("ABCD-EFGH");
+            assert_eq!(
+                parse(&args).err().unwrap().kind(),
+                ErrorKind::ArgumentConflict,
+                "{args:?}"
+            );
+            assert_eq!(
+                parse(&prefix).err().unwrap().kind(),
+                ErrorKind::MissingRequiredArgument,
+                "{prefix:?}"
+            );
+            let mut positional = prefix;
+            positional.push("ABCD-EFGH");
+            assert!(parse(&positional).is_ok(), "{positional:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn leave_cleanup_quotes_terminal_controls_but_preserves_json_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let path = "/cleanup/line\n\u{1b}[2J";
+        let error = "denied\n\u{1b}[31m";
+        let listener = koidrive_ipc::bind(&paths.socket()).unwrap();
+        let served = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            koidrive_ipc::read_line(&mut stream).await.unwrap();
+            koidrive_ipc::write_line(
+                &mut stream,
+                &Response::SignedOut {
+                    not_removed: vec![koidrive_driver::CleanupFailure {
+                        path: path.into(),
+                        error: error.into(),
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let done = device(paths, DeviceAction::Leave { last_device: false })
+            .await
+            .unwrap();
+        served.await.unwrap();
+
+        assert!(done.text.contains("\"/cleanup/line\\n\\u{1b}[2J\""));
+        assert!(done.text.contains("denied\\u{a}\\u{1b}[31m"));
+        assert_eq!(done.text.lines().count(), 2);
+        assert!(!done.text.contains('\u{1b}'));
+        assert_eq!(done.data["not_removed"][0]["path"], path);
+        assert_eq!(done.data["not_removed"][0]["error"], error);
+        let encoded = serde_json::to_vec(&Envelope::of("device leave", done)).unwrap();
+        let decoded: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded["data"]["not_removed"][0]["path"], path);
+        assert_eq!(decoded["data"]["not_removed"][0]["error"], error);
+    }
+
+    #[test]
+    fn leave_cleanup_accepts_non_utf8_paths_and_emits_lossy_json_without_panicking() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let done = left(vec![koidrive_driver::CleanupFailure {
+            path: PathBuf::from(OsString::from_vec(b"/cleanup/bad\xff\n\x1b".to_vec())),
+            error: "denied\n\u{1b}".into(),
+        }]);
+
+        assert!(done.text.contains("\"/cleanup/bad\\xFF\\n\\u{1b}\""));
+        assert!(done.text.contains("denied\\u{a}\\u{1b}"));
+        assert_eq!(done.text.lines().count(), 2);
+        assert!(!done.text.contains('\u{1b}'));
+        assert_eq!(
+            done.data["not_removed"][0]["path"],
+            "/cleanup/bad\u{fffd}\n\u{1b}"
+        );
+        assert_eq!(done.data["not_removed"][0]["error"], "denied\n\u{1b}");
+        let encoded = serde_json::to_vec(&Envelope::of("device leave", done)).unwrap();
+        let decoded: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            decoded["data"]["not_removed"][0]["path"],
+            "/cleanup/bad\u{fffd}\n\u{1b}"
+        );
+        assert_eq!(decoded["data"]["not_removed"][0]["error"], "denied\n\u{1b}");
+    }
+
+    #[tokio::test]
+    async fn leaving_retries_cleanup_without_requiring_a_paired_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let listener = koidrive_ipc::bind(&paths.socket()).unwrap();
+        let served = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let line = koidrive_ipc::read_line(&mut stream).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<Request>(&line).unwrap(),
+                Request::Leave {
+                    confirm_last_device: false,
+                }
+            );
+            koidrive_ipc::write_line(
+                &mut stream,
+                &Response::Error {
+                    code: Code::Failed,
+                    message: "cleanup pending".into(),
+                    next: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let error = device(paths, DeviceAction::Leave { last_device: false })
+            .await
+            .err()
+            .unwrap();
+        served.await.unwrap();
+        assert_eq!(error.message, "cleanup pending");
+    }
+
+    #[tokio::test]
+    async fn resume_without_a_daemon_reconciles_without_overriding_background_off() {
+        let (_dir, paths, _root) = ipc::tests::linked_profile();
+        std::fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
+        std::fs::write(&paths.config_file, "[service]\nbackground = false\n").unwrap();
+        assert_eq!(
+            ipc::run(&paths, Request::Pause).await.unwrap(),
+            Response::Paused
+        );
+        assert!(!paths.socket().exists());
+        let validator = jsonschema::validator_for(&schema::envelope("resume").unwrap()).unwrap();
+
+        for expected in [report::Outcome::Ok, report::Outcome::Unchanged] {
+            let done = run(
+                paths.clone(),
+                Command::Resume,
+                true,
+                Arc::new(terminal::Terminal::new(true, false)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(done.outcome, expected);
+            assert_eq!(done.data["service"]["state"], "off");
+            assert_eq!(done.data["service"]["folders"], 1);
+            assert!(!paths.paused().exists());
+            assert!(!paths.socket().exists());
+            let envelope = serde_json::to_value(report::Envelope::of("resume", done)).unwrap();
+            assert!(validator.is_valid(&envelope), "{envelope:#}");
+        }
+    }
+
+    #[test]
+    fn a_daemon_waits_asynchronously_for_a_stopped_profile_reader() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::under(dir.path());
+            let held = Driver::open(paths.clone()).unwrap();
+            let release = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                drop(held);
+            });
+            let opened =
+                tokio::time::timeout(std::time::Duration::from_secs(2), daemon_driver(paths))
+                    .await
+                    .expect("the daemon must yield while a status reader holds the profile");
+            assert!(
+                opened.is_ok(),
+                "the daemon must start after the reader releases the profile"
+            );
+            release.await.unwrap();
+        });
+    }
+
+    #[tokio::test]
+    async fn a_daemon_does_not_wait_for_another_daemon_that_already_listens() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let _held = Driver::open(paths.clone()).unwrap();
+        let _listener = koidrive_ipc::bind(&paths.socket()).unwrap();
+        let opened = tokio::time::timeout(std::time::Duration::from_secs(1), daemon_driver(paths))
+            .await
+            .unwrap();
+        assert!(matches!(opened, Err(DriverError::Busy(_))));
+    }
+
+    #[test]
     fn every_command_parses_in_its_group() {
         let parses = [
             &["koi", "status", "--check"][..],
@@ -2491,6 +2759,8 @@ mod tests {
             &["koi", "device", "invite"],
             &["koi", "device", "list"],
             &["koi", "device", "revoke", ID],
+            &["koi", "device", "leave"],
+            &["koi", "device", "leave", "--last-device"],
             &["koi", "history", "trash"],
             &["koi", "history", "versions", "a.txt"],
             &["koi", "history", "restore", "a.txt", "--node", "n1"],
@@ -2757,6 +3027,7 @@ mod tests {
             lineage: "q1".into(),
             space_id: "s1".into(),
             asked_at_ms: 1,
+            recovery_cause: None,
             kind: QuestionKind::MassDelete {
                 deletions,
                 affected_files,

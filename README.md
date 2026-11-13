@@ -18,7 +18,7 @@
 </p>
 
 > [!WARNING]
-> **Not released yet.** There is no packaged release of 0.1.0, and the protocol and storage format may change before it. Keep another copy of anything you sync.
+> **Koidrive is in alpha.** Install the `koi` command as [Get started](#get-started) shows, and the macOS app from the disk image on [GitHub releases](https://github.com/koidrive/koidrive/releases). The protocol and storage format may change before 0.1.0. Keep another copy of anything you sync.
 
 ## Why Koidrive
 
@@ -65,7 +65,7 @@ Dropbox does much more, and charges per person for it. Koidrive does the core of
 | **Both copies kept on a conflict** | Yes | Yes |
 | **Trash and version history** | 30 days | 30 days to 1 year |
 | **Share links** | Yes | Yes |
-| **macOS on Apple silicon** | Command line, and a menu bar app in progress | Yes |
+| **macOS on Apple silicon** | Menu bar app and command line | Yes |
 | **Linux** | Command line and daemon | Yes |
 
 ### Where Dropbox does more
@@ -104,7 +104,7 @@ You need a Cloudflare account with R2 turned on, and a Mac or a Linux machine.
    curl -fsSL https://koidrive.com/install.sh | sh
    ```
 
-   Downloads start with the first release. Until then, [build from source](docs/guide/install.md#build-from-source).
+   The script installs the latest release from GitHub. You can also [build from source](docs/guide/install.md#build-from-source).
 
 2. **Set up your server and this machine.**
 
@@ -128,11 +128,19 @@ You need a Cloudflare account with R2 turned on, and a Mac or a Linux machine.
 
 The [user guide](docs/guide/README.md) covers conflicts, the trash, devices, limits and how to remove everything.
 
+## The macOS app
+
+Koidrive for macOS is a menu bar app. It shows each folder's sync status, asks before a large delete reaches your other machines, links folders, adds devices and pauses sync. It needs macOS 14 or later.
+
+Download `Koidrive-<version>-arm64.dmg` from [GitHub releases](https://github.com/koidrive/koidrive/releases), open it and drag Koidrive to Applications.
+
+The app runs the `koi` command it carries inside it, so the app and `koi` are one device. They share one profile and one background sync service, and a folder you link in either one shows up in both.
+
 ## Coming next
 
 - For agents, `koi status --check` with exit codes for scripts, conflict decisions that an agent can answer, a machine-readable list of every command, and a skill that teaches an agent to use Koidrive.
 - Files on demand on macOS.
-- A packaged release with a signed Mac app.
+- The packaged 0.1.0 release.
 
 ## Repository layout
 

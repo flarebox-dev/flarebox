@@ -82,6 +82,23 @@
         }
       ]
     },
+    "Blocked": {
+      "description": "A folder that the daemon may not read, as its `access` request finds it.",
+      "properties": {
+        "folder": {
+          "type": "string"
+        },
+        "waiting": {
+          "description": "The read still waits after two seconds, usually because macOS is asking the person. Otherwise macOS refused it.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "folder",
+        "waiting"
+      ],
+      "type": "object"
+    },
     "Code": {
       "description": "What kind of failure an error is. Each code has one exit status.",
       "oneOf": [
@@ -117,7 +134,12 @@
         },
         {
           "const": "stale_decision",
-          "description": "The decision answered no longer exists, or a request ID was used before with other arguments or for a pairing\ncode that has expired.",
+          "description": "The decision answered no longer exists, or a local request ID was replayed with different arguments or after\nits saved invitation expired.",
+          "type": "string"
+        },
+        {
+          "const": "wrong_code",
+          "description": "The server rejected a claim or pairing code as wrong or expired.",
           "type": "string"
         },
         {
@@ -197,6 +219,51 @@
       ],
       "type": "object"
     },
+    "ConflictData": {
+      "oneOf": [
+        {
+          "properties": {
+            "copy": {
+              "$ref": "#/$defs/ConflictFileData"
+            },
+            "original": {
+              "$ref": "#/$defs/ConflictFileData"
+            },
+            "sent_in": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "conflict",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "original",
+            "copy"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ConflictFileData": {
+      "properties": {
+        "node_id": {
+          "type": "string"
+        },
+        "revisions": {
+          "$ref": "#/$defs/RevisionsData"
+        }
+      },
+      "required": [
+        "node_id",
+        "revisions"
+      ],
+      "type": "object"
+    },
     "Counts": {
       "properties": {
         "affected_files": {
@@ -242,6 +309,16 @@
           "format": "int64",
           "type": "integer"
         },
+        "conflict": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConflictData"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "counts": {
           "anyOf": [
             {
@@ -273,6 +350,16 @@
         },
         "kind": {
           "$ref": "#/$defs/DecisionKind"
+        },
+        "recovery_cause": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RecoveryCauseData"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "requires_choice": {
           "description": "False for a notice that only takes `dismiss`: it holds nothing and blocks nothing.",
@@ -312,9 +399,6 @@
         "recovery"
       ],
       "type": "string"
-    },
-    "Empty": {
-      "type": "object"
     },
     "ErrorBody": {
       "properties": {
@@ -522,7 +606,7 @@
       ]
     },
     "Output": {
-      "description": "What it prints on stdout with `--json`. It reads stdin only when an explicit input flag requests it.",
+      "description": "What it prints on stdout with `--json`.",
       "oneOf": [
         {
           "const": "envelope",
@@ -535,6 +619,150 @@
           "type": "string"
         }
       ]
+    },
+    "RecoveryCauseData": {
+      "properties": {
+        "restore_point_ms": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "trigger": {
+          "$ref": "#/$defs/RecoveryTriggerData"
+        }
+      },
+      "required": [
+        "trigger"
+      ],
+      "type": "object"
+    },
+    "RecoveryTriggerData": {
+      "enum": [
+        "space_rewound",
+        "store_rolled_back",
+        "store_older_than_disk",
+        "space_imported",
+        "no_sync_state",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "Report": {
+      "description": "The service as a command left it.",
+      "properties": {
+        "blocked": {
+          "items": {
+            "$ref": "#/$defs/Blocked"
+          },
+          "type": "array"
+        },
+        "folders": {
+          "description": "The folders the profile links, as the command that brought the service in line counted them. Left out when it\nlinks none or the command did not count them.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lingers": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "manager": {
+          "$ref": "#/$defs/ServiceManager"
+        },
+        "name": {
+          "type": "string"
+        },
+        "problem": {
+          "description": "Why the service cannot run, or did not change as it should.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/State"
+        }
+      },
+      "required": [
+        "manager",
+        "name",
+        "state"
+      ],
+      "type": "object"
+    },
+    "RevisionsData": {
+      "properties": {
+        "content_rev": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "meta_rev": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "content_rev",
+        "meta_rev"
+      ],
+      "type": "object"
+    },
+    "ServiceManager": {
+      "enum": [
+        "systemd",
+        "launchd"
+      ],
+      "type": "string"
+    },
+    "State": {
+      "description": "What the service manager reports for a service, or what keeps koi from using it.",
+      "oneOf": [
+        {
+          "enum": [
+            "running",
+            "not_installed"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "stopped",
+          "description": "Installed, but not running: it failed.",
+          "type": "string"
+        },
+        {
+          "const": "switched_off",
+          "description": "The launch agent is installed but launchd lists it as disabled: the person switched koi off in Login Items.",
+          "type": "string"
+        },
+        {
+          "const": "unavailable",
+          "description": "This machine has no service manager koi can use, such as a Linux system without a systemd user session.",
+          "type": "string"
+        },
+        {
+          "const": "off",
+          "description": "config.toml turns the service off.",
+          "type": "string"
+        }
+      ]
+    },
+    "WithService_Empty": {
+      "description": "The data of a command that brings the background service in line with the profile, with the service's report.",
+      "properties": {
+        "service": {
+          "$ref": "#/$defs/Report"
+        }
+      },
+      "required": [
+        "service"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -565,7 +793,7 @@
           "$ref": "#/$defs/HelpData"
         },
         {
-          "$ref": "#/$defs/Empty"
+          "$ref": "#/$defs/WithService_Empty"
         }
       ]
     },

@@ -5,10 +5,9 @@ Koidrive keeps folders in sync between your computers through a server that you 
 This guide covers the `koi` command on macOS and Linux, version 0.1.0.
 
 > [!IMPORTANT]
-> 0.1.0 is not released yet, and two parts of the setup are still missing:
+> Koidrive is in alpha, and the protocol and storage format may change before 0.1.0. [Install](install.md) the command with the install script, and the macOS app from the disk image on [GitHub releases](https://github.com/koidrive/koidrive/releases).
 >
-> - There is no packaged release. You [build the command from source](install.md).
-> - The Cloudflare login that `koi setup` uses needs Koidrive's public OAuth client, which doesn't exist yet. Until it does, only members of the project's own test account can log in. Everyone else deploys the server with the deploy button and claims it with `koi server claim`, as [Set up](setup.md#without-the-cloudflare-login) describes.
+> The Cloudflare login that `koi setup` uses needs Koidrive's public OAuth client, which doesn't exist yet. Until it does, only members of the project's own test account can log in. Everyone else deploys the server with the deploy button and claims it with `koi server claim`, as [Set up](setup.md#without-the-cloudflare-login) describes.
 
 ## Words this guide uses
 

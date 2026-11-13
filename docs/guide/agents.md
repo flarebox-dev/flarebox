@@ -101,9 +101,10 @@ The records are in `requests/` in the profile's state directory (`~/.local/state
 | 5 | A folder is halted or stopped | Fix the cause the folder's `problem` names |
 | 6 | The server is offline, unavailable or limits the rate | Try again later. `retryable` is true |
 | 7 | The decision answered no longer exists, or a request ID was used with other arguments or its pairing code expired | Read the current state, then decide again |
+| 8 | `koi join` or `koi server claim` got a claim or pairing code that is wrong or has expired | Ask the person for the code again |
 | 130 | Ctrl-C stopped the command, or an earlier run with the same request ID has no recorded outcome | Read the state before you run a change again |
 
-The `error.code` values match these: `failed`, `usage`, `decision_required`, `auth_required`, `halted`, `unavailable`, `stale_decision` and `interrupted`.
+The `error.code` values match these: `failed`, `usage`, `decision_required`, `auth_required`, `halted`, `unavailable`, `stale_decision`, `wrong_code` and `interrupted`.
 
 ## Check health with status --check
 

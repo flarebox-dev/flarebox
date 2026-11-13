@@ -18,6 +18,18 @@ Take the ID from `koi device list`. The device stops syncing at once. The files 
 
 A revoked device can't sync any more. To use that machine again, remove Koidrive from it as [Uninstall](uninstall.md#remove-koidrive-from-one-device) describes, then set it up again.
 
+## Sign this device out
+
+```sh
+koi device leave
+```
+
+This revokes the device on the server and unlinks every folder. The files stay where they are. If the server refuses because this is your account's last active device, Koidrive keeps the local pairing and folder links.
+
+If revocation is interrupted or the server doesn't answer, its outcome may be unknown. While the outcome is unknown, sync stays stopped and this device's account stays blocked. Run `koi device leave` again to resolve the saved sign-out.
+
+Add `--last-device` to confirm signing out anyway. If the server is unreachable, this removes only the local pairing and links. The server may still accept the device's credential, so revoke it from another device when the server is reachable. If you sign out of every device, use [owner recovery](#if-you-lose-every-device) to sign in again.
+
 ## If you lose every device
 
 Your files stay on the server. Add a new device with a `koi` [built with the server inside it](install.md#build):

@@ -125,26 +125,14 @@ private final class Recorder: SessionListener {
     #expect(session.state().problems.isEmpty)
 }
 
-@Test func theDriverSessionHoldsItsProfileAndKeepsThePause() throws {
-    let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-    defer { try? FileManager.default.removeItem(at: directory) }
-    var session: SyncSession? = try SyncSession.openWithEventStream(profileDirectory: directory).0
-    #expect(throws: SessionError.ProfileInUse) {
-        _ = try SyncSession.openWithEventStream(profileDirectory: directory)
+@Test func aSessionWithoutItsKoiDoesNotOpen() {
+    let missing = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString).appending(path: "koi")
+    #expect {
+        _ = try SyncSession.openWithEventStream(helper: missing)
+    } throws: { error in
+        guard case .Failed(let reason) = error as? SessionError else { return false }
+        return reason.contains("koi is missing")
     }
-    session?.start()
-    #expect(session?.state().status == .needsSetup)
-    #expect(throws: SessionError.NotSignedIn) { try session?.spaces() }
-    try session?.pause()
-    #expect(session?.state().status == .paused)
-
-    session = nil
-    let reopened = try SyncSession.openWithEventStream(profileDirectory: directory).0
-    #expect(reopened.state().status == .stopped)
-    reopened.start()
-    #expect(reopened.state().status == .paused)
-    try reopened.resume()
-    #expect(reopened.state().status == .needsSetup)
 }
 
 @Test(.timeLimit(.minutes(1)))
@@ -167,4 +155,57 @@ func eventStreamFinishesWhenTheSessionIsReleased() async {
     #expect(await seen == [
         .questions(questions: []), .notices(notices: []), .status(status: .needsSetup), .status(status: .stopped),
     ])
+}
+
+@Test func aCodeKoiCallsWrongIsInvalidCode() throws {
+    let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let koi = directory.appending(path: "koi")
+    try """
+    #!/bin/sh
+    if [ "$2" = join ]; then
+      echo '{"outcome":"error","data":null,"error":{"code":"wrong_code","message":"the code is wrong or has expired"}}'
+    else
+      echo '{"outcome":"ok","data":{"account":null,"running":false,"folders":[]}}'
+    fi
+    """.write(to: koi, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: koi.path(percentEncoded: false))
+    let server = try OneAnswerServer(
+        answer: Array("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n".utf8) + [0x10, 0x01, 0x18, 0x01]
+    )
+
+    let session = try SyncSession.openWithEventStream(helper: koi).0
+    _ = try session.connect(url: server.url)
+    #expect(throws: SessionError.InvalidCode) {
+        try session.pair(code: "AAAA-BBBB", deviceName: "Mac")
+    }
+}
+
+private final class OneAnswerServer: Sendable {
+    let url: String
+
+    init(answer: [UInt8]) throws {
+        let listener = socket(AF_INET, SOCK_STREAM, 0)
+        var address = sockaddr_in()
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let bound = withUnsafeMutablePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { pointer in
+                bind(listener, pointer, length) == 0 && listen(listener, 1) == 0
+                    && getsockname(listener, pointer, &length) == 0
+            }
+        }
+        try #require(listener >= 0 && bound)
+        url = "http://127.0.0.1:\(UInt16(bigEndian: address.sin_port))"
+        Thread.detachNewThread {
+            let connection = accept(listener, nil, nil)
+            var request = [UInt8](repeating: 0, count: 8192)
+            _ = read(connection, &request, request.count)
+            _ = answer.withUnsafeBytes { write(connection, $0.baseAddress, $0.count) }
+            close(connection)
+            close(listener)
+        }
+    }
 }

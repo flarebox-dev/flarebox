@@ -82,19 +82,19 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
         Request::Status => Ok(Response::Status {
             status: driver.status(),
         }),
-        Request::Pair { server, code, name } => driver
-            .pair(&server, &code, &name)
-            .await
-            .map(|account| Response::Paired { account }),
+        Request::Pair { server, code, name } => match driver.pair(&server, &code, &name).await {
+            Ok(account) => Ok(Response::Paired { account }),
+            Err(error) => return Response::from(CliError::code_refused(error)),
+        },
         Request::Claim {
             server,
             code,
             user_name,
             name,
-        } => driver
-            .claim(&server, &code, &user_name, &name)
-            .await
-            .map(|account| Response::Paired { account }),
+        } => match driver.claim(&server, &code, &user_name, &name).await {
+            Ok(account) => Ok(Response::Paired { account }),
+            Err(error) => return Response::from(CliError::code_refused(error)),
+        },
         Request::SaveCredential { credential } => driver
             .save_credential(credential)
             .await
@@ -102,7 +102,13 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
         Request::SignOut { device_id } => driver
             .sign_out_device(&device_id)
             .await
-            .map(|()| Response::SignedOut),
+            .map(|not_removed| Response::SignedOut { not_removed }),
+        Request::Leave {
+            confirm_last_device,
+        } => driver
+            .sign_out(confirm_last_device)
+            .await
+            .map(|not_removed| Response::SignedOut { not_removed }),
         Request::Link { folder, space } => {
             driver
                 .link(&folder, &space)
@@ -517,6 +523,7 @@ pub(crate) mod tests {
             lineage: "q1".into(),
             space_id: SPACE.into(),
             asked_at_ms: 10,
+            recovery_cause: None,
             kind: koidrive_driver::QuestionKind::AmbiguousDisappearance,
             items: Vec::new(),
         };
@@ -544,6 +551,56 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_leave_without_the_server_changes_nothing_until_confirmed_and_keeps_the_files() {
+        let (_dir, paths, root) = linked_profile();
+        fs::write(root.join("kept.txt"), b"kept").unwrap();
+        koidrive_driver::Credential {
+            server: "http://127.0.0.1:9/".into(),
+            user_id: "u1".into(),
+            user_name: None,
+            device_id: "d1".into(),
+            device_name: "Mac".into(),
+            refresh_credential: "not-a-secret".into(),
+        }
+        .save_new(&paths.credential())
+        .unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+        let leave = |confirm_last_device| {
+            handle(
+                &driver,
+                Request::Leave {
+                    confirm_last_device,
+                },
+            )
+        };
+
+        let Response::Error { code, next, .. } = leave(false).await else {
+            panic!("a sign-out the server did not confirm went on");
+        };
+        assert_eq!(code, Code::Unavailable);
+        assert_eq!(
+            next,
+            [Next::of(&["koi", "device", "leave", "--last-device"])]
+        );
+        assert!(paths.credential().exists());
+        assert_eq!(driver.status().folders.len(), 1);
+
+        assert_eq!(
+            leave(true).await,
+            Response::SignedOut {
+                not_removed: Vec::new()
+            }
+        );
+        assert!(!paths.credential().exists());
+        let status = driver.status();
+        assert!(
+            status.account.is_none() && status.folders.is_empty(),
+            "{status:?}"
+        );
+        assert_eq!(fs::read(root.join("kept.txt")).unwrap(), b"kept");
+    }
+
+    #[tokio::test]
     async fn resolve_reads_a_decision_sync_took_so_the_same_word_is_unchanged_and_another_is_stale()
     {
         use koidrive_engine::question::{ConflictFile, Revisions};
@@ -561,6 +618,7 @@ pub(crate) mod tests {
             lineage: "c1".into(),
             space_id: SPACE.into(),
             asked_at_ms: 20,
+            recovery_cause: None,
             kind: koidrive_driver::QuestionKind::Conflict {
                 original: file("n-original"),
                 copy: file("n-copy"),
@@ -727,6 +785,7 @@ pub(crate) mod tests {
             lineage: "q2".into(),
             space_id: SPACE.into(),
             asked_at_ms: 20,
+            recovery_cause: None,
             kind: koidrive_driver::QuestionKind::AmbiguousDisappearance,
             items: Vec::new(),
         };

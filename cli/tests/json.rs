@@ -75,6 +75,125 @@ fn argv(next: &Value) -> Vec<&str> {
         .collect()
 }
 
+#[tokio::test]
+async fn pair_and_claim_read_codes_from_stdin_or_positional_arguments() {
+    use koidrive_ipc::{Code, Request, Response};
+    use tokio::io::AsyncWriteExt;
+
+    for (prefix, code, expected) in [
+        (
+            vec![
+                "join",
+                "--server",
+                "https://files.example.com",
+                "--name",
+                "Mac",
+            ],
+            "K7QM-2XPD",
+            Request::Pair {
+                server: "https://files.example.com".into(),
+                code: "K7QM-2XPD".into(),
+                name: "Mac".into(),
+            },
+        ),
+        (
+            vec![
+                "server",
+                "claim",
+                "files.example.com",
+                "--user",
+                "Ada",
+                "--name",
+                "Mac",
+            ],
+            "ABCD-EFGH",
+            Request::Claim {
+                server: "https://files.example.com".into(),
+                code: "ABCD-EFGH".into(),
+                user_name: "Ada".into(),
+                name: "Mac".into(),
+            },
+        ),
+    ] {
+        for stdin in [true, false] {
+            let profile = Profile::new();
+            let home = profile.home.path();
+            let paths = koidrive_driver::Paths::from_vars(|name| match name {
+                "XDG_CONFIG_HOME" => Some(home.join("config").into()),
+                "XDG_STATE_HOME" => Some(home.join("state").into()),
+                "XDG_RUNTIME_DIR" => Some(home.join("run").into()),
+                _ => None,
+            })
+            .unwrap();
+            let listener = koidrive_ipc::bind(&paths.socket()).unwrap();
+            let expected = expected.clone();
+            let mut served = tokio::spawn(async move {
+                for expected in [expected, Request::Questions] {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let line = koidrive_ipc::read_line(&mut stream).await.unwrap();
+                    assert_eq!(serde_json::from_str::<Request>(&line).unwrap(), expected);
+                    let response = match expected {
+                        Request::Questions => Response::Questions {
+                            questions: Vec::new(),
+                        },
+                        _ => Response::Error {
+                            code: Code::WrongCode,
+                            message: "the code is wrong or has expired".into(),
+                            next: Vec::new(),
+                        },
+                    };
+                    koidrive_ipc::write_line(&mut stream, &response)
+                        .await
+                        .unwrap();
+                }
+            });
+            let mut args = prefix.clone();
+            args.extend([
+                if stdin { "--code-stdin" } else { code },
+                "--json",
+                "--telemetry",
+                "off",
+            ]);
+            let mut child = tokio::process::Command::from(profile.command(&args))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut input = child.stdin.take().unwrap();
+            if stdin {
+                input
+                    .write_all(format!(" {code} \r\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            drop(input);
+            let output =
+                tokio::time::timeout(std::time::Duration::from_secs(10), child.wait_with_output())
+                    .await;
+            if output.is_err() {
+                served.abort();
+                let _ = served.await;
+                panic!("the child did not finish after reading the code");
+            }
+            let output = output.unwrap().unwrap();
+            match tokio::time::timeout(std::time::Duration::from_secs(2), &mut served).await {
+                Ok(result) => result.unwrap(),
+                Err(_) => {
+                    served.abort();
+                    let _ = served.await;
+                    panic!("the child exited before sending both requests: {output:?}");
+                }
+            }
+            assert_eq!(output.status.code(), Some(8), "{output:?}");
+            let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+            schema::check(&envelope);
+            assert_eq!(envelope["error"]["code"], "wrong_code");
+        }
+    }
+}
+
 #[test]
 fn interrupt_during_telemetry_upload_prints_one_json_envelope() {
     use std::net::TcpListener;

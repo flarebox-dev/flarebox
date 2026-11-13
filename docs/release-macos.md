@@ -5,19 +5,19 @@ The [macOS release](../.github/workflows/release-macos.yml) workflow builds the 
 | Trigger | What it builds |
 |---|---|
 | A tag like `v0.1.0`, `v0.1.0-alpha.2` or `v0.1.0-rc.1` on a commit that is on `main` | The CLI distribution workflow builds the app at that version, signed and notarized, and attaches `Koidrive-<version>-arm64.dmg` to the release, for example `Koidrive-0.1.0-alpha.2-arm64.dmg`. If the app does not build, sign, notarize or verify, or a signing secret is missing, the run fails and publishes nothing, not even the CLI tarballs. |
-| **Run workflow** (manual) on the macOS release workflow from `main` | The app at the version you enter (`0.1.0` or `0.1.0-alpha.2`), or at `MARKETING_VERSION` from `apps/macos/project.yml` when you leave it empty. It is signed and notarized if the signing secrets are set, and it is only a workflow artifact on the run's page. |
+| **Run workflow** (manual) on the macOS release workflow from `main` | The app at the version you enter (`0.1.0` or `0.1.0-alpha.2`), or at the version in `[workspace.package]` of `Cargo.toml` when you leave it empty. It is signed and notarized if the signing secrets are set, and it is only a workflow artifact on the run's page. |
 | Pull requests, the merge queue and pushes to `main` | An unsigned DMG, to check that the build, packaging and verification still work. The `macos app` job of [CI](../.github/workflows/ci.yml) builds it after testing the app's Swift bindings. A pull request or merge queue run builds it only when the change touches `core/`, `apps/macos/`, `.cargo/`, the Cargo files (including `cli/Cargo.toml`, which Cargo loads as a workspace member), `rust-toolchain.toml` or the workflow. A push to `main` always builds it, and `ci-report` fails the push if it did not run and pass. For a pull request from a fork it runs on GitHub-hosted `xcode-27` runners with Xcode 27.2. For a pull request from a branch of this repository, the `pick-macos` job of CI puts it on a self-hosted Mac runner or on `xcode-27`. In the merge queue and on `main` it runs on the self-hosted Mac runners with the Xcode installed there, or on `xcode-27` when the `MACOS_RUNS_ON` variable is set (see the [runner README](../.github/runner/README.md), which also describes the hook that keeps fork pull requests off the self-hosted runners). These runs never see the signing secrets. |
 
 ## What a signed run does
 
 1. Checks, in a job without access to the secrets, that the tagged or dispatched commit is on `main` and that a manual run started from `main`. Otherwise the run stops before the signing job starts.
 2. Waits for a required reviewer to approve the `macos-release` environment, which releases the secrets to the signing job.
-3. Builds the Release app with Xcode 27.2 on an `xcode-27` runner, without signing. `xcode-27` is a GitHub [preview image](https://github.com/actions/runner-images/issues/14404) with macOS 27.
+3. Builds the Release app with Xcode 27.2 on an `xcode-27` runner, without signing, with `koi` in `Contents/Helpers/koi`. `koi` embeds the server bundle, as the CLI release does. `xcode-27` is a GitHub [preview image](https://github.com/actions/runner-images/issues/14404) with macOS 27.
 4. Creates a temporary keychain with a random password, imports the Developer ID certificate into it, and writes the notary key to a file readable only by the runner user.
-5. Signs the app with the Developer ID Application identity, the hardened runtime, a secure timestamp and [`apps/macos/Koidrive.entitlements`](../apps/macos/Koidrive.entitlements).
+5. Signs `Contents/Helpers/koi` and then the app with the Developer ID Application identity, the hardened runtime and a secure timestamp, the app also with [`apps/macos/Koidrive.entitlements`](../apps/macos/Koidrive.entitlements).
 6. Notarizes the app with `notarytool` and the App Store Connect API key, then staples the ticket to the app. It submits the app without waiting, prints the submission id, and then asks Apple for the submission's status every minute for up to 2.5 hours. When a request fails with a network error, it tries again after 15 seconds, doubling the wait up to 5 minutes.
 7. Packages the stapled app in a DMG, signs the DMG, notarizes it the same way and staples it.
-8. Verifies the DMG and the app inside it with `codesign --verify --deep --strict`, `xcrun stapler validate` and `spctl --assess`, and checks for the hardened runtime, the Developer ID authority and the absence of `get-task-allow`.
+8. Verifies the DMG and the app inside it with `codesign --verify --deep --strict`, `xcrun stapler validate` and `spctl --assess`, and checks for the hardened runtime, the Developer ID authority and the absence of `get-task-allow`. It also checks that `Contents/Helpers/koi` carries the same kind of signature and reports the app's `KoidriveVersion`.
 9. Uploads `Koidrive-<version>-arm64.dmg` as an artifact and writes its SHA-256 to the run summary.
 10. Deletes the keychain and the key files, even when a step failed.
 
@@ -37,7 +37,7 @@ The app carries the version in three `Info.plist` keys. For the tag `v0.1.0-alph
 | `CFBundleVersion` | The build number, for example `412` | The run number of the workflow run: the CLI distribution run for a tag, or the macOS release run (or the **build-number** input) for a manual run |
 | `KoidriveVersion` | `0.1.0-alpha.2` | The full version, including `-alpha.N` or `-rc.N` |
 
-`apps/macos/scripts/build-release.sh` takes the full version in `VERSION` and sets the first and third keys; `KoidriveVersion` comes from the `KOIDRIVE_VERSION` build setting in `apps/macos/project.yml`, which defaults to `MARKETING_VERSION`. Read `KoidriveVersion` to compare two builds, because it orders `0.1.0-alpha.2` before `0.1.0-rc.1` and `0.1.0`, which `CFBundleShortVersionString` cannot.
+`apps/macos/scripts/build-release.sh` takes the full version in `VERSION` and sets the first and third keys; `KoidriveVersion` comes from the `KOIDRIVE_VERSION` build setting in `apps/macos/project.yml`. `koi --version` must report the same version, so set the version in `[workspace.package]` of `Cargo.toml` before you tag. Without `VERSION`, the script uses the version `koi` reports. Read `KoidriveVersion` to compare two builds, because it orders `0.1.0-alpha.2` before `0.1.0-rc.1` and `0.1.0`, which `CFBundleShortVersionString` cannot.
 
 ## Before you add any secret
 

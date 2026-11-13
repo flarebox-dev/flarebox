@@ -11,8 +11,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use koidrive_driver::{
-    Account, Answer, Credential, Expiry, FolderStatus, LinkApproval, Paths, Question,
-    RestoreRequest, RestoreStatus, Secret, SharedLink, Status,
+    Account, Answer, CleanupFailure, Credential, Expiry, FolderStatus, LinkApproval, Paths,
+    Question, RestoreRequest, RestoreStatus, Secret, SharedLink, Status,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -54,6 +54,11 @@ pub enum Request {
     /// credential saved for another device meanwhile is kept.
     SignOut {
         device_id: String,
+    },
+    /// `Driver::sign_out`: revokes this device on the server, unlinks every folder and removes the credential. Without
+    /// `confirm_last_device`, the account's last active device and a server that does not answer change nothing.
+    Leave {
+        confirm_last_device: bool,
     },
     Link {
         folder: PathBuf,
@@ -185,7 +190,10 @@ pub enum Response {
     Restores {
         restores: Vec<RestoreStatus>,
     },
-    SignedOut,
+    SignedOut {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        not_removed: Vec<CleanupFailure>,
+    },
     Access {
         blocked: Vec<Blocked>,
     },
@@ -236,9 +244,11 @@ pub enum Code {
     Halted,
     /// The server or the network is offline, unavailable or limits the rate at the moment.
     Unavailable,
-    /// The decision answered no longer exists, or a request ID was used before with other arguments or for a pairing
-    /// code that has expired.
+    /// The decision answered no longer exists, or a local request ID was replayed with different arguments or after
+    /// its saved invitation expired.
     StaleDecision,
+    /// The server rejected a claim or pairing code as wrong or expired.
+    WrongCode,
     /// A signal stopped the command, or an earlier run with the same request ID has no recorded outcome.
     Interrupted,
 }
@@ -253,6 +263,7 @@ impl Code {
             Code::Halted => 5,
             Code::Unavailable => 6,
             Code::StaleDecision => 7,
+            Code::WrongCode => 8,
             Code::Interrupted => 130,
         }
     }
@@ -492,6 +503,39 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn signed_out_writes_non_utf8_cleanup_paths_as_lossy_json_strings() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let bytes = b"/tmp/cleanup-\xff\n\x1b[31m";
+        let response = Response::SignedOut {
+            not_removed: vec![CleanupFailure {
+                path: PathBuf::from(OsString::from_vec(bytes.to_vec())),
+                error: "denied\n\x1b[31m".into(),
+            }],
+        };
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        write_line(&mut writer, &response)
+            .await
+            .expect("a signed-out response must encode a non-UTF-8 cleanup path");
+        let line = read_line(&mut reader).await.unwrap();
+        assert_eq!(line.matches('\n').count(), 1);
+        assert!(!line.contains('\x1b'));
+        let Response::SignedOut { not_removed } = parse(&line).unwrap() else {
+            panic!("the cleanup result must survive IPC");
+        };
+        assert_eq!(
+            not_removed[0].path,
+            PathBuf::from(String::from_utf8_lossy(bytes).as_ref())
+        );
+        assert_eq!(not_removed[0].error, "denied\n\x1b[31m");
+        let Response::SignedOut { not_removed } = response else {
+            unreachable!();
+        };
+        assert_eq!(not_removed[0].path.as_os_str().as_bytes(), bytes);
+    }
+
     #[test]
     fn an_approved_link_is_not_a_plain_link_to_an_older_daemon() {
         #[derive(Debug, Deserialize)]
@@ -617,6 +661,51 @@ mod tests {
     }
 
     #[test]
+    fn recovery_causes_survive_direct_and_watch_responses_with_legacy_defaults() {
+        for payload in [
+            json!(null),
+            json!({ "trigger": "space_rewound", "restore_point_ms": 1_794_442_424_000_i64 }),
+            json!({ "trigger": "future_cause" }),
+            json!({}),
+        ] {
+            let mut question = json!({
+                "id": "q1", "space_id": "s1", "asked_at_ms": 7,
+                "kind": { "type": "recovery", "group": "created_after_restore_point" },
+                "items": []
+            });
+            if !payload.is_null() {
+                question["recovery_cause"] = payload.clone();
+            }
+            let expected: Question = serde_json::from_value(question.clone()).unwrap();
+            assert_eq!(expected.recovery_cause.is_some(), !payload.is_null());
+            if payload["trigger"] == "future_cause" || payload == json!({}) {
+                assert_eq!(
+                    expected.recovery_cause.as_ref().unwrap().trigger,
+                    koidrive_driver::RecoveryTrigger::Unknown
+                );
+            }
+            for response in [
+                json!({ "response": "questions", "questions": [question.clone()] }),
+                json!({ "response": "answered_question", "question": question.clone() }),
+                json!({ "response": "state", "status": Status::default(), "questions": [question.clone()] }),
+            ] {
+                let response: Response = serde_json::from_value(response).unwrap();
+                let round_trip: Response =
+                    serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+                assert_eq!(round_trip, response);
+                let question = match round_trip {
+                    Response::Questions { questions } | Response::State { questions, .. } => {
+                        questions.into_iter().next().unwrap()
+                    }
+                    Response::AnsweredQuestion { question } => question.unwrap(),
+                    _ => unreachable!(),
+                };
+                assert_eq!(question, expected);
+            }
+        }
+    }
+
+    #[test]
     fn requests_are_tagged_json() {
         let request = Request::Answer {
             question_id: "q1".into(),
@@ -698,6 +787,27 @@ mod tests {
         pinned(Request::Pause, r#"{"request":"pause"}"#);
         pinned(Request::Resume, r#"{"request":"resume"}"#);
         pinned(Request::Watch, r#"{"request":"watch"}"#);
+        pinned(
+            Request::Leave {
+                confirm_last_device: false,
+            },
+            r#"{"request":"leave","confirm_last_device":false}"#,
+        );
+        pinned(
+            Response::SignedOut {
+                not_removed: Vec::new(),
+            },
+            r#"{"response":"signed_out"}"#,
+        );
+        pinned(
+            Response::SignedOut {
+                not_removed: vec![CleanupFailure {
+                    path: "/a/.koidrive/device.json".into(),
+                    error: "Permission denied (os error 13)".into(),
+                }],
+            },
+            r#"{"response":"signed_out","not_removed":[{"path":"/a/.koidrive/device.json","error":"Permission denied (os error 13)"}]}"#,
+        );
 
         pinned(
             Response::Status {

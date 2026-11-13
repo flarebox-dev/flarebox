@@ -27,6 +27,7 @@ mod engine;
 mod failures;
 mod folder;
 pub mod ignore;
+mod leave;
 mod observe;
 mod paths;
 pub mod policy;
@@ -42,13 +43,15 @@ mod volume;
 pub use claim::{Flock, Identity as DirectoryIdentity};
 pub use config::{BackgroundService, Config, ConfigError, LocalTrash, SyncRules, UpdateCheck};
 pub use credential::{Credential, CredentialError, SET_UP_AGAIN, api_for};
-pub use driver::{Answered, Driver, DriverError, LinkApproval, Linked};
+pub use driver::{Answered, CleanupFailure, Driver, DriverError, LinkApproval, Linked};
 pub use failures::{Failure, failures};
 pub use folder::MAX_FORMAT;
 pub use koidrive_engine::guard::MAX_DELETIONS;
 pub use observe::{FsObserver, Observation, Observed, Observer, RulesChange};
 pub use paths::{Paths, PathsError};
-pub use question::{Answer, HeldItem, Limit, Question, QuestionKind, RecoveryGroup};
+pub use question::{
+    Answer, HeldItem, Limit, Question, QuestionKind, RecoveryCause, RecoveryGroup, RecoveryTrigger,
+};
 pub use restore::{RestoreRejection, RestoreRequest, RestoreState, RestoreStatus, RestoreWait};
 pub use share::{Expiry, LinkState, Revoked, Secret, SharedLink, Target, TargetKind};
 pub use status::{Account, FolderState, FolderStatus, Status, Wait, WaitKind};

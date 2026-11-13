@@ -9,6 +9,7 @@ use crate::report::{ArgumentInfo, Auth, CommandInfo, GroupInfo, OptionInfo, Outp
 
 fn auth(command: &str) -> Auth {
     match command {
+        "device leave" => Auth::None,
         "server deploy" | "server add-device" | "server upgrade" | "server delete" => {
             Auth::Cloudflare
         }
@@ -302,6 +303,18 @@ mod tests {
     #[test]
     fn constraints_clap_enforces_are_in_the_manifest() {
         let all = commands("");
+        for path in ["join", "server claim"] {
+            let info = find(&all, path);
+            let source = info
+                .groups
+                .iter()
+                .find(|group| group.members.contains(&"CODE".to_owned()))
+                .unwrap();
+            assert_eq!(source.members, ["CODE", "--code-stdin"]);
+            assert!(source.required && !source.multiple);
+        }
+        assert_eq!(find(&all, "device leave").auth, Auth::None);
+        assert_eq!(find(&all, "device list").auth, Auth::Device);
         let resolve = find(&all, "resolve");
         assert_eq!(resolve.arguments[0].requires, ["ANSWER"]);
         assert!(resolve.arguments[1].requires.is_empty());

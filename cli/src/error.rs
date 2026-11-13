@@ -12,6 +12,9 @@ use koidrive_proto::v1::{Error as ProtoError, error::Code as ServerCode};
 
 use crate::report::Done;
 
+const LEAVE_LAST_DEVICE: [&str; 4] = ["koi", "device", "leave", "--last-device"];
+const WRONG_CODE: [&str; 2] = ["wrong claim code", "invalid or expired pairing code"];
+
 #[derive(Debug)]
 pub struct CliError {
     pub code: Code,
@@ -78,6 +81,16 @@ impl CliError {
                  wrong. To use this device again, {SET_UP_AGAIN}."
             ),
         )
+    }
+
+    pub fn code_refused(error: DriverError) -> Self {
+        let refused = matches!(&error, DriverError::Api(api)
+            if api.server().is_some_and(|server| server.code() == ServerCode::Forbidden
+                && WRONG_CODE.contains(&server.message())));
+        match refused {
+            true => CliError::new(Code::WrongCode, "the code is wrong or has expired"),
+            false => CliError::from(error),
+        }
     }
 
     /// The `Error` result of an RPC: a refused credential needs a person, and a refusal the server allows sending again
@@ -170,6 +183,12 @@ impl From<DriverError> for CliError {
             }
             DriverError::NeedsConfirmation => CliError::new(Code::AuthRequired, message),
             DriverError::ShareTreeChanged => CliError::new(Code::Unavailable, message),
+            DriverError::LastDevice => {
+                CliError::new(Code::Failed, message).then(&LEAVE_LAST_DEVICE)
+            }
+            DriverError::NotRevoked(_) => {
+                CliError::new(Code::Unavailable, message).then(&LEAVE_LAST_DEVICE)
+            }
             DriverError::QuestionNotFound(_) | DriverError::AnsweredOtherwise { .. } => {
                 CliError::new(
                     Code::StaleDecision,
@@ -226,14 +245,53 @@ mod tests {
     use std::path::PathBuf;
 
     fn refused(status: u16, code: ServerCode) -> ApiError {
+        refused_with(status, code, "refused")
+    }
+
+    fn refused_with(status: u16, code: ServerCode, message: &str) -> ApiError {
         ApiError::Server {
             status,
             error: ServerError(koidrive_proto::v1::Error {
                 code: code as i32,
-                message: "refused".into(),
+                message: message.into(),
                 ..Default::default()
             }),
         }
+    }
+
+    #[test]
+    fn a_refused_claim_or_pairing_code_is_the_codes_fault() {
+        for message in WRONG_CODE {
+            let wrong = CliError::code_refused(DriverError::Api(refused_with(
+                403,
+                ServerCode::Forbidden,
+                message,
+            )));
+            assert_eq!(wrong.code, Code::WrongCode);
+            assert_eq!(wrong.code.exit(), 8);
+            assert_eq!(wrong.message, "the code is wrong or has expired");
+            assert!(wrong.next.is_empty());
+        }
+        let owned = CliError::code_refused(DriverError::Api(refused_with(
+            403,
+            ServerCode::Forbidden,
+            "this deployment already has an owner",
+        )));
+        assert_ne!(owned.code, Code::WrongCode);
+        assert!(
+            owned.message.contains("already has an owner"),
+            "{}",
+            owned.message
+        );
+        let throttled =
+            CliError::code_refused(DriverError::Api(refused(400, ServerCode::RetryLater)));
+        assert_eq!(throttled.code, Code::Unavailable);
+        let offline = CliError::code_refused(DriverError::Api(ApiError::Status { status: 503 }));
+        assert_eq!(offline.code, Code::Unavailable);
+        assert_eq!(
+            CliError::code_refused(DriverError::NotPaired).code,
+            CliError::from(DriverError::NotPaired).code
+        );
     }
 
     #[test]
@@ -298,6 +356,14 @@ mod tests {
         let stale = CliError::from(DriverError::QuestionNotFound("q1".into()));
         assert_eq!(stale.code, Code::StaleDecision);
         assert_eq!(stale.next, [Next::of(&["koi", "resolve", "--json"])]);
+        let leave = [Next::of(&["koi", "device", "leave", "--last-device"])];
+        let last = CliError::from(DriverError::LastDevice);
+        assert_eq!((last.code, &last.next[..]), (Code::Failed, &leave[..]));
+        let unconfirmed = CliError::from(DriverError::NotRevoked("no answer".into()));
+        assert_eq!(
+            (unconfirmed.code, &unconfirmed.next[..]),
+            (Code::Unavailable, &leave[..])
+        );
         let unpaired = CliError::from(DriverError::NotPaired);
         assert_eq!(unpaired.code, Code::AuthRequired);
         assert_eq!(unpaired.next, [Next::of(&["koi", "setup"])]);

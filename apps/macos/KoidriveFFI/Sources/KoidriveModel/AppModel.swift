@@ -33,9 +33,9 @@ public final class AppModel {
         }
     }
 
-    /// A model backed by the sync driver, on the sync profile in `profileDirectory`.
-    public static func open(profileDirectory: URL) throws -> AppModel {
-        let (session, events) = try SyncSession.openWithEventStream(profileDirectory: profileDirectory)
+    /// A model of the CLI's sync profile on this Mac, worked through the `koi` at `helper`.
+    public static func open(helper: URL) throws -> AppModel {
+        let (session, events) = try SyncSession.openWithEventStream(helper: helper)
         return AppModel(session: session, events: events)
     }
 

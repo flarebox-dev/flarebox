@@ -156,6 +156,7 @@ extension RecoveryCause {
         case .storeOlderThanDisk: String(localized: "This Mac's sync state is older than the folder's files.")
         case .spaceImported: String(localized: "This folder is linked to an imported space.")
         case .noSyncState: String(localized: "The folder had files when linked, and Koidrive couldn't match them all.")
+        case .unknown: String(localized: "Some files need your decision before Koidrive can sync them.")
         }
         guard let ms = restorePointMs else { return cause }
         let date = Date(milliseconds: ms).formatted(.dateTime.day().month(.abbreviated).year().hour().minute())
@@ -170,6 +171,7 @@ extension RecoveryCause {
             case .storeOlderThanDisk: String(localized: "Sync state older than the folder")
             case .spaceImported: String(localized: "Imported space")
             case .noSyncState: String(localized: "Linked with files")
+            case .unknown: String(localized: "Recovery needs a decision")
             }
         }
         return String(localized: "Restored to \(Date(milliseconds: ms).formatted(.dateTime.day().month(.abbreviated).hour().minute()))")
@@ -234,6 +236,7 @@ extension ProblemKind {
         case .signInRequired: String(localized: "This Mac was removed")
         case .stateNotWritable: String(localized: "Koidrive can't save its sync state")
         case .folderHalted: String(localized: "Sync for this folder stopped")
+        case .conflict: String(localized: "This file has a conflict copy")
         }
     }
 
@@ -260,6 +263,8 @@ extension ProblemKind {
             String(localized: "Another device removed this Mac, or its credential stopped working. Sign out in Account settings, then sign in with a pairing code from another device.")
         case .stateNotWritable(let reason): String(localized: "Free up disk space. \(reason)")
         case .folderHalted(let reason): reason
+        case .conflict(let resolveCommand):
+            String(localized: "Both files are kept and continue syncing. Run \(resolveCommand) in Terminal to review the files and choose which to keep.")
         }
     }
 }
@@ -304,7 +309,6 @@ extension SessionError {
         case .AnswerNotAllowed: String(localized: "This question doesn't take that answer.")
         case .NoticeNotFound: String(localized: "Already dismissed.")
         case .NotSaved(let reason): String(localized: "Change not saved: \(reason)")
-        case .ProfileInUse: String(localized: "Koidrive is already running.")
         case .NotAFolder: String(localized: "Choose a folder, not a file.")
         case .FolderInUse: String(localized: "Another Koidrive process is syncing this folder.")
         case .FolderOfOtherDevice: String(localized: "Another device syncs this folder. Unlink it there first.")
