@@ -390,9 +390,11 @@ struct Backup {
     space: SpaceDo,
     held: Held,
     in_history: Held,
+    spent: Vec<Spent>,
 }
 
-fn unspend(spent: &mut Vec<Spent>, touches: &mut [BTreeMap<u128, BTreeSet<u64>>], kept: u64) {
+fn unspend(spent: &mut Vec<Spent>, touches: &mut [BTreeMap<u128, BTreeSet<u64>>], backup: &Backup) {
+    let kept = backup.space.head_seq();
     let (lost, still): (Vec<Spent>, Vec<Spent>) = std::mem::take(spent)
         .into_iter()
         .partition(|spent| spent.seq > kept);
@@ -402,6 +404,11 @@ fn unspend(spent: &mut Vec<Spent>, touches: &mut [BTreeMap<u128, BTreeSet<u64>>]
     } in lost
     {
         touches[device].entry(ino).or_default().insert(at);
+    }
+    for kept in &backup.spent {
+        if (touches[kept.device].get_mut(&kept.ino)).is_some_and(|times| times.remove(&kept.at)) {
+            spent.push(kept.clone());
+        }
     }
 }
 
@@ -464,6 +471,7 @@ pub struct World {
     spent: Vec<Spent>,
 }
 
+#[derive(Clone)]
 struct Spent {
     seq: u64,
     device: usize,
@@ -611,6 +619,7 @@ impl World {
                     space: self.space.clone(),
                     held: self.held.clone(),
                     in_history: self.in_history.clone(),
+                    spent: self.spent.clone(),
                 });
             }
             Step::Restore => self.restore(false),
@@ -782,7 +791,7 @@ impl World {
             return;
         };
         note(&mut self.seen, "server rewound");
-        unspend(&mut self.spent, &mut self.touches, backup.space.head_seq());
+        unspend(&mut self.spent, &mut self.touches, backup);
         let taken: Vec<i64> = (self.writers.keys())
             .filter(|write| {
                 stored(&self.in_history, **write) && !stored(&backup.in_history, **write)
@@ -846,7 +855,7 @@ impl World {
         if backup.space.head_seq() < self.space.head_seq() {
             note(&mut self.seen, "server restored, commits lost");
         }
-        unspend(&mut self.spent, &mut self.touches, backup.space.head_seq());
+        unspend(&mut self.spent, &mut self.touches, backup);
         type Shape = (String, String, i32, Option<Vec<u8>>);
         let shapes = |space: &SpaceDo| -> BTreeMap<NodeId, Shape> {
             (space.nodes().into_iter())
@@ -1647,7 +1656,12 @@ impl World {
                                 .filter(|(_, outcome)| {
                                     outcome.code != op_result::Code::Rejected as i32
                                 })
-                                .filter_map(|(op, _)| match &op.op {
+                                .filter_map(|(op, outcome)| match &op.op {
+                                    Some(op::Op::CreateDir(_))
+                                        if outcome.code == op_result::Code::MergedInto as i32 =>
+                                    {
+                                        Some(&outcome.node_id)
+                                    }
                                     Some(op::Op::CreateDir(op)) => Some(&op.node_id),
                                     Some(op::Op::CreateFile(op)) => Some(&op.node_id),
                                     Some(op::Op::UpdateContent(op)) => Some(&op.node_id),
