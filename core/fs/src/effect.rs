@@ -666,6 +666,7 @@ fn folder_entry(id: FileId) -> Entry {
         size: 0,
         mtime_ns: 0,
         executable: false,
+        linked: false,
     }
 }
 

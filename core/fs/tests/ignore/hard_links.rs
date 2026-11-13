@@ -341,3 +341,48 @@ fn a_file_moved_into_an_ignored_folder_out_of_a_removed_folder_with_an_included_
     assert!(rescan.changes.iter().any(ignored), "{:?}", rescan.changes);
     assert!(snapshot.entries.contains_key(Path::new("also.txt")));
 }
+
+#[test]
+fn a_file_saved_by_rename_with_a_link_below_an_ignored_folder_is_modified() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, RULES_FILE, "ig/\n");
+    write(root, "f.txt", "f");
+    fs::create_dir_all(root.join("ig/snap")).unwrap();
+    fs::hard_link(root.join("f.txt"), root.join("ig/snap/f.txt")).unwrap();
+    let mut rules = rules();
+    let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
+    save(root, "f.txt", "saved");
+
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(
+        rescan.changes,
+        [Change::Modified {
+            path: "f.txt".into(),
+        }]
+    );
+}
+
+#[test]
+fn a_file_saved_by_rename_with_a_link_at_an_ignored_name_is_modified() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, RULES_FILE, "*.bak\n");
+    write(root, "f.txt", "f");
+    fs::hard_link(root.join("f.txt"), root.join("f.bak")).unwrap();
+    let mut rules = rules();
+    let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
+    save(root, "f.txt", "saved");
+
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(
+        rescan.changes,
+        [Change::Modified {
+            path: "f.txt".into(),
+        }]
+    );
+}

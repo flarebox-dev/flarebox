@@ -440,6 +440,7 @@ fn a_file_moved_over_another_out_of_a_deferred_folder_leaves_with_the_folder() {
     let mut rules = rules().with_search_budget(100);
     let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
     let id = snapshot.entries[Path::new("b/c")].id;
+    let top = snapshot.entries[Path::new("top.txt")].id;
     fs::rename(root.join("top.txt"), root.join("ig/zz/deep/top.txt")).unwrap();
     fs::rename(root.join("b/c/2.txt"), root.join("top.txt")).unwrap();
     fs::rename(root.join("b/c"), root.join("ig/zz/deep/c")).unwrap();
@@ -463,20 +464,32 @@ fn a_file_moved_over_another_out_of_a_deferred_folder_leaves_with_the_folder() {
         }
         paths = rescan.unsettled;
     };
-    assert_eq!(
-        changes,
-        [
+    let folder = Change::Ignored {
+        from: "b/c".into(),
+        to: "ig/zz/deep/c".into(),
+        kind: Dir,
+        id,
+    };
+    let expected = if cfg!(target_os = "macos") {
+        vec![
+            folder,
+            created("top.txt", File),
             Change::Ignored {
-                from: "b/c".into(),
-                to: "ig/zz/deep/c".into(),
-                kind: Dir,
-                id,
+                from: "top.txt".into(),
+                to: "ig/zz/deep/top.txt".into(),
+                kind: File,
+                id: top,
             },
+        ]
+    } else {
+        vec![
+            folder,
             Change::Modified {
                 path: "top.txt".into(),
             },
         ]
-    );
+    };
+    assert_eq!(changes, expected);
 }
 
 #[test]

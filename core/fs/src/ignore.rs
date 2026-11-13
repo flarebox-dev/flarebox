@@ -373,6 +373,54 @@ impl<'r> Pending<'r> {
         });
     }
 
+    /// Where the file `old` recorded now is, when the system names its
+    /// identity at or below a name the rules leave out and the entry there
+    /// still matches the record, so a file that reused the identity is not
+    /// taken for it.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn locate(&self, root: BorrowedFd<'_>, old: &Entry) -> Option<PathBuf> {
+        unsafe extern "C" {
+            fn fsgetpath(
+                buf: *mut std::ffi::c_char,
+                size: usize,
+                fsid: *const rustix::fs::Fsid,
+                obj_id: u64,
+            ) -> isize;
+        }
+        let fsid = rustix::fs::fstatfs(root).ok()?.f_fsid;
+        let base = rustix::fs::getpath(root).ok()?;
+        let mut buf = vec![0u8; 4096];
+        let len = unsafe {
+            fsgetpath(
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &fsid,
+                u64::try_from(old.id.ino).ok()?,
+            )
+        };
+        let found =
+            std::ffi::CStr::from_bytes_until_nul(buf.get(..usize::try_from(len).ok()?)?).ok()?;
+        let rel = Path::new(OsStr::from_bytes(found.to_bytes()))
+            .strip_prefix(OsStr::from_bytes(base.as_bytes()))
+            .ok()?;
+        let left_out = rel.ancestors().any(|path| {
+            (path.parent().zip(path.file_name())).is_some_and(|(folder, name)| {
+                (self.rules.ignored.get(folder)).is_some_and(|names| names.contains(name))
+            })
+        });
+        if !left_out {
+            return None;
+        }
+        let (dir, _) = open_attached(root, rel.parent()?, &mut |_| {}).ok()??;
+        let entry = stat_at(dir.as_fd(), rel.file_name()?).ok()?.entry()?;
+        (entry == *old).then(|| rel.to_path_buf())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn locate(&self, _: BorrowedFd<'_>, _: &Entry) -> Option<PathBuf> {
+        None
+    }
+
     pub(crate) fn search(
         &mut self,
         root: BorrowedFd<'_>,

@@ -514,6 +514,7 @@ pub fn decode(text: &str) -> Vec<Entry> {
                 size: fields[4].parse().unwrap(),
                 mtime_ns: fields[5].parse().unwrap(),
                 executable: fields[6] == "true",
+                linked: false,
             }
         })
         .collect()
