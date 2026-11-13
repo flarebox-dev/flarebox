@@ -396,6 +396,12 @@ jobs:
           cache-dependency-path: server/pnpm-lock.yaml
       - name: Check the committed standalone release version before generating it
         run: node --test server/scripts/check-release-version.mjs
+      - name: Keep KOIDRIVE_FEATURES out of the tracked Worker config
+        run: |
+          if grep -n KOIDRIVE_FEATURES server/wrangler.jsonc; then
+            echo "::error file=server/wrangler.jsonc::KOIDRIVE_FEATURES is for test deployments, which pass it at deploy time. Every new deployment copies server/wrangler.jsonc, so it must not set it (RFC 0022 §3 rule 7)."
+            exit 1
+          fi
       - name: Deploy a copy of server/ on its own (dry run, then wrangler dev and a claim)
         run: node server/scripts/check-deploy.mjs
       - name: Install server dependencies
