@@ -1,0 +1,305 @@
+// SPDX-License-Identifier: Apache-2.0
+
+#[test]
+fn a_first_link_records_its_proven_cause_with_the_stored_question() {
+    let mut remote = Remote::new();
+    let (site, b) = a_first_link_with_a_name_clash(&mut remote, "notes.txt", "Notes.txt");
+    drop(b);
+    let question = answer(&site, Answer::Publish);
+    assert_eq!(
+        question.recovery_cause,
+        Some(crate::RecoveryCause {
+            trigger: crate::RecoveryTrigger::NoSyncState,
+            restore_point_ms: None,
+        })
+    );
+    assert_eq!(
+        question.kind,
+        crate::QuestionKind::Recovery {
+            group: crate::RecoveryGroup::CreatedOnThisDevice,
+        }
+    );
+}
+
+#[test]
+fn a_first_link_holds_what_the_space_lacks_and_publishing_it_keeps_both_files_of_one_name() {
+    // The space's name and the folder's: in another case, in another Unicode form, and where case folding changes
+    // the name's length.
+    for (theirs, mine) in [
+        ("notes.txt", "Notes.txt"),
+        ("r\u{e9}sum\u{e9}.txt", "re\u{301}sume\u{301}.txt"),
+        ("stra\u{df}e.txt", "STRASSE.txt"),
+    ] {
+        let mut remote = Remote::new();
+        let (site, mut b) = a_first_link_with_a_name_clash(&mut remote, theirs, mine);
+
+        let question = answer(&site, Answer::Publish);
+        assert_eq!(
+            question.kind,
+            crate::question::QuestionKind::Recovery {
+                group: crate::question::RecoveryGroup::CreatedOnThisDevice,
+            }
+        );
+        let held: Vec<_> = (question.items.iter())
+            .map(|item| (item.path.as_str(), item.files))
+            .collect();
+        let mut expected = [(mine, 1), ("mine.txt", 1)];
+        expected.sort();
+        assert_eq!(held, expected, "{mine}");
+        let step = b.folder.requested();
+        b.take(step).unwrap();
+        b.run(&mut remote);
+        b.settle();
+        b.run(&mut remote);
+
+        let on_disk = files(&site.root);
+        let texts: Vec<&str> = on_disk.iter().map(|(_, text)| text.as_str()).collect();
+        assert_eq!(texts.len(), 3, "{mine}: {on_disk:?}");
+        for text in ["already here", "mine", "written on a"] {
+            assert!(texts.contains(&text), "{mine}: {on_disk:?}");
+        }
+        assert!(
+            on_disk
+                .iter()
+                .any(|(path, text)| path == theirs && text == "written on a")
+        );
+        assert_eq!(remote.names().len(), 3, "{mine}");
+        assert_eq!(b.folder.view().questions, 0);
+        assert_eq!(b.state(), FolderState::UpToDate);
+    }
+}
+
+#[test]
+fn discarding_what_a_first_link_holds_moves_it_to_the_local_trash_and_downloads_the_space() {
+    let mut remote = Remote::new();
+    let (site, mut b) = a_first_link_with_a_name_clash(&mut remote, "notes.txt", "Notes.txt");
+
+    answer(&site, Answer::Discard);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+
+    assert!(b.sent.is_empty(), "nothing is sent for a discarded entry");
+    assert_eq!(
+        files(&site.root),
+        [("notes.txt".to_owned(), "written on a".to_owned())]
+    );
+    let mut trash = trashed(&site.root);
+    trash.sort();
+    assert_eq!(trash.len(), 2, "{trash:?}");
+    assert_eq!(remote.names(), ["notes.txt"]);
+    assert_eq!(b.folder.view().questions, 0);
+    assert_eq!(b.state(), FolderState::UpToDate);
+}
+
+#[test]
+fn a_question_the_engine_holds_without_its_row_is_shown_and_answered_once_the_folder_opens() {
+    let mut remote = Remote::new();
+    let (site, b) = a_first_link_with_a_name_clash(&mut remote, "notes.txt", "Notes.txt");
+    drop(b);
+    let mut store = Store::open(&site.db).unwrap();
+    store
+        .transaction(|tx| {
+            let [stored] = &tx.questions()?[..] else {
+                panic!("one question");
+            };
+            assert!(tx.remove_question(&stored.question_id)?);
+            Ok::<_, koidrive_store::Error>(())
+        })
+        .unwrap();
+    drop(store);
+
+    let mut b = restarted(&site, &mut remote);
+    b.settle();
+    b.run(&mut remote);
+    assert!(b.sent.is_empty(), "nothing is sent before an answer");
+    let question = answer(&site, Answer::Publish);
+    assert_eq!(question.items.len(), 2);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    assert_eq!(remote.names().len(), 3);
+    assert_eq!(b.folder.view().questions, 0);
+}
+
+/// Discard on a first link whose held folder also holds an entry L does not know: a file the device's rules exclude,
+/// or a symlink. Discard moves the listed file to the local trash and keeps the folder with that entry. The folder's
+/// removal is not planned again on a timer, and the status names the entry.
+#[test]
+fn discarding_a_held_folder_that_holds_an_entry_l_does_not_know_keeps_the_folder_and_names_the_entry()
+ {
+    for unknown in ["build.log", "link"] {
+        let mut remote = Remote::new();
+        let (site_a, mut a) = linked(&mut remote, "a");
+        a.create(&mut remote, &site_a.root.join("notes.txt"), b"written on a");
+        let site = Site::new(&remote, "b");
+        fs::create_dir(site.root.join("held")).unwrap();
+        fs::write(site.root.join("held/a.txt"), b"listed").unwrap();
+        let entry = site.root.join("held").join(unknown);
+        match unknown {
+            "link" => std::os::unix::fs::symlink("/etc/hosts", &entry).unwrap(),
+            _ => fs::write(&entry, b"left out").unwrap(),
+        }
+        let sync = SyncRules {
+            include: Vec::new(),
+            exclude: vec!["*.log".into()],
+        };
+        let mut b = site.start_with(&sync);
+        b.connect(&remote);
+        b.scan_until(|b| b.folder.scanned);
+        b.run(&mut remote);
+        b.settle();
+        b.run(&mut remote);
+        answer(&site, Answer::Discard);
+        let step = b.folder.requested();
+        b.take(step).unwrap();
+        let mut steps = 0;
+        while let Some(work) = b.work.pop_front() {
+            steps += 1;
+            assert!(
+                steps < 20,
+                "{unknown}: the removal is planned again and again"
+            );
+            b.perform(work, &mut remote).unwrap();
+        }
+
+        assert!(
+            b.sent.is_empty(),
+            "{unknown}: nothing is sent for a discarded entry"
+        );
+        assert!(fs::symlink_metadata(&entry).is_ok(), "{unknown} is kept");
+        assert!(!site.root.join("held/a.txt").exists());
+        assert_eq!(trashed(&site.root).len(), 1, "{unknown}");
+        let view = b.folder.view();
+        assert_eq!(
+            (view.state, view.questions),
+            (FolderState::UpToDate, 0),
+            "{unknown}"
+        );
+        let problem = view.problem.unwrap_or_default();
+        assert!(
+            problem.contains(&format!("\"held\" (the server's change could not be made here: the folder holds entries this device does not sync: {unknown:?})")),
+            "{problem}"
+        );
+    }
+}
+
+#[test]
+fn a_first_link_holds_what_another_devices_rules_leave_out_for_a_while_until_the_person_publishes_it()
+ {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("notes.txt"), b"written on a");
+
+    let site = Site::new(&remote, "b");
+    fs::write(site.root.join("mine.txt"), b"mine").unwrap();
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    assert_eq!(b.folder.view().questions, 1);
+
+    let rules = site_a.root.join(".koiignore");
+    for (written, left_out) in [(&b"mine.txt\n"[..], true), (b"other.txt\n", false)] {
+        a.create(&mut remote, &rules, written);
+        b.pull(&remote);
+        b.run(&mut remote);
+        b.scan_until(|b| !b.folder.disk.awaits_rules());
+        b.run(&mut remote);
+        b.settle();
+        b.run(&mut remote);
+        let id = (b.folder.engine.trees.local().iter())
+            .find(|(_, node)| node.shape.name == "mine.txt")
+            .map(|(id, _)| id.clone())
+            .unwrap();
+        assert_eq!(b.folder.engine.trees.excluded(&id), left_out);
+        assert!(b.sent.is_empty(), "mine.txt waits for the person's answer");
+    }
+    assert_eq!(remote.names(), [".koiignore", "notes.txt"]);
+    assert_eq!(b.folder.view().questions, 1);
+
+    let question = answer(&site, Answer::Publish);
+    let held: Vec<_> = (question.items.iter())
+        .map(|item| item.path.as_str())
+        .collect();
+    assert_eq!(held, ["mine.txt"]);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    assert_eq!(remote.names(), [".koiignore", "mine.txt", "notes.txt"]);
+    assert_eq!(b.folder.view().questions, 0);
+}
+
+#[test]
+fn a_first_link_adopts_what_the_space_holds_alike_and_publishes_the_rest_when_asked() {
+    let mut remote = Remote::new();
+    let site_a = Site::new(&remote, "a");
+    fs::write(site_a.root.join("notes.txt"), b"written on a").unwrap();
+    fs::create_dir(site_a.root.join("shared")).unwrap();
+    fs::write(site_a.root.join("shared/plan.txt"), b"a plan from a").unwrap();
+    let mut a = site_a.start();
+    a.connect(&remote);
+    a.scan_until(|a| a.folder.scanned);
+    assert_eq!(a.run(&mut remote), ["list", "subscribe", "upload", "send"]);
+    assert_eq!(a.folder.view().questions, 0, "the space was empty");
+
+    let site = Site::new(&remote, "b");
+    fs::write(site.root.join("notes.txt"), b"written on a").unwrap();
+    fs::write(site.root.join("mine.txt"), b"already here").unwrap();
+    fs::create_dir(site.root.join("shared")).unwrap();
+    fs::write(site.root.join("shared/draft.txt"), b"a draft from b").unwrap();
+    let mut b = site.start();
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    assert!(b.sent.is_empty(), "nothing is sent before an answer");
+    assert_eq!(remote.space.head_seq(), 1);
+    let local = b.folder.engine.trees.local();
+    let notes = (local.iter()).find(|(_, node)| node.shape.name == "notes.txt");
+    assert!(
+        notes.is_some_and(|(id, _)| b.folder.engine.trees.remote().get(id).is_some()),
+        "the same notes.txt is adopted as the space's node"
+    );
+    assert_eq!(
+        fs::read(site.root.join("shared/plan.txt")).unwrap(),
+        b"a plan from a"
+    );
+
+    let question = answer(&site, Answer::Publish);
+    let held: Vec<_> = (question.items.iter())
+        .map(|item| (item.path.as_str(), item.files))
+        .collect();
+    assert_eq!(held, [("mine.txt", 1), ("shared/draft.txt", 1)]);
+    let step = b.folder.requested();
+    b.take(step).unwrap();
+    b.run(&mut remote);
+    b.settle();
+    b.run(&mut remote);
+    a.pull(&remote);
+    a.run(&mut remote);
+    a.settle();
+    assert!(a.work.is_empty());
+
+    let both = [
+        ("mine.txt", "already here"),
+        ("notes.txt", "written on a"),
+        ("shared/draft.txt", "a draft from b"),
+        ("shared/plan.txt", "a plan from a"),
+    ]
+    .map(|(path, text)| (path.to_owned(), text.to_owned()));
+    assert_eq!(files(&site.root), both);
+    assert_eq!(files(&site_a.root), both);
+    assert_eq!(remote.space.head_seq(), 2);
+    assert_eq!(a.state(), FolderState::UpToDate);
+    assert_eq!(b.state(), FolderState::UpToDate);
+}

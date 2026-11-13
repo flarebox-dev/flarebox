@@ -341,6 +341,13 @@ jobs:
         if: runner.environment != 'self-hosted'
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked --features koidrive-cli/test-install-inventory -- -D warnings
+      - name: Test the scenario splitter
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/test-split-target
+        run: |
+          nice -n 10 cargo fmt --manifest-path scripts/test-split/Cargo.toml --check
+          nice -n 10 cargo clippy --manifest-path scripts/test-split/Cargo.toml --all-targets --locked -- -D warnings
+          python3 scripts/test-split/test_split.py -v
       - run: cargo test --workspace --locked --features koidrive-cli/test-install-inventory
 
   server:
