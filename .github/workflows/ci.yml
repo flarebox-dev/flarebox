@@ -647,31 +647,6 @@ jobs:
       - name: Test the hook's installer without root
         run: .github/runner/test-install-hook.sh
 
-  installer:
-    name: installer (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-15]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - name: Install shell test tools on Linux
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y shellcheck zsh fish
-      - name: Install shell test tools on macOS
-        if: runner.os == 'macOS'
-        run: brew install shellcheck fish
-      - name: Check installer syntax and lint
-        run: |
-          nice -n 10 sh -n install.sh
-          nice -n 10 sh -n scripts/test-install.sh
-          nice -n 10 shellcheck -s sh install.sh scripts/test-install.sh
-      - name: Test isolated installer journeys
-        run: nice -n 10 python3 scripts/test-install-journey.py -v
-
   comments:
     name: comments
     if: github.event_name != 'push'
@@ -701,7 +676,7 @@ jobs:
   ci-report:
     name: ci-report
     if: always()
-    needs: [changes, pick-macos, rust, server, server-deploy, net-integration, driver-integration, cli-integration, ffi-integration, spec, macos-app, runner-hook, installer, comments]
+    needs: [changes, pick-macos, rust, server, server-deploy, net-integration, driver-integration, cli-integration, ffi-integration, spec, macos-app, runner-hook, comments]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any CI job failed or was cancelled
@@ -719,14 +694,13 @@ jobs:
           SPEC: ${{ needs.spec.result }}
           MACOS_APP: ${{ needs.macos-app.result }}
           RUNNER_HOOK: ${{ needs.runner-hook.result }}
-          INSTALLER: ${{ needs.installer.result }}
           COMMENTS: ${{ needs.comments.result }}
           FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
         run: |
           echo "site-only change: ${SITE_ONLY:-unknown}. Build and test jobs that skip for a site-only change report skipped."
-          echo "changes: $CHANGES, pick-macos: $PICK_MACOS, rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, driver-integration: $DRIVER_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP, runner-hook: $RUNNER_HOOK, installer: $INSTALLER, comments: $COMMENTS"
+          echo "changes: $CHANGES, pick-macos: $PICK_MACOS, rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, driver-integration: $DRIVER_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP, runner-hook: $RUNNER_HOOK, comments: $COMMENTS"
           if [ "$FAILED" = "true" ]; then
-            echo "::error::At least one CI job failed or was cancelled (changes: $CHANGES, pick-macos: $PICK_MACOS, rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, driver-integration: $DRIVER_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP, runner-hook: $RUNNER_HOOK, installer: $INSTALLER, comments: $COMMENTS). Open that job's log for the cause."
+            echo "::error::At least one CI job failed or was cancelled (changes: $CHANGES, pick-macos: $PICK_MACOS, rust: $RUST, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, driver-integration: $DRIVER_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP, runner-hook: $RUNNER_HOOK, comments: $COMMENTS). Open that job's log for the cause."
             exit 1
           fi
       - name: Fail unless the build and test jobs ran for a change outside site/

@@ -6,31 +6,13 @@ Install the `koi` command on Linux (x86_64 or arm64) or on a Mac with Apple sili
 curl -fsSL https://koidrive.com/install.sh | sh
 ```
 
-On a Mac, the installer continues into guided setup in your terminal. Setup installs and verifies the macOS app and helps you connect this machine. On Linux, run `~/.local/bin/koi setup` after installation.
+The installer prints `Installed koi to /home/alice/.local/bin/koi`. Check it with `koi --version`, which prints the version, such as `koi 0.1.0-alpha.1`.
 
 The installer downloads the latest [GitHub release](https://github.com/koidrive/koidrive/releases) for your system, checks it against the release's `SHA256SUMS` file and installs `koi` in `~/.local/bin`. It never needs root. The release includes the server, so you can deploy a server without Node.js or Rust. On macOS, the release's `koi` is signed with a Developer ID and notarized.
 
-## Use koi in your shell
+## Fix a PATH warning
 
-In an attended terminal, the installer adds one marked entry if the install directory is missing from `PATH`. It uses `~/.zprofile` for zsh, `~/.bash_profile` for bash, or `$XDG_CONFIG_HOME/fish/conf.d/koidrive.fish` for fish, with `~/.config` as the default configuration directory. An exported `ZDOTDIR` selects zsh's profile directory. When creating `.bash_profile`, it preserves loading an existing `.bash_login` or `.profile`. It prints the file and lines it changes. Open a new terminal to run `koi` by name. Setup uses the installed command's absolute path, so it does not need a new terminal.
-
-If the installer warns that `koi` on `PATH` runs another program, put the install directory before it. The installer never replaces a `koi` in the install directory that is another program. Other shells get a PATH instruction without a profile change.
-
-## Install without setup or profile changes
-
-Use `--no-setup` to install without starting setup, `--no-modify-path` to leave shell profiles alone, or `--no-app` to skip installing and opening the macOS app during setup:
-
-```sh
-curl -fsSL https://koidrive.com/install.sh | sh -s -- --no-app
-```
-
-You can also set `KOIDRIVE_NO_SETUP=1` or `KOIDRIVE_NO_MODIFY_PATH=1` for `sh`:
-
-```sh
-curl -fsSL https://koidrive.com/install.sh | KOIDRIVE_NO_SETUP=1 KOIDRIVE_NO_MODIFY_PATH=1 sh
-```
-
-CI and unattended installs do not change profiles or start setup. Automatic setup requires terminal output and error streams, a controlling terminal for input, and no `CI` environment variable. To start it later, run `~/.local/bin/koi setup`, or use your custom install directory. `koi setup --no-app` runs setup without the app.
+If the installer warns that `~/.local/bin` is not on `PATH`, add it to your shell profile. If it warns that `koi` on `PATH` runs another program, such as the Koi theme switcher for KDE, put `~/.local/bin` before it. The installer never replaces a `koi` in the install directory that is another program.
 
 ## Update Koidrive
 

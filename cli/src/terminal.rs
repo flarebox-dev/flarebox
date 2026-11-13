@@ -112,7 +112,11 @@ struct InputBridge {
 }
 
 impl InputBridge {
-    fn new(input: &OwnedFd, size: rustix::termios::Winsize) -> io::Result<(Self, std::fs::File)> {
+    fn new(
+        input: &OwnedFd,
+        output: impl AsFd,
+        size: rustix::termios::Winsize,
+    ) -> io::Result<(Self, std::fs::File)> {
         use rustix::fs::{Mode, OFlags, fcntl_getfl, fcntl_setfl, open};
         use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
 
@@ -120,7 +124,23 @@ impl InputBridge {
             unsafe { AsyncFd::register(fd) }.map_err(|error| error.into_parts().1)
         }
 
-        let name = rustix::termios::ttyname(input, Vec::new())?;
+        let mut name = rustix::termios::ttyname(input, Vec::new())?;
+        if name.as_c_str() == c"/dev/tty" {
+            let session = rustix::termios::tcgetsid(input)?;
+            if rustix::termios::tcgetsid(&output).ok() != Some(session) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "stdin and stderr are not the same terminal",
+                ));
+            }
+            name = rustix::termios::ttyname(&output, Vec::new())?;
+            if name.as_c_str() == c"/dev/tty" {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "the terminal device name is unavailable",
+                ));
+            }
+        }
         let terminal = open(
             name.as_c_str(),
             OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
@@ -469,7 +489,7 @@ impl Terminal {
         }
         tcsetattr(&saved.input, OptionalActions::Flush, &hidden).map_err(io::Error::from)?;
         let size = rustix::termios::tcgetwinsize(io::stderr()).map_err(io::Error::from)?;
-        let (bridge, input) = InputBridge::new(&saved.input, size)?;
+        let (bridge, input) = InputBridge::new(&saved.input, io::stderr(), size)?;
         let child = tokio::process::Command::new(std::env::current_exe()?)
             .arg("_prompt")
             .arg(if self.interaction == Interaction::Rich {
@@ -763,7 +783,7 @@ mod tests {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        let (bridge, helper) = InputBridge::new(&slave, size).unwrap();
+        let (bridge, helper) = InputBridge::new(&slave, &slave, size).unwrap();
         fcntl_setfl(&helper, fcntl_getfl(&helper).unwrap() | OFlags::NONBLOCK).unwrap();
         (terminal, slave, bridge, helper)
     }
