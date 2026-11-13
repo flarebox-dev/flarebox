@@ -848,7 +848,6 @@ fn a_file_moved_below_an_ignored_folder_while_a_new_file_takes_its_name_stays_on
         if over {
             fs::rename(site.root.join("d/f"), site.root.join("x")).unwrap();
             fs::remove_dir(site.root.join("d")).unwrap();
-            a.scan_until(|a| !a.work.is_empty());
             a.rest(&mut remote);
         }
         let synced = server_nodes(&remote);
@@ -868,7 +867,6 @@ fn a_file_moved_below_an_ignored_folder_while_a_new_file_takes_its_name_stays_on
         b.rest(&mut remote);
         fs::rename(site.root.join("x"), site.root.join(to)).unwrap();
         fs::write(site.root.join("x"), b"new").unwrap();
-        a.scan_until(|a| !a.work.is_empty());
         a.rest(&mut remote);
         b.pull(&remote);
         b.rest(&mut remote);
