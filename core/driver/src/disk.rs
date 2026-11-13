@@ -811,8 +811,8 @@ impl Pending {
     /// A content that cannot be fetched does not stall the batch. That is a chunk the server refused as gone or
     /// whose bytes never matched, a malformed manifest, or a content that omits its chunk list when the store's R has
     /// no version with that content. Each write that lists such a chunk fails when the batch is applied, with that
-    /// reason, and the transfer goes on for the others. A transfer that failed for now stalls the whole batch, which
-    /// is staged again from the start.
+    /// reason, and the transfer goes on for the others. A transfer the server asks to retry later stalls the whole
+    /// batch, which is staged again from the start.
     pub async fn stage(&self, fetch: &impl Fetch) -> Result<Staged, Stall> {
         let mut unfetchable: Vec<Option<String>> = vec![None; self.effects.len()];
         let mut writes: Vec<(usize, &Content, Manifest)> = Vec::new();
