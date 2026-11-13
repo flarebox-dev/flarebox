@@ -441,6 +441,8 @@ impl Engine {
         let behind = (self.cursor.as_ref()).is_some_and(|cursor| cursor.ahead_of_server);
         let trashed = self.trees.trashed_here();
         let edited = self.trees.edited_here();
+        let commits = &self.commits;
+        let synced = (self.trees).taken_from_others(|seq| commits.made_here(seq));
         let root = self.trees.remote().root.clone();
         let mut tree = Tree::new(root.clone());
         for state in staging.nodes.values().filter(|state| state.node_id != root) {
@@ -462,16 +464,18 @@ impl Engine {
         }
         for (id, node) in tree.iter() {
             if self.trees.remote().get(id) != Some(node) {
-                self.trees.set_remote(id.clone(), node.clone());
+                self.trees.set_listed_remote(id.clone(), node.clone());
             }
         }
         if behind {
             (self.trees).forget_lost(
                 trashed,
                 edited,
+                synced,
                 self.commits.held_through(),
                 self.commits.accepted(),
             );
+            self.commits.forget_lost_slots();
         }
         tx.clear_remote_nodes()?;
         for state in staging.nodes.values() {
@@ -1764,6 +1768,7 @@ mod tests {
                     content_rev: 1,
                     meta_rev: 1,
                     trash_group: String::new(),
+                    version_id: String::new(),
                 };
                 trees.set_remote((*id).into(), node);
             }
@@ -2049,6 +2054,7 @@ mod tests {
                         content_rev: 1,
                         meta_rev: 2,
                         trash_group: String::new(),
+                        version_id: String::new(),
                     };
                     trees.set_remote("d".into(), node);
                 },

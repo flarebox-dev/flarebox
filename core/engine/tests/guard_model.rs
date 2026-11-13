@@ -759,6 +759,7 @@ fn remote(node: &ServerNode) -> RemoteNode {
         content_rev: 1,
         meta_rev: node.meta_rev,
         trash_group: (node.trash.as_ref()).map_or_else(String::new, |t| t.group.clone()),
+        version_id: String::new(),
     }
 }
 

@@ -49,8 +49,6 @@ fn step(losses: Losses) -> BoxedStrategy<Step> {
         1 => Just(Outcome::Fail),
         4 => cut.prop_map(Outcome::Crash),
     ];
-    // The engine builds no commit that requires its base, so the server never gives it
-    // `HEAD_MOVED`.
     let refused = prop_oneof![
         Just(error::Code::RetryLater),
         Just(error::Code::LimitExceeded),
@@ -1437,11 +1435,35 @@ fn a_lost_file_both_devices_create_again_is_kept_once() {
         (0, Step::Connect),
         (0, DELIVER),
         (0, COMMIT),
+        (1, COMMIT),
+        (0, COMMIT),
+    ];
+    let world = converge(2, &[lost, again]).unwrap();
+    assert_eq!(world.seen["op rejected"], 1);
+    assert!(
+        world
+            .devices
+            .iter()
+            .all(|device| device.disk.entries().len() == 1)
+    );
+}
+
+#[test]
+fn a_lost_file_another_device_creates_again_after_its_author_is_kept_once() {
+    let lost = vec![(0, BACKUP), (0, file("a"))];
+    let again = vec![
+        (0, RESTORE),
+        (1, Step::Connect),
+        (1, DELIVER),
+        (1, COMMIT),
+        (0, Step::Connect),
+        (0, DELIVER),
+        (0, COMMIT),
         (0, COMMIT),
         (1, COMMIT),
     ];
     let world = converge(2, &[lost, again]).unwrap();
-    assert_eq!(world.seen["op rejected"], 1);
+    assert!(!world.seen.contains_key("op rejected"));
     assert!(
         world
             .devices
@@ -1860,4 +1882,336 @@ fn a_folder_sent_at_a_pending_name_for_a_case_folded_name_that_an_edit_brings_ba
         ],
     ];
     converge(2, &phases).unwrap();
+}
+
+#[test]
+fn a_lost_edit_another_device_took_comes_back_at_its_name_without_a_conflict_copy() {
+    for (first, second) in [(0, 1), (1, 0)] {
+        let mut world = converge(
+            2,
+            &[vec![(0, file("a"))], vec![(0, BACKUP), (0, overwrite(0))]],
+        )
+        .unwrap();
+        let edit = (world.devices[0].disk.entries().values())
+            .find_map(|entry| entry.content.clone())
+            .unwrap();
+        let mut again = vec![(0, RESTORE)];
+        for device in [first, second] {
+            again.push((device, Step::Connect));
+            again.extend([(device, DELIVER); 8]);
+        }
+        for device in [first, second] {
+            again.extend(commit(device));
+            again.extend([(device, DELIVER); 4]);
+        }
+        world.phase(2, &again).unwrap();
+        for device in &world.devices {
+            let entries: Vec<_> = device.disk.entries().values().collect();
+            assert_eq!(entries.len(), 1, "device {first} first: {entries:?}");
+            assert_eq!(entries[0].name, "a");
+            assert_eq!(entries[0].content.as_ref(), Some(&edit));
+        }
+    }
+}
+
+#[test]
+fn a_lost_edit_is_kept_beside_an_edit_made_after_the_loss() {
+    let mut world = converge(
+        3,
+        &[vec![(0, file("a"))], vec![(0, BACKUP), (0, overwrite(0))]],
+    )
+    .unwrap();
+    let edit = (world.devices[0].disk.entries().values())
+        .find_map(|entry| entry.content.clone())
+        .unwrap();
+    let mut again = vec![(0, RESTORE), (2, Step::Connect)];
+    again.extend([(2, DELIVER); 8]);
+    again.push((2, overwrite(0)));
+    again.extend(commit(2));
+    again.extend([(2, DELIVER); 4]);
+    world.phase(2, &again).unwrap();
+    let later = (world.devices[2].disk.entries().values())
+        .find(|entry| entry.name == "a")
+        .and_then(|entry| entry.content.clone())
+        .unwrap();
+    assert_ne!(later, edit);
+    for device in &world.devices {
+        let entries = device.disk.entries();
+        let at_a = entries.values().find(|entry| entry.name == "a").unwrap();
+        assert_eq!(at_a.content.as_ref(), Some(&later));
+        assert!(
+            entries
+                .values()
+                .any(|entry| entry.content.as_ref() == Some(&edit)),
+            "{entries:?}"
+        );
+    }
+}
+
+#[test]
+fn a_second_restore_to_a_later_backup_keeps_the_edit_it_brings_back() {
+    let mut world = converge(3, &[vec![(0, file("a"))]]).unwrap();
+    let mut edit = vec![(0, BACKUP), (0, overwrite(0))];
+    edit.extend(commit(0));
+    edit.extend([(1, DELIVER); 4]);
+    edit.push((0, BACKUP));
+    world.run(1, &edit).unwrap();
+    let mut first = vec![(0, Step::RestoreEarlier), (1, Step::Connect)];
+    first.extend([(1, DELIVER); 8]);
+    first.extend([(2, Step::Connect), (2, file("b"))]);
+    first.extend(commit(2));
+    first.extend([(1, DELIVER); 4]);
+    world.run(2, &first).unwrap();
+    let mut second = vec![(0, RESTORE), (1, Step::Connect)];
+    second.extend([(1, DELIVER); 8]);
+    second.extend(commit(1));
+    world.phase(3, &second).unwrap();
+}
+
+#[test]
+fn a_second_restore_keeps_an_edit_another_device_never_downloaded() {
+    let mut world = converge(3, &[vec![(0, file("a"))]]).unwrap();
+    let mut edit = vec![(0, BACKUP), (0, overwrite(0))];
+    edit.extend(commit(0));
+    edit.extend([(1, DELIVER); 4]);
+    edit.push((1, file("b")));
+    edit.extend(commit(1));
+    edit.extend([(1, DELIVER); 4]);
+    edit.push((0, BACKUP));
+    world.run(1, &edit).unwrap();
+    let mut first = vec![(0, Step::RestoreEarlier), (1, Step::Connect)];
+    first.extend([(1, DELIVER); 8]);
+    first.extend(commit(1));
+    first.extend([(1, DELIVER); 4]);
+    world.run(2, &first).unwrap();
+    let mut second = vec![(0, RESTORE), (1, Step::Connect)];
+    second.extend([(1, DELIVER); 8]);
+    second.extend(commit(1));
+    world.phase(3, &second).unwrap();
+}
+
+#[test]
+fn a_file_a_user_deletes_after_a_restore_stays_deleted() {
+    let world = converge(
+        2,
+        &[
+            vec![(0, file("a"))],
+            vec![(0, BACKUP), (0, overwrite(0))],
+            vec![(0, RESTORE), (0, delete(0))],
+        ],
+    )
+    .unwrap();
+    assert!(
+        world
+            .devices
+            .iter()
+            .all(|device| device.disk.entries().is_empty())
+    );
+}
+
+#[test]
+fn a_file_a_restore_moves_back_stays_deleted_when_a_user_deletes_it_after() {
+    let u = |kind, target, parent, name, text| {
+        Step::User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text,
+        })
+    };
+    let phases = vec![
+        vec![
+            (2, u(1, 0, 0, 0, 0)),
+            (0, u(0, 0, 0, 5, 0)),
+            (0, u(1, 0, 71331116303773897, 0, 0)),
+            (0, u(0, 0, 1770787363935275214, 5, 0)),
+            (2, u(1, 0, 4121262060029593686, 4, 0)),
+            (2, u(0, 0, 0, 1, 0)),
+            (1, u(0, 0, 0, 5, 0)),
+        ],
+        vec![
+            (0, u(0, 0, 0, 0, 0)),
+            (1, u(3, 2084651236646964065, 4004382200176247093, 0, 0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (0, u(4, 90225674511278402, 0, 0, 0)),
+            (0, BACKUP),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (0, RESTORE),
+        ],
+    ];
+    let world = keep(2, &phases).unwrap();
+    assert!(world.devices.iter().all(|device| !device.disk.holds(2)));
+}
+
+#[test]
+fn an_own_lost_create_under_a_folder_deleted_after_the_loss_is_kept() {
+    let mut world = converge(2, &[vec![(0, folder("a"))]]).unwrap();
+    let mut steps = vec![(0, BACKUP), (1, user(1, 0, 1, "b"))];
+    steps.extend(commit(1));
+    steps.extend([(1, DELIVER); 4]);
+    steps.extend([(0, RESTORE), (1, Step::Connect)]);
+    steps.extend([(1, DELIVER); 8]);
+    steps.push((0, Step::Connect));
+    steps.extend([(0, DELIVER); 8]);
+    steps.push((0, delete(0)));
+    steps.extend(commit(0));
+    steps.extend([(1, DELIVER); 4]);
+    world.phase(1, &steps).unwrap();
+}
+
+#[test]
+fn a_resend_built_before_a_delete_reaches_the_server_yields_to_it() {
+    let mut world = converge(
+        2,
+        &[vec![(0, file("a"))], vec![(0, BACKUP), (0, overwrite(0))]],
+    )
+    .unwrap();
+    let mut steps = vec![(0, RESTORE), (1, Step::Connect)];
+    steps.extend([(1, DELIVER); 8]);
+    steps.push((1, COMMIT));
+    steps.push((0, Step::Connect));
+    steps.extend([(0, DELIVER); 8]);
+    steps.push((0, delete(0)));
+    steps.extend(commit(0));
+    steps.extend([(1, DELIVER); 8]);
+    world.phase(2, &steps).unwrap();
+    assert!(
+        world
+            .devices
+            .iter()
+            .all(|device| device.disk.entries().is_empty())
+    );
+}
+
+#[test]
+#[ignore = "a resend the server applies before a delete built without it keeps the file (GUN-552)"]
+fn a_resend_applied_before_a_delete_built_without_it_yields_to_it() {
+    let mut world = converge(
+        2,
+        &[vec![(0, file("a"))], vec![(0, BACKUP), (0, overwrite(0))]],
+    )
+    .unwrap();
+    let mut steps = vec![(0, RESTORE), (1, Step::Connect)];
+    steps.extend([(1, DELIVER); 8]);
+    steps.push((0, Step::Connect));
+    steps.extend([(0, DELIVER); 8]);
+    steps.extend([(0, delete(0)), (0, SCAN), (0, COMMIT)]);
+    steps.extend([(1, COMMIT), (1, COMMIT), (0, COMMIT)]);
+    steps.extend([(0, DELIVER); 8]);
+    steps.extend([(1, DELIVER); 8]);
+    world.phase(2, &steps).unwrap();
+    assert!(
+        world
+            .devices
+            .iter()
+            .all(|device| device.disk.entries().is_empty())
+    );
+}
+
+#[test]
+fn a_folder_deleted_after_a_restore_stays_deleted_when_another_device_held_its_lost_file() {
+    let u = |kind, target, parent, name| {
+        Step::User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text: 0,
+        })
+    };
+    let phases = vec![
+        vec![
+            (1, u(1, 0, 0, 3)),
+            (1, u(1, 0, 0, 4)),
+            (0, u(0, 0, 0, 0)),
+            (2, u(1, 0, 0, 1)),
+            (1, u(0, 0, 0, 2)),
+            (0, u(2, 0, 0, 0)),
+            (0, Step::Backup),
+            (0, u(1, 0, 954053144849064707, 0)),
+        ],
+        vec![
+            (0, u(2, 5042142129610238072, 0, 0)),
+            (0, Step::Restore),
+            (2, Step::Work(0)),
+            (0, Step::Connect),
+            (2, Step::Work(0)),
+            (0, COMMIT),
+            (0, Step::Work(7574408442752017209)),
+            (2, DELIVER),
+            (0, u(3, 331644337139499906, 3731511274330555145, 0)),
+            (2, u(4, 328653590929317078, 0, 0)),
+            (0, Step::Work(339420830684385840)),
+        ],
+    ];
+    let world = converge(2, &phases).unwrap();
+    for device in &world.devices {
+        let names: Vec<&str> = (device.disk.entries().values())
+            .filter(|entry| entry.place == Place::Root)
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert!(!names.contains(&"a"), "{names:?}");
+    }
+}
+
+#[test]
+fn a_resend_keeps_an_edit_back_to_the_restored_bytes_that_the_server_took_first() {
+    let u = |kind, target, parent, name, text| {
+        Step::User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text,
+        })
+    };
+    let phases: Vec<Vec<(usize, Step)>> = vec![
+        vec![
+            (0, u(1, 0, 0, 1, 0)),
+            (1, u(0, 0, 0, 0, 0)),
+            (0, u(1, 0, 0, 0, 0)),
+            (2, u(3, 12768519513024442974, 0, 2, 0)),
+        ],
+        vec![
+            (0, Step::Backup),
+            (1, u(2, 6880866165967015066, 0, 0, 0)),
+            (2, u(0, 0, 4008580898241398591, 0, 0)),
+            (1, u(0, 0, 0, 3, 0)),
+        ],
+        vec![
+            (0, u(2, 2682981555425727673, 0, 0, 0)),
+            (0, Step::Work(0)),
+            (2, Step::Work(0)),
+            (2, Step::Work(0)),
+            (0, Step::Restore),
+        ],
+    ];
+    keep(2, &phases).unwrap();
+}
+
+#[test]
+fn an_edit_back_to_the_restored_bytes_beats_another_devices_resend() {
+    let u = |kind, target, parent, name, text| {
+        Step::User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text,
+        })
+    };
+    let phases: Vec<Vec<(usize, Step)>> = vec![
+        vec![(1, u(1, 0, 0, 0, 1))],
+        vec![(0, u(2, 0, 0, 0, 0)), (0, Step::Backup)],
+        vec![
+            (0, Step::Restore),
+            (1, Step::Connect),
+            (1, Step::Work(0)),
+            (1, u(2, 0, 0, 0, 1)),
+        ],
+    ];
+    keep(3, &phases).unwrap();
 }

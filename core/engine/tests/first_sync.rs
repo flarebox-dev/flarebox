@@ -32,6 +32,7 @@ fn remote(parent: &str, name: String, kind: Kind) -> RemoteNode {
         content_rev: 1,
         meta_rev: 1,
         trash_group: String::new(),
+        version_id: String::new(),
     }
 }
 

@@ -66,6 +66,7 @@ fn trees(local: &[(&str, Shape)], remote: &[(&str, Shape)]) -> Trees {
             content_rev: 1,
             meta_rev: 1,
             trash_group: String::new(),
+            version_id: String::new(),
         };
         trees.set_remote((*id).into(), node);
     }
@@ -431,6 +432,7 @@ fn renamed_create(commits: &mut Commits, trees: &mut Trees, id: &str, name: &str
         content_rev: seq,
         meta_rev: seq,
         trash_group: String::new(),
+        version_id: String::new(),
     };
     trees.set_remote(id.into(), node);
     let renamed = OpResult {
@@ -496,6 +498,7 @@ fn a_published_create_that_takes_a_conflict_name_asks_nothing_and_a_later_create
         content_rev: 3,
         meta_rev: 3,
         trash_group: String::new(),
+        version_id: String::new(),
     };
     trees.set_remote("r-later".into(), theirs);
     renamed_create(&mut commits, &mut trees, "l-later", "later (conflict)", 3);
@@ -857,6 +860,7 @@ fn a_discard_whose_s_update_waits_stays_after_a_server_loss() {
         content_rev: 2,
         meta_rev: 2,
         trash_group: String::new(),
+        version_id: String::new(),
     };
     trees.set_remote("pad".into(), pad);
     let applied = OpResult {
@@ -883,7 +887,13 @@ fn a_discard_whose_s_update_waits_stays_after_a_server_loss() {
     assert_eq!(commits.connected(&welcome), Reconnect::AheadOfServer);
     let (trashed, edited) = (trees.trashed_here(), trees.edited_here());
     trees.remove_remote("pad");
-    trees.forget_lost(trashed, edited, commits.held_through(), commits.accepted());
+    trees.forget_lost(
+        trashed,
+        edited,
+        Vec::new(),
+        commits.held_through(),
+        commits.accepted(),
+    );
     trees.settle();
     assert!(trees.waiting().contains_key("l-A"));
     let sent = ops(&mut commits, &mut trees, &mut ids);

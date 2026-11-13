@@ -189,6 +189,23 @@ impl Tx<'_> {
         while let Some(row) = rows.next()? {
             state.trees.unsent_edits.insert(row.get(0)?);
         }
+        let mut stmt = self.0.prepare_cached(
+            "SELECT node_id, version_id FROM replaced_versions ORDER BY node_id, position",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            (state
+                .trees
+                .replaced_versions
+                .entry(row.get(0)?)
+                .or_default())
+            .push(row.get(1)?);
+        }
+        let mut stmt = self.0.prepare_cached("SELECT node_id FROM resends")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            state.trees.resends.insert(row.get(0)?);
+        }
 
         if let Some((accepted, halt, code, cap)) = self
             .0
@@ -270,6 +287,8 @@ impl Tx<'_> {
             "recorded_nodes",
             "edited_here",
             "unsent_edits",
+            "replaced_versions",
+            "resends",
             "effect_state",
             "failed_effects",
             "restore_intents",
@@ -464,6 +483,38 @@ impl Tx<'_> {
             .0
             .prepare_cached("INSERT OR IGNORE INTO unsent_edits (node_id) VALUES (?1)")?;
         let (old, new) = (&before.trees.unsent_edits, &after.trees.unsent_edits);
+        for node in old.difference(new) {
+            remove.execute([node])?;
+        }
+        for node in new.difference(old) {
+            put.execute([node])?;
+        }
+        let mut remove = self
+            .0
+            .prepare_cached("DELETE FROM replaced_versions WHERE node_id = ?1")?;
+        let mut put = self.0.prepare_cached(
+            "INSERT INTO replaced_versions (node_id, position, version_id) VALUES (?1, ?2, ?3)",
+        )?;
+        let (removed, changed) = differences(
+            &before.trees.replaced_versions,
+            &after.trees.replaced_versions,
+        );
+        for node in removed {
+            remove.execute([node])?;
+        }
+        for (node, versions) in changed {
+            remove.execute([node])?;
+            for (position, version) in versions.iter().enumerate() {
+                put.execute(params![node, position, version])?;
+            }
+        }
+        let mut remove = self
+            .0
+            .prepare_cached("DELETE FROM resends WHERE node_id = ?1")?;
+        let mut put = self
+            .0
+            .prepare_cached("INSERT OR IGNORE INTO resends (node_id) VALUES (?1)")?;
+        let (old, new) = (&before.trees.resends, &after.trees.resends);
         for node in old.difference(new) {
             remove.execute([node])?;
         }

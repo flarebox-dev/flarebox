@@ -70,6 +70,18 @@ pub struct TreesState {
     /// The files whose content in L is an edit of this device that the server does not hold,
     /// although S and R may hold the same bytes (section 4.4).
     pub unsent_edits: BTreeSet<NodeId>,
+    /// For each file of R, the `version_id`s it held before its current one as the log moved it
+    /// forward, oldest first, at most
+    /// [`REPLACED_VERSIONS_KEPT`](crate::classify::REPLACED_VERSIONS_KEPT). A server never gives a
+    /// version ID to two versions, also across a loss of commits (RFC 0016), so a version of this
+    /// list that a restored server holds is one that the content S took from R replaced.
+    pub replaced_versions: BTreeMap<NodeId, Vec<String>>,
+    /// The nodes this device sends again after a server loss although no change of its user is in
+    /// them (section 4.4): a file whose content S took back from R so that the content L holds is
+    /// sent again, and a node S forgot that L holds as S did. A delete that R holds of the node, or
+    /// of a folder L holds it under, beats the resend: S then takes L's shape, so the delete reaches
+    /// L. The record also ends when S takes L's shape or L changes the node.
+    pub resends: BTreeSet<NodeId>,
 }
 
 /// A node this device sent under a pending name (docs/design/sync-engine.md section 2.6).
@@ -159,8 +171,14 @@ pub enum StateError {
     NotEditedHere(NodeId),
     /// A file is recorded with an edit the server does not hold, but L does not hold it.
     NotUnsentEdit(NodeId),
+    NotRemote(NodeId),
+    /// A node is recorded as sent again after a server loss, but L does not hold it.
+    NotResend(NodeId),
     /// The commit in flight does not take the slot after the accepted counter.
-    DeviceSeq { accepted: u64, device_seq: u64 },
+    DeviceSeq {
+        accepted: u64,
+        device_seq: u64,
+    },
     /// The result of the commit in flight does not have one outcome per op.
     ResultMismatch,
     /// Planned deletes are listed for a node that no `Delete` op of the commit in flight targets.
@@ -174,5 +192,8 @@ pub enum StateError {
     /// A restore is queued and also has an outcome, or has two outcomes.
     RestoreResolved(RestoreId),
     /// The effect in flight does not carry the counter after the cleared one.
-    EffectCounter { cleared: u64, counter: u64 },
+    EffectCounter {
+        cleared: u64,
+        counter: u64,
+    },
 }

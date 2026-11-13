@@ -18,6 +18,11 @@ use crate::tree::{
 /// Every subset of a group is tried, so the search costs up to 2^n checks of n nodes.
 pub const SETTLE_GROUP_LIMIT: usize = 12;
 
+/// How many of the versions R held for one file before its current one
+/// [`Trees::replaced_versions`] keeps. A loss that rolls a file back further than that is not
+/// proven, and the file's content is kept beside R's as a conflict copy.
+pub const REPLACED_VERSIONS_KEPT: usize = 64;
+
 /// An S update of an acknowledged op that waits until S stays a valid tree with it
 /// ([`Trees::waiting`]).
 #[derive(Clone, Debug, PartialEq)]
@@ -189,6 +194,8 @@ pub struct Trees {
     edited_here: BTreeMap<NodeId, u64>,
     /// See [`TreesState::unsent_edits`].
     unsent_edits: BTreeSet<NodeId>,
+    replaced_versions: BTreeMap<NodeId, Vec<String>>,
+    resends: BTreeSet<NodeId>,
     ignore: Matcher,
     /// Nodes whose local copy the user moved into an ignored folder that is no node. L keeps the
     /// entry each had before the move.
@@ -259,6 +266,8 @@ impl Trees {
             discarded: BTreeSet::new(),
             edited_here: BTreeMap::new(),
             unsent_edits: BTreeSet::new(),
+            replaced_versions: BTreeMap::new(),
+            resends: BTreeSet::new(),
             ignore: Matcher::new(LocalRules::default()),
             outside: BTreeSet::new(),
             lost: BTreeSet::new(),
@@ -391,7 +400,54 @@ impl Trees {
     }
 
     pub fn set_remote(&mut self, id: NodeId, node: RemoteNode) {
+        let hidden = (self.r.get(&id)).is_some_and(|old| old.content_rev != node.content_rev)
+            && !node.trashed
+            && self.edited(&id)
+            && (self
+                .acknowledged(&id)
+                .and_then(|shape| shape.content.as_ref()))
+            .zip(node.shape.content.as_ref())
+            .is_some_and(|(synced, remote)| same_content(synced, remote));
+        if let Some(replaced) = (self.r.get(&id))
+            .map(|old| &old.version_id)
+            .filter(|old| !old.is_empty() && **old != node.version_id)
+        {
+            let versions = self.replaced_versions.entry(id.clone()).or_default();
+            if !versions.contains(replaced) {
+                versions.push(replaced.clone());
+            }
+            if versions.len() > REPLACED_VERSIONS_KEPT {
+                versions.remove(0);
+            }
+        }
+        self.place_remote(id.clone(), node);
+        if hidden && !self.set_synced_if_valid(id.clone(), None) {
+            self.wait(id, None, Origin::Other);
+        }
+    }
+
+    /// Sets R's node from a listing, which can take R back to a version that a lost commit
+    /// replaced. A listing records no replaced version, and of those recorded it keeps only the ones
+    /// up to the version it lists.
+    pub fn set_listed_remote(&mut self, id: NodeId, node: RemoteNode) {
+        let moved = (self.r.get(&id)).is_some_and(|old| old.version_id != node.version_id);
+        if moved && let Some(versions) = self.replaced_versions.get_mut(&id) {
+            let kept = (versions.iter())
+                .position(|version| *version == node.version_id)
+                .map_or(0, |at| at + 1);
+            versions.truncate(kept);
+            if versions.is_empty() {
+                self.replaced_versions.remove(&id);
+            }
+        }
+        self.place_remote(id, node);
+    }
+
+    fn place_remote(&mut self, id: NodeId, node: RemoteNode) {
         self.mark(&id);
+        if node.trashed {
+            self.yield_resends(&id);
+        }
         if (self.trashed_here.get(&id)).is_some_and(|&seq| !(node.trashed && node.meta_rev == seq))
         {
             self.trashed_here.remove(&id);
@@ -416,6 +472,33 @@ impl Trees {
         self.record_edit_in_trash(&id);
     }
 
+    pub(crate) fn resends(&self) -> &BTreeSet<NodeId> {
+        &self.resends
+    }
+
+    fn yield_resends(&mut self, trashed: &str) {
+        let under = |trees: &Self, id: &str| {
+            std::iter::successors(Some(id), |id| {
+                trees.l.get(id).map(|node| node.shape.parent.as_str())
+            })
+            .any(|id| id == trashed)
+        };
+        let yielded: Vec<NodeId> = (self.resends.iter())
+            .filter(|id| under(self, id))
+            .cloned()
+            .collect();
+        for id in yielded {
+            self.resends.remove(&id);
+            self.unsent_edits.remove(&id);
+            let Some(local) = self.l.get(&id).map(|node| node.shape.clone()) else {
+                continue;
+            };
+            if !self.set_synced_if_valid(id.clone(), Some(local.clone())) {
+                self.wait(id, Some(local), Origin::Other);
+            }
+        }
+    }
+
     pub fn remove_remote(&mut self, id: &str) {
         self.remote_rules_files.remove(id);
         self.trashed_here.remove(id);
@@ -423,6 +506,8 @@ impl Trees {
         self.count_trashed(id, false);
         self.displaced.remove(id);
         self.edited_here.remove(id);
+        self.replaced_versions.remove(id);
+        self.resends.remove(id);
         if self.r.remove(id).is_some() {
             self.mark(id);
         }
@@ -437,6 +522,16 @@ impl Trees {
     /// moved by the user, and is no longer reverted: that move is committed instead.
     pub fn set_local(&mut self, id: NodeId, node: LocalNode) {
         if let Some(old) = self.l.get(&id) {
+            if !old.shape.same(&node.shape) && self.resends.remove(&id) {
+                let restored = (self
+                    .acknowledged(&id)
+                    .and_then(|shape| shape.content.as_ref()))
+                .zip(node.shape.content.as_ref())
+                .is_some_and(|(synced, local)| same_content(synced, local));
+                if restored {
+                    self.unsent_edits.insert(id.clone());
+                }
+            }
             let moved = !old.parked && !node.parked && !old.shape.same_position(&node.shape);
             let to_remote =
                 (self.r.live(&id)).is_some_and(|remote| node.shape.same_position(remote));
@@ -475,6 +570,7 @@ impl Trees {
         self.lost.remove(id);
         self.count_held_trash(id, false);
         self.unsent_edits.remove(id);
+        self.resends.remove(id);
         if let Some(old) = self.l.remove(id) {
             if !old.parked {
                 self.l_names.remove(id, &old.shape);
@@ -909,6 +1005,27 @@ impl Trees {
             .collect()
     }
 
+    /// The nodes whose content L and S hold as R holds it live, a folder's as any folder's, where no
+    /// commit of this device made R's record: `made_here` tells whether a seq is one of this
+    /// device's commits. For [`Trees::forget_lost`] once a bootstrap has replaced R.
+    pub fn taken_from_others(&self, made_here: impl Fn(u64) -> bool) -> Vec<NodeId> {
+        (self.s.iter())
+            .filter(|(id, synced)| {
+                let holds = |shape: Option<&Shape>| {
+                    shape.is_some_and(|shape| match (&shape.content, &synced.content) {
+                        (Some(held), Some(synced)) => same_content(held, synced),
+                        (held, synced) => held.is_none() && synced.is_none(),
+                    })
+                };
+                let remote = (self.r.get(id))
+                    .filter(|remote| !remote.trashed)
+                    .filter(|remote| !made_here(remote.content_rev.max(remote.meta_rev)));
+                holds(remote.map(|remote| &remote.shape)) && holds(self.l.live(id))
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     /// The nodes a delete of this device trashed and R still holds trashed by it, for
     /// [`Trees::forget_lost`] once a bootstrap has replaced R.
     pub fn trashed_here(&self) -> Vec<Trashed> {
@@ -964,6 +1081,23 @@ impl Trees {
     /// in the trash keeps S, and is recorded when L holds content S does not, since a device that
     /// restores it from the trash with L's bytes would otherwise make L, S and R agree.
     ///
+    /// `synced` lists the nodes whose content L and S held as R did before the bootstrap, where no
+    /// commit of this device made R's record ([`Trees::taken_from_others`]). A file of it that R
+    /// now holds live at the
+    /// position S holds, at a version the log replaced for it before
+    /// ([`TreesState::replaced_versions`]), holds content from before the loss that S's
+    /// content replaced: nothing changed it since. S takes R's shape, so the content L holds is sent
+    /// again as an edit instead of being kept beside R's as a conflict copy. Any other file of it may
+    /// hold an edit another device made after the loss, or content older than R's that a listing
+    /// gave, so it stays on the path below.
+    ///
+    /// A node of `synced` that S takes R's shape for above, or forgets below while L holds it as S
+    /// did, is sent again with no change of this device's user in it ([`TreesState::resends`]). A
+    /// delete that R holds of it, or of a folder L holds it under, before the server takes the
+    /// resend was made after the loss by a user who may have held what the resend brings back, so
+    /// the delete beats the resend (GUN-548). The device that made the change sends it again
+    /// itself, as above.
+    ///
     /// `accepted` is the count of this device's commits the server still holds (*w*, section
     /// 2.8). An S update that waits ([`Trees::waiting`]) from a commit above it came from a commit
     /// the server lost. The update is dropped, a removal as well as a shape, so S keeps what it held: L's change is
@@ -986,6 +1120,7 @@ impl Trees {
         &mut self,
         trashed: Vec<Trashed>,
         edited: Vec<(NodeId, u64)>,
+        synced: Vec<NodeId>,
         held_through: u64,
         accepted: u64,
     ) {
@@ -1020,6 +1155,26 @@ impl Trees {
                 continue;
             };
             self.set_synced_if_valid(id, Some(remote));
+        }
+        let synced: BTreeSet<NodeId> = synced.into_iter().collect();
+        for id in synced.iter().cloned() {
+            let replaced = self.replaced_versions.get(&id);
+            let Some(remote) = (self.r.get(&id))
+                .filter(|remote| !remote.trashed)
+                .filter(|remote| {
+                    replaced.is_some_and(|versions| versions.contains(&remote.version_id))
+                })
+                .filter(|remote| {
+                    (self.s.live(&id))
+                        .is_some_and(|s| s.same_position(&remote.shape) && !s.same(&remote.shape))
+                })
+                .map(|remote| remote.shape.clone())
+            else {
+                continue;
+            };
+            if self.set_synced_if_valid(id.clone(), Some(remote)) {
+                self.resends.insert(id);
+            }
         }
         let dropped: Vec<NodeId> = (self.waiting.iter())
             .filter(
@@ -1091,6 +1246,11 @@ impl Trees {
             self.unsent_edits.insert(id);
         }
         for (id, waits) in lost {
+            let unchanged = (self.l.get(&id))
+                .is_some_and(|local| (self.s.get(&id)).is_some_and(|s| s.same(&local.shape)));
+            if unchanged && synced.contains(&id) {
+                self.resends.insert(id.clone());
+            }
             if self.r.get(&id).is_none() {
                 self.reverted.remove(&id);
             }
@@ -1605,6 +1765,11 @@ impl Trees {
 
     fn set_synced_unmarked(&mut self, id: &str, shape: Option<Shape>) {
         self.waiting.remove(id);
+        if (shape.as_ref())
+            .is_some_and(|shape| (self.l.get(id)).is_some_and(|local| local.shape.same(shape)))
+        {
+            self.resends.remove(id);
+        }
         self.changed.insert(id.to_owned());
         let old = match shape {
             Some(shape) => {
@@ -1684,6 +1849,8 @@ impl Trees {
             displaced: self.displaced.clone(),
             edited_here: self.edited_here.clone(),
             unsent_edits: self.unsent_edits.clone(),
+            replaced_versions: self.replaced_versions.clone(),
+            resends: self.resends.clone(),
         }
     }
 
@@ -1746,6 +1913,12 @@ impl Trees {
         {
             return Err(StateError::NotUnsentEdit(id.clone()));
         }
+        if let Some(id) = (state.replaced_versions.keys()).find(|id| self.r.get(id).is_none()) {
+            return Err(StateError::NotRemote(id.clone()));
+        }
+        if let Some(id) = (state.resends.iter()).find(|id| self.l.get(id).is_none()) {
+            return Err(StateError::NotResend(id.clone()));
+        }
         let TreesState {
             dirty,
             unsearched,
@@ -1761,6 +1934,8 @@ impl Trees {
             displaced,
             edited_here,
             unsent_edits,
+            replaced_versions,
+            resends,
         } = state;
         self.unsettled = dirty.clone();
         self.same.clear();
@@ -1779,6 +1954,8 @@ impl Trees {
         self.displaced = displaced;
         self.edited_here = edited_here;
         self.unsent_edits = unsent_edits;
+        self.replaced_versions = replaced_versions;
+        self.resends = resends;
         self.rules_known = false;
         self.unknown_rules.clear();
         Ok(())
