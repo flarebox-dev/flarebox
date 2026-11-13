@@ -604,7 +604,9 @@
     "fn:a_folder_the_user_moves_elsewhere_under_its_owed_name_is_still_moved": "parked_edits_and_pending_names",
     "fn:a_file_another_device_deletes_while_this_device_edits_it_takes_its_owed_name_once_the_edit_brings_it_back": "parked_edits_and_pending_names",
     "fn:a_folder_another_device_deletes_takes_its_owed_name_once_an_unsent_edit_below_it_brings_it_back": "parked_edits_and_pending_names",
-    "fn:reparent_a_folder_at_its_pending_name": "common"
+    "fn:reparent_a_folder_at_its_pending_name": "common",
+    "fn:a_folder_another_device_moves_takes_that_place_once_the_node_on_its_owed_name_stays": "parked_edits_and_pending_names",
+    "fn:a_folder_another_device_deletes_is_deleted_once_the_node_on_its_owed_name_stays": "parked_edits_and_pending_names"
   },
   "core/sim/tests/engine_sync.rs": {
     "use:std :: collections :: { BTreeMap , BTreeSet }": "common",

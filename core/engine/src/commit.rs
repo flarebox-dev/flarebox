@@ -2120,7 +2120,10 @@ fn take_owed_name(trees: &mut Trees, id: &str, pending: &Pending) -> bool {
         name: local.shape.name.clone(),
         ..synced.clone()
     };
-    trees.set_synced_if_valid(id.to_owned(), Some(shape))
+    if !trees.set_synced_if_valid(id.to_owned(), Some(shape)) {
+        trees.revert(id.to_owned());
+    }
+    true
 }
 
 fn renames_owed<'a>(
