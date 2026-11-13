@@ -402,6 +402,43 @@ fn a_create_whose_result_never_came_is_sent_again_after_a_listing_whose_pages_he
     }
 }
 
+#[test]
+fn a_listing_that_waits_for_a_sent_commit_replaces_r_once_the_commit_is_abandoned() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::write(site.root.join("n.txt"), b"first").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    let upload = a.work.pop_front().unwrap();
+    a.perform(upload, &mut remote).unwrap();
+    let Some(Work::Send(_)) = a.work.pop_front() else {
+        panic!("the commit is sent after its upload");
+    };
+    a.event(Event::ResyncRequired(ResyncRequired {
+        reason: Reason::LogTruncated as i32,
+        ..ResyncRequired::default()
+    }))
+    .unwrap();
+    a.run(&mut remote);
+    assert!(matches!(a.folder.stream, Stream::Replaying(_)));
+    let missing = ProtoError {
+        code: Code::MissingChunks as i32,
+        ..Default::default()
+    };
+    let step = a.folder.sent(Err(CallError::Server(ServerError(missing))));
+    a.take(step).unwrap();
+    let Some(Work::Upload(_)) = a.work.pop_front() else {
+        panic!("the missing content is uploaded again");
+    };
+    fs::write(site.root.join("n.txt"), b"second").unwrap();
+    let step = a.folder.uploaded(Err(ChunkError::SourceChanged { hash: vec![0; 32] }));
+    a.take(step).unwrap();
+    assert!(a.folder.engine.commits.in_flight().is_none());
+    a.settle();
+    a.rest(&mut remote);
+    assert_eq!(remote.names(), ["n.txt"]);
+    assert_eq!(a.state(), FolderState::UpToDate);
+}
+
 /// The server's storage is restored from a backup taken before `a` deleted `one.txt` (GUN-359). `a` lists the tree
 /// again, which holds `one.txt` live as it was deleted, and sends the delete again instead of downloading the file.
 #[test]
