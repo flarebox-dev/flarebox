@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use koidrive_engine::classify::Trees;
 use koidrive_engine::commit::{Commits, Failure, Halt, MAX_OPS, Reconnect};
-use koidrive_engine::effects::{Effect, Effects};
+use koidrive_engine::effects::{Base, Effect, Effects, Location};
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::ignore::{LocalRules, RuleFile};
 use koidrive_engine::names::name_key;
@@ -1116,6 +1116,37 @@ fn run_ignoring(
                 _ => false,
             };
             removals += usize::from(removes);
+            if let (
+                Effect::CreateDir {
+                    at:
+                        Location::At {
+                            base: Base::Root,
+                            dirs,
+                            name,
+                        },
+                }
+                | Effect::WriteFile {
+                    at:
+                        Location::At {
+                            base: Base::Root,
+                            dirs,
+                            name,
+                        },
+                    ..
+                },
+                Some(after),
+            ) = (&record.effect, &record.after)
+            {
+                let path: Vec<&str> = (dirs.iter().map(|dir| dir.name.as_str()))
+                    .chain([name.as_str()])
+                    .collect();
+                prop_assert!(
+                    !device.trees.ignores(&path, after.kind),
+                    "{} is written at {:?}, which the rules exclude",
+                    record.node,
+                    path
+                );
+            }
             if cut == Cut::Effect {
                 (device.trees, commits, effects) =
                     reload(&device.trees, &commits, &effects, &device.rules)?;
@@ -4084,4 +4115,69 @@ fn a_local_delete_keeps_a_recorded_entry_and_the_folders_above_it_as_the_driver_
     assert!(device.trees.local().get("d").is_some());
     assert!(device.trees.local().get("m").is_some());
     assert!(device.trees.local().get("c").is_some());
+}
+
+#[test]
+fn a_folder_brought_back_inside_a_folder_the_rules_exclude_here_is_left_out() {
+    let seed = [
+        act(0, 0, 0, 2, 0),
+        act(1, 0, 1423286438289531559, 0, 0),
+        act(0, 0, 10880074063369139784, 0, 0),
+        act(0, 0, 2339271216845459220, 0, 0),
+        act(0, 0, 9235770013735250324, 0, 0),
+        act(1, 0, 0, 0, 0),
+        act(1, 0, 20707279234150786, 0, 0),
+        act(0, 0, 10878909224886797202, 0, 0),
+        act(1, 0, 37475922255184027, 0, 0),
+    ];
+    let local = [
+        act(4, 9017015455031306602, 0, 0, 0),
+        act(0, 0, 991922665228092267, 5, 0),
+        act(3, 4100218986585080613, 8173643921442050310, 0, 0),
+    ];
+    let remote = [
+        act(1, 0, 3762238378559001317, 0, 0),
+        act(0, 0, 14392790914454771113, 2, 0),
+    ];
+    let during = [
+        (false, vec![act(0, 0, 0, 0, 0)]),
+        (false, vec![act(0, 0, 0, 0, 0)]),
+    ];
+    let rulings = [
+        Ruling::File(vec![]),
+        Ruling::Exclude(vec!["ss/"]),
+        Ruling::File(vec![]),
+    ];
+    for cut in CUTS {
+        let answer = Answer::Delete;
+        run_ignoring(
+            &seed, &local, &remote, MAX_OPS, false, &during, cut, &rulings, answer, false,
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn a_server_entry_below_a_folder_moved_out_of_what_the_rules_include_here_is_left_out() {
+    let seed = [act(0, 0, 0, 2, 0), act(0, 0, 7184675023852569860, 0, 0)];
+    let local = [
+        act(0, 0, 2196176128997887001, 0, 0),
+        act(3, 7566706047339877485, 172849414804194726, 0, 0),
+    ];
+    let remote = [act(1, 0, 0, 0, 0)];
+    let during = [(
+        false,
+        vec![
+            act(4, 526189589210477396, 0, 0, 0),
+            act(0, 0, 3559868529946001299, 0, 0),
+        ],
+    )];
+    let rulings = [Ruling::File(vec![]), Ruling::Include(vec!["b/"])];
+    for cut in CUTS {
+        let answer = Answer::Delete;
+        run_ignoring(
+            &seed, &local, &remote, MAX_OPS, false, &during, cut, &rulings, answer, false,
+        )
+        .unwrap();
+    }
 }

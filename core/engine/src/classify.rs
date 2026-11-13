@@ -750,7 +750,7 @@ impl Trees {
     }
 
     /// Whether the node is excluded on this device (section 5.10): its position in R, S or L
-    /// matches the rules, or its local copy, or a folder L holds it under, was moved into an
+    /// matches the rules, or so does its place in L below its R parent, or a folder R holds it under is excluded, or its local copy, or a folder L holds it under, was moved into an
     /// ignored folder. Nothing is planned for an excluded node, in either direction. Its S entry
     /// stays the merge base it was: S takes only what L and R both hold, and gives up a position
     /// neither holds any more, so that the entry never keeps another node out of S. A node that L holds at an included position
@@ -799,9 +799,60 @@ impl Trees {
         if local == Some(false) && moved {
             return false;
         }
+        let there = path(&self.r, id);
+        let written = self.r.live(id).and_then(|remote| {
+            let mut names = vec![remote.name.as_str()];
+            let mut current = remote.parent.as_str();
+            for _ in 0..=self.l.len() {
+                if current == self.l.root {
+                    names.reverse();
+                    return Some((names, remote.kind));
+                }
+                if current == id {
+                    return None;
+                }
+                let parent = &self.l.get(current)?.shape;
+                names.push(&parent.name);
+                current = &parent.parent;
+            }
+            None
+        });
+        let matches = |path: &Option<(Vec<&str>, Kind)>| {
+            (path.as_ref()).is_some_and(|(names, kind)| self.ignores(names, *kind))
+        };
         local == Some(true)
             || ignored(path(&self.s, id)) == Some(true)
-            || ignored(path(&self.r, id)) == Some(true)
+            || matches(&there)
+            || (written != there && matches(&written))
+            || self.r.live(id).is_some_and(|remote| {
+                remote.parent != self.r.root
+                    && self.placed_apart_above(id)
+                    && self.ignored(&remote.parent)
+            })
+    }
+
+    fn placed_apart_above(&self, id: &str) -> bool {
+        let mut current = id;
+        for _ in 0..self.r.len() {
+            let Some(remote) = self.r.live(current) else {
+                return false;
+            };
+            let folder = remote.parent.as_str();
+            let Some(placed) = self.r.live(folder) else {
+                return false;
+            };
+            let apart =
+                |shape: Option<&Shape>| shape.is_some_and(|shape| !shape.same_position(placed));
+            if apart(self.l.get(folder).map(|node| &node.shape))
+                || apart(self.s.live(folder))
+                || self.outside.contains(folder)
+                || self.displaced.contains_key(folder)
+            {
+                return true;
+            }
+            current = folder;
+        }
+        false
     }
 
     pub(crate) fn ignored_in_remote(&self, id: &str) -> bool {
