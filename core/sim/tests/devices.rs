@@ -2423,7 +2423,7 @@ fn paths_on(world: &World, device: usize) -> Vec<String> {
     paths
 }
 
-fn a_folder_made_in_a_folder_a_restore_lost(delete_it: bool) -> World {
+fn a_folder_made_in_a_folder_a_restore_lost(found_first: bool, delete_it: bool) -> World {
     let mut world = converge(
         2,
         &[
@@ -2437,12 +2437,14 @@ fn a_folder_made_in_a_folder_a_restore_lost(delete_it: bool) -> World {
         (0, SCAN),
         (0, RESTORE),
         (1, user(0, 0, 2, "ss")),
-        (1, SCAN),
     ];
+    if found_first {
+        steps.push((1, SCAN));
+    }
+    steps.extend([(0, Step::Connect), (1, Step::Connect)]);
+    steps.extend([(0, Step::Work(0)); 12]);
+    steps.extend([(1, DELIVER); 8]);
     if delete_it {
-        steps.extend([(0, Step::Connect), (1, Step::Connect)]);
-        steps.extend([(0, Step::Work(0)); 12]);
-        steps.extend([(1, DELIVER); 8]);
         steps.extend([(1, delete(2)), (1, SCAN)]);
     }
     world.phase(2, &steps).unwrap();
@@ -2451,7 +2453,15 @@ fn a_folder_made_in_a_folder_a_restore_lost(delete_it: bool) -> World {
 
 #[test]
 fn a_folder_made_after_a_restore_in_a_folder_the_restore_lost_survives_a_delete_of_its_parent() {
-    let world = a_folder_made_in_a_folder_a_restore_lost(false);
+    let world = a_folder_made_in_a_folder_a_restore_lost(true, false);
+    for device in 0..2 {
+        assert_eq!(paths_on(&world, device), ["a", "a/b", "a/b/ss"]);
+    }
+}
+
+#[test]
+fn a_folder_made_in_a_folder_the_restore_lost_survives_a_delete_of_its_parent_that_lands_first() {
+    let world = a_folder_made_in_a_folder_a_restore_lost(false, false);
     for device in 0..2 {
         assert_eq!(paths_on(&world, device), ["a", "a/b", "a/b/ss"]);
     }
@@ -2459,7 +2469,39 @@ fn a_folder_made_after_a_restore_in_a_folder_the_restore_lost_survives_a_delete_
 
 #[test]
 fn a_folder_a_restore_lost_gives_way_to_a_delete_once_the_change_in_it_is_gone() {
-    let world = a_folder_made_in_a_folder_a_restore_lost(true);
+    let world = a_folder_made_in_a_folder_a_restore_lost(true, true);
+    for device in 0..2 {
+        assert_eq!(paths_on(&world, device), Vec::<String>::new());
+    }
+}
+
+#[test]
+fn a_file_a_restore_lost_with_an_edit_not_yet_downloaded_gives_way_to_a_delete_of_its_folder() {
+    let world = keep(
+        2,
+        &[
+            vec![(0, folder("a"))],
+            vec![
+                (0, BACKUP),
+                (0, user(0, 0, 1, "b")),
+                (0, user(1, 0, 2, "c.txt")),
+            ],
+            vec![
+                (0, overwrite(2)),
+                (0, SCAN),
+                (0, COMMIT),
+                (0, COMMIT),
+                (0, DELIVER),
+                (1, DELIVER),
+                (1, DELIVER),
+                (1, DELIVER),
+                (0, delete(0)),
+                (0, SCAN),
+                (0, RESTORE),
+            ],
+        ],
+    )
+    .unwrap();
     for device in 0..2 {
         assert_eq!(paths_on(&world, device), Vec::<String>::new());
     }
