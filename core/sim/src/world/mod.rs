@@ -394,10 +394,9 @@ struct Backup {
 }
 
 fn unspend(spent: &mut Vec<Spent>, touches: &mut [BTreeMap<u128, BTreeSet<u64>>], backup: &Backup) {
-    let kept = backup.space.head_seq();
     let (lost, still): (Vec<Spent>, Vec<Spent>) = std::mem::take(spent)
         .into_iter()
-        .partition(|spent| spent.seq > kept);
+        .partition(|spent| !backup.spent.contains(spent));
     *spent = still;
     for Spent {
         device, ino, at, ..
@@ -471,7 +470,7 @@ pub struct World {
     spent: Vec<Spent>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct Spent {
     seq: u64,
     device: usize,
