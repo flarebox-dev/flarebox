@@ -172,7 +172,8 @@ fn keep(devices: usize, phases: &[Vec<(usize, Step)>]) -> Result<World, Failure>
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(
+    #![proptest_config(koidrive_test_support::regression_config(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/devices.proptest-regressions"),
         std::env::var("PROPTEST_CASES").ok().and_then(|cases| cases.parse().ok()).unwrap_or(256),
     ))]
 

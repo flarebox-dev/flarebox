@@ -35,6 +35,7 @@ url = "2.5.8"
 [dev-dependencies]
 futures-util = { version = "0.3.31", default-features = false, features = ["sink", "std"] }
 koidrive-sim = { path = "../sim" }
+koidrive-test-support = { path = "../test-support" }
 proptest = "1.12.0"
 rusqlite = "0.41.1"
 tempfile = "3.27.0"

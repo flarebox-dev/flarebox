@@ -1393,6 +1393,7 @@ dependencies = [
  "koidrive-sim",
  "koidrive-store",
  "koidrive-telemetry",
+ "koidrive-test-support",
  "proptest",
  "prost",
  "reqwest",
@@ -1526,6 +1527,7 @@ version = "0.0.0-dev"
 dependencies = [
  "koidrive-engine",
  "koidrive-proto",
+ "koidrive-test-support",
  "proptest",
  "prost",
  "serde_json",
@@ -1561,6 +1563,14 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "koidrive-test-support"
+version = "0.0.0-dev"
+dependencies = [
+ "proptest",
+ "tempfile",
 ]
 
 [[package]]

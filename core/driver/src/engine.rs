@@ -3268,6 +3268,10 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(koidrive_test_support::regression_config(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/proptest-regressions/engine.txt"),
+            ProptestConfig::default().cases,
+        ))]
         /// Whatever a person does to the folder between scans, each batch leaves L a tree that holds every entry on
         /// disk at its path, with its kind and a file's identity, and nothing else. A scan takes a folder at the
         /// same path for the same folder whatever its identity, so a folder's identity is not compared.

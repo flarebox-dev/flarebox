@@ -1,0 +1,1 @@
+cc 9018ed88183f499e1fb5a9368e992031895c0a0a31ced1166653fe334d2a5755 # shrinks to devices = 3, a create served after a restore point loses its result, and another device deletes its folder after the restore (GUN-659)

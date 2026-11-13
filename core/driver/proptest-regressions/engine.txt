@@ -4,6 +4,3 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 7c5d523abc6f567842eb25dd4b0b614e4420c2d5a5565bc7299f8f68cb0d067f # shrinks to rounds = [[File { folder: 0, name: 0 }, Move { entry: 0, folder: 0, name: 0 }, Folder { folder: 0, name: 1 }], [Move { entry: 2949593138433753332, folder: 7160633866578565229, name: 0 }, Move { entry: 4027846373108729288, folder: 10936899906654515318, name: 0 }]]
-cc 4707a502691feb0e61f4925d49e8e31c11f214b9d93f3bfd603cd02b9b422c08 # shrinks to rounds = [[Folder { folder: 0, name: 0 }, Folder { folder: 619629178810061954, name: 1 }], [Folder { folder: 2619459073139546430, name: 2 }, Folder { folder: 9666538403552624223, name: 0 }], [Remove { entry: 11619162946485322168 }, Move { entry: 4551029879960079064, folder: 954603007471856724, name: 0 }, Move { entry: 2019309326128269721, folder: 214771579044628139, name: 0 }]]
-cc f6eb529d329810a67893bba4ad8710d6995b83b9ce85a48e078d79900906f89b

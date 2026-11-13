@@ -1,0 +1,1 @@
+cc 9700493386f8883553c86d67eae4848d6e9dc8ca88dc66a6be31804d4456cd17 # shrinks to devices = 2, a folder renamed while another device replaces it with a new folder of that name (GUN-632)

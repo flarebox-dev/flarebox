@@ -349,6 +349,16 @@ jobs:
           nice -n 10 cargo clippy --manifest-path scripts/test-split/Cargo.toml --all-targets --locked -- -D warnings
           python3 scripts/test-split/test_split.py -v
       - run: cargo test --workspace --locked --features koidrive-cli/test-install-inventory
+      - name: Test the regression-case splitter
+        run: |
+          python3 scripts/test-split-proptest-regressions.py -v
+          LC_ALL=C PYTHONUTF8=0 PYTHONCOERCECLOCALE=0 python3 scripts/test-split-proptest-regressions.py -v
+      - name: Replay every saved sim and driver regression without random cases
+        env:
+          PROPTEST_CASES: '0'
+        run: |
+          cargo test --locked -p koidrive-sim --test devices --test engine_sync -- --show-output
+          cargo test --locked -p koidrive-driver --lib batches_leave_l_a_tree_that_holds_the_disk -- --show-output
       - name: Test release updates with a tag-derived version
         run: |
           python3 scripts/stamp-release-version.py v0.1.0-alpha.1

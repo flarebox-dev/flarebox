@@ -1,0 +1,1 @@
+cc 424d4a6bc5f2605f190c978de615336332668e83c4f91c9e9059e3c9a55746f1 # shrinks to devices = 3, a removal recovered after the user moved its file (GUN-443)
