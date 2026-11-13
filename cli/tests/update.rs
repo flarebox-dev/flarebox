@@ -79,6 +79,7 @@ fn koi_at(binary: &Path, home: &Path, github: &GitHub, args: &[&str]) -> Command
         .env("XDG_STATE_HOME", home.join("state"))
         .env("XDG_RUNTIME_DIR", home.join("run"))
         .env("HOMEBREW_PREFIX", home.join("brew"))
+        .env("KOIDRIVE_TEST_INSTALL_INVENTORY", home)
         .env("KOIDRIVE_UPDATE_CHECK_URL", &github.base)
         .env_remove("KOIDRIVE_UPDATE_CHECK")
         .env_remove("KOIDRIVE_LOG");
@@ -169,6 +170,57 @@ fn koi_update_on_the_newest_release_changes_nothing() {
         std::fs::read_to_string(home.path().join("brew/opt/koidrive/bin/koi.calls")).unwrap(),
         "reconciled\n"
     );
+}
+
+#[test]
+fn koi_update_preserves_disabled_login_items_and_only_fails_for_a_real_problem() {
+    for problem in [None, Some("the service could not be registered")] {
+        let home = tempfile::tempdir().unwrap();
+        let github = github("v99.0.0");
+        homebrew(home.path(), "0.0.1");
+        let mut report: Value = serde_json::from_str(REPORT).unwrap();
+        report["data"]["service"]["state"] = Value::from("switched_off");
+        if let Some(problem) = problem {
+            report["data"]["service"]["problem"] = Value::from(problem);
+        }
+        let brew = home.path().join("brew/bin/brew");
+        let script = std::fs::read_to_string(&brew)
+            .unwrap()
+            .replace(REPORT, &report.to_string());
+        executable(&brew, &script);
+        let output = koi(home.path(), &github, &["update", "--json"])
+            .output()
+            .unwrap();
+        let envelope = envelope(&output);
+        assert_eq!(output.status.success(), problem.is_none(), "{envelope:#}");
+        assert_eq!(envelope["data"]["result"], "updated");
+        assert_eq!(envelope["data"]["service"]["state"], "switched_off");
+        let output = koi(home.path(), &github, &["update"]).output().unwrap();
+        assert_eq!(output.status.success(), problem.is_none());
+        let text = String::from_utf8(output.stdout).unwrap();
+        match problem {
+            None => assert!(text.contains("Login Items"), "{text}"),
+            Some(problem) => assert!(text.contains(problem), "{text}"),
+        }
+    }
+}
+
+#[test]
+fn schema_one_status_without_an_update_notice_is_still_valid() {
+    let home = tempfile::tempdir().unwrap();
+    let github = github("v99.0.0");
+    let output = koi(home.path(), &github, &["status", "--json"])
+        .output()
+        .unwrap();
+    let mut envelope = envelope(&output);
+    assert!(
+        envelope["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("update")
+            .is_some()
+    );
+    schema::check(&envelope);
 }
 
 #[test]

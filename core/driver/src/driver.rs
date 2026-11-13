@@ -572,6 +572,7 @@ impl Driver {
     /// The sign-out itself, run while the caller holds the lifecycle lock.
     async fn signing_out(&self, confirm_last_device: bool) -> Result<(), DriverError> {
         let was_running = self.inner.running.load(Ordering::SeqCst);
+        let was_checking = self.inner.updates.is_running();
         self.stop().await;
         let signed_in = self.inner.credential.lock().unwrap().clone();
         if let Some(credential) = &signed_in
@@ -580,6 +581,9 @@ impl Driver {
         {
             if was_running {
                 self.start();
+            }
+            if was_checking {
+                self.check_for_updates();
             }
             return Err(refused);
         }
@@ -3276,6 +3280,44 @@ mod tests {
             assert!(expected, "{case}: {refused:?}");
             assert!(paths.credential().exists(), "{case}");
             assert_eq!(driver.status().folders.len(), 1, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_signout_restores_only_previously_active_update_checks() {
+        for response in [
+            b"HTTP/1.1 409 Conflict\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".as_slice(),
+            b"HTTP/1.1 500 Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".as_slice(),
+        ] {
+            for active in [true, false] {
+                let dir = tempfile::tempdir().unwrap();
+                let base = fs::canonicalize(dir.path()).unwrap();
+                let server = revocation_answered_with(response, false).await;
+                let paths = linked_with_server(&base, server);
+                fs::write(
+                    paths.update_check(),
+                    format!(
+                        r#"{{"checked_at":{},"successful_at":100}}"#,
+                        i64::MAX - 1000
+                    ),
+                )
+                .unwrap();
+                let driver = Driver::open(paths).unwrap();
+                if active {
+                    driver.check_for_updates();
+                }
+                tokio::task::yield_now().await;
+                assert_eq!(driver.inner.updates.is_running(), active);
+                let refused = driver.sign_out(false).await.unwrap_err();
+                assert!(matches!(
+                    refused,
+                    DriverError::LastDevice | DriverError::NotRevoked(_)
+                ));
+                tokio::task::yield_now().await;
+                assert_eq!(driver.inner.updates.is_running(), active, "{refused:?}");
+                driver.stop().await;
+                assert!(!driver.inner.updates.is_running());
+            }
         }
     }
 

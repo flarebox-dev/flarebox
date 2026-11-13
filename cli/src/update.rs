@@ -43,10 +43,17 @@ impl Installs {
                 .map(PathBuf::from)
                 .filter(|path| path.is_absolute())
         };
-        Installs::under(
-            absolute("HOMEBREW_PREFIX").as_deref(),
-            absolute("HOME").as_deref(),
-        )
+        let prefix = absolute("HOMEBREW_PREFIX");
+        let home = absolute("HOME");
+        let mut installs = Installs::under(prefix.as_deref(), home.as_deref());
+        if let Some(root) = absolute("KOIDRIVE_TEST_INSTALL_INVENTORY") {
+            installs.homebrew = prefix
+                .into_iter()
+                .map(|prefix| prefix.join("opt/koidrive/bin/koi"))
+                .collect();
+            installs.app = root.join("Applications/Koidrive.app/Contents/Helpers/koi");
+        }
+        installs
     }
 
     fn under(homebrew_prefix: Option<&Path>, home: Option<&Path>) -> Installs {
@@ -78,11 +85,10 @@ impl Installs {
     }
 
     fn pick(&self, exists: impl Fn(&Path) -> bool, running: &[&Path]) -> Option<Install> {
-        let homebrew = self
-            .homebrew
+        let homebrew = running
             .iter()
-            .cloned()
-            .chain(running.iter().filter_map(|koi| homebrew_link(koi)));
+            .filter_map(|koi| homebrew_link(koi))
+            .chain(self.homebrew.iter().cloned());
         if let Some(koi) = homebrew.into_iter().find(|koi| exists(koi)) {
             let prefix = koi.ancestors().nth(4)?.to_path_buf();
             return Some(Install::Homebrew { prefix });
@@ -465,7 +471,11 @@ pub async fn run(paths: &Paths, json: bool) -> Result<Done, CliError> {
             text => text,
         }
     );
-    let failed_service = report.failed();
+    let failed_service = report.problem.is_some()
+        || matches!(
+            report.state,
+            service::State::Stopped | service::State::Unavailable
+        );
     let done = Done::ok(
         UpdatedData {
             from: from.to_string(),
@@ -1081,6 +1091,28 @@ echo "==> brew $1"
             );
         }
         fs::remove_file(&opt).unwrap();
-        assert_eq!(installs.pick(Path::is_file, &[&opt]), None);
+        assert_eq!(
+            installs.pick(
+                |path| path.starts_with(dir.path()) && path.is_file(),
+                &[&opt]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_owned_custom_homebrew_wins_over_an_unrelated_standard_install() {
+        let installs = Installs::under(None, None);
+        let custom = Path::new("/srv/custombrew/opt/koidrive/bin/koi");
+        let standard = Path::new("/opt/homebrew/opt/koidrive/bin/koi");
+        assert_eq!(
+            installs.pick(
+                |path| path == custom || path == standard,
+                &[Path::new("/srv/custombrew/Cellar/koidrive/0.1.0/bin/koi")]
+            ),
+            Some(Install::Homebrew {
+                prefix: "/srv/custombrew".into()
+            })
+        );
     }
 }

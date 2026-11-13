@@ -464,6 +464,10 @@ pub struct StatusData {
     /// Every condition `status --check` weighs, whether or not `--check` was given.
     pub conditions: Vec<Condition>,
     pub service: crate::service::Report,
+    #[schemars(
+        with = "Option<UpdateNoticeData>",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub update: UpdateNoticeData,
 }
 

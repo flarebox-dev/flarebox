@@ -4,6 +4,7 @@
 //! the answer in the profile's `update-check.json`. Every reader turns that file into an [`Update`] for the version
 //! it runs, with no request of its own. `koi update` asks again at once with [`check_now`].
 
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -261,6 +262,9 @@ pub(crate) fn answer(
 
 pub(crate) fn releases_url(base: Option<&str>) -> Option<(Url, bool)> {
     let mut base = Url::parse(base.unwrap_or(API)).ok()?;
+    if !base.username().is_empty() || base.password().is_some() {
+        return None;
+    }
     if !base.path().ends_with('/') {
         base.path_segments_mut().ok()?.push("");
     }
@@ -279,24 +283,111 @@ pub(crate) async fn ask(
     etag: Option<&str>,
     asset: &str,
 ) -> Answer {
-    let mut request = (http.get(url))
-        .header(ACCEPT, "application/vnd.github+json")
-        .header("x-github-api-version", "2022-11-28");
-    if let Some(etag) = etag {
-        request = request.header(IF_NONE_MATCH, etag);
+    tokio::time::timeout(TIMEOUT, async {
+        let mut page = url.clone();
+        let mut conditional = etag;
+        let mut visited = HashSet::new();
+        let mut listed = Vec::new();
+        let mut single_etag = None;
+        loop {
+            if !visited.insert(page.clone()) {
+                return Answer::Refused { until: None };
+            }
+            let mut request = (http.get(page.clone()))
+                .header(ACCEPT, "application/vnd.github+json")
+                .header("x-github-api-version", "2022-11-28");
+            if let Some(etag) = conditional {
+                request = request.header(IF_NONE_MATCH, etag);
+            }
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(_) if visited.len() == 1 => return Answer::Unreachable,
+                Err(_) => return Answer::Refused { until: None },
+            };
+            let (status, headers) = (response.status(), response.headers().clone());
+            let next = match next_page(&url, &headers) {
+                Ok(next) => next,
+                Err(()) => return Answer::Refused { until: None },
+            };
+            if status == StatusCode::NOT_MODIFIED {
+                if visited.len() != 1 || conditional.is_none() {
+                    return Answer::Refused { until: None };
+                }
+                if next.is_none() {
+                    return Answer::NotModified;
+                }
+                conditional = None;
+                visited.clear();
+                continue;
+            }
+            if status != StatusCode::OK {
+                return answer(status, &headers, &[], asset, now_ms());
+            }
+            let body = match response.bytes().await {
+                Ok(body) => body,
+                Err(_) => return Answer::Refused { until: None },
+            };
+            let Ok(mut releases) = serde_json::from_slice::<Vec<Listed>>(&body) else {
+                return Answer::Refused { until: None };
+            };
+            listed.append(&mut releases);
+            if visited.len() == 1 && next.is_none() {
+                single_etag = headers
+                    .get("etag")
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| value.trim().to_owned());
+            }
+            let Some(next) = next else {
+                return Answer::Releases {
+                    etag: single_etag,
+                    release: track(&listed, asset),
+                };
+            };
+            page = next;
+            conditional = None;
+        }
+    })
+    .await
+    .unwrap_or(Answer::Refused { until: None })
+}
+
+fn next_page(endpoint: &Url, headers: &HeaderMap) -> Result<Option<Url>, ()> {
+    let mut next = None;
+    for header in headers.get_all("link") {
+        for link in header.to_str().map_err(|_| ())?.split(',') {
+            let mut parts = link.split(';');
+            let target = parts.next().ok_or(())?.trim();
+            let is_next = parts.any(|part| {
+                part.trim().split_once('=').is_some_and(|(key, value)| {
+                    key.trim() == "rel"
+                        && value
+                            .trim()
+                            .trim_matches('"')
+                            .split_whitespace()
+                            .any(|rel| rel == "next")
+                })
+            });
+            if !is_next {
+                continue;
+            }
+            let target = target
+                .strip_prefix('<')
+                .and_then(|target| target.strip_suffix('>'))
+                .ok_or(())?;
+            let url = endpoint.join(target).map_err(|_| ())?;
+            if url.origin() != endpoint.origin()
+                || url.path() != endpoint.path()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.fragment().is_some()
+                || next.is_some()
+            {
+                return Err(());
+            }
+            next = Some(url);
+        }
     }
-    let Ok(response) = request.send().await else {
-        return Answer::Unreachable;
-    };
-    let (status, headers) = (response.status(), response.headers().clone());
-    let body = match status {
-        StatusCode::OK => match response.bytes().await {
-            Ok(body) => body,
-            Err(_) => return Answer::Refused { until: None },
-        },
-        _ => Default::default(),
-    };
-    answer(status, &headers, &body, asset, now_ms())
+    Ok(next)
 }
 
 pub(crate) fn client(https_only: bool) -> reqwest::Result<reqwest::Client> {
@@ -407,6 +498,14 @@ impl Updates {
         if let Some(task) = self.task.lock().unwrap().take() {
             task.abort();
         }
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.task
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
     }
 
     async fn keep_checking(
@@ -828,7 +927,10 @@ mod tests {
     }
 
     async fn served(listener: &TcpListener, response: &str) -> String {
-        let (mut stream, _) = listener.accept().await.unwrap();
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
         let mut request = Vec::new();
         let mut buffer = [0; 4096];
         while !request.ends_with(b"\r\n\r\n") {
@@ -848,6 +950,248 @@ mod tests {
             .collect();
         lines.sort();
         lines
+    }
+
+    fn page(body: serde_json::Value, next: Option<&str>, etag: &str) -> String {
+        let body = body.to_string();
+        let link = next.map_or(String::new(), |next| {
+            format!("link: <{next}>; rel=\"next\"\r\n")
+        });
+        format!(
+            "HTTP/1.1 200 OK\r\netag: {etag}\r\n{link}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn pagination_selects_the_track_and_highest_version_across_every_page() {
+        for (first, second, expected) in [
+            ("v0.2.0-alpha.1", "v0.1.0", "0.1.0"),
+            ("v0.1.3", "v0.2.0", "0.2.0"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}/", listener.local_addr().unwrap());
+            let (url, https) = releases_url(Some(&base)).unwrap();
+            let next = format!("{}&page=2", url);
+            let first = page(
+                serde_json::json!([listed(first, false, &[ASSET])]),
+                Some(&next),
+                "\"first\"",
+            );
+            let second = page(
+                serde_json::json!([listed(second, false, &[ASSET])]),
+                None,
+                "\"second\"",
+            );
+            let server = async {
+                served(&listener, &first).await;
+                served(&listener, &second).await
+            };
+            let http = client(https).unwrap();
+            let (_, answer) = tokio::join!(server, ask(&http, url, None, ASSET));
+            assert_eq!(
+                answer,
+                Answer::Releases {
+                    etag: None,
+                    release: release(expected)
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_later_page_keeps_the_last_good_notice_and_waits_a_day() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        let (url, https) = releases_url(Some(&base)).unwrap();
+        let first = page(
+            serde_json::json!([listed("v99.0.0", false, &[ASSET])]),
+            Some(&format!("{}&page=2", url)),
+            "\"first\"",
+        );
+        let server = async {
+            served(&listener, &first).await;
+            served(&listener, "HTTP/1.1 500 Error\r\ncontent-length: 0\r\n\r\n").await;
+        };
+        let http = client(https).unwrap();
+        let (_, answer) = tokio::join!(server, ask(&http, url, None, ASSET));
+        assert_eq!(answer, Answer::Refused { until: None });
+        let runs = Version::parse("0.1.0").unwrap();
+        for previous in [
+            Checked::default(),
+            Checked {
+                checked_at: Some(100),
+                successful_at: Some(100),
+                release: release("0.1.2"),
+                ..Checked::default()
+            },
+        ] {
+            let notice = previous.notice(&runs);
+            let failed = previous.after(Answer::Refused { until: None }, 200);
+            assert_eq!(failed.notice(&runs), notice);
+            assert_eq!(failed.due(), 200 + DAY_MS);
+        }
+    }
+
+    #[tokio::test]
+    async fn multipage_lists_do_not_cache_page_one_etags_or_hide_later_changes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        let (url, https) = releases_url(Some(&base)).unwrap();
+        let http = client(https).unwrap();
+        let next = format!("{}&page=2", url);
+        let first = page(
+            serde_json::json!([listed("v0.1.0", false, &[ASSET])]),
+            Some(&next),
+            "\"first\"",
+        );
+        let mut checked = Checked {
+            etag: Some("\"old-single-page\"".into()),
+            ..Checked::default()
+        };
+        for version in ["0.2.0", "0.3.0"] {
+            let second = page(
+                serde_json::json!([listed(&format!("v{version}"), false, &[ASSET])]),
+                None,
+                "\"second\"",
+            );
+            let cached = checked.etag.clone();
+            let server = async {
+                let request = served(&listener, &first).await;
+                assert_eq!(
+                    request.to_ascii_lowercase().contains("if-none-match:"),
+                    cached.is_some()
+                );
+                let request = served(&listener, &second).await;
+                assert!(!request.to_ascii_lowercase().contains("if-none-match:"));
+            };
+            let (_, answer) = tokio::join!(
+                server,
+                ask(&http, url.clone(), checked.etag.as_deref(), ASSET)
+            );
+            checked = checked.after(answer, 100);
+            assert_eq!(checked.release, release(version));
+            assert_eq!(checked.etag, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_not_modified_page_with_a_new_next_link_fetches_the_whole_list() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        let (url, https) = releases_url(Some(&base)).unwrap();
+        let next = format!("{}&page=2", url);
+        let not_modified = format!(
+            "HTTP/1.1 304 Not Modified\r\nlink: <{next}>; rel=\"next\"\r\ncontent-length: 0\r\n\r\n"
+        );
+        let first = page(
+            serde_json::json!([listed("v0.1.0", false, &[ASSET])]),
+            Some(&next),
+            "\"first\"",
+        );
+        let second = page(
+            serde_json::json!([listed("v0.2.0", false, &[ASSET])]),
+            None,
+            "\"second\"",
+        );
+        let server = async {
+            served(&listener, &not_modified).await;
+            let request = served(&listener, &first).await;
+            assert!(!request.to_ascii_lowercase().contains("if-none-match:"));
+            served(&listener, &second).await;
+        };
+        let http = client(https).unwrap();
+        let (_, answer) = tokio::join!(server, ask(&http, url, Some("\"first\""), ASSET));
+        assert_eq!(
+            answer,
+            Answer::Releases {
+                etag: None,
+                release: release("0.2.0")
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn pagination_refuses_links_outside_the_release_endpoint_and_cycles() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        let (url, https) = releases_url(Some(&base)).unwrap();
+        let http = client(https).unwrap();
+        let mut credentials = url.clone();
+        credentials.set_username("account").unwrap();
+        credentials.set_password(Some("password")).unwrap();
+        let mut other_host = url.clone();
+        other_host.set_host(Some("localhost")).unwrap();
+        let mut other_port = url.clone();
+        other_port.set_port(Some(1)).unwrap();
+        let mut other_scheme = url.clone();
+        other_scheme.set_scheme("https").unwrap();
+        for next in [
+            credentials,
+            other_host,
+            other_port,
+            other_scheme,
+            url.join("/arbitrary").unwrap(),
+            url.clone(),
+        ] {
+            let first = page(
+                serde_json::json!([listed("v99.0.0", false, &[ASSET])]),
+                Some(next.as_str()),
+                "\"first\"",
+            );
+            let server = async {
+                served(&listener, &first).await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                        .await
+                        .is_err(),
+                    "followed {next}"
+                );
+            };
+            let (_, answer) = tokio::join!(server, ask(&http, url.clone(), None, ASSET));
+            assert_eq!(answer, Answer::Refused { until: None }, "{next}");
+        }
+    }
+
+    #[test]
+    fn next_links_accept_relative_urls_and_relation_lists_but_not_ambiguous_targets() {
+        let (url, _) = releases_url(None).unwrap();
+        let mut links = headers(&[("link", "<?per_page=20&page=2>; rel=\"next last\"")]);
+        let expected = url.join("?per_page=20&page=2").unwrap();
+        assert_eq!(next_page(&url, &links), Ok(Some(expected)));
+        links.append("link", HeaderValue::from_static("<?page=3>; rel=\"next\""));
+        assert_eq!(next_page(&url, &links), Err(()));
+        assert_eq!(
+            next_page(&url, &headers(&[("link", "not-a-link; rel=next")])),
+            Err(())
+        );
+    }
+
+    #[tokio::test]
+    async fn all_pages_and_their_bodies_share_one_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        let (url, https) = releases_url(Some(&base)).unwrap();
+        let http = client(https).unwrap();
+        let first = page(
+            serde_json::json!([listed("v99.0.0", false, &[ASSET])]),
+            Some(&format!("{}&page=2", url)),
+            "\"first\"",
+        );
+        let server = async {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            served(&listener, &first).await;
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        };
+        let started = std::time::Instant::now();
+        tokio::pin!(server);
+        let answer = tokio::select! {
+            _ = &mut server => panic!("the stub must keep page two open"),
+            answer = ask(&http, url, None, ASSET) => answer,
+        };
+        assert_eq!(answer, Answer::Refused { until: None });
+        assert!(started.elapsed() < Duration::from_secs(12));
     }
 
     #[tokio::test]

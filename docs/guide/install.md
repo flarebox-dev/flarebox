@@ -53,7 +53,7 @@ The daemon asks GitHub once a day whether a newer release is out, and `koi statu
 Update: Koidrive 0.1.2 is out (this device runs 0.1.0). Run: koi update
 ```
 
-The check is one request for Koidrive's public list of releases, `https://api.github.com/repos/koidrive/koidrive/releases`. It sends the user agent `koidrive` and, after the first answer, the list's ETag, a hash of the list that is the same for everyone. It sends no version, device, account or server address. GitHub sees your IP address, as it does for any download. The check isn't a [usage report](telemetry.md): nothing goes to Koidrive, and turning reports off leaves the check on.
+Each daily check reads Koidrive's public list of releases, `https://api.github.com/repos/koidrive/koidrive/releases`, following its pages with ordinary GitHub requests. It sends the user agent `koidrive` and, for a cached single-page list, the list's ETag, a hash that is the same for everyone. It sends no version, device, account or server address. GitHub sees your IP address, as it does for any download. The check isn't a [usage report](telemetry.md): nothing goes to Koidrive, and turning reports off leaves the check on.
 
 Until a stable release exists, the notice follows prereleases. After that it follows stable releases only, so a computer on a prerelease hears nothing until a newer stable release is out.
 

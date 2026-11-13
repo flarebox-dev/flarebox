@@ -917,7 +917,14 @@
           "$ref": "#/$defs/Report"
         },
         "update": {
-          "$ref": "#/$defs/UpdateNoticeData"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UpdateNoticeData"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -925,8 +932,7 @@
         "running",
         "folders",
         "conditions",
-        "service",
-        "update"
+        "service"
       ],
       "type": "object"
     },
