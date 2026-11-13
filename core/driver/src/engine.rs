@@ -2378,6 +2378,34 @@ mod tests {
     }
 
     #[test]
+    fn a_save_made_while_no_watcher_ran_keeps_its_node() {
+        for budget in [usize::MAX, 100] {
+            let (_outer, root) = tree_with_a_large_ignored_folder();
+            let mut rules = search_rules(budget);
+            let mut snapshot = Snapshot::default();
+            let (_dir, mut engine) = mapper();
+            observe_rescan(&mut engine, &mut snapshot, &root, &mut rules);
+            let local: Vec<_> = (engine.trees.local().iter())
+                .map(|(id, node)| (id.clone(), node.shape.clone()))
+                .collect();
+            for (id, shape) in local {
+                engine.trees.set_synced(id, Some(shape));
+            }
+            let (before, _, _) = holding(&engine, "d/x.txt").unwrap();
+            fs::write(root.join("d/.x.txt.tmp"), "saved").unwrap();
+            fs::rename(root.join("d/.x.txt.tmp"), root.join("d/x.txt")).unwrap();
+            let mut rules = search_rules(budget);
+            let mut rescans = 0;
+            while !observe_rescan(&mut engine, &mut snapshot, &root, &mut rules).is_empty() {
+                rescans += 1;
+                assert!(rescans < 40, "the search never ended");
+            }
+            let after = holding(&engine, "d/x.txt").map(|(id, _, _)| id);
+            assert_eq!(after, Some(before), "budget {budget}");
+        }
+    }
+
+    #[test]
     fn a_file_removed_from_a_folder_renamed_while_the_search_runs_leaves_l() {
         let (_outer, root) = tree_with_a_large_ignored_folder();
         let mut rules = search_rules(100);
