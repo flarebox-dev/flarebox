@@ -295,6 +295,14 @@ fn verified(
         return Ok(false);
     };
     let scope = Path::new(&target.path);
+    let local_scope = if node_id == tree.root {
+        PathBuf::new()
+    } else {
+        let Some(path) = engine.path_of(node_id) else {
+            return Ok(false);
+        };
+        path
+    };
     let mut disk = Snapshot::default();
     let scanned = disk
         .rescan(root, [PathBuf::new()])
@@ -302,10 +310,18 @@ fn verified(
     if scanned.root.dev != identity.dev() || scanned.root.ino != u128::from(identity.ino()) {
         return Ok(false);
     }
+    if scanned
+        .unreadable
+        .iter()
+        .chain(&scanned.unsettled)
+        .any(|blocked| local_scope.starts_with(blocked) || blocked.starts_with(&local_scope))
+    {
+        return Ok(false);
+    }
     let mut selected = None;
     for (&id, remote) in &tree.by_id {
         let Some(target) = tree.target(id) else {
-            return Ok(false);
+            continue;
         };
         let remote_path = Path::new(&target.path);
         if !remote_path.starts_with(scope) && !scope.starts_with(remote_path) {
@@ -327,14 +343,6 @@ fn verified(
         let Some(path) = engine.path_of(id) else {
             return Ok(false);
         };
-        if scanned
-            .unreadable
-            .iter()
-            .chain(&scanned.unsettled)
-            .any(|blocked| path.starts_with(blocked) || blocked.starts_with(&path))
-        {
-            return Ok(false);
-        }
         let Some(entry) = disk.entries.get(&path) else {
             return Ok(false);
         };
@@ -366,7 +374,7 @@ fn verified(
         return Ok(false);
     }
     if node_id == tree.root {
-        return Ok(scanned.unreadable.is_empty() && scanned.unsettled.is_empty());
+        return Ok(true);
     }
     let Some(expected) = selected else {
         return Ok(false);
@@ -975,6 +983,14 @@ mod tests {
                     NodeStatus::Live,
                 )
             },
+            node("trash", SPACE, "Trash", NodeKind::Dir, NodeStatus::Trashed),
+            node(
+                "hidden",
+                "trash",
+                "hidden.txt",
+                NodeKind::File,
+                NodeStatus::Live,
+            ),
         ];
         let mut store = Store::open(dir.path().join("store.sqlite")).unwrap();
         let engine = store
@@ -1020,6 +1036,17 @@ mod tests {
             ]
         };
         assert_eq!(valid(), [true; 3]);
+        let private = root.join("Docs/private");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::set_permissions(&private, std::os::unix::fs::PermissionsExt::from_mode(0o0))
+            .unwrap();
+        let readable_file = valid();
+        std::fs::set_permissions(
+            &private,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        assert_eq!(readable_file, [true, false, false]);
         std::fs::write(root.join("not-synced-yet.txt"), b"a future folder addition").unwrap();
         assert_eq!(valid(), [true; 3]);
 

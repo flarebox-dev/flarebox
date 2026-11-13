@@ -62,7 +62,17 @@ pub async fn run(paths: &Paths, action: ShareAction) -> Result<Done, CliError> {
                     None
                 },
             };
-            match ipc::run(paths, request).await? {
+            let response = ipc::run(paths, request);
+            tokio::pin!(response);
+            let response = tokio::select! {
+                biased;
+                response = &mut response => response?,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                    eprintln!("Checking files before sharing...");
+                    response.await?
+                }
+            };
+            match response {
                 Response::Shared { link } => Ok(created(&link, now_ms())),
                 other => Err(unexpected(other)),
             }
