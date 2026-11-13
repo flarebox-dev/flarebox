@@ -18,7 +18,7 @@ use koidrive_sim::world::disk::Place;
 use koidrive_sim::world::{Action, Cut, Failure, NAMES, Outcome, Reply, Step, TEXTS, World};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
-use proptest::test_runner::{FileFailurePersistence, RngSeed, TestRunner};
+use proptest::test_runner::{RngSeed, TestRunner};
 
 #[path = "devices/restore_write_history.rs"]
 mod restore_write_history;
@@ -213,9 +213,8 @@ fn converges_from(test: &'static str, seed: u64, cases: u32) {
 
 fn converges_from_saved_cases(test: &'static str, file: &'static str) {
     converges_with(ProptestConfig {
-        failure_persistence: Some(Box::new(FileFailurePersistence::Direct(file))),
         test_name: Some(test),
-        ..ProptestConfig::with_cases(0)
+        ..koidrive_test_support::regression_config(file, 0)
     });
 }
 
@@ -352,7 +351,10 @@ fn rewinds_converge_from_seed_3417() {
 fn rewinds_converge_from_the_saved_gun_551_cases() {
     converges_from_saved_cases(
         test_name!(rewinds_converge_from_the_saved_gun_551_cases),
-        "tests/gun-551.proptest-regressions",
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/gun-551.proptest-regressions"
+        ),
     );
 }
 
