@@ -3378,8 +3378,8 @@ fn an_entry_a_rule_left_out_in_a_renamed_unreadable_folder_is_created_once_inclu
     snapshot
         .rescan_with_rules(root, whole(), &mut rules)
         .unwrap();
-    fs::set_permissions(root.join("sub"), fs::Permissions::from_mode(0o000)).unwrap();
     fs::rename(root.join("sub"), root.join("moved")).unwrap();
+    fs::set_permissions(root.join("moved"), fs::Permissions::from_mode(0o000)).unwrap();
     write(root, RULES_FILE, "c.txt\n");
     let blocked = snapshot.rescan_with_rules(root, whole(), &mut rules);
     fs::set_permissions(root.join("moved"), fs::Permissions::from_mode(0o755)).unwrap();
