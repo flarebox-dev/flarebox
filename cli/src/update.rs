@@ -394,6 +394,19 @@ fn log_path(paths: &Paths) -> PathBuf {
 
 pub async fn run(paths: &Paths, json: bool) -> Result<Done, CliError> {
     refuse_root(rustix::process::geteuid().is_root())?;
+    if update::is_development_version(env!("CARGO_PKG_VERSION")) {
+        return Ok(Done::ok(
+            UpdatedData {
+                from: env!("CARGO_PKG_VERSION").to_owned(),
+                to: env!("CARGO_PKG_VERSION").to_owned(),
+                via: None,
+                result: UpdateResult::Unchanged,
+                service: None,
+            },
+            "Development builds do not update to releases.\n".to_owned(),
+        )
+        .unchanged());
+    }
     let release = update::check_now(paths)
         .await
         .map_err(|error| CliError::new(Code::Unavailable, error.to_string()))?
@@ -510,6 +523,9 @@ fn scan(
     candidates: &[PathBuf],
     runs: &Version,
 ) -> Option<PathBuf> {
+    if update::is_development_version(&runs.to_string()) {
+        return None;
+    }
     (candidates.iter())
         .filter_map(|koi| {
             let Ok(modified) = fs::metadata(koi).and_then(|metadata| metadata.modified()) else {
@@ -562,6 +578,9 @@ fn take_service(koi: &Path) {
 }
 
 pub async fn follow_newest(paths: Paths) {
+    if update::is_development_version(env!("CARGO_PKG_VERSION")) {
+        return;
+    }
     let mut seen = HashMap::new();
     let mut every = tokio::time::interval(SCAN);
     loop {
@@ -995,6 +1014,29 @@ echo "==> brew $1"
             .unwrap_err();
         served.await.unwrap();
         assert_eq!(error.message, "install.sh failed (exit status 3)");
+    }
+
+    #[test]
+    fn development_daemons_do_not_hand_the_service_to_installed_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let koi = dir.path().join("koi");
+        executable(
+            &koi,
+            "#!/bin/sh\necho probe >> \"$0.calls\"\necho 'koi 99.0.0'\n",
+        );
+        for version in ["0.0.0-dev", "0.0.0-dev+abc123"] {
+            let mut seen = HashMap::new();
+            assert_eq!(
+                scan(
+                    &mut seen,
+                    std::slice::from_ref(&koi),
+                    &Version::parse(version).unwrap()
+                ),
+                None
+            );
+            assert!(seen.is_empty());
+            assert!(!koi.with_extension("calls").exists());
+        }
     }
 
     #[test]

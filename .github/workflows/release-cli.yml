@@ -48,7 +48,7 @@ jobs:
             changed="$(tr '\0' '\n' < "$RUNNER_TEMP/changed")"
             echo "Files this pull request changes against $BASE:"
             printf '%s\n' "$changed"
-            pattern='^(cli/|core/|server/|\.cargo/|install\.sh$|scripts/test-install\.sh$|scripts/(test-)?publish-release\.sh$|scripts/(test-)?homebrew-[a-z-]+\.sh$|\.github/requirements-musl\.txt$|\.github/workflows/release-cli\.yml$|Cargo\.[^/]*$|rust-toolchain\.toml$)'
+            pattern='^(cli/|core/|server/|\.cargo/|install\.sh$|scripts/test-install\.sh$|scripts/(stamp|test)-release-version\.py$|scripts/(test-)?publish-release\.sh$|scripts/(test-)?homebrew-[a-z-]+\.sh$|\.github/requirements-musl\.txt$|\.github/workflows/release-cli\.yml$|Cargo\.[^/]*$|rust-toolchain\.toml$)'
             if grep -Eq "$pattern" <<<"$changed"; then
               echo "Linux targets: build, because a changed file matches $pattern"
             else
@@ -60,7 +60,7 @@ jobs:
               echo "::error::Listing the macOS-specific files between $BASE and HEAD failed (see the error above)."
               exit 1
             fi
-            pattern='^(install\.sh$|scripts/test-install\.sh$|scripts/(test-)?publish-release\.sh$|scripts/(test-)?homebrew-[a-z-]+\.sh$|scripts/(test-)?macos-changes\.sh$|\.github/workflows/release-cli\.yml$)'
+            pattern='^(install\.sh$|scripts/test-install\.sh$|scripts/(stamp|test)-release-version\.py$|scripts/(test-)?publish-release\.sh$|scripts/(test-)?homebrew-[a-z-]+\.sh$|scripts/(test-)?macos-changes\.sh$|\.github/workflows/release-cli\.yml$)'
             reasons="$(cut -f1 <<<"$platform" | grep -Ev '^(apps/macos|core/ffi)/' || true)"$'\n'"$(grep -E "$pattern" <<<"$changed" || true)"
             if [ -n "$(tr -d '[:space:]' <<<"$reasons")" ]; then
               echo "macOS targets: build, because of $(tr '\n' ' ' <<<"$reasons")"
@@ -128,6 +128,15 @@ jobs:
           node-version: 24
           cache: pnpm
           cache-dependency-path: server/pnpm-lock.yaml
+      - name: Set the release or validation version
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT" != push ]; then TAG=v0.0.0-rc.0; fi
+          python3 scripts/stamp-release-version.py "$TAG"
+      - name: Test release version stamping
+        run: python3 scripts/test-release-version.py
       - name: Pack the server bundle
         run: |
           pnpm --dir server install --frozen-lockfile
@@ -199,7 +208,7 @@ jobs:
             actual=$("$binary" --version)
           fi
           if [ "$actual" != "koi $expected" ]; then
-            echo "::error::koi --version prints '$actual', but $from needs 'koi $expected'. Set version in [workspace.package] of Cargo.toml to $expected and tag again."
+            echo "::error::koi --version prints '$actual', but $from needs 'koi $expected'. Check release version stamping before the build."
             exit 1
           fi
           echo "koi --version prints '$actual', matching $from."

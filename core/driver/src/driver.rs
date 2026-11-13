@@ -2129,6 +2129,19 @@ mod tests {
         }
     }
 
+    fn release_driver(paths: Paths) -> Driver {
+        let mut driver = Driver::open(paths).unwrap();
+        let inner = Arc::get_mut(&mut driver.inner).unwrap();
+        let config = Config::load(&inner.paths.config_file).unwrap_or_default();
+        let variable = std::env::var(update::VARIABLE).ok();
+        inner.updates = Arc::new(Updates::for_version(
+            update::switched_on(&config.updates, variable.as_deref()),
+            inner.paths.update_check(),
+            semver::Version::parse("0.1.0").unwrap(),
+        ));
+        driver
+    }
+
     /// A profile with one linked folder whose store holds `questions`.
     fn profile(questions: &[Question]) -> (tempfile::TempDir, Paths, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -3297,7 +3310,7 @@ mod tests {
             "release": { "version": "999.0.0", "url": "https://example.com/v999.0.0" },
         });
         fs::write(paths.update_check(), release.to_string()).unwrap();
-        let driver = Driver::open(paths.clone()).unwrap();
+        let driver = release_driver(paths.clone());
         assert_eq!(
             driver.status().update,
             crate::Update::Available {
@@ -3309,7 +3322,7 @@ mod tests {
         drop(driver);
 
         fs::write(&paths.config_file, "[updates]\ncheck = false\n").unwrap();
-        let driver = Driver::open(paths.clone()).unwrap();
+        let driver = release_driver(paths.clone());
         assert_eq!(driver.status().update, crate::Update::Off);
         driver.check_for_updates();
         assert!(!paths.update_check().exists());
@@ -3860,7 +3873,7 @@ mod tests {
                     }
                     calls
                 });
-                let mut driver = Driver::open(paths.clone()).unwrap();
+                let mut driver = release_driver(paths.clone());
                 if running {
                     driver.start();
                 }
@@ -3891,7 +3904,7 @@ mod tests {
                 }
                 if reopen {
                     drop(driver);
-                    driver = Driver::open(paths.clone()).unwrap();
+                    driver = release_driver(paths.clone());
                 }
                 release.send(()).unwrap();
                 assert!(matches!(
@@ -4980,7 +4993,7 @@ mod tests {
                     .to_string(),
                 )
                 .unwrap();
-                let driver = Driver::open(paths).unwrap();
+                let driver = release_driver(paths);
                 if active {
                     driver.check_for_updates();
                 }

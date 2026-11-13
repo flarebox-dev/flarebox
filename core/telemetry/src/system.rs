@@ -43,15 +43,17 @@ impl Environment {
             },
             Os::Other => (None, None),
         };
+        let koi_version = Version::parse(koi_version)
+            .unwrap_or_else(|_| Version::parse("0").expect("0 is a version"));
+        let build = if koi_version.is_development() {
+            Build::Dev
+        } else {
+            Build::Release
+        };
         Environment {
             client,
-            koi_version: Version::parse(koi_version)
-                .unwrap_or_else(|_| Version::parse("0").expect("0 is a version")),
-            build: if cfg!(debug_assertions) {
-                Build::Dev
-            } else {
-                Build::Release
-            },
+            koi_version,
+            build,
             os,
             os_version,
             distro,
@@ -106,6 +108,28 @@ fn numbers(value: &str) -> Option<OsVersion> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_identity_comes_from_the_version_and_preserves_prereleases() {
+        for (version, build) in [
+            ("0.0.0-dev", Build::Dev),
+            ("0.0.0-dev+abc123", Build::Dev),
+            ("0.1.0-alpha.3", Build::Release),
+            ("0.1.0-rc.1+abc123", Build::Release),
+            ("0.1.0", Build::Release),
+            ("0.1.0-dev", Build::Release),
+            ("0.0.0", Build::Release),
+        ] {
+            let environment = Environment::detect(Client::CliDaemon, version);
+            assert_eq!(environment.build, build, "{version}");
+            let value = serde_json::to_value(&environment.koi_version).unwrap();
+            assert_eq!(value, version);
+            assert_eq!(
+                serde_json::from_value::<Version>(value).unwrap(),
+                environment.koi_version
+            );
+        }
+    }
 
     #[test]
     fn the_macos_version_comes_from_product_version() {

@@ -32,7 +32,7 @@ A Worker instance may run the previous release while an object runs the new one,
 
 ## 5. Clients see the release and the protocol range
 
-`server/release.json` holds the workspace version from `Cargo.toml`, so a standalone copy of `server/` knows its release. `GET /v1/server` and `Welcome` report it as `server_version`, with the protocol range `proto_min` to `proto_max`. The client and server pick the highest common minor version, and a session with none closes with `Goodbye` code 4002. A test keeps the server serving clients one minor version behind. `Welcome.latest_release` exists, and the server leaves it empty.
+The release workflows stamp the tag's version into `Cargo.toml`, the workspace packages in `Cargo.lock`, and `server/release.json` before building. Server builds and bundle packing export the workspace version to `server/release.json`, so a standalone copy of `server/` knows its version. Source checkouts report `0.0.0-dev`, including checkouts of a release tag. To deploy a versioned server from source, run `python3 scripts/stamp-release-version.py <tag>` before building. `GET /v1/server` and `Welcome` report it as `server_version`, with the protocol range `proto_min` to `proto_max`. The client and server pick the highest common minor version, and a session with none closes with `Goodbye` code 4002. A test keeps the server serving clients one minor version behind. `Welcome.latest_release` exists, and the server leaves it empty.
 
 ## 6. Owners upgrade by deploying the new release
 

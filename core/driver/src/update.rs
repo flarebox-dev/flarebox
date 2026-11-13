@@ -71,9 +71,18 @@ pub enum CheckError {
     Url,
 }
 
+/// Whether a version identifies a local development build rather than a release.
+pub fn is_development_version(version: &str) -> bool {
+    koidrive_telemetry::schema::Version::parse(version)
+        .is_ok_and(|version| version.is_development())
+}
+
 /// Whether the update check is on for the profile at `paths`: `[updates]` in its config.toml, unless [`VARIABLE`]
 /// says otherwise. A config.toml that cannot be read leaves it on.
 pub fn is_on(paths: &Paths) -> bool {
+    if is_development_version(env!("CARGO_PKG_VERSION")) {
+        return false;
+    }
     let config = Config::load(&paths.config_file).map(|config| config.updates);
     switched_on(
         &config.unwrap_or_default(),
@@ -162,6 +171,9 @@ impl Checked {
     }
 
     pub fn notice(&self, runs: &Version) -> Update {
+        if is_development_version(&runs.to_string()) {
+            return Update::Off;
+        }
         let Some(checked_at_ms) = self
             .successful_at
             .or_else(|| self.release.as_ref().and(self.checked_at))
@@ -420,6 +432,9 @@ fn endpoint() -> Result<(reqwest::Client, Url), CheckError> {
 /// A list that GitHub answers is unchanged since the profile's last check gives that check's release. Nothing is
 /// saved.
 pub async fn check_now(paths: &Paths) -> Result<Option<Release>, CheckError> {
+    if is_development_version(env!("CARGO_PKG_VERSION")) {
+        return Ok(None);
+    }
     let (http, url) = endpoint()?;
     let checked = load(&paths.update_check()).unwrap_or_default();
     match ask(&http, url, checked.etag.as_deref(), &this_asset()).await {
@@ -456,6 +471,7 @@ fn this_version() -> Version {
 
 pub(crate) struct Updates {
     on: bool,
+    version: Version,
     path: PathBuf,
     checked: Mutex<Option<Checked>>,
     task: Mutex<Option<AbortHandle>>,
@@ -463,9 +479,15 @@ pub(crate) struct Updates {
 
 impl Updates {
     pub fn open(on: bool, path: PathBuf) -> Updates {
+        Self::for_version(on, path, this_version())
+    }
+
+    pub(super) fn for_version(on: bool, path: PathBuf, version: Version) -> Updates {
+        let on = on && !is_development_version(&version.to_string());
         let checked = on.then(|| load(&path)).flatten();
         Updates {
             on,
+            version,
             path,
             checked: Mutex::new(checked),
             task: Mutex::new(None),
@@ -476,7 +498,7 @@ impl Updates {
         match (self.on, self.checked.lock().unwrap().as_ref()) {
             (false, _) => Update::Off,
             (true, None) => Update::Unknown,
-            (true, Some(checked)) => checked.notice(&this_version()),
+            (true, Some(checked)) => checked.notice(&self.version),
         }
     }
 
@@ -631,6 +653,53 @@ mod tests {
             version: version.to_owned(),
             url: format!("https://github.com/koidrive/koidrive/releases/tag/v{version}"),
         })
+    }
+
+    fn release_updates(on: bool, path: PathBuf) -> Updates {
+        Updates::for_version(on, path, Version::parse("0.1.0").unwrap())
+    }
+
+    #[tokio::test]
+    async fn development_builds_disable_checks_even_when_the_switch_is_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update-check.json");
+        for version in ["0.0.0-dev", "0.0.0-dev+abc123"] {
+            let cached = Checked {
+                asset: Some(this_asset()),
+                checked_at: Some(1_000),
+                release: release("99.0.0"),
+                ..Checked::default()
+            };
+            save(&path, &cached).unwrap();
+            let updates = Arc::new(Updates::for_version(
+                true,
+                path.clone(),
+                Version::parse(version).unwrap(),
+            ));
+            assert_eq!(updates.notice(), Update::Off);
+            updates.start(Arc::new(watch::Sender::new(())));
+            assert!(!updates.is_running());
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn development_versions_never_offer_a_cached_release() {
+        let checked = Checked {
+            checked_at: Some(1_000),
+            release: release("99.0.0"),
+            ..Checked::default()
+        };
+        for version in ["0.0.0-dev", "0.0.0-dev+abc123"] {
+            assert_eq!(
+                checked.notice(&Version::parse(version).unwrap()),
+                Update::Off
+            );
+            assert_eq!(
+                Checked::default().notice(&Version::parse(version).unwrap()),
+                Update::Off
+            );
+        }
     }
 
     #[test]
@@ -1331,14 +1400,14 @@ mod tests {
         save(&path, &answered).unwrap();
         assert_eq!(load(&path), Some(answered));
 
-        let off = Arc::new(Updates::open(false, path.clone()));
+        let off = Arc::new(release_updates(false, path.clone()));
         assert_eq!(off.notice(), Update::Off);
         off.start(Arc::new(watch::Sender::new(())));
         assert!(!path.exists());
         assert!(off.task.lock().unwrap().is_none());
 
         save(&path, &Checked::default()).unwrap();
-        let on = Updates::open(true, path.clone());
+        let on = release_updates(true, path.clone());
         assert_eq!(on.notice(), Update::Unknown);
     }
 
@@ -1360,7 +1429,7 @@ mod tests {
                 }
                 fs::write(&path, cached.to_string()).unwrap();
                 assert_eq!(
-                    Updates::open(true, path.clone()).notice(),
+                    release_updates(true, path.clone()).notice(),
                     Update::Unknown,
                     "{asset:?}"
                 );
@@ -1390,7 +1459,7 @@ mod tests {
             url: "https://github.com/koidrive/koidrive/releases/tag/v99.0.0".into(),
             checked_at_ms: 100,
         };
-        assert_eq!(Updates::open(true, path.clone()).notice(), expected);
+        assert_eq!(release_updates(true, path.clone()).notice(), expected);
         let checked = load(&path).unwrap();
         assert!(checked.due() > now_ms());
         assert_eq!(checked.etag.as_deref(), Some("\"same\""));

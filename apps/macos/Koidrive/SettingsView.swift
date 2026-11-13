@@ -658,7 +658,7 @@ struct GeneralSettings: View {
                 .padding(.top, 8)
             RowGroup {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(verbatim: "Koidrive " + (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""))
+                    Text(verbatim: "Koidrive " + (Bundle.main.object(forInfoDictionaryKey: "KoidriveVersion") as? String ?? KoidriveFFI.version()))
                     Text("Command-line tool: koi")
                         .font(.caption.monospaced())
                         .foregroundStyle(.secondary)
