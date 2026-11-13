@@ -26,15 +26,22 @@ Use the arrow keys and Enter to choose. Pairing codes and pasted login callback 
    - With several, it asks which one.
 2. Enter a pairing code from another device, written as `<code>@<host>`. For a code without the host, run `koi join <code> --server <address>` instead. See [Add another device](#add-another-device).
 
+Once this machine is connected, setup asks which folder to sync:
+
+- The shared folder: a space whose files are the same on each of your devices. When the server has none, setup proposes one named `Koidrive`. Otherwise it lists them, adds the end of the ID when two have the same name, and offers to create a new one.
+- Where its files go on this machine. The default is `~/Koidrive`, shown as a full path. Press Enter to use it, or type another path. `~`, spaces and other characters work. Setup asks before it creates a missing folder or a new shared folder. A folder that already holds files is linked only after you agree: its files upload, and the shared folder's files download into it. A file is refused, and setup asks again.
+
+Setup then links the folder, as `koi folder link` does, and starts background sync. It ends with the folder to add files to and `koi status`, which shows how sync is going. If you cancel a folder question, this machine stays connected and no folder is linked.
+
 After setup succeeds, it asks whether to send anonymous usage reports, unless you already chose or an environment variable decides it. Press Enter for yes. The choice applies to future commands, not the setup that just finished. [Usage reports](telemetry.md) lists what they hold and how to turn them off.
 
 The login asks for four permissions: reading the account's settings, managing its Workers, writing to its R2 buckets, and keeping access while the command runs (`account-settings.read`, `workers-scripts.admin`, `workers-r2.write` and `offline_access`). Koidrive revokes the login when the command ends. If it can't, it says so, and you can revoke it under Manage OAuth authorizations in the Cloudflare dashboard.
 
 The device takes this machine's host name. Give it another with `--name`.
 
-If a setup stops halfway, for example because the network dropped, run `koi setup` again. It finishes from where it stopped.
+If a setup stops halfway, for example because the network dropped, run `koi setup` again. It finishes from where it stopped. On a machine that is already connected, it doesn't log in or pair again: with a linked folder, it lists the linked folders and changes nothing, and without one, it goes on to the folder questions.
 
-Without a terminal on stdin and stderr, with `--json`, or with the `CI` environment variable set, `koi setup` asks nothing. It lists the commands below and exits. `koi setup --interactive` asks for the guided setup explicitly, and fails when no terminal is attached.
+Without a terminal on stdin and stderr, with `--json`, or with the `CI` environment variable set, `koi setup` asks nothing. Unless `--folder` asks for a [scripted setup](#scripted-setup), it lists the commands below and exits. `koi setup --interactive` asks for the guided setup explicitly, and fails when no terminal is attached.
 
 **On a machine without a browser**, add `--interactive --no-browser`. Koidrive prints the login page's address. Open it on any device, log in, and select Authorize. The browser then fails to load a page on `127.0.0.1`. Copy that page's address and paste it into the terminal. To forward the login over SSH instead, pick the callback port with `--port`.
 
@@ -46,6 +53,21 @@ Without a terminal on stdin and stderr, with `--json`, or with the `CI` environm
 | `koi join <code>` | Joins with a pairing code |
 
 `koi server deploy` and `koi server add-device [--worker <name>]` log in with Cloudflare in a browser, so a person runs them on a terminal with `--interactive`. Without it, with or without `--json`, they open no browser: they stop with `auth_required` and name the same command with `--interactive`. `deploy` deploys a new server and claims it, and stops if the account already has one. `add-device` adds this device to the server in the account without a pairing code, and `--worker` names the Worker when there are several. See [Agents and scripts](agents.md).
+
+### Scripted setup
+
+To pair and link a folder in one command, give the pairing code on stdin:
+
+```sh
+printf '%s\n' "$KOI_PAIRING_CODE" | koi setup --pairing-code-stdin \
+  --folder "$HOME/Koidrive" --space "$KOI_SPACE" --telemetry off --json
+```
+
+With `--folder`, setup asks nothing, with or without a terminal. `--space` takes a space's ID or name, as `koi space list` shows it, and must name a space that exists. Setup creates a missing folder. A folder that already holds files needs `--accept-existing-files`: its files upload, and the space's files download into it. Setup checks the arguments, the folder and the code before it uses the code, which works once.
+
+On a machine that is already connected, `--pairing-code-stdin` is optional, and setup links the folder without pairing again. A code for another server is refused. A machine that isn't connected needs the code, or setup stops with `auth_required` (exit 4). Running the same command again changes nothing and reports `unchanged`.
+
+With `--json`, `data` holds `account` (the device this machine is connected as), `folder` (the linked folder, with its `space_id`, `space_name` and `state`) and `service` (the background service). [docs/json-schema/v1/koi-setup.json](../json-schema/v1/koi-setup.json) is the schema.
 
 ## Without the Cloudflare login
 

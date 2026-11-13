@@ -383,6 +383,14 @@ impl AccountData {
 }
 
 #[derive(Debug, PartialEq, Serialize, JsonSchema)]
+pub struct SetupData {
+    /// The device this computer is connected as.
+    pub account: AccountData,
+    /// The linked folder, with the ID and name of the space it syncs with.
+    pub folder: FolderData,
+}
+
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
 pub struct FolderData {
     pub path: String,
     pub space_id: String,

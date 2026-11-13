@@ -122,7 +122,7 @@ Connecting and catching up aren't failures, so they exit 0. Neither is a pause: 
 
 No command asks a question unless both stdin and stderr are terminals. Without them, commands that would ask stop instead and say which flag answers the question.
 
-- `koi setup` runs the guided setup only on a terminal, without `--json` and without the `CI` environment variable. Otherwise it lists the setup commands and exits 0. With `--json` they are in `data.choices` and `next_commands`.
+- `koi setup` runs the guided setup only on a terminal, without `--json` and without the `CI` environment variable. Otherwise it lists the setup commands and exits 0. With `--json` they are in `data.choices` and `next_commands`. `--folder` and `--space`, with `--pairing-code-stdin` on a new device, run a [scripted setup](setup.md#scripted-setup) that asks nothing.
 - `--interactive` asks for the guided setup explicitly. It fails with exit status 2 when no terminal is attached, and can't be used with `--json`.
 - `koi server deploy`, `add-device`, `upgrade` and `delete` log in with Cloudflare in a browser, so they run only with `--interactive` and a terminal on stdin and stderr. Otherwise, with or without `--json`, they stop with `auth_required` (exit 4) and name the same command with `--interactive` for a person to run.
 - `--no-browser` reads the login address from the terminal, so it needs `--interactive` too.

@@ -8,8 +8,8 @@ use crate::manifest::file_name;
 use crate::report::{
     AccountData, AnsweredData, ChoicesData, DaemonLine, DevicesData, DiagnosticsData, Empty,
     Envelope, FolderData, HelpData, InvitationData, RequestsData, RestoreAskedData, RevokedData,
-    SCHEMA_VERSION, SpaceData, SpacesData, StatusData, TrashData, UnlinkedData, UsagesData,
-    VersionInfoData, VersionsData, WithService,
+    SCHEMA_VERSION, SetupData, SpaceData, SpacesData, StatusData, TrashData, UnlinkedData,
+    UsagesData, VersionInfoData, VersionsData, WithService,
 };
 use crate::telemetry::{ChoiceData, TelemetryStatusData};
 
@@ -26,7 +26,11 @@ fn data(command: &str) -> Option<&'static [Data]> {
         "resolve" => &[of::<AnsweredData>],
         "help" | "server" | "server upgrade" | "server delete" => &[],
         "space" | "folder" | "service" | "device" | "history" | "telemetry" | "_daemon" => &[],
-        "setup" => &[of::<WithService<ChoicesData>>, of::<WithService<Empty>>],
+        "setup" => &[
+            of::<WithService<ChoicesData>>,
+            of::<WithService<SetupData>>,
+            of::<WithService<Empty>>,
+        ],
         "join" | "server claim" => &[of::<WithService<AccountData>>],
         "server deploy" | "server add-device" | "service start" | "_reconcile" => {
             &[of::<WithService<Empty>>]
