@@ -1879,6 +1879,35 @@ async fn a_share_link_opens_what_it_shares_until_it_is_revoked() {
     assert_eq!(status, 200, "{info:#}");
     assert_eq!(info["name"], "plan.txt", "{info:#}");
 
+    for request in [
+        koidrive_ipc::Request::Share {
+            path: plan.clone(),
+            expiry: koidrive_driver::Expiry::Default,
+            password: None,
+        },
+        koidrive_ipc::Request::ShareLinks,
+        koidrive_ipc::Request::RevokeShareLink {
+            link: koidrive_driver::Secret(url.clone()),
+        },
+    ] {
+        let request = request.once(
+            Some(koidrive_ipc::RequestId::parse("share-record").unwrap()),
+            koidrive_ipc::Key::restart(&folder),
+        );
+        let response = koidrive_ipc::send(&socket, &request, rustix::process::getuid().as_raw())
+            .await
+            .unwrap();
+        assert!(matches!(
+            response,
+            Some(koidrive_ipc::Response::Error {
+                code: koidrive_ipc::Code::Usage,
+                ..
+            })
+        ));
+        assert!(!machine.path("state/koidrive/requests").exists());
+    }
+    assert_eq!(shared(&file_link).await.0, 200);
+
     let printed = machine.output(&[
         "share",
         "create",
