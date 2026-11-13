@@ -2089,15 +2089,18 @@ fn edited_here(trees: &Trees, id: &str) -> bool {
 }
 
 fn changed_below(trees: &Trees, id: &str) -> bool {
-    trees.local_children(id).any(|child| {
-        let Some(local) = trees.local().live(child) else {
+    let parked = (trees.local().iter())
+        .filter(|(_, local)| local.parked && local.shape.parent == id)
+        .map(|(child, _)| child);
+    trees.local_children(id).chain(parked).any(|child| {
+        let Some(local) = trees.local().get(child) else {
             return false;
         };
         !trees.excluded(child)
             && (trees
                 .synced()
                 .live(child)
-                .is_none_or(|synced| !synced.same(local))
+                .is_none_or(|synced| !synced.same(&local.shape))
                 || edited_here(trees, child)
                 || changed_below(trees, child))
     })

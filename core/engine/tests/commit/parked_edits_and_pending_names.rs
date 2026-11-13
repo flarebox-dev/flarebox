@@ -904,6 +904,37 @@ fn a_folder_another_device_deletes_is_deleted_once_the_node_on_its_owed_name_sta
 }
 
 #[test]
+fn a_folder_another_device_deletes_keeps_its_owed_name_while_a_parked_file_in_it_holds_an_edit() {
+    let (mut commits, mut trees, mut ids) = owing_its_name(&[
+        (
+            "a",
+            Some(dir(ROOT, "a")),
+            Some(dir(ROOT, "a (pending)")),
+            Some(trashed(dir(ROOT, "a (pending)"))),
+        ),
+        (
+            "f",
+            Some(file("a", "c.txt", 2)),
+            Some(file("a", "c.txt", 1)),
+            Some(trashed(file("a", "c.txt", 1))),
+        ),
+    ]);
+    trees.set_local(
+        "f".into(),
+        LocalNode {
+            parked: true,
+            ..local(file("a", "c.txt", 2), 7)
+        },
+    );
+    trees.settle();
+    assert!(!commits.acknowledge(&mut trees, 1));
+    trees.settle();
+    assert!(commits.state().pending.contains_key("a"));
+    assert_eq!(trees.class("a"), Class::Concurrent);
+    let _ = build(&mut commits, &mut trees, &mut ids);
+}
+
+#[test]
 fn a_folder_the_user_moves_elsewhere_under_its_owed_name_is_still_moved() {
     let (mut commits, mut trees, mut ids) = owing_its_name(&[
         synced("u", dir(ROOT, "u")),
