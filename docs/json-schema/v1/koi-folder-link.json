@@ -559,6 +559,12 @@
           },
           "type": "array"
         },
+        "folders": {
+          "description": "The folders the profile links, as the command that brought the service in line counted them. Left out when it\nlinks none or the command did not count them.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "lingers": {
           "type": [
             "boolean",
@@ -613,7 +619,7 @@
         },
         {
           "const": "switched_off",
-          "description": "The launch agent is installed but not loaded: the person switched koi off in Login Items, which unloads it.",
+          "description": "The launch agent is installed but launchd lists it as disabled: the person switched koi off in Login Items.",
           "type": "string"
         },
         {

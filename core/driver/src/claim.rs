@@ -50,7 +50,7 @@ fn private_dir(root: &Path) -> io::Result<OwnedFd> {
 /// of every descriptor of its parent from its fork to its exec, close-on-exec or not. Without the unlock, a folder
 /// whose task ended while another thread started a child stayed locked for some milliseconds (GUN-343).
 #[derive(Debug)]
-pub(crate) struct Flock(File);
+pub struct Flock(File);
 
 impl Flock {
     /// Takes the lock on `file` without waiting. Returns `None` while another open of the file holds it, in this

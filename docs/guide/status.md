@@ -17,7 +17,7 @@ Each linked folder has one line. Its state is one of these:
 
 | State | Meaning |
 |---|---|
-| `Stopped` | The daemon isn't running. The `Background service` line says why |
+| `Stopped` | The daemon isn't running, or sync is paused. The `Background service` and `Sync` lines say which |
 | `Connecting` | Opening a session with the server |
 | `Bootstrapping` | Reading the space's whole file tree, the first time or after a long time offline |
 | `CatchingUp` | Applying changes from other devices |
@@ -26,6 +26,15 @@ Each linked folder has one line. Its state is one of these:
 | `Halted` | A problem stopped the folder. The line below says which |
 
 `seq` counts the changes the space has had: how many this device has applied, and how many the server has. A second line under the folder shows a problem, or the last failure the folder is retrying. Below that come the folder's pending decisions (see [Decisions](#decisions)). `--json` returns all of it, and `--check` makes the exit status say whether anything needs you. See [Agents and scripts](agents.md#check-health-with-status---check).
+
+## Pause sync
+
+```sh
+koi pause
+koi resume
+```
+
+`koi pause` stops every folder on this device until `koi resume`, also across restarts of the daemon and the machine. The folders stay linked, and changes on this device wait on disk. `koi status` shows `Sync: paused`. Without a running daemon, the pause takes effect when the daemon next starts. Only `koi resume` ends a pause: `koi service start` and the commands that link folders leave it as it is.
 
 ## Calls the server puts off
 

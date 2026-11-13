@@ -62,6 +62,8 @@ A build without `KOIDRIVE_SERVER_BUNDLE` can't find or deploy a server in your C
 
 Linking the first folder installs a service that runs the sync daemon, starts it, and waits until the daemon answers. If the service can't start, the folder stays linked and the command says why. Unlinking the last folder stops the service and removes it. `koi setup`, `koi join`, `koi folder link` and `koi folder unlink` bring the service in line with the linked folders. To repair a stopped or missing service, run `koi service start`.
 
+When more than one `koi` is installed, for example one in `~/.local/bin` and one inside the macOS app, the newest runs the service. A command that brings the service in line keeps the binary the service runs when that binary reports a version at least as new as its own, and otherwise points the service at itself. An older `koi` hands `koi service start` to the newer binary, so it never opens a profile that a newer version upgraded. When the daemon that runs is older than the binary the service then runs, the command restarts it on that binary.
+
 `koi status` shows the service on its `Background service` line. With `--json`, `status` and the commands above add it as `service`, with `state` set to `running`, `stopped`, `switched_off`, `not_installed`, `unavailable` or `off`, and `problem`, when koi knows the cause, saying why it isn't running.
 
 Give each profile its own `XDG_STATE_HOME`. The service and the daemon's socket are named with a hash of the state folder, so profiles that share `XDG_RUNTIME_DIR` sync side by side. Two profiles that share a state folder can't.

@@ -9,8 +9,15 @@ use serde::{Deserialize, Serialize};
 pub struct Status {
     /// The paired device, or none before `pair`.
     pub account: Option<Account>,
-    /// Whether the folders are syncing: the daemon is running, or the app started the driver.
+    /// Whether the driver was started: the daemon is running, or the app started it. A paused driver syncs nothing all
+    /// the same.
     pub running: bool,
+    /// Whether sync is paused until a resume, also across restarts.
+    #[serde(default)]
+    pub paused: bool,
+    /// The Koidrive version of the process that reports the status. None from a daemon too old to send it.
+    #[serde(default)]
+    pub version: Option<String>,
     pub folders: Vec<FolderStatus>,
 }
 

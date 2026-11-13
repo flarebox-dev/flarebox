@@ -36,6 +36,7 @@ mod scripted;
 mod status;
 mod volume;
 
+pub use claim::Flock;
 pub use config::{BackgroundService, Config, ConfigError, LocalTrash, SyncRules};
 pub use credential::{Credential, CredentialError, SET_UP_AGAIN, api_for};
 pub use driver::{Answered, Driver, DriverError, Linked};

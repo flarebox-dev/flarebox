@@ -76,6 +76,16 @@ impl Paths {
         self.state_dir.join("lock")
     }
 
+    /// Present while sync is paused, so that the pause outlives the process that holds the profile.
+    pub fn paused(&self) -> PathBuf {
+        self.state_dir.join("paused")
+    }
+
+    /// Locked while a koi picks the binary that runs the profile's service and installs it.
+    pub fn service_lock(&self) -> PathBuf {
+        self.state_dir.join("service.lock")
+    }
+
     pub fn socket(&self) -> PathBuf {
         match self.runtime_dir == self.state_dir {
             true => self.runtime_dir.join("daemon.sock"),

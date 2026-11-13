@@ -143,6 +143,10 @@ enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
+    /// Pause sync on this device until koi resume, also across restarts. The folders stay linked.
+    Pause,
+    /// Resume sync after koi pause.
+    Resume,
     /// Invite, list, or revoke devices.
     #[command(arg_required_else_help = true)]
     Device {
@@ -170,6 +174,10 @@ enum Command {
         #[arg(long, value_enum, default_value_t = LogFormat::Text)]
         log_format: LogFormat,
     },
+    /// Bring the background service in line with the linked folders, as linking a folder does. It leaves koi switched
+    /// off in Login Items off and never resumes a pause.
+    #[command(name = "_reconcile", hide = true)]
+    Reconcile,
 }
 
 impl Command {
@@ -483,15 +491,17 @@ fn telemetry_of(
         Command::Folder { .. } => (Name::Folder, None, None),
         Command::Device { .. } => (Name::Device, None, None),
         Command::History { .. } => (Name::History, None, None),
-        Command::Service { .. } => (Name::Service, None, None),
+        Command::Service { .. } | Command::Reconcile => (Name::Service, None, None),
+        Command::Pause => (Name::Pause, None, None),
+        Command::Resume => (Name::Resume, None, None),
         Command::Telemetry { .. } => (Name::Telemetry, None, None),
         Command::Diagnose => (Name::Diagnose, None, None),
         Command::Daemon { .. } => (Name::Daemon, None, None),
     }
 }
 
-/// Runs the command. After one that may change the folders this profile links or its pairing, or `service start`, it
-/// brings the background service in line with the profile and reports it as `service`.
+/// Runs the command. After one that may change the folders this profile links or its pairing, `service start` or
+/// `_reconcile`, it brings the background service in line with the profile and reports it as `service`.
 async fn run(
     paths: Paths,
     command: Command,
@@ -499,7 +509,8 @@ async fn run(
     terminal: Arc<terminal::Terminal>,
 ) -> Result<Done, CliError> {
     let asked = matches!(command, Command::Service { .. });
-    let reconciles = asked
+    let shows_state = asked || matches!(command, Command::Reconcile);
+    let reconciles = shows_state
         || matches!(
             command,
             Command::Folder {
@@ -516,13 +527,11 @@ async fn run(
     if reconciles {
         let report = service::reconcile(&paths, asked).await;
         let text = match report.text() {
-            text if text.is_empty() && asked => report.status_line(),
+            text if text.is_empty() && shows_state => report.status_line(),
             text => text,
         };
-        if asked && report.failed() {
-            return Err(CliError::new(Code::Failed, text.trim_end()));
-        }
-        done.text.push_str(&text);
+        let failed = asked && report.failed();
+        let failure = failed.then(|| report.failure_message());
         let data = match done.data.take() {
             Value::Null => Value::Object(serde_json::Map::new()),
             data => data,
@@ -532,6 +541,13 @@ async fn run(
             service: report,
         })
         .expect("the CLI's own types serialize");
+        if let Some(message) = failure {
+            return Err(CliError {
+                partial: Some(Box::new(done)),
+                ..CliError::new(Code::Failed, message)
+            });
+        }
+        done.text.push_str(&text);
     }
     Ok(done)
 }
@@ -590,7 +606,10 @@ async fn execute(
         Command::Folder { action } => folder(&paths, action).await,
         Command::Service {
             action: ServiceAction::Start,
-        } => Ok(Done::ok(Empty {}, "")),
+        }
+        | Command::Reconcile => Ok(Done::ok(Empty {}, "")),
+        Command::Pause => pause(&paths).await,
+        Command::Resume => resume(&paths).await,
         Command::Device { action } => device(paths, action).await,
         Command::History { action } => history::run(&paths, action).await,
         Command::Telemetry { action } => telemetry::command(&paths, action),
@@ -1003,6 +1022,7 @@ async fn status(paths: &Paths, check: bool) -> Result<Done, CliError> {
     let data = StatusData {
         account: status.account.as_ref().map(AccountData::of),
         running: status.running,
+        paused: status.paused,
         folders: status.folders.iter().map(FolderData::of).collect(),
         conditions,
         service,
@@ -1013,7 +1033,29 @@ async fn status(paths: &Paths, check: bool) -> Result<Done, CliError> {
     if status.account.is_none() {
         done = done.then(&["koi", "setup"]);
     }
+    if status.paused {
+        done = done.then(&["koi", "resume"]);
+    }
     Ok(done)
+}
+
+async fn pause(paths: &Paths) -> Result<Done, CliError> {
+    match ipc::run(paths, Request::Pause).await? {
+        Response::Paused => Ok(Done::ok(
+            Empty {},
+            "Paused sync. To sync again, run: koi resume\n",
+        )),
+        Response::AlreadyPaused => Ok(Done::ok(Empty {}, "Sync is already paused.\n").unchanged()),
+        other => Err(unexpected(other)),
+    }
+}
+
+async fn resume(paths: &Paths) -> Result<Done, CliError> {
+    match ipc::run(paths, Request::Resume).await? {
+        Response::Resumed => Ok(Done::ok(Empty {}, "Resumed sync.\n")),
+        Response::NotPaused => Ok(Done::ok(Empty {}, "Sync is not paused.\n").unchanged()),
+        other => Err(unexpected(other)),
+    }
 }
 
 /// `koi resolve`: every pending decision, or the answer to one. An answer is recorded; sync carries it out later.
@@ -1680,6 +1722,9 @@ fn status_text(status: &Status, questions: &[Question], service: &str) -> String
         }
     ));
     text.push_str(service);
+    if status.paused {
+        text.push_str("Sync: paused. To sync again, run: koi resume\n");
+    }
     if status.folders.is_empty() {
         text.push_str("No linked folders; run koi folder link.\n");
     }
@@ -2255,6 +2300,7 @@ mod tests {
             }),
             running: true,
             folders: vec![folder],
+            ..Status::default()
         };
         let text = status_text(&status, &[], "");
         for raw in ['\u{1b}', '\u{7}', '\u{9b}', '\u{202e}', '\r'] {

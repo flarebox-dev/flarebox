@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The protocol of the daemon's local socket and its client. A client sends one [`Request`] as a JSON line and reads
-//! one [`Response`] line back, one exchange per connection. The socket is the owner's only: [`bind`] makes its
-//! directory 0700 and the socket 0600, and [`send`] refuses a socket that another user serves.
+//! one [`Response`] line back, one exchange per connection. [`Request::Watch`] is the exception: the daemon keeps that
+//! connection open and sends a line on every change, which [`watch`] reads. The socket is the owner's only: [`bind`]
+//! makes its directory 0700 and the socket 0600, and [`send`] refuses a socket that another user serves.
 
 mod bind;
 
@@ -18,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 pub use bind::bind;
 
@@ -91,6 +93,13 @@ pub enum Request {
     },
     /// The linked folders that this process may not read.
     Access,
+    /// `Driver::pause`.
+    Pause,
+    /// `Driver::resume`.
+    Resume,
+    /// Keeps the connection open and answers with a [`Response::State`] at once and after each change, until the client
+    /// closes the connection.
+    Watch,
     /// Runs `run` once for `request_id`: a later request with the same ID and key gets the first response, and one
     /// with another key fails as stale.
     Once {
@@ -162,6 +171,16 @@ pub enum Response {
     SignedOut,
     Access {
         blocked: Vec<Blocked>,
+    },
+    Paused,
+    AlreadyPaused,
+    Resumed,
+    /// Sync was not paused.
+    NotPaused,
+    /// What a watcher shows: the status and the questions waiting for an answer.
+    State {
+        status: Status,
+        questions: Vec<Question>,
     },
     /// A failed request. An older daemon sends only `message`, which reads as [`Code::Failed`].
     Error {
@@ -331,6 +350,56 @@ impl Key {
 /// Sends a request to the daemon at `socket`, or returns `None` when no daemon listens there. A socket served by
 /// anyone but the user `owner` gets nothing: requests carry pairing codes and the credential.
 pub async fn send(socket: &Path, request: &Request, owner: u32) -> io::Result<Option<Response>> {
+    let Some(stream) = connect(socket, owner).await? else {
+        return Ok(None);
+    };
+    let (reader, mut writer) = stream.into_split();
+    write_line(&mut writer, request).await?;
+    let line = read_line(reader).await?;
+    parse(&line).map(Some)
+}
+
+/// The daemon's state as [`watch`] receives it, line by line. Dropping it closes the connection.
+pub struct Watch {
+    reader: BufReader<OwnedReadHalf>,
+    _writer: OwnedWriteHalf,
+}
+
+impl Watch {
+    /// The next line the daemon sent, or `None` once it closed the connection.
+    pub async fn next(&mut self) -> io::Result<Option<Response>> {
+        let mut line = String::new();
+        if (&mut self.reader)
+            .take(MAX_LINE)
+            .read_line(&mut line)
+            .await?
+            == 0
+        {
+            return Ok(None);
+        }
+        parse(&line).map(Some)
+    }
+}
+
+/// Sends [`Request::Watch`] to the daemon at `socket` as [`send`] does, or returns `None` when no daemon listens there.
+/// The first line follows at once, and another after each change of the status or the questions.
+pub async fn watch(socket: &Path, owner: u32) -> io::Result<Option<Watch>> {
+    let Some(stream) = connect(socket, owner).await? else {
+        return Ok(None);
+    };
+    let (reader, mut writer) = stream.into_split();
+    write_json(&mut writer, &Request::Watch).await?;
+    Ok(Some(Watch {
+        reader: BufReader::new(reader),
+        _writer: writer,
+    }))
+}
+
+fn parse(line: &str) -> io::Result<Response> {
+    serde_json::from_str(line).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+async fn connect(socket: &Path, owner: u32) -> io::Result<Option<UnixStream>> {
     let stream = match UnixStream::connect(socket).await {
         Ok(stream) => stream,
         Err(error)
@@ -350,12 +419,7 @@ pub async fn send(socket: &Path, request: &Request, owner: u32) -> io::Result<Op
             format!("it is served by another user (uid {peer})"),
         ));
     }
-    let (reader, mut writer) = stream.into_split();
-    write_line(&mut writer, request).await?;
-    let line = read_line(reader).await?;
-    serde_json::from_str(&line)
-        .map(Some)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    Ok(Some(stream))
 }
 
 /// Runs a request in the daemon, or returns `None` when no daemon answers on the profile's socket.
@@ -380,10 +444,18 @@ pub async fn write_line(
     writer: &mut (impl tokio::io::AsyncWrite + Unpin),
     value: &impl Serialize,
 ) -> io::Result<()> {
+    write_json(writer, value).await?;
+    writer.shutdown().await
+}
+
+/// Writes `value` as one JSON line.
+pub async fn write_json(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    value: &impl Serialize,
+) -> io::Result<()> {
     let mut line = serde_json::to_vec(value)?;
     line.push(b'\n');
-    writer.write_all(&line).await?;
-    writer.shutdown().await
+    writer.write_all(&line).await
 }
 
 #[cfg(test)]
@@ -404,6 +476,61 @@ mod tests {
                 code: Code::Failed,
                 next: Vec::new(),
             }
+        );
+    }
+
+    #[test]
+    fn a_status_from_a_daemon_without_pause_or_version_reads_as_unpaused_and_unversioned() {
+        let line = r#"{"response":"status","status":{"account":null,"running":true,"folders":[]}}"#;
+        assert_eq!(
+            serde_json::from_str::<Response>(line).unwrap(),
+            Response::Status {
+                status: Status {
+                    running: true,
+                    ..Status::default()
+                }
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_watch_reads_each_line_the_daemon_sends_until_it_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let daemon = UnixListener::bind(&socket).unwrap();
+        let served = tokio::spawn(async move {
+            let (stream, _) = daemon.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            for paused in [false, true] {
+                let status = Status {
+                    paused,
+                    ..Status::default()
+                };
+                let questions = Vec::new();
+                write_json(&mut writer, &Response::State { status, questions })
+                    .await
+                    .unwrap();
+            }
+            request
+        });
+        let owner = rustix::process::getuid().as_raw();
+        let mut lines = watch(&socket, owner).await.unwrap().unwrap();
+        let paused = |response: Option<Response>| match response {
+            Some(Response::State { status, .. }) => status.paused,
+            other => panic!("{other:?}"),
+        };
+        assert!(!paused(lines.next().await.unwrap()));
+        assert!(paused(lines.next().await.unwrap()));
+        assert_eq!(served.await.unwrap(), "{\"request\":\"watch\"}\n");
+        assert_eq!(lines.next().await.unwrap(), None);
+        assert!(
+            watch(&dir.path().join("none.sock"), owner)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -507,6 +634,9 @@ mod tests {
             r#"{"request":"once","request_id":"r1","key":{"command":"folder restart","arguments":{"folder":[47,97]}},"run":{"request":"restart","folder":"/a"}}"#,
         );
         pinned(Request::Access, r#"{"request":"access"}"#);
+        pinned(Request::Pause, r#"{"request":"pause"}"#);
+        pinned(Request::Resume, r#"{"request":"resume"}"#);
+        pinned(Request::Watch, r#"{"request":"watch"}"#);
 
         pinned(
             Response::Status {
@@ -519,10 +649,23 @@ mod tests {
                         device_name: "laptop".into(),
                     }),
                     running: true,
+                    paused: true,
+                    version: Some("0.1.0-alpha.2".into()),
                     folders: Vec::new(),
                 },
             },
-            r#"{"response":"status","status":{"account":{"server":"https://files.example.com","user_id":"u1","user_name":"Ada","device_id":"d1","device_name":"laptop"},"running":true,"folders":[]}}"#,
+            r#"{"response":"status","status":{"account":{"server":"https://files.example.com","user_id":"u1","user_name":"Ada","device_id":"d1","device_name":"laptop"},"running":true,"paused":true,"version":"0.1.0-alpha.2","folders":[]}}"#,
+        );
+        pinned(Response::Paused, r#"{"response":"paused"}"#);
+        pinned(Response::AlreadyPaused, r#"{"response":"already_paused"}"#);
+        pinned(Response::Resumed, r#"{"response":"resumed"}"#);
+        pinned(Response::NotPaused, r#"{"response":"not_paused"}"#);
+        pinned(
+            Response::State {
+                status: Status::default(),
+                questions: Vec::new(),
+            },
+            r#"{"response":"state","status":{"account":null,"running":false,"paused":false,"version":null,"folders":[]},"questions":[]}"#,
         );
         pinned(
             Response::Unlinked {
