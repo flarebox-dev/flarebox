@@ -230,6 +230,34 @@ fn stores_opened_at_once_apply_each_migration_once() {
 }
 
 #[test]
+fn a_migration_recorded_after_the_open_read_the_table_is_not_applied_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    populate(&path);
+    rewind(&path, LEGACY_STEPS - 2);
+    let next = &MIGRATIONS[LEGACY_STEPS - 2];
+    let last = &MIGRATIONS[LEGACY_STEPS - 1];
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE migrations (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;")
+        .unwrap();
+    for m in &MIGRATIONS[..LEGACY_STEPS - 2] {
+        conn.execute("INSERT INTO migrations (name) VALUES (?1)", [m.name])
+            .unwrap();
+    }
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER other_opener AFTER INSERT ON migrations WHEN NEW.name = '{}'
+         BEGIN INSERT INTO migrations (name) VALUES ('{}'); END;",
+        next.name, last.name
+    ))
+    .unwrap();
+    conn.pragma_update(None, "user_version", NAMED).unwrap();
+    drop(conn);
+
+    drop(Store::open(&path).unwrap());
+    assert_eq!(applied(&path), all_migrations());
+}
+
+#[test]
 fn an_upgraded_store_carries_a_version_no_positional_build_supports() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
