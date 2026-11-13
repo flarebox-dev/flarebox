@@ -542,6 +542,7 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
           console.error("rewind admission failed", errorText(error));
           return failure(Error_Code.RETRY_LATER, "the space could not be read; retry the rewind");
         }
+        if (info.bookmark === undefined) return failure(Error_Code.INVALID_ARGUMENT, "restore_point_ms is before the space's point-in-time history begins");
         if (info.historyId !== args.expectedHistoryId) return failure(Error_Code.HISTORY_MISMATCH, "expected_history_id is not the space's current history");
         if (!info.descriptorDurable) return failure(Error_Code.RETRY_LATER, "the space's current history is not exported to R2 yet");
         if (this.rewindRow(args.rewindId) || this.spaceClosed(args.spaceId)) return failure(Error_Code.RETRY_LATER, "another rewind of this space has not ended");

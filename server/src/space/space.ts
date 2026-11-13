@@ -1233,7 +1233,7 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       };
     }
 
-    async rewindInfo(restorePointMs: number): Promise<{ historyId: string; headSeq: number; descriptorDurable: boolean; bookmark: string }> {
+    async rewindInfo(restorePointMs: number): Promise<{ historyId: string; headSeq: number; descriptorDurable: boolean; bookmark: string | undefined }> {
       this.dropLeases();
       const bookmark = await this.pitr.bookmarkForTime(restorePointMs);
       return { historyId: String(getMeta(this.sql, "history_id")), headSeq: this.headSeq, descriptorDurable: descriptorDurable(this.sql), bookmark };

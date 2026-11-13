@@ -597,6 +597,28 @@ describe("space rewind (RFC 0003)", () => {
     }
   });
 
+  it("refuses a restore point before the space's point-in-time history begins, recording nothing and leaving the space open", async () => {
+    const { spaceId, createdAtMs, creds, device } = await newSpace();
+    const token = creds.access!.token;
+    const a = device();
+    await createFile(a, spaceId, "a.txt", "a");
+    const point = createdAtMs + MINUTE;
+    await snapshot(spaceId, point + MINUTE);
+    const history = await a.history();
+    await setAccountClock(createdAtMs + 5 * MINUTE);
+
+    const refused = await rewind(token, spaceId, { restorePointMs: point, expectedHistoryId: history });
+    expect([refused.status, refused.error?.code, refused.error?.message]).toEqual([
+      400,
+      Error_Code.INVALID_ARGUMENT,
+      "restore_point_ms is before the space's point-in-time history begins",
+    ]);
+    const recorded = await runInDurableObject(account(), (_instance, state) => state.storage.sql.exec("SELECT * FROM rewinds WHERE space_id = ?", spaceId).toArray());
+    expect(recorded).toEqual([]);
+    expect(await spaceRows(spaceId, "SELECT * FROM rewind_markers")).toEqual([]);
+    expect((await rpc(token, spaceId, { case: "listTree", value: {} })).status).toBe(200);
+  });
+
   it("logs the error the Space DO raised when the admission cannot read the space, and answers retry later", async () => {
     const { spaceId, createdAtMs, creds, device } = await newSpace();
     const token = creds.access!.token;
