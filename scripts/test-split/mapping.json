@@ -299,7 +299,8 @@
     "fn:a_file_moved_over_another_out_of_a_removed_folder_leaves_the_server_across_a_restart_during_a_bounded_search": "moves_and_name_collisions",
     "fn:a_file_moved_into_an_ignored_folder_while_its_overwrite_is_held_stays_on_the_other_device": "ignored_entries_and_moves",
     "fn:a_bulk_delete_with_a_file_moved_over_another_keeps_the_file_at_its_path": "moves_and_name_collisions",
-    "mod:telemetry_tests": "root"
+    "mod:telemetry_tests": "root",
+    "fn:a_file_moved_below_an_ignored_folder_while_a_new_file_takes_its_name_stays_on_the_server_on_macos": "ignored_entries_and_moves"
   },
   "core/engine/tests/commit.rs": {
     "fn:resend": "common",
@@ -834,6 +835,8 @@
     "fn:an_entry_a_rule_left_out_moved_to_another_excluded_name_is_removed_once_it_is_gone": "deferred_searches",
     "fn:a_rescan_of_a_sibling_reports_an_entry_a_rule_left_out_as_removed_once_it_is_gone": "deferred_searches",
     "fn:a_file_moved_over_another_out_of_a_removed_folder_is_removed_through_a_bounded_search": "deferred_searches",
-    "fn:a_file_moved_over_another_out_of_a_removed_folder_is_removed_by_fresh_rules_through_a_bounded_search": "deferred_searches"
+    "fn:a_file_moved_over_another_out_of_a_removed_folder_is_removed_by_fresh_rules_through_a_bounded_search": "deferred_searches",
+    "fn:a_file_moved_below_an_ignored_folder_while_another_takes_its_path_is_ignored_on_macos": "moves_and_removals",
+    "fn:a_file_changed_after_it_was_moved_into_an_ignored_folder_while_another_takes_its_path_is_modified": "moves_and_removals"
   }
 }

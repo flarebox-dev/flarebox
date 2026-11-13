@@ -506,3 +506,58 @@ fn many_files_moved_out_of_a_removed_folder_are_renamed_in_less_than_a_second() 
     );
     eprintln!("{files} files: {elapsed:?}");
 }
+
+#[test]
+fn a_file_moved_below_an_ignored_folder_while_another_takes_its_path_is_ignored_on_macos() {
+    for to in ["ig/f.txt", "ig/deep/f.txt"] {
+        let (dir, mut snapshot, mut rules) = tree_with_an_ignored_folder();
+        let root = dir.path();
+        let id = snapshot.entries[Path::new("f.txt")].id;
+        fs::rename(root.join("f.txt"), root.join(to)).unwrap();
+        write(root, "f.txt", "new");
+
+        let rescan = snapshot
+            .rescan_with_rules(root, whole(), &mut rules)
+            .unwrap();
+        let expected = if cfg!(target_os = "macos") {
+            vec![
+                created("f.txt", File),
+                Change::Ignored {
+                    from: "f.txt".into(),
+                    to: to.into(),
+                    kind: File,
+                    id,
+                },
+            ]
+        } else {
+            vec![Change::Modified {
+                path: "f.txt".into(),
+            }]
+        };
+        assert_eq!(rescan.changes, expected, "{to}");
+    }
+}
+
+#[test]
+fn a_file_changed_after_it_was_moved_into_an_ignored_folder_while_another_takes_its_path_is_modified()
+ {
+    let (dir, mut snapshot, mut rules) = tree_with_an_ignored_folder();
+    let root = dir.path();
+    fs::rename(root.join("f.txt"), root.join("ig/f.txt")).unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(root.join("ig/f.txt"))
+        .and_then(|mut file| std::io::Write::write_all(&mut file, b" changed"))
+        .unwrap();
+    write(root, "f.txt", "new");
+
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(
+        rescan.changes,
+        [Change::Modified {
+            path: "f.txt".into(),
+        }]
+    );
+}

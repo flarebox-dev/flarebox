@@ -824,3 +824,80 @@ fn a_file_moved_into_an_ignored_folder_while_its_overwrite_is_held_stays_on_the_
         server_nodes(&remote)
     );
 }
+
+#[test]
+fn a_file_moved_below_an_ignored_folder_while_a_new_file_takes_its_name_stays_on_the_server_on_macos()
+ {
+    let conflict = "x (conflict from a 2023-11-14)";
+    for (over, to) in [
+        (false, "ignored/x"),
+        (false, "ignored/zzz/x"),
+        (true, "ignored/x"),
+        (true, "ignored/zzz/x"),
+    ] {
+        let case = format!("{over} {to}");
+        let mut remote = Remote::new();
+        let (site, mut a) = linked(&mut remote, "a");
+        a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
+        fs::create_dir(site.root.join("d")).unwrap();
+        a.create(&mut remote, &site.root.join("d/f"), b"kept");
+        a.create(&mut remote, &site.root.join("x"), b"other");
+        fs::create_dir_all(site.root.join("ignored/zzz")).unwrap();
+        a.rest(&mut remote);
+        let content = if over { "kept" } else { "other" };
+        if over {
+            fs::rename(site.root.join("d/f"), site.root.join("x")).unwrap();
+            fs::remove_dir(site.root.join("d")).unwrap();
+            a.scan_until(|a| !a.work.is_empty());
+            a.rest(&mut remote);
+        }
+        let synced = server_nodes(&remote);
+        let moved = live_id(&synced, "x");
+        assert_eq!(
+            server_size(&remote, &moved),
+            content.len() as u64,
+            "{case}: {synced:?}"
+        );
+        assert_eq!(
+            synced.iter().filter(|(_, _, live)| *live).count(),
+            if over { 2 } else { 4 },
+            "{case}: {synced:?}"
+        );
+        let (site_b, mut b) = linked(&mut remote, "b");
+        b.pull(&remote);
+        b.rest(&mut remote);
+        fs::rename(site.root.join("x"), site.root.join(to)).unwrap();
+        fs::write(site.root.join("x"), b"new").unwrap();
+        a.scan_until(|a| !a.work.is_empty());
+        a.rest(&mut remote);
+        b.pull(&remote);
+        b.rest(&mut remote);
+        let after = server_nodes(&remote);
+        let on_b: Vec<(String, String)> = files(&site_b.root)
+            .into_iter()
+            .filter(|(path, _)| path.starts_with('x'))
+            .collect();
+        assert_eq!(live_id(&after, "x"), moved, "{case}: {after:?}");
+        if cfg!(target_os = "macos") {
+            assert_eq!(server_size(&remote, &moved), content.len() as u64, "{case}");
+            live_id(&after, conflict);
+            assert_eq!(
+                on_b,
+                [
+                    ("x".into(), content.into()),
+                    (conflict.into(), "new".into())
+                ],
+                "{case}"
+            );
+            assert_eq!(
+                fs::read(site.root.join(to)).unwrap(),
+                content.as_bytes(),
+                "{case}"
+            );
+        } else {
+            assert_eq!(server_size(&remote, &moved), 3, "{case}");
+            assert_eq!(on_b, [("x".into(), "new".into())], "{case}");
+        }
+        assert_eq!(a.folder.engine.trees.check(), Ok(()), "{case}");
+    }
+}
