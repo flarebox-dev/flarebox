@@ -403,7 +403,7 @@ fn main() -> ExitCode {
                     "interrupted by Ctrl-C; what the command already did stays done",
                 );
                 telemetry::flush();
-                finish(&command, json, Err(error), Vec::new());
+                let _ = finish(&command, json, Err(error), Vec::new());
                 let _ = io::Write::flush(&mut io::stdout());
                 std::process::exit(Code::Interrupted.exit().into());
             }
