@@ -64,6 +64,7 @@ fn a_move_and_edit_whose_s_update_waits_is_not_overwritten_by_a_change_after_the
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -116,6 +117,7 @@ fn a_create_the_server_lost_while_its_s_update_waits_is_sent_again() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -192,6 +194,7 @@ fn an_edit_of_a_file_the_server_went_back_to_holding_in_the_trash_is_kept_from_a
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -229,6 +232,7 @@ fn a_file_in_the_trash_after_a_loss_that_l_did_not_edit_is_not_recorded() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -275,6 +279,7 @@ fn an_edit_this_device_committed_to_the_content_a_lost_commit_replaced_is_sent_a
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -306,6 +311,7 @@ fn a_write_to_the_content_the_server_went_back_to_seen_after_the_bootstrap_is_se
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -342,6 +348,7 @@ fn an_edit_sent_after_a_loss_and_lost_in_a_second_one_is_sent_again() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -379,6 +386,7 @@ fn an_edit_the_server_kept_is_not_sent_again_after_a_loss() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -507,6 +515,7 @@ fn a_kept_move_that_another_device_reverses_before_a_loss_is_not_sent_again() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -564,6 +573,7 @@ fn a_kept_create_that_another_device_deletes_after_a_loss_stays_deleted() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -668,6 +678,7 @@ fn an_effect_on_a_node_whose_update_waits_keeps_its_slot_for_a_loss() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -729,6 +740,7 @@ fn a_lost_update_is_not_the_effects_base_while_it_cannot_fit() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -833,6 +845,7 @@ fn a_removal_the_server_lost_while_it_waits_is_sent_again() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Default::default(),
         commits.held_through(),
         commits.accepted(),
     );

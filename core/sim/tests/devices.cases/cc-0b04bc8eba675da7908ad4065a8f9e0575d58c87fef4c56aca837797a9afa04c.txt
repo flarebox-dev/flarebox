@@ -1,0 +1,1 @@
+cc 0b04bc8eba675da7908ad4065a8f9e0575d58c87fef4c56aca837797a9afa04c # an observer keeps S when the listed R holds the version R held before

@@ -1452,6 +1452,14 @@ impl Trees {
             .collect()
     }
 
+    /// The version R holds of each node, live or in the trash, for [`Trees::forget_lost`] once a
+    /// bootstrap has replaced R.
+    pub fn remote_versions(&self) -> BTreeMap<NodeId, String> {
+        (self.r.iter())
+            .map(|(id, remote)| (id.clone(), remote.version_id.clone()))
+            .collect()
+    }
+
     /// The nodes a delete of this device trashed and R still holds trashed by it, for
     /// [`Trees::forget_lost`] once a bootstrap has replaced R.
     pub fn trashed_here(&self) -> Vec<Trashed> {
@@ -1481,6 +1489,11 @@ impl Trees {
     /// unless it is a file whose edit the server lost (see `edited` below).
     /// S then forgets each such ancestor only once the delete has taken what it held: the update
     /// waits ([`Trees::waiting`]) and is made as soon as it fits.
+    ///
+    /// A node R holds live at the version R held before the bootstrap (`versions`, from
+    /// [`Trees::remote_versions`]) keeps S whatever R's shape: S's content came from the record that
+    /// made that version or an earlier one, so the server kept it, and what R holds otherwise is a
+    /// remote change this device has not taken yet.
     ///
     /// A node R holds live as S does but at another position keeps S, so R's position is a remote
     /// move: a device that did not set S's position cannot tell whether a lost commit set it, and
@@ -1589,6 +1602,7 @@ impl Trees {
         synced: Vec<NodeId>,
         moved: Vec<(NodeId, MovedHere)>,
         untaken: Vec<(NodeId, bool)>,
+        versions: BTreeMap<NodeId, String>,
         held_through: u64,
         accepted: u64,
     ) {
@@ -1738,8 +1752,12 @@ impl Trees {
                     };
                     at.same(remote)
                 };
+                let survived = (self.r.get(id)).is_some_and(|remote| {
+                    !remote.version_id.is_empty() && versions.get(*id) == Some(&remote.version_id)
+                });
                 self.r.get(id).is_none()
                     || (!untaken.contains_key(*id)
+                        && !survived
                         && (self.r.live(id))
                             .is_some_and(|remote| !remote.same(synced) && !moved(remote)))
             })
