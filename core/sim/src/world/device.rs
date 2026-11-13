@@ -95,6 +95,9 @@ impl Engine {
 
     /// Applies change records to R, as the receiving side does for records in seq order.
     pub fn apply(&mut self, changes: &[ChangeRecord], made: Option<&str>) -> Result<(), Failure> {
+        if let Some(commit_id) = made {
+            self.commits.restored(&mut self.trees, commit_id, changes);
+        }
         for change in changes {
             match &change.change {
                 Some(change_record::Change::Node(state))

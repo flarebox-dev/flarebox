@@ -409,6 +409,10 @@ impl Engine {
             ));
         };
         let made_here = self.commits.own_record(at.seq, &at.commit_id);
+        if made_here {
+            self.commits
+                .restored(&mut self.trees, &at.commit_id, changes);
+        }
         for change in changes {
             match &change.change {
                 Some(change_record::Change::Node(state)) => {

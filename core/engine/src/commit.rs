@@ -387,6 +387,28 @@ impl Commits {
             .collect()
     }
 
+    /// Drops the removal records that each restore of the commit in flight brings back, when
+    /// the records of that commit show the restored node live.
+    pub fn restored(&self, trees: &mut Trees, commit_id: &str, changes: &[proto::ChangeRecord]) {
+        let Some(flight) = (self.in_flight.as_ref()).filter(|f| f.commit.commit_id == commit_id)
+        else {
+            return;
+        };
+        for op in &flight.commit.ops {
+            let Some(op::Op::Restore(restore)) = &op.op else {
+                continue;
+            };
+            let live = changes.iter().any(|change| {
+                matches!(&change.change, Some(proto::change_record::Change::Node(state))
+                    if state.node_id == restore.node_id
+                        && state.status == proto::NodeStatus::Live as i32)
+            });
+            if live {
+                trees.forget_removed(&restore.node_id);
+            }
+        }
+    }
+
     /// Whether one of this device's commits that the server lost has seq `seq`: one above
     /// [`Commits::held_through`], until R is listed again.
     pub fn lost_here(&self, seq: u64) -> bool {
@@ -1212,28 +1234,6 @@ impl Commits {
                 _ => None,
             })
             .collect();
-        for (op, outcome) in flight.commit.ops.iter().zip(&result.results) {
-            let Some(op::Op::Restore(restore)) = &op.op else {
-                continue;
-            };
-            let code = op_result::Code::try_from(outcome.code);
-            if !matches!(
-                code,
-                Ok(op_result::Code::Applied | op_result::Code::AppliedRenamed)
-            ) {
-                continue;
-            }
-            let restored = BTreeSet::from([restore.node_id.as_str()]);
-            for (id, node) in trees.remote().iter() {
-                if !node.trashed
-                    && node.meta_rev == result.seq
-                    && trees.local().get(id).is_none()
-                    && (*id == restore.node_id || remote_below(trees, id, &restored))
-                {
-                    synced.set(id, None);
-                }
-            }
-        }
         for (index, (op, outcome)) in flight.commit.ops.iter().zip(&result.results).enumerate() {
             use op_result::Code;
             let code = Code::try_from(outcome.code).unwrap_or(Code::Unspecified);

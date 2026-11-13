@@ -4341,6 +4341,42 @@ fn a_file_its_user_removed_and_then_restores_from_the_trash_stays_restored() {
 }
 
 #[test]
+fn a_file_restored_after_its_user_removed_it_keeps_a_rename_made_before_the_restore_is_acknowledged()
+ {
+    let synced = vec![(0, folder("a")), (0, user(1, 0, 1, "b"))];
+    let mut racing = vec![(0, delete(0))];
+    racing.extend(commit(0));
+    racing.extend([(1, delete(1)), (1, SCAN), (1, DELIVER)]);
+    let mut world = converge(2, &[synced, racing]).unwrap();
+    let engine = &mut world.devices[1].engine;
+    let b = (engine.trees.remote().iter())
+        .find(|(_, node)| node.shape.name == "b")
+        .map(|(id, _)| id.clone())
+        .unwrap();
+    let request = engine.ids.uuid_v7(1_700_000_000_000);
+    let intent = RestoreIntent::from_trash(b, None, None).unwrap();
+    assert!(engine.commits.restore(request, intent));
+    world
+        .run(2, &[(1, SCAN), (1, COMMIT), (1, COMMIT)])
+        .unwrap();
+    let mut steps = vec![(0, DELIVER); 6];
+    steps.extend([(0, Step::Work(1)); 6]);
+    world.run(3, &steps).unwrap();
+    let b = (world.devices[0].disk.entries().values())
+        .position(|entry| entry.name == "b")
+        .unwrap();
+    let renamed = [(0, rename(b, 1, "ss")), (0, SCAN), (0, COMMIT), (0, COMMIT)];
+    world.run(4, &renamed).unwrap();
+    world.phase(5, &[]).unwrap();
+    for device in 0..2 {
+        let names: Vec<String> = (files_on(&world, device).into_iter())
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["a", "ss"], "device {device}");
+    }
+}
+
+#[test]
 fn a_folder_delete_superseded_behind_a_name_that_differs_only_in_case_brings_the_folder_back() {
     let made = vec![(0, folder("a")), (2, file("C.TXT"))];
     let filled = vec![(0, user(1, 0, 1, "ß"))];

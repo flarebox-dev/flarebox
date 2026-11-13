@@ -153,6 +153,17 @@ fn outcome(code: op_result::Code) -> OpResult {
     }
 }
 
+fn live(node: &str) -> proto::ChangeRecord {
+    let state = proto::NodeState {
+        node_id: node.into(),
+        status: proto::NodeStatus::Live as i32,
+        ..Default::default()
+    };
+    proto::ChangeRecord {
+        change: Some(proto::change_record::Change::Node(state)),
+    }
+}
+
 fn rejected(reason: &str) -> OpResult {
     OpResult {
         reject_reason: reason.into(),
@@ -1204,6 +1215,7 @@ fn an_explicit_restore_of_a_file_its_user_removed_is_downloaded() {
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert_eq!(ops(&commit), [restore_op(&intent)]);
 
+    commits.restored(&mut trees, &commit.commit_id, &[live(&n)]);
     let restored = RemoteNode {
         meta_rev: 2,
         ..remote(shape)
@@ -1246,6 +1258,7 @@ fn a_restore_of_a_folder_its_user_removed_downloads_the_files_in_it() {
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert_eq!(ops(&commit), [restore_op(&intent)]);
 
+    commits.restored(&mut trees, &commit.commit_id, &[live(&d), live(&f)]);
     let at_2 = |shape: Shape| RemoteNode {
         meta_rev: 2,
         ..remote(shape)
