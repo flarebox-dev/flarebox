@@ -1007,6 +1007,8 @@ mod tests {
     }
 
     async fn served(listener: &TcpListener, response: &str) -> String {
+        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+        let response = format!("{headers}\r\nconnection: close\r\n\r\n{body}");
         let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
             .await
             .unwrap()
@@ -1021,6 +1023,46 @@ mod tests {
         stream.write_all(response.as_bytes()).await.unwrap();
         stream.shutdown().await.unwrap();
         String::from_utf8(request).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_single_response_fixture_declares_connection_close_and_preserves_its_body() {
+        for (status, body) in [
+            ("200 OK", "first\r\n\r\nlast"),
+            ("304 Not Modified", ""),
+            ("500 Error", ""),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let receive = async {
+                let mut stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                stream
+                    .write_all(b"GET / HTTP/1.1\r\nhost: fixture\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut wire = Vec::new();
+                tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut wire))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                String::from_utf8(wire).unwrap()
+            };
+            let (request, wire) = tokio::join!(served(&listener, &response), receive);
+            assert_eq!(request, "GET / HTTP/1.1\r\nhost: fixture\r\n\r\n");
+            let (headers, received) = wire.split_once("\r\n\r\n").unwrap();
+            assert!(
+                headers
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("connection: close")),
+                "{headers}"
+            );
+            assert_eq!(received, body);
+        }
     }
 
     fn header_lines(request: &str) -> Vec<String> {
@@ -1038,7 +1080,7 @@ mod tests {
             format!("link: <{next}>; rel=\"next\"\r\n")
         });
         format!(
-            "HTTP/1.1 200 OK\r\netag: {etag}\r\n{link}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            "HTTP/1.1 200 OK\r\netag: {etag}\r\n{link}content-length: {}\r\n\r\n{body}",
             body.len()
         )
     }
@@ -1162,7 +1204,7 @@ mod tests {
         let (url, https) = releases_url(Some(&base)).unwrap();
         let next = format!("{}&page=2", url);
         let not_modified = format!(
-            "HTTP/1.1 304 Not Modified\r\nlink: <{next}>; rel=\"next\"\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            "HTTP/1.1 304 Not Modified\r\nlink: <{next}>; rel=\"next\"\r\ncontent-length: 0\r\n\r\n"
         );
         let first = page(
             serde_json::json!([listed("v0.1.0", false, &[ASSET])]),
