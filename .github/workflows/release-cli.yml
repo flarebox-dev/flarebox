@@ -166,12 +166,13 @@ jobs:
         run: |
           shellcheck -s sh install.sh scripts/test-install.sh
           shellcheck scripts/publish-release.sh scripts/test-publish-release.sh
-          shellcheck scripts/homebrew-formula.sh scripts/homebrew-track.sh scripts/test-homebrew-formula.sh scripts/test-homebrew-install.sh
+          shellcheck scripts/homebrew-formula.sh scripts/homebrew-cask.sh scripts/homebrew-track.sh scripts/test-homebrew-formula.sh scripts/test-homebrew-cask.sh scripts/test-homebrew-install.sh scripts/test-homebrew-cask-install.sh
       - name: Test publishing a release against a stub gh
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           bash scripts/test-publish-release.sh
           bash scripts/test-homebrew-formula.sh
+          bash scripts/test-homebrew-cask.sh
       - name: Build the CLI with its server bundle
         env:
           TARGET: ${{ matrix.target }}
@@ -234,7 +235,7 @@ jobs:
     name: Homebrew install (${{ matrix.target }})
     needs: [changes, build]
     if: needs.changes.outputs.homebrew != '[]'
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.target == 'aarch64-apple-darwin' && 'xcode-27' || matrix.runner }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -265,6 +266,9 @@ jobs:
           mkdir package
           tar -xzf "dist/koidrive-$TARGET.tar.gz" -C package
           bash scripts/test-homebrew-install.sh package/koi "$TARGET"
+      - name: Install the app and CLI from a local tap
+        if: runner.os == 'macOS'
+        run: bash scripts/test-homebrew-cask-install.sh package/koi
 
   sign-macos:
     name: Sign and notarize the macOS CLI
@@ -485,7 +489,7 @@ jobs:
         run: scripts/publish-release.sh "$TAG" dist
 
   homebrew:
-    name: Update the Homebrew formula
+    name: Update the Homebrew formula and cask
     needs: [publish, homebrew-install]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -514,17 +518,19 @@ jobs:
           github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
           github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
           EOF
-      - name: Render the formula from the published release
+      - name: Render the formula and cask from the published release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
           release="$RUNNER_TEMP/release"
-          gh release download "$TAG" --dir "$release" --pattern SHA256SUMS --pattern 'koidrive-*.tar.gz'
-          scripts/homebrew-formula.sh "$TAG" "$release/SHA256SUMS" > "$RUNNER_TEMP/koidrive.rb"
-          (cd "$release" && grep -E '  koidrive-[^ ]+\.tar\.gz$' SHA256SUMS | sha256sum --strict -c -) || { echo "::error::A tarball of the $TAG release does not match its SHA256SUMS entry."; exit 1; }
-      - name: Push the formula to koidrive/homebrew-tap
+          gh release download "$TAG" --dir "$release" --pattern SHA256SUMS --pattern 'koidrive-*.tar.gz' --pattern "Koidrive-${TAG#v}-arm64.dmg"
+          mkdir -p "$RUNNER_TEMP/Formula" "$RUNNER_TEMP/Casks"
+          scripts/homebrew-formula.sh "$TAG" "$release/SHA256SUMS" > "$RUNNER_TEMP/Formula/koidrive.rb"
+          scripts/homebrew-cask.sh "$TAG" "$release/SHA256SUMS" > "$RUNNER_TEMP/Casks/koidrive.rb"
+          (cd "$release" && sha256sum --strict -c SHA256SUMS) || { echo "::error::An asset of the $TAG release does not match its SHA256SUMS entry."; exit 1; }
+      - name: Push the formula and cask to koidrive/homebrew-tap
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -538,15 +544,16 @@ jobs:
           export GIT_SSH_COMMAND="ssh -i $ssh_dir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$ssh_dir/known_hosts -o StrictHostKeyChecking=yes"
           tap="$RUNNER_TEMP/homebrew-tap"
           git clone --depth 1 git@github.com:koidrive/homebrew-tap.git "$tap"
-          decision=$(scripts/homebrew-track.sh "$TAG" "$tap/Formula/koidrive.rb")
-          if [ "$decision" = skip ]; then
-            exit 0
-          fi
-          mkdir -p "$tap/Formula"
-          cp "$RUNNER_TEMP/koidrive.rb" "$tap/Formula/koidrive.rb"
-          git -C "$tap" add Formula/koidrive.rb
+          for kind in Formula Casks; do
+            decision=$(scripts/homebrew-track.sh "$TAG" "$tap/$kind/koidrive.rb")
+            if [ "$decision" = bump ]; then
+              mkdir -p "$tap/$kind"
+              cp "$RUNNER_TEMP/$kind/koidrive.rb" "$tap/$kind/koidrive.rb"
+              git -C "$tap" add "$kind/koidrive.rb"
+            fi
+          done
           if git -C "$tap" diff --cached --quiet; then
-            echo "Formula/koidrive.rb already matches $TAG, so there is nothing to push."
+            echo "The formula and cask need no change for $TAG, so there is nothing to push."
             exit 0
           fi
           git -C "$tap" commit -q -m "koidrive ${TAG#v}"

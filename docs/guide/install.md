@@ -14,6 +14,36 @@ The installer downloads the latest [GitHub release](https://github.com/koidrive/
 
 If the installer warns that `~/.local/bin` is not on `PATH`, add it to your shell profile. If it warns that `koi` on `PATH` runs another program, such as the Koi theme switcher for KDE, put `~/.local/bin` before it. The installer never replaces a `koi` in the install directory that is another program.
 
+## Install with Homebrew
+
+On macOS 26 or later with Apple silicon and [Homebrew](https://brew.sh), install the app and CLI. Homebrew 7 requires [trusting the CLI dependency](https://docs.brew.sh/Taps) first:
+
+```sh
+brew tap koidrive/tap
+brew trust --formula koidrive/tap/koidrive
+```
+
+Install the cask:
+
+```sh
+brew install --cask koidrive/tap/koidrive
+```
+
+The cask is marked `auto_updates`. To include it in [Homebrew upgrades](https://docs.brew.sh/Manpage), run `brew upgrade --cask --greedy koidrive/tap/koidrive`. Uninstalling with `brew uninstall --cask --zap koidrive/tap/koidrive` deletes the app state in `~/Library/Application Support/Koidrive`, but keeps synced folders and CLI state.
+
+For the CLI only on macOS or Linux:
+
+```sh
+brew install --formula koidrive/tap/koidrive
+koi setup
+```
+
+To upgrade:
+
+```sh
+brew update && brew upgrade --formula koidrive/tap/koidrive
+```
+
 ## Update Koidrive
 
 ```sh
