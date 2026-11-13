@@ -54,3 +54,30 @@ fn a_delete_its_own_move_out_of_the_trash_superseded_is_sent_again() {
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert_eq!(ops(&commit), [delete("g")]);
 }
+
+#[test]
+fn a_rename_out_of_the_trash_holds_a_create_onto_a_member_its_user_removed_until_its_delete() {
+    let mut trees = trees(&[
+        ("t", Some(dir(ROOT, "T2")), Some(dir(ROOT, "T")), Some(trashed(dir(ROOT, "T")))),
+        ("g", None, Some(file("t", "g", 1)), Some(trashed(file("t", "g", 1)))),
+        ("x", Some(file("t", "g", 2)), None, None),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("t", ROOT, "T2")]);
+
+    trees.set_remote_made_here("t".into(), remote_at(dir(ROOT, "T2"), 2));
+    trees.set_remote_made_here("g".into(), remote_at(file("t", "g", 1), 2));
+    use op_result::Code;
+    commits.received(result(2, vec![outcome(Code::Applied)])).unwrap();
+    assert!(commits.acknowledge(&mut trees, 2));
+    trees.settle();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    let create = op::Op::CreateFile(proto::CreateFile {
+        node_id: "x".into(),
+        parent_id: "t".into(),
+        name: "g".into(),
+        content: Some(content(2)),
+    });
+    assert_eq!(ops(&commit), [delete("g"), create]);
+}
