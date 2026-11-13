@@ -188,7 +188,7 @@ pub enum Code {
     AuthRequired,
     /// Sync is halted or stopped, and the command cannot go on until that is fixed.
     Halted,
-    /// The server or the network is offline, unavailable or limits the rate for now.
+    /// The server or the network is offline, unavailable or limits the rate at the moment.
     Unavailable,
     /// The decision answered no longer exists, or a request ID was used before with other arguments or for a pairing
     /// code that has expired.

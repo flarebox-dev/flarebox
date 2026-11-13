@@ -129,7 +129,7 @@
         },
         {
           "const": "unavailable",
-          "description": "The server or the network is offline, unavailable or limits the rate for now.",
+          "description": "The server or the network is offline, unavailable or limits the rate at the moment.",
           "type": "string"
         },
         {
