@@ -867,6 +867,80 @@ fn two_files_swapped_through_a_third_name_reach_the_other_device() {
     assert_eq!(world.devices[1].disk.entries().len(), 2);
 }
 
+fn a_pending_folder() -> World {
+    let mut world = converge(2, &[vec![(0, Step::CopyStore), (0, file("ss"))]]).unwrap();
+    world
+        .run(
+            1,
+            &[
+                (0, folder("ß")),
+                (0, rename(0, 1, "a")),
+                (0, SCAN),
+                (0, COMMIT),
+                (0, COMMIT),
+            ],
+        )
+        .unwrap();
+    assert!(
+        world
+            .space()
+            .nodes()
+            .iter()
+            .any(|node| node.name == "ß (pending)")
+    );
+    world
+}
+
+#[test]
+fn a_pending_folder_waits_while_its_author_recovers_from_a_store_rollback() {
+    let mut world = a_pending_folder();
+    world.phase(2, &[(0, Step::RollBack)]).unwrap();
+    assert!(world.devices[0].recovering.is_some());
+    assert!(world.devices[1].recovering.is_none());
+    assert!(
+        world
+            .space()
+            .nodes()
+            .iter()
+            .any(|node| node.name == "ß (pending)")
+    );
+}
+
+#[test]
+fn a_pending_folder_waits_while_its_author_recovers_from_a_rewind() {
+    let mut world = a_pending_folder();
+    world.phase(2, &[(0, BACKUP), (0, Step::Rewind)]).unwrap();
+    assert!(
+        world
+            .devices
+            .iter()
+            .all(|device| device.recovering.is_some())
+    );
+    assert!(
+        world
+            .space()
+            .nodes()
+            .iter()
+            .any(|node| node.name == "ß (pending)")
+    );
+}
+
+#[test]
+fn a_pending_folder_is_renamed_while_another_device_recovers() {
+    let mut world = a_pending_folder();
+    world.devices[1].recovering = Some("unrelated recovery".into());
+    world.phase(2, &[]).unwrap();
+    assert!(world.devices[0].recovering.is_none());
+    assert!(world.space().nodes().iter().any(|node| node.name == "ß"));
+    assert!(
+        !world
+            .space()
+            .nodes()
+            .iter()
+            .any(|node| node.name == "ß (pending)")
+    );
+}
+
 /// Device 2 sends its rename of a file to b, and while the commit is in flight it receives device
 /// 0's rename to b and then device 1's rename to c.txt. The server applies device 2's commit after
 /// device 1's, so the file ends as b. The driver plans no effect while a commit is in flight, so

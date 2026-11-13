@@ -30,3 +30,7 @@ cc cb2141f762b7ad2e80b01c20c8ab4ea7af51deabc085e16137140c8251998889 # shrinks to
 cc 9700493386f8883553c86d67eae4848d6e9dc8ca88dc66a6be31804d4456cd17 # shrinks to devices = 2, a folder renamed while another device replaces it with a new folder of that name (GUN-632)
 cc 1fea5eea9698323d68f143f925f2490de3218007401c2e76d89e035fd93b53ec # shrinks to devices = 2, a file another device edits and then deletes across a restore (GUN-591)
 cc 20754178e62a43be85dc2862de50a5a93ced1117fd2e668db6feb7946a37a92e # shrinks to devices = 3, a deleted file another device brings back after restores (GUN-622)
+cc 63ed624261418bda08fd4fe331aa3f988fa2a9676b594b381105737648755e2f
+cc 292a2c1dc6b24202dd8bd9a0edfe5c3403c5bb3eb6890573ba69e0faa59ef1f7
+cc 41ef8e85eb93fc2a752d2c3a3263d4aed43d4fdd6e28b9e0249f6de3f6f5dffb
+cc 0834c84e417cc6174e593249280c1e5ee7c80153444740e2ce94e707208e440a
