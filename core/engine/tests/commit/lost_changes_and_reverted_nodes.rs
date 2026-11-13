@@ -1123,6 +1123,71 @@ fn a_lost_move_is_sent_again_when_the_loss_also_took_a_delete_made_after_it() {
 }
 
 #[test]
+fn a_delete_the_server_lost_is_sent_again_for_a_record_it_saw_above_the_bound() {
+    let seen = |shape: Shape| RemoteNode {
+        content_rev: 3,
+        edit_rev: 3,
+        meta_rev: 3,
+        version_id: "v3".into(),
+        ..remote(shape)
+    };
+    let row = |id: &'static str, r: RemoteNode| (id, Some(r.shape.clone()), Some(r.shape.clone()), Some(r));
+    let rows = [
+        row("dir", remote_at(dir(ROOT, "dir"), 3)),
+        row("same", seen(file(ROOT, "same", 1))),
+        row("restored", seen(file(ROOT, "restored", 1))),
+        row("marked", seen(file(ROOT, "marked", 1))),
+    ];
+    let (mut commits, mut trees, mut ids, _) = deleted_at_5_then_lost(&rows);
+    for id in ["same", "restored", "marked"] {
+        let deleted = RemoteNode {
+            meta_rev: 5,
+            trash_group: "5:0".into(),
+            trashed: true,
+            ..seen(file(ROOT, id, 1))
+        };
+        trees.set_remote(id.into(), deleted);
+    }
+    let trashed = trees.trashed_here();
+    assert_eq!(trashed.len(), 4);
+    trees.set_listed_remote("dir".into(), remote_at(dir(ROOT, "dir"), 3));
+    trees.set_listed_remote("same".into(), seen(file(ROOT, "same", 1)));
+    let restored = RemoteNode {
+        meta_rev: 7,
+        ..seen(file(ROOT, "restored", 1))
+    };
+    trees.set_listed_remote("restored".into(), restored);
+    let marked = RemoteNode {
+        edit_rev: 6,
+        ..seen(file(ROOT, "marked", 1))
+    };
+    trees.set_listed_remote("marked".into(), marked);
+    trees.forget_lost(
+        trashed,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        commits.held_through(),
+        commits.accepted(),
+    );
+    trees.settle();
+    let classes = ["dir", "same", "restored", "marked"].map(|id| (id, trees.class(id)));
+    assert_eq!(
+        classes,
+        [
+            ("dir", Class::Local),
+            ("same", Class::Local),
+            ("restored", Class::Remote),
+            ("marked", Class::Remote)
+        ]
+    );
+    let mut sent = ops(&build(&mut commits, &mut trees, &mut ids).unwrap());
+    sent.sort_by_key(|op| format!("{op:?}"));
+    assert_eq!(sent, [delete("dir"), delete("same")]);
+}
+
+#[test]
 fn a_file_this_device_made_follows_a_delete_after_another_device_edited_it_past_a_loss() {
     let made = RemoteNode {
         meta_rev: 2,

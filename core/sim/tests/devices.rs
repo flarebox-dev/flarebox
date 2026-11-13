@@ -3861,3 +3861,15 @@ fn a_folder_delete_superseded_behind_a_name_that_differs_only_in_case_brings_the
         assert_eq!(paths, ["a", "a/a", "c.txt", "ß"]);
     }
 }
+
+#[test]
+fn a_folder_another_device_made_stays_deleted_when_a_restore_takes_its_delete() {
+    let synced = vec![(1, folder("b")), (1, user(1, 0, 1, "a"))];
+    let mut lost = vec![(0, BACKUP), (0, delete(0))];
+    lost.extend(commit(0));
+    lost.push((0, RESTORE));
+    let world = keep(2, &[synced, lost]).unwrap();
+    for device in &world.devices {
+        assert_eq!(device.disk.entries().len(), 0);
+    }
+}

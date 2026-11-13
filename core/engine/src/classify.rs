@@ -160,6 +160,9 @@ impl ByName {
 pub struct Trashed {
     pub id: NodeId,
     pub shape: Shape,
+    pub content_rev: u64,
+    pub edit_rev: u64,
+    pub version_id: String,
     pub kept: Option<NodeId>,
 }
 
@@ -1458,6 +1461,9 @@ impl Trees {
                 Some(Trashed {
                     id: id.clone(),
                     shape: remote.shape.clone(),
+                    content_rev: remote.content_rev,
+                    edit_rev: remote.edit_rev,
+                    version_id: remote.version_id.clone(),
                     kept: self.kept_originals.get(id).cloned(),
                 })
             })
@@ -1484,15 +1490,19 @@ impl Trees {
     /// above `held_through`, and R holds the node as it was before the commit: at a revision at or
     /// below `held_through`, or with a record R held earlier, or when the store upgrade
     /// recorded the move without those records. So the position this device set is sent again,
-    /// unless another device moved the node after the loss.
+    /// unless another device moved the node after the loss. S takes R's position for these nodes
+    /// before `edited` and `synced` compare positions, so a file whose move and edit were both
+    /// lost is sent again as both.
     ///
     /// `trashed` lists what deletes of this device had trashed before the bootstrap
     /// ([`Trees::trashed_here`]), and `held_through` the seq of the newest commit of this device the
     /// server still counts ([`Commits::held_through`]), at or below which every seq is from before
     /// the loss. A node of `trashed` that R now holds live, as it was deleted and with no revision
-    /// above `held_through`, lost its delete: nothing changed it after the loss. S takes R's shape
-    /// for it, parents first, so the delete is sent again. Any other node of it is downloaded again,
-    /// since a restore or another change after the loss can take a seq the lost commits had.
+    /// above `held_through` or, for a file, at the version the delete trashed, lost its delete:
+    /// nothing changed it after the loss, since a server never gives a version ID twice (RFC 0016).
+    /// S takes R's shape for it, parents first, so the delete is sent again. Any other node of it is
+    /// downloaded again, since a restore or another change after the loss can take a seq the lost
+    /// commits had.
     ///
     /// `edited` lists the files whose content an edit of this device set before the bootstrap
     /// ([`Trees::edited_here`]), each with the seq of that edit's commit. A file of it that R now
@@ -1582,20 +1592,20 @@ impl Trees {
         held_through: u64,
         accepted: u64,
     ) {
+        let seen = |id: &NodeId, remote: &RemoteNode| {
+            (self.past_positions.get(id).into_iter().flatten()).any(|past| {
+                past.rev == remote.meta_rev
+                    && past.parent == remote.shape.parent
+                    && past.name == remote.shape.name
+            })
+        };
         let before = |id: &NodeId, moved: &MovedHere| {
-            let seen = |remote: &RemoteNode| {
-                (self.past_positions.get(id).into_iter().flatten()).any(|past| {
-                    past.rev == remote.meta_rev
-                        && past.parent == remote.shape.parent
-                        && past.name == remote.shape.name
-                })
-            };
             (self.r.get(id))
                 .filter(|remote| !remote.trashed)
                 .is_some_and(|remote| {
                     remote.meta_rev <= held_through
                         || (moved.upgraded && remote.meta_rev < moved.seq)
-                        || seen(remote)
+                        || seen(id, remote)
                 })
         };
         let lost_moves: BTreeSet<NodeId> = (moved.into_iter())
@@ -1619,7 +1629,13 @@ impl Trees {
             .filter_map(|deleted| {
                 let remote = (self.r.get(&deleted.id))
                     .filter(|remote| !remote.trashed && remote.shape.same(&deleted.shape))
-                    .filter(|remote| remote.content_rev.max(remote.meta_rev) <= held_through)?;
+                    .filter(|remote| {
+                        remote.content_rev.max(remote.meta_rev) <= held_through
+                            || (seen(&deleted.id, remote)
+                                && remote.content_rev == deleted.content_rev
+                                && remote.edit_rev == deleted.edit_rev
+                                && remote.version_id == deleted.version_id)
+                    })?;
                 Some((deleted.id, remote.shape.clone(), deleted.kept))
             })
             .collect();
@@ -1632,6 +1648,19 @@ impl Trees {
                 self.kept_originals.insert(id.clone(), kept);
             }
             self.set_synced(id, Some(shape));
+        }
+        for id in &lost_moves {
+            let (Some(remote), Some(synced)) = (self.r.live(id), self.s.live(id)) else {
+                continue;
+            };
+            let before = Shape {
+                parent: remote.parent.clone(),
+                name: remote.name.clone(),
+                ..synced.clone()
+            };
+            if !self.set_synced_if_valid(id.clone(), Some(before.clone())) {
+                self.wait(id.clone(), Some(before), Origin::Other);
+            }
         }
         for (id, _) in edited {
             let replaced = self.replaced_versions.get(&id);
@@ -1679,19 +1708,6 @@ impl Trees {
             }
             self.waiting.remove(&id);
             self.mark(&id);
-        }
-        for id in &lost_moves {
-            let (Some(remote), Some(synced)) = (self.r.live(id), self.s.live(id)) else {
-                continue;
-            };
-            let before = Shape {
-                parent: remote.parent.clone(),
-                name: remote.name.clone(),
-                ..synced.clone()
-            };
-            if !self.set_synced_if_valid(id.clone(), Some(before.clone())) {
-                self.wait(id.clone(), Some(before), Origin::Other);
-            }
         }
         let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for (id, shape) in self.s.iter() {
