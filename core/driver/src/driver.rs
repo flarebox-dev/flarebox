@@ -1224,6 +1224,19 @@ impl Driver {
         let (link, done, store) = {
             let mut folders = self.inner.folders.lock().unwrap();
             let found = find(&mut folders, folder)?;
+            if let Err(error) = found.status.begin_unlink() {
+                let error = io_error(found.status.path())(error);
+                if found.run.as_ref().is_none_or(Running::ended) {
+                    halt(
+                        found,
+                        Halted::Io,
+                        format!("the folder could not be unlinked: {error}"),
+                    );
+                }
+                drop(folders);
+                self.changed();
+                return Err(error);
+            }
             found.unlink = Some(Unlink::Running);
             let done = found.run.as_ref().map(Running::stop);
             (found.link.clone(), done, found.store.clone())
@@ -5557,6 +5570,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unlink_preparation_failure_leaves_the_task_running() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let dir = tempfile::tempdir().unwrap();
+            let base = fs::canonicalize(dir.path()).unwrap();
+            let root = base.join("Koidrive");
+            let paths = Paths::under(&base.join("profile"));
+            let (driver, gate) = paused_driver(&paths, &root).await;
+            let blocked = paths
+                .store(SPACE)
+                .unwrap()
+                .with_file_name("lifecycle.json.tmp");
+            fs::create_dir(&blocked).unwrap();
+            let watch = driver.watch();
+            assert!(matches!(
+                driver.unlink(&root).await,
+                Err(DriverError::Io { .. })
+            ));
+            assert!(watch.has_changed().unwrap());
+            {
+                let folders = driver.inner.folders.lock().unwrap();
+                let folder = folders.get(SPACE).unwrap();
+                assert!(folder.unlink.is_none());
+                assert!(!*folder.run.as_ref().unwrap().stop.borrow());
+                assert!(!folder.status.needs_restart());
+            }
+            assert!(!lockable(&root));
+            fs::remove_dir(blocked).unwrap();
+            gate.open();
+            driver.unlink(&root).await.unwrap();
+            assert!(driver.status().folders.is_empty());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_process_exit_during_unlink_keeps_its_recovery_authority() {
+        const CHILD: &str = "KOI_UNLINK_EXIT_CHILD";
+        if let Some(base) = std::env::var_os(CHILD) {
+            let base = PathBuf::from(base);
+            let paths = Paths::under(&base.join("profile"));
+            let root = base.join("Koidrive");
+            let (driver, _gate) = paused_driver(&paths, &root).await;
+            let unlink = tokio::spawn({
+                let driver = driver.clone();
+                async move { driver.unlink(&root).await }
+            });
+            assert!(still_waiting(&unlink).await);
+            std::process::exit(0);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "driver::tests::a_process_exit_during_unlink_keeps_its_recovery_authority",
+                "--nocapture",
+            ])
+            .env(CHILD, &base)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(15), child.wait()).await;
+        let Ok(result) = result else {
+            let _ = child.kill().await;
+            panic!("the unlink child did not exit within 15 seconds");
+        };
+        assert!(result.unwrap().success());
+        let paths = Paths::under(&base.join("profile"));
+        let root = base.join("Koidrive");
+        let driver = Driver::open(paths.clone()).unwrap();
+        driver.start();
+        assert_eq!(driver.status().folders[0].state, FolderState::Halted);
+        driver.restart(&root).await.unwrap();
+        assert_eq!(driver.status().folders[0].state, FolderState::Halted);
+        assert!(lockable(&root));
+        driver.unlink(&root).await.unwrap();
+        assert!(driver.status().folders.is_empty());
+        assert!(!paths.store(SPACE).unwrap().parent().unwrap().exists());
+    }
+
+    #[tokio::test]
     async fn an_unfinished_unlink_stays_halted_after_reopen_resume_and_restart() {
         tokio::time::timeout(Duration::from_secs(15), async {
             let dir = tempfile::tempdir().unwrap();
@@ -5572,6 +5667,25 @@ mod tests {
             assert!(still_waiting(&unlink).await);
             unlink.abort();
             assert!(unlink.await.unwrap_err().is_cancelled());
+            let lifecycle = driver
+                .inner
+                .folders
+                .lock()
+                .unwrap()
+                .get(SPACE)
+                .unwrap()
+                .status
+                .clone();
+            lifecycle.halt(
+                Halted::Io,
+                "a task stopped after unlink was cancelled".into(),
+                crate::lifecycle::Recovery::Restart,
+            );
+            assert!(
+                lifecycle
+                    .claimed(claim::Identity::of(&fs::metadata(&root).unwrap()))
+                    .is_err()
+            );
             gate.open();
             driver.pause().await.unwrap();
             drop(driver);

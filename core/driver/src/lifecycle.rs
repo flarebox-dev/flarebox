@@ -75,6 +75,13 @@ impl Lifecycle {
 
     pub(crate) fn claimed(&self, root: Identity) -> io::Result<()> {
         let mut checkpoint = self.checkpoint.lock().unwrap();
+        if checkpoint
+            .halt
+            .as_ref()
+            .is_some_and(|halt| halt.recovery == Recovery::Unlink)
+        {
+            return Err(io::Error::other("the folder's unlink is unfinished"));
+        }
         if checkpoint.root != Some(root) || checkpoint.halt.is_some() {
             let next = Checkpoint {
                 root: Some(root),
@@ -105,6 +112,20 @@ impl Lifecycle {
         Ok(())
     }
 
+    pub(crate) fn begin_unlink(&self) -> io::Result<()> {
+        let mut checkpoint = self.checkpoint.lock().unwrap();
+        let next = Checkpoint {
+            root: checkpoint.root,
+            halt: Some(Halt {
+                problem: "unlinking the folder did not finish; unlink it again to finish".into(),
+                recovery: Recovery::Unlink,
+            }),
+        };
+        self.save(&next)?;
+        *checkpoint = next;
+        Ok(())
+    }
+
     pub(crate) fn persist(&self) -> io::Result<()> {
         let checkpoint = self.checkpoint.lock().unwrap();
         self.save(&checkpoint)?;
@@ -120,6 +141,14 @@ impl Lifecycle {
 
     pub(crate) fn halt(&self, why: Halted, problem: String, recovery: Recovery) {
         let mut checkpoint = self.checkpoint.lock().unwrap();
+        if recovery != Recovery::Unlink
+            && checkpoint
+                .halt
+                .as_ref()
+                .is_some_and(|halt| halt.recovery == Recovery::Unlink)
+        {
+            return;
+        }
         checkpoint.halt = Some(Halt {
             problem: problem.clone(),
             recovery,
@@ -158,5 +187,53 @@ impl Lifecycle {
             let _ = fs::remove_file(&temp);
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unlink_authority_survives_task_halts_and_claims_in_either_order() {
+        for recovery in [Recovery::Root, Recovery::Restart] {
+            for claim_first in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let store = dir.path().join("store.sqlite");
+                let status: FolderStatus = serde_json::from_value(serde_json::json!({
+                    "space_id":"abc", "space_name":"Work", "path":"/Work",
+                    "state":"stopped", "history_id":null, "last_seq":null,
+                    "head_seq":null, "remote_nodes":0, "local_entries":null,
+                    "questions":0, "problem":null,
+                }))
+                .unwrap();
+                let lifecycle = Lifecycle::open(&store, status.clone()).unwrap();
+                let identity = Identity::of(&fs::metadata(dir.path()).unwrap());
+                lifecycle.claimed(identity).unwrap();
+                lifecycle.halt(
+                    Halted::Unlink,
+                    "unlink owns recovery".into(),
+                    Recovery::Unlink,
+                );
+                if claim_first {
+                    assert!(lifecycle.claimed(identity).is_err());
+                }
+                lifecycle.halt(Halted::Io, "late task halt".into(), recovery);
+                if !claim_first {
+                    assert!(lifecycle.claimed(identity).is_err());
+                }
+                lifecycle.restart().unwrap();
+                drop(lifecycle);
+                let reopened = Lifecycle::open(&store, status).unwrap();
+                let checkpoint = reopened.checkpoint.lock().unwrap();
+                assert_eq!(checkpoint.halt.as_ref().unwrap().recovery, Recovery::Unlink);
+                assert_eq!(checkpoint.root, Some(identity));
+                drop(checkpoint);
+                assert!(reopened.needs_restart());
+                let status = reopened.lock().unwrap();
+                assert_eq!(status.state, FolderState::Halted);
+                assert_eq!(status.problem.as_deref(), Some("unlink owns recovery"));
+            }
+        }
     }
 }
