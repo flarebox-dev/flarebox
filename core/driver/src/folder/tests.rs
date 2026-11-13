@@ -7912,3 +7912,39 @@ fn a_link_moved_into_an_ignored_folder_beside_an_included_link_keeps_its_node() 
         assert_eq!(server_nodes(&remote), after, "{made}");
     }
 }
+
+#[test]
+fn a_link_moved_into_an_ignored_folder_while_another_link_is_renamed_keeps_its_node() {
+    for (made, link) in [("source/file", "also"), ("also", "source/file")] {
+        let mut remote = Remote::new();
+        let (site, mut a) = linked(&mut remote, "a");
+        let settled = |a: &mut Device, remote: &mut Remote| {
+            for _ in 0..3 {
+                a.settle();
+                a.run(remote);
+            }
+        };
+        a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
+        fs::create_dir(site.root.join("source")).unwrap();
+        a.create(&mut remote, &site.root.join(made), b"kept");
+        fs::hard_link(site.root.join(made), site.root.join(link)).unwrap();
+        settled(&mut a, &mut remote);
+        let before = server_nodes(&remote);
+        let (file, also) = (live_id(&before, "file"), live_id(&before, "also"));
+        let live =
+            |nodes: &Nodes, id: &str| nodes.iter().any(|(_, node, live)| node == id && *live);
+
+        fs::create_dir(site.root.join("ignored")).unwrap();
+        fs::rename(site.root.join("also"), site.root.join("renamed")).unwrap();
+        fs::rename(
+            site.root.join("source/file"),
+            site.root.join("ignored/file"),
+        )
+        .unwrap();
+        settled(&mut a, &mut remote);
+        let moved = server_nodes(&remote);
+        assert!(live(&moved, &file), "{made}: {moved:?}");
+        assert_eq!(live_id(&moved, "renamed"), also, "{made}: {moved:?}");
+        assert_eq!(a.folder.engine.trees.check(), Ok(()));
+    }
+}

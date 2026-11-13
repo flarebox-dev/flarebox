@@ -737,6 +737,50 @@ fn a_link_moved_into_an_ignored_folder_while_another_link_stays_included_is_igno
 }
 
 #[test]
+fn a_link_moved_into_an_ignored_folder_while_another_link_is_renamed_is_ignored() {
+    for (renamed, ignored, over) in [
+        ("also.txt", "f.txt", false),
+        ("f.txt", "also.txt", false),
+        ("also.txt", "f.txt", true),
+    ] {
+        for budget in [usize::MAX, 100] {
+            let dir = large_ignored_tree();
+            let root = dir.path();
+            write(root, "f.txt", "f");
+            if over {
+                write(root, "other.txt", "o");
+            }
+            fs::hard_link(root.join("f.txt"), root.join("also.txt")).unwrap();
+            let mut rules = rules().with_search_budget(budget);
+            let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
+            fs::rename(root.join(renamed), root.join("other.txt")).unwrap();
+            fs::rename(root.join(ignored), root.join("ig/zz/deep/moved.txt")).unwrap();
+
+            let mut paths = whole().to_vec();
+            let mut changes = Vec::new();
+            for _ in 0..20 {
+                let rescan = snapshot.rescan_with_rules(root, paths, &mut rules).unwrap();
+                changes.extend(rescan.changes);
+                if rescan.unsettled.is_empty() {
+                    break;
+                }
+                paths = rescan.unsettled;
+            }
+            let case = format!("{renamed} {ignored} over={over} budget={budget}: {changes:?}");
+            assert!(
+                (changes.iter()).any(|change| matches!(change, Change::Ignored { from, to, .. }
+                    if from == Path::new(ignored) && to == Path::new("ig/zz/deep/moved.txt"))),
+                "{case}"
+            );
+            assert!(
+                !(changes.iter()).any(|change| matches!(change, Change::Removed { .. })),
+                "{case}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_link_removed_while_another_link_stays_included_is_removed() {
     for budget in [usize::MAX, 100] {
         let dir = large_ignored_tree();
