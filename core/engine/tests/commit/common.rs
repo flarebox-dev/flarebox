@@ -467,6 +467,7 @@ fn a_move_and_edit_whose_s_update_waits_lost_at_5() -> (Trees, Commits, IdGen) {
         edited,
         Vec::new(),
         Vec::new(),
+        Vec::new(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -519,6 +520,7 @@ fn lose_with_n_at(
         edited,
         Vec::new(),
         moved,
+        Vec::new(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -578,6 +580,7 @@ fn an_edit_to_the_content_a_lost_commit_replaced() -> (Trees, Commits, IdGen) {
         edited,
         Vec::new(),
         Vec::new(),
+        Vec::new(),
         commits.held_through(),
         commits.accepted(),
     );
@@ -627,6 +630,7 @@ fn a_move_and_edit_lost_while_r_holds_it_in_the_trash() -> (Trees, Commits, IdGe
     trees.forget_lost(
         gone,
         edited,
+        Vec::new(),
         Vec::new(),
         Vec::new(),
         commits.held_through(),
@@ -1033,6 +1037,7 @@ fn list_after_a_loss(trees: &mut Trees, commits: &Commits, restored: RemoteNode)
         Vec::new(),
         Vec::new(),
         synced,
+        Vec::new(),
         Vec::new(),
         commits.held_through(),
         commits.accepted(),

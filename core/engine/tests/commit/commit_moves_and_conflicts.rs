@@ -860,7 +860,15 @@ fn a_parked_folder_the_server_lost_is_created_again_after_a_delete_empties_it() 
             ..local(dir(ROOT, "albums"), 1)
         },
     );
-    trees.forget_lost(Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0, 0);
+    trees.forget_lost(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        0,
+        0,
+    );
     trees.settle();
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
     let removed = effects.plan(&trees, None, &mut ids, NOW).cloned().unwrap();

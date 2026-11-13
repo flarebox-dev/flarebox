@@ -415,14 +415,18 @@ impl Trees {
     }
 
     pub fn set_remote(&mut self, id: NodeId, node: RemoteNode) {
-        self.apply_remote(id, node, false);
+        self.apply_remote(id, node, false, false);
     }
 
     pub fn set_remote_made_here(&mut self, id: NodeId, node: RemoteNode) {
-        self.apply_remote(id, node, true);
+        self.apply_remote(id, node, true, false);
     }
 
-    fn apply_remote(&mut self, id: NodeId, node: RemoteNode, made_here: bool) {
+    pub fn set_remote_edited_here(&mut self, id: NodeId, node: RemoteNode) {
+        self.apply_remote(id, node, true, true);
+    }
+
+    fn apply_remote(&mut self, id: NodeId, node: RemoteNode, made_here: bool, edit: bool) {
         let hidden = (self.r.get(&id)).is_some_and(|old| old.content_rev != node.content_rev)
             && !node.trashed
             && self.edited(&id)
@@ -459,7 +463,13 @@ impl Trees {
                 versions.remove(0);
             }
         }
+        let edited_here = edit
+            && !node.trashed
+            && (self.r.get(&id)).is_some_and(|old| old.edit_rev != node.edit_rev);
         let shape = node.shape.clone();
+        if edited_here {
+            self.edited_here.insert(id.clone(), node.edit_rev);
+        }
         self.place_remote(id.clone(), node);
         if hidden && !self.set_synced_if_valid(id.clone(), None) {
             self.wait(id.clone(), None, Origin::Other);
@@ -1344,10 +1354,10 @@ impl Trees {
     }
 
     /// The nodes whose content L and S hold as R holds it live, a folder's as any folder's, where no
-    /// commit of this device made R's record and L holds no unsent edit ([`Trees::unsent_edits`]):
-    /// `made_here` tells whether a seq is one of this device's commits. For [`Trees::forget_lost`]
-    /// once a bootstrap has replaced R.
-    pub fn taken_from_others(&self, made_here: impl Fn(u64) -> bool) -> Vec<NodeId> {
+    /// commit of this device that the server lost made R's record and L holds no unsent edit
+    /// ([`Trees::unsent_edits`]): `lost_here` tells whether a seq is one of those commits. For
+    /// [`Trees::forget_lost`] once a bootstrap has replaced R.
+    pub fn taken_from_others(&self, lost_here: impl Fn(u64) -> bool) -> Vec<NodeId> {
         (self.s.iter())
             .filter(|(id, _)| !self.unsent_edits.contains(*id))
             .filter(|(id, synced)| {
@@ -1360,11 +1370,36 @@ impl Trees {
                 let remote = (self.r.get(id))
                     .filter(|remote| !remote.trashed)
                     .filter(|remote| {
-                        !made_here(remote.content_rev.max(remote.meta_rev).max(remote.edit_rev))
+                        !lost_here(remote.content_rev.max(remote.meta_rev).max(remote.edit_rev))
                     });
                 holds(remote.map(|remote| &remote.shape)) && holds(self.l.live(id))
             })
             .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// The files whose content L and S hold alike, with no waiting S update to other content, while R
+    /// holds other content live that no edit of this device set ([`Trees::edited_here`]): edits of
+    /// other devices that this device has not taken yet, each
+    /// with whether a commit of this device that the server lost made R's record of the file's
+    /// position: `lost_here` tells whether a seq is one of those commits. For
+    /// [`Trees::forget_lost`] once a bootstrap has replaced R.
+    pub fn untaken_edits(&self, lost_here: impl Fn(u64) -> bool) -> Vec<(NodeId, bool)> {
+        (self.s.iter())
+            .filter(|(id, _)| {
+                !self.unsent_edits.contains(*id) && !self.edited_here.contains_key(*id)
+            })
+            .filter_map(|(id, synced)| {
+                let remote = self.r.get(id).filter(|remote| !remote.trashed)?;
+                let held = synced.content.as_ref()?;
+                let acknowledged = self.acknowledged(id)?.content.as_ref()?;
+                let local = self.l.live(id)?.content.as_ref()?;
+                let theirs = remote.shape.content.as_ref()?;
+                (same_content(local, held)
+                    && same_content(acknowledged, held)
+                    && !same_content(theirs, held))
+                .then(|| (id.clone(), lost_here(remote.meta_rev)))
+            })
             .collect()
     }
 
@@ -1436,9 +1471,8 @@ impl Trees {
     /// restores it from the trash with L's bytes would otherwise make L, S and R agree.
     ///
     /// `synced` lists the nodes whose content L and S held as R did before the bootstrap, where no
-    /// commit of this device made R's record ([`Trees::taken_from_others`]). A file of it that R
-    /// now holds live at the
-    /// position S holds, at a version the log replaced for it before
+    /// commit of this device that the server lost made R's record ([`Trees::taken_from_others`]).
+    /// A file of it that R now holds live at the position S holds, at a version the log replaced for it before
     /// ([`TreesState::replaced_versions`]), holds content from before the loss that S's
     /// content replaced: nothing changed it since. S takes R's shape, so the content L holds is sent
     /// again as an edit instead of being kept beside R's as a conflict copy. Any other file of it may
@@ -1470,13 +1504,27 @@ impl Trees {
     /// record may be lost, and a later record can take its seq, so a revision comparison cannot
     /// tell it survived (GUN-457). The agreement is then taken again from L and the new R.
     ///
+    /// `untaken` lists the files whose content L and S held alike while R held other content live
+    /// before the bootstrap, each with whether a lost commit of this device set R's position of it
+    /// ([`Trees::untaken_edits`]).
+    /// R's content was newer than S's, so L holds nothing the server lacks. Each such file that the
+    /// new R holds, live or in the trash, keeps S's content and is never recorded as holding an
+    /// unsent edit, so whatever content R holds now is taken as a remote change, and a delete made
+    /// since follows it (GUN-591). It keeps S's position too, so a move R holds is a remote change,
+    /// except where a lost commit of this device set the position and R holds the file live: S
+    /// takes R's position, so L's is sent again. One that S forgets below a folder S forgets gets that shape
+    /// back as a waiting update (section 2.7) once the folder is in S again, instead of L's older
+    /// content being kept beside R's as a conflict copy.
+    ///
     /// [`Commits::held_through`]: crate::commit::Commits::held_through
+    #[allow(clippy::too_many_arguments)]
     pub fn forget_lost(
         &mut self,
         trashed: Vec<Trashed>,
         edited: Vec<(NodeId, u64)>,
         synced: Vec<NodeId>,
         moved: Vec<(NodeId, MovedHere)>,
+        untaken: Vec<(NodeId, bool)>,
         held_through: u64,
         accepted: u64,
     ) {
@@ -1595,6 +1643,17 @@ impl Trees {
         for (id, shape) in self.s.iter() {
             children.entry(&shape.parent).or_default().push(id);
         }
+        let untaken: BTreeMap<NodeId, Shape> = (untaken.into_iter())
+            .filter_map(|(id, moved_in_lost_commit)| {
+                let remote = self.r.get(&id)?;
+                let mut kept = self.s.get(&id)?.clone();
+                if moved_in_lost_commit && !remote.trashed && remote.meta_rev <= held_through {
+                    kept.parent = remote.shape.parent.clone();
+                    kept.name = remote.shape.name.clone();
+                }
+                Some((id, kept))
+            })
+            .collect();
         let mut lost: BTreeSet<&str> = (self.s.iter())
             .filter(|(id, synced)| {
                 let moved = |remote: &Shape| {
@@ -1606,8 +1665,9 @@ impl Trees {
                     at.same(remote)
                 };
                 self.r.get(id).is_none()
-                    || (self.r.live(id))
-                        .is_some_and(|remote| !remote.same(synced) && !moved(remote))
+                    || (!untaken.contains_key(*id)
+                        && (self.r.live(id))
+                            .is_some_and(|remote| !remote.same(synced) && !moved(remote)))
             })
             .map(|(id, _)| id.as_str())
             .collect();
@@ -1639,6 +1699,7 @@ impl Trees {
         let unsent: Vec<NodeId> = (lost.iter().map(|(id, _)| id))
             .chain(&lost_edits)
             .chain(&in_trash)
+            .filter(|id| !untaken.contains_key(*id))
             .filter(|id| {
                 let remote = self.r.get(id).map(|remote| &remote.shape);
                 let (Some(local), Some(remote)) = (content(self.l.live(id)), content(remote))
@@ -1669,6 +1730,13 @@ impl Trees {
                 self.wait(id, None, Origin::Other);
             } else {
                 self.set_synced(id, None);
+            }
+        }
+        for (id, kept) in untaken {
+            if self.s.get(&id) != Some(&kept)
+                && !self.set_synced_if_valid(id.clone(), Some(kept.clone()))
+            {
+                self.wait(id, Some(kept), Origin::Other);
             }
         }
         let trashed: BTreeSet<NodeId> = (self.resends.iter())

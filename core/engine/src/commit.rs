@@ -344,6 +344,28 @@ impl Commits {
             || (self.in_flight.as_ref()).is_some_and(|flight| flight.commit.commit_id == commit_id)
     }
 
+    /// Whether the commit in flight is `commit_id` and its last op that sets the content of `id` is
+    /// an edit other than a resend: a record of it that arrives before the result is this device's
+    /// edit.
+    pub fn edits_in_flight(&self, commit_id: &str, id: &str) -> bool {
+        (self.in_flight.as_ref()).is_some_and(|flight| {
+            flight.commit.commit_id == commit_id
+                && (flight.commit.ops.iter().rev()).find_map(|op| match &op.op {
+                    Some(op::Op::UpdateContent(update)) if update.node_id == id => {
+                        Some(!update.resend)
+                    }
+                    Some(op::Op::Restore(restore)) if restore.node_id == id => Some(false),
+                    _ => None,
+                }) == Some(true)
+        })
+    }
+
+    /// Whether one of this device's commits that the server lost has seq `seq`: one above
+    /// [`Commits::held_through`], until R is listed again.
+    pub fn lost_here(&self, seq: u64) -> bool {
+        self.made_here(seq) && seq > self.held_through()
+    }
+
     /// Forgets the slots above the accepted counter, those of the commits a loss took, once R is
     /// listed again and [`Trees::forget_lost`] no longer needs them.
     pub fn forget_lost_slots(&mut self) {
@@ -1538,7 +1560,7 @@ impl Commits {
     /// there too: *a* takes *w*, the refused commit is dropped, since its slot is no longer the one
     /// after the server's count, and R is listed again, while the halt stays. The slots above *w*
     /// stay until R is listed again ([`Commits::forget_lost_slots`]), so that
-    /// [`Commits::made_here`] still names the commits the server lost, while
+    /// [`Commits::lost_here`] still names the commits the server lost, while
     /// [`Commits::held_through`] counts none above *a*. A later `Welcome` finds *w* = *a*, so a
     /// loss is handled once. Whether R
     /// itself belongs to the `Welcome`'s history is checked where R is kept.

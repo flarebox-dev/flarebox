@@ -318,7 +318,7 @@ fn acknowledge(engine: &mut Engine) -> Result<(), Failure> {
     if let Some((commit_id, result)) =
         next.filter(|(_, result)| result.seq == engine.cursor.seq + 1)
     {
-        engine.apply(&result.changes, true)?;
+        engine.apply(&result.changes, Some(&commit_id))?;
         engine.cursor = match result.committed_at_ms {
             0 => Base::from(result.seq),
             committed_at_ms => Base {
@@ -1349,8 +1349,9 @@ impl World {
                 } = &mut self.devices[d].engine;
                 let trashed = trees.trashed_here();
                 let edited = trees.edited_here();
-                let synced = trees.taken_from_others(|seq| commits.made_here(seq));
+                let synced = trees.taken_from_others(|seq| commits.lost_here(seq));
                 let moved = trees.moved_here();
+                let untaken = trees.untaken_edits(|seq| commits.lost_here(seq));
                 let root = trees.remote().root.clone();
                 let mut listed = BTreeMap::new();
                 for state in nodes.iter().filter(|state| state.node_id != root) {
@@ -1378,6 +1379,7 @@ impl World {
                         edited,
                         synced,
                         moved,
+                        untaken,
                         commits.held_through(),
                         commits.accepted(),
                     );
@@ -1402,8 +1404,9 @@ impl World {
                         break;
                     }
                     if record.seq == engine.cursor.seq + 1 {
-                        let made_here = engine.commits.made_record(record.seq, &record.commit_id);
-                        engine.apply(&record.changes, made_here)?;
+                        let made = (engine.commits.made_record(record.seq, &record.commit_id))
+                            .then_some(record.commit_id.as_str());
+                        engine.apply(&record.changes, made)?;
                         engine.cursor = Base {
                             seq: record.seq,
                             commit_id: record.commit_id.clone(),

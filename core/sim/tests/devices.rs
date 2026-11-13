@@ -3006,6 +3006,209 @@ fn an_author_that_crashes_while_it_sends_a_lost_edit_again_sends_it_at_its_name(
 }
 
 #[test]
+fn a_file_another_device_edits_and_deletes_across_a_restore_stays_deleted() {
+    let user = |kind, target, parent, name| {
+        Step::User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text: 0,
+        })
+    };
+    let created = vec![
+        (1, user(1, 0, 0, 0)),
+        (0, user(1, 0, 0, 1)),
+        (0, user(0, 0, 0, 2)),
+        (1, user(1, 0, 0, 1)),
+        (2, user(0, 0, 8070642558861201026, 0)),
+    ];
+    let lost = vec![
+        (0, user(2, 14626354869250174423, 0, 0)),
+        (1, user(0, 0, 0, 0)),
+        (1, Step::Work(0)),
+        (1, Step::Work(0)),
+        (0, Step::Work(0)),
+        (2, Step::Work(0)),
+        (2, Step::Work(0)),
+        (2, Step::Deliver(0)),
+        (0, BACKUP),
+        (1, Step::Work(10555856991292968265)),
+        (1, Step::Work(8608730646068491420)),
+        (2, user(4, 8124263451402198873, 0, 0)),
+        (0, RESTORE),
+    ];
+    converge(2, &[created, lost]).unwrap();
+}
+
+#[test]
+fn a_file_another_device_edited_before_a_restore_and_deleted_after_it_stays_deleted() {
+    let user = |kind, target, parent, name| {
+        Step::User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text: 0,
+        })
+    };
+    let created = vec![
+        (1, user(1, 0, 0, 0)),
+        (0, user(1, 0, 0, 1)),
+        (0, user(0, 0, 0, 2)),
+        (1, user(1, 0, 0, 1)),
+        (2, user(0, 0, 8070642558861201026, 0)),
+    ];
+    let lost = vec![
+        (0, user(2, 14626354869250174423, 0, 0)),
+        (1, user(0, 0, 0, 0)),
+        (1, Step::Work(63779932184036)),
+        (1, Step::Work(12097345643055467446)),
+        (0, Step::Work(6711461528218520286)),
+        (2, Step::Work(16636816709496478910)),
+        (2, Step::Work(563873543365864804)),
+        (2, Step::Deliver(4161883621331327623)),
+        (0, BACKUP),
+        (1, Step::Work(13190423102586310382)),
+        (1, Step::Work(14288492056209541958)),
+        (1, Step::Work(12049626435681642106)),
+        (2, user(4, 8270141932729720698, 11291193124424285686, 2)),
+        (0, RESTORE),
+    ];
+    keep(2, &[created, lost]).unwrap();
+}
+
+#[test]
+fn a_file_another_device_renamed_and_edited_before_a_restore_and_deleted_after_it_stays_deleted() {
+    let user = |kind, target, parent, name, text| {
+        Step::User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text,
+        })
+    };
+    let created = vec![
+        (1, user(1, 0, 0, 0, 0)),
+        (0, user(1, 0, 0, 1, 0)),
+        (0, user(0, 0, 0, 2, 0)),
+        (1, user(1, 0, 0, 1, 0)),
+        (2, user(0, 0, 8070642558861201026, 0, 0)),
+    ];
+    let lost = vec![
+        (0, user(2, 14626354869250174423, 0, 0, 0)),
+        (1, user(0, 0, 0, 0, 0)),
+        (1, Step::Work(127559864368073)),
+        (1, Step::Work(12097345643055467446)),
+        (2, user(3, 12440659901360184398, 381004134453766589, 2, 2)),
+        (0, Step::Work(6711461528218520286)),
+        (2, Step::Work(16636816709496478910)),
+        (2, Step::Work(563873543365864804)),
+        (2, Step::Deliver(4161883621331327623)),
+        (0, BACKUP),
+        (1, Step::Work(13190423102586310382)),
+        (1, Step::Work(14288492056209541958)),
+        (1, Step::Work(12049626435681642106)),
+        (2, user(4, 8270141932729720698, 11291193124424285686, 2, 0)),
+        (0, RESTORE),
+    ];
+    keep(2, &[created, lost]).unwrap();
+}
+
+#[test]
+fn a_file_another_device_edited_below_a_folder_renamed_in_a_lost_commit_stays_deleted() {
+    let synced = vec![(0, folder("b")), (0, user(1, 0, 1, "a"))];
+    let mut lost = vec![(1, overwrite(1))];
+    lost.extend(commit(1));
+    lost.extend([
+        (0, DELIVER),
+        (0, DELIVER),
+        (0, BACKUP),
+        (0, rename(0, 0, "ss")),
+    ]);
+    lost.extend(commit(0));
+    lost.extend([(1, delete(1)), (0, RESTORE)]);
+    let world = keep(2, &[synced, lost]).unwrap();
+    for (d, device) in world.devices.iter().enumerate() {
+        let names: Vec<&str> = (device.disk.entries().values())
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["ss"], "device {d}");
+    }
+}
+
+#[test]
+fn a_file_another_device_edited_and_renamed_in_a_lost_commit_keeps_its_new_name() {
+    let synced = vec![(0, file("a"))];
+    let mut lost = vec![(1, overwrite(0))];
+    lost.extend(commit(1));
+    lost.extend([
+        (0, DELIVER),
+        (0, DELIVER),
+        (0, BACKUP),
+        (0, rename(0, 0, "b")),
+    ]);
+    lost.extend(commit(0));
+    lost.push((0, RESTORE));
+    let world = keep(2, &[synced, lost]).unwrap();
+    for (d, device) in world.devices.iter().enumerate() {
+        let names: Vec<&str> = (device.disk.entries().values())
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["b"], "device {d}");
+    }
+}
+
+#[test]
+fn a_file_another_device_edited_and_moved_into_a_new_folder_in_a_lost_commit_stays_there() {
+    let synced = vec![(0, file("a"))];
+    let mut lost = vec![(1, overwrite(0))];
+    lost.extend(commit(1));
+    lost.extend([
+        (0, DELIVER),
+        (0, DELIVER),
+        (0, BACKUP),
+        (0, folder("ss")),
+        (0, rename(0, 1, "a")),
+    ]);
+    lost.extend(commit(0));
+    lost.push((0, RESTORE));
+    let world = keep(2, &[synced, lost]).unwrap();
+    for (d, device) in world.devices.iter().enumerate() {
+        let entries = device.disk.entries();
+        assert_eq!(entries.len(), 2, "device {d}");
+        let moved = (entries.values()).find(|entry| entry.name == "a").unwrap();
+        let Place::In(folder) = moved.place else {
+            panic!("device {d} holds a in the root");
+        };
+        assert_eq!(entries[&folder].name, "ss", "device {d}");
+    }
+}
+
+#[test]
+fn a_file_another_device_made_and_edited_keeps_the_name_of_this_devices_first_lost_commit() {
+    let synced = vec![(1, file("a"))];
+    let mut lost = vec![(1, overwrite(0))];
+    lost.extend(commit(1));
+    lost.extend([
+        (0, DELIVER),
+        (0, DELIVER),
+        (0, BACKUP),
+        (0, rename(0, 0, "b")),
+    ]);
+    lost.extend(commit(0));
+    lost.push((0, RESTORE));
+    let world = keep(2, &[synced, lost]).unwrap();
+    for (d, device) in world.devices.iter().enumerate() {
+        let names: Vec<&str> = (device.disk.entries().values())
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["b"], "device {d}");
+    }
+}
+
+#[test]
 fn a_write_on_a_third_device_reaches_the_server_around_an_owed_rename() {
     let user = |kind, target, parent, name| {
         Step::User(Action {
