@@ -101,6 +101,14 @@ The planner orders ops by simulating them on a scratch copy of R. It repeatedly 
 
 An op into a folder R holds in the trash revives that folder and every trashed folder above it at their old positions (R8). A `Move` or `Restore` of a trashed folder brings back only the folder and its trash group, at the position it names. So a create, move, edit or restore that would revive a trashed folder waits for a restore of that folder or of a trashed folder above it, because a restore of a live folder does nothing. It also waits for a move of such a folder whose own parent is in the trash, because going first would bring back that parent, which the move leaves behind. When the moving folder's parent is live, the op goes first and revives only what the move would bring back. A move into the node it moves is a cycle (R6), and a restore into the node it restores is sent for the server to refuse. When the waits form a cycle, the planner sends one op of the cycle.
 
+### Removals a move out of the trash brings back
+
+A `Move` or `Restore` of a trashed folder also brings back the members of its trash group that this device's user removed. A `Delete` of such a member in the same commit is superseded, because the commit's own move changed the member after `base_seq` (RFC 0002 §9). So the member is deleted in the next commit and is never downloaded:
+
+- A member the user removed while R held it trashed by another device's delete is recorded with that delete's seq (`removed_here`) while R holds it trashed by it. When a record of this device's commit shows the member live again, S takes R's shape, so the removal is a local delete again.
+- A `Delete` that its own commit's move or restore superseded leaves S at R's shape for the same reason.
+- The scratch copy brings back the trash group with the folder. A create or move onto the name of a member that the next commit deletes waits for that commit, so it keeps its name instead of getting a conflict name.
+
 ### Name cycles and pending names
 
 - When no op is valid, the planner looks for a name cycle: moves that each wait only for a name held by a node whose own move is in the cycle, as in a swap or a rotation through a third name. It moves one node of the cycle to a free pending name under its target folder, which frees the old name. The other moves become valid, and that node moves from the pending name to its target last. A move into a trashed folder that waits for the folder's own move counts as waiting for that move, so a trashed folder moving onto the name of a folder that moves into it goes through a pending name. Change records hold each node's final state, so other devices never see the pending name, and every node keeps its identity and exact name.

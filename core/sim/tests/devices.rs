@@ -4250,6 +4250,72 @@ fn a_folder_deleted_while_its_creator_writes_into_it_takes_its_own_name() {
 }
 
 #[test]
+fn a_file_deleted_in_the_commit_that_renames_its_deleted_folder_stays_deleted() {
+    let synced = vec![(0, folder("a")), (0, user(1, 0, 1, "b"))];
+    let mut racing = vec![(0, delete(0))];
+    racing.extend(commit(0));
+    racing.extend([(1, rename(0, 0, "A")), (1, delete(1))]);
+    racing.extend(commit(1));
+    let world = converge(2, &[synced, racing]).unwrap();
+    for device in 0..2 {
+        assert_eq!(
+            files_on(&world, device),
+            [("A".into(), None)],
+            "device {device}"
+        );
+    }
+}
+
+#[test]
+fn a_file_deleted_before_its_folder_is_renamed_out_of_the_trash_stays_deleted() {
+    let synced = vec![(0, folder("a")), (0, user(1, 0, 1, "b"))];
+    let mut racing = vec![(0, delete(0))];
+    racing.extend(commit(0));
+    racing.extend([
+        (1, delete(1)),
+        (1, SCAN),
+        (1, DELIVER),
+        (1, rename(0, 0, "A")),
+    ]);
+    racing.extend(commit(1));
+    let world = converge(2, &[synced, racing]).unwrap();
+    for device in 0..2 {
+        assert_eq!(
+            files_on(&world, device),
+            [("A".into(), None)],
+            "device {device}"
+        );
+    }
+}
+
+#[test]
+fn a_file_replaced_in_a_folder_moved_out_of_the_trash_keeps_its_name() {
+    let synced = vec![
+        (0, folder("c.txt")),
+        (0, user(0, 0, 1, "a")),
+        (0, user(1, 0, 2, "b")),
+    ];
+    let old = content_on(&converge(2, std::slice::from_ref(&synced)).unwrap(), 1, "b");
+    let mut racing = vec![(0, delete(0))];
+    racing.extend(commit(0));
+    racing.extend([
+        (1, delete(2)),
+        (1, SCAN),
+        (1, DELIVER),
+        (1, user(1, 0, 2, "b")),
+        (1, rename(1, 0, "a")),
+    ]);
+    racing.extend(commit(1));
+    let world = converge(2, &[synced, racing]).unwrap();
+    let new = content_on(&world, 1, "b");
+    assert_ne!(new, old);
+    for device in 0..2 {
+        let files = [("a".into(), None), ("b".into(), Some(new.clone()))];
+        assert_eq!(files_on(&world, device), files, "device {device}");
+    }
+}
+
+#[test]
 fn a_folder_delete_superseded_behind_a_name_that_differs_only_in_case_brings_the_folder_back() {
     let made = vec![(0, folder("a")), (2, file("C.TXT"))];
     let filled = vec![(0, user(1, 0, 1, "ß"))];

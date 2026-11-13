@@ -152,6 +152,13 @@ impl Tx<'_> {
         while let Some(row) = rows.next()? {
             state.trees.trashed_here.insert(row.get(0)?, row.get(1)?);
         }
+        let mut stmt = self
+            .0
+            .prepare_cached("SELECT node_id, seq FROM removed_here")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            state.trees.removed_here.insert(row.get(0)?, row.get(1)?);
+        }
         let mut stmt = self.0.prepare_cached(
             "SELECT node_id, parent_id, name, kind, content FROM discarded_nodes",
         )?;
@@ -366,6 +373,7 @@ impl Tx<'_> {
             "watched_contents",
             "watched_positions",
             "trashed_here",
+            "removed_here",
             "discarded_nodes",
             "published_nodes",
             "pending_names",
@@ -424,6 +432,7 @@ impl Tx<'_> {
             watched,
             watched_positions,
             trashed_here,
+            removed_here,
             discarded,
             outside,
             lost,
@@ -542,6 +551,12 @@ impl Tx<'_> {
             trashed_here,
             "DELETE FROM trashed_here WHERE node_id = ?1",
             "INSERT OR REPLACE INTO trashed_here (node_id, seq) VALUES (?1, ?2)",
+            |put, node, seq| put.execute(params![node, seq]),
+        )?;
+        self.write_map(
+            removed_here,
+            "DELETE FROM removed_here WHERE node_id = ?1",
+            "INSERT OR REPLACE INTO removed_here (node_id, seq) VALUES (?1, ?2)",
             |put, node, seq| put.execute(params![node, seq]),
         )?;
         self.write_map(

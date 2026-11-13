@@ -61,6 +61,9 @@ pub struct TreesState {
     /// The nodes a delete of this device trashed, each with the seq of its commit, while R holds
     /// them trashed by that commit.
     pub trashed_here: BTreeMap<NodeId, u64>,
+    /// The nodes this device's user removed while R held them trashed by a delete of another
+    /// device, each with the seq of that delete's commit, while R holds them trashed by it.
+    pub removed_here: BTreeMap<NodeId, u64>,
     /// The nodes the person discarded in answer to a first-link question (section 6.4), each with
     /// the shape the question showed, while L, S or the S update waiting for them holds them.
     pub discarded: BTreeMap<NodeId, Shape>,
@@ -198,6 +201,7 @@ pub struct TreesChanges {
     pub watched: MapChanges<NodeId, bool>,
     pub watched_positions: MapChanges<NodeId, Option<Agreed>>,
     pub trashed_here: MapChanges<NodeId, u64>,
+    pub removed_here: MapChanges<NodeId, u64>,
     pub discarded: MapChanges<NodeId, Shape>,
     pub outside: SetChanges<NodeId>,
     pub lost: SetChanges<NodeId>,
@@ -225,6 +229,7 @@ impl TreesChanges {
             watched,
             watched_positions,
             trashed_here,
+            removed_here,
             discarded,
             outside,
             lost,
@@ -248,6 +253,7 @@ impl TreesChanges {
             watched: map_changes(&before.watched, watched),
             watched_positions: map_changes(&before.watched_positions, watched_positions),
             trashed_here: map_changes(&before.trashed_here, trashed_here),
+            removed_here: map_changes(&before.removed_here, removed_here),
             discarded: map_changes(&before.discarded, discarded),
             outside: set_changes(&before.outside, outside),
             lost: set_changes(&before.lost, lost),
@@ -416,6 +422,9 @@ pub enum StateError {
     /// A node is recorded as trashed by a delete of this device, but R does not hold it trashed by
     /// that commit.
     NotTrashedHere(NodeId),
+    /// A node is recorded as removed by this device's user while a delete of another device
+    /// trashed it, but R does not hold it trashed by that commit.
+    NotRemovedHere(NodeId),
     /// A node is recorded as moved into an ignored folder, or as a folder the disk lost, but L does not hold it or the
     /// lost folder is not recorded.
     NotIgnoredLocal(NodeId),
