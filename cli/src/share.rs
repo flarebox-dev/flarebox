@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use koidrive_driver::Paths;
 use koidrive_driver::{Expiry, LinkState, Secret, SharedLink, TargetKind};
 use koidrive_ipc::{Request, Response};
-use rustix::termios::{LocalModes, OptionalActions, tcgetattr, tcsetattr};
+use rustix::termios::{LocalModes, OptionalActions, Termios, tcgetattr, tcsetattr};
 
 use crate::error::CliError;
 use crate::report::{Done, NodeType, ShareLinkData, ShareLinksData, ShareState, SharedData};
@@ -57,7 +57,7 @@ pub async fn run(paths: &Paths, action: ShareAction) -> Result<Done, CliError> {
                 path: crate::absolute(&path)?,
                 expiry: expires.unwrap_or_default(),
                 password: if password {
-                    Some(read_password()?)
+                    Some(read_password().await?)
                 } else {
                     None
                 },
@@ -171,7 +171,7 @@ fn table(links: &[SharedLink], all: bool, now_ms: i64) -> String {
 fn shown(link: &SharedLink) -> String {
     let Some(target) = &link.target else {
         return format!(
-            "a file or folder of {} that is in the trash or gone",
+            "a file or folder of {} whose path is unavailable",
             printable(&link.space_name)
         );
     };
@@ -237,38 +237,75 @@ fn expiry(text: &str) -> Result<Expiry, String> {
     Ok(Expiry::After { ms })
 }
 
-fn read_password() -> Result<Secret, CliError> {
+async fn read_password() -> Result<Secret, CliError> {
     let stdin = std::io::stdin();
     if !stdin.is_terminal() {
-        let mut line = String::new();
-        stdin
-            .lock()
-            .read_line(&mut line)
-            .map_err(|error| format!("reading the password from standard input failed: {error}"))?;
-        return Ok(Secret(line.trim_end_matches(['\n', '\r']).to_owned()));
+        return Ok(Secret(read_line().await?));
     }
-    let password = hidden("Password for the link: ")?;
-    if hidden("The same password again: ")? != password {
+    let password = hidden("Password for the link: ").await?;
+    if hidden("The same password again: ").await? != password {
         return Err(CliError::usage("the two passwords differ"));
     }
     Ok(Secret(password))
 }
 
-fn hidden(prompt: &str) -> Result<String, CliError> {
+async fn hidden(prompt: &str) -> Result<String, CliError> {
     let stdin = std::io::stdin();
     let failed = |error: std::io::Error| format!("reading the password failed: {error}");
     let echoing = tcgetattr(&stdin).map_err(|error| failed(error.into()))?;
     let mut quiet = echoing.clone();
     quiet.local_modes.remove(LocalModes::ECHO);
     eprint!("{prompt}");
+    let mut restore = Echo(Some(echoing));
     tcsetattr(&stdin, OptionalActions::Now, &quiet).map_err(|error| failed(error.into()))?;
-    let mut line = String::new();
-    let read = stdin.lock().read_line(&mut line);
-    let restored = tcsetattr(&stdin, OptionalActions::Now, &echoing);
+    let read = read_line().await;
+    let restored = restore.restore();
     eprintln!();
-    read.map_err(failed)?;
+    let line = read?;
     restored.map_err(|error| failed(error.into()))?;
-    Ok(line.trim_end_matches(['\n', '\r']).to_owned())
+    Ok(line)
+}
+
+struct Echo(Option<Termios>);
+
+impl Echo {
+    fn restore(&mut self) -> Result<(), rustix::io::Errno> {
+        if let Some(echoing) = &self.0 {
+            tcsetattr(std::io::stdin(), OptionalActions::Now, echoing)?;
+            self.0 = None;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Echo {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+async fn read_line() -> Result<String, CliError> {
+    let (sender, answer) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .and_then(|read| {
+                if read == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "stdin closed before a password",
+                    ));
+                }
+                Ok(line.trim_end_matches(['\n', '\r']).to_owned())
+            });
+        let _ = sender.send(result);
+    });
+    answer
+        .await
+        .map_err(|_| "the password could not be read".to_owned())?
+        .map_err(|error| format!("reading the password failed: {error}").into())
 }
 
 #[cfg(test)]
@@ -383,7 +420,7 @@ mod tests {
             "ID          ENDS             PASSWORD  SHARES\n\
              0123456789  in 3 days                  /home/ada/Team/Plans/Q3\n\
              abcdefabcd  never            yes       Plans/Q3 in the space Team\n\
-             1111111111  revoked 3 h ago            a file or folder of Team that is in the trash or gone\n"
+             1111111111  revoked 3 h ago            a file or folder of Team whose path is unavailable\n"
         );
         let data = serde_json::to_string(&ShareLinksData {
             links: links.iter().map(data).collect(),

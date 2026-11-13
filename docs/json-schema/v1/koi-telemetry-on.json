@@ -537,7 +537,7 @@
       ]
     },
     "Output": {
-      "description": "What it prints on stdout with `--json`. It never reads stdin then.",
+      "description": "What it prints on stdout with `--json`. Only `share create --password` reads stdin, or asks on a terminal.",
       "oneOf": [
         {
           "const": "envelope",

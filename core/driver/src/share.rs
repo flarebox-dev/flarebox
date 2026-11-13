@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::driver::{now_ms, store_error};
-use crate::{Driver, DriverError, FolderStatus};
+use crate::{Driver, DriverError, FolderState, FolderStatus};
 
 const TREE_PAGE: u32 = 1000;
 const SHORT_ID_DIGITS: usize = 10;
@@ -81,7 +81,7 @@ pub struct SharedLink {
     /// The folder that syncs the space on this device, if one does.
     pub folder: Option<String>,
     pub node_id: String,
-    /// None once the node or a folder above it is in the trash or gone, which leaves the link opening nothing.
+    /// None if the node or an ancestor is trashed or gone, or its path could not be fetched after revocation.
     pub target: Option<Target>,
     pub created_at_ms: i64,
     pub expires_at_ms: Option<i64>,
@@ -183,11 +183,25 @@ impl Driver {
             link.revoked_at_ms = now_ms();
         }
         let folders = self.status().folders;
-        let mut described = self.describe(&auth, &folders, &space, vec![link]).await?;
-        Ok(Revoked {
-            link: described.remove(0),
-            already,
-        })
+        let link = match self
+            .describe(&auth, &folders, &space, vec![link.clone()])
+            .await
+        {
+            Ok(mut links) => links.remove(0),
+            Err(_) => SharedLink {
+                target: None,
+                ..described(
+                    link,
+                    &space.name,
+                    folders
+                        .iter()
+                        .find(|folder| folder.space_id == space.space_id),
+                    &Tree::new(&space.space_id, &[]),
+                    now_ms(),
+                )
+            },
+        };
+        Ok(Revoked { link, already })
     }
 
     async fn describe(
@@ -198,11 +212,13 @@ impl Driver {
         links: Vec<ShareLink>,
     ) -> Result<Vec<SharedLink>, DriverError> {
         let folder = (folders.iter()).find(|folder| folder.space_id == space.space_id);
-        let mut nodes = match folder {
-            Some(_) => self.remote_nodes(&space.space_id)?,
-            None => Vec::new(),
+        let cached = folder.is_some_and(|folder| folder.state == FolderState::UpToDate);
+        let mut nodes = if cached {
+            self.remote_nodes(&space.space_id)?
+        } else {
+            Vec::new()
         };
-        let missing = {
+        let missing = !cached || {
             let tree = Tree::new(&space.space_id, &nodes);
             (links.iter()).any(|link| tree.target(&link.node_id).is_none())
         };
@@ -357,41 +373,64 @@ fn locate<'a>(
     if !path.is_absolute() {
         return Err(DriverError::RelativePath(path.to_owned()));
     }
-    let typed = lexical(path);
-    let components: Vec<Component> = typed.components().collect();
+    let outside = || DriverError::OutsideLinkedFolders(path.to_owned());
+    let mut components: VecDeque<_> = path
+        .components()
+        .map(|component| component.as_os_str().to_owned())
+        .collect();
     let mut prefix = PathBuf::new();
-    for (index, component) in components.iter().enumerate() {
-        prefix.push(component);
-        let Ok(real) = std::fs::canonicalize(&prefix) else {
-            break;
-        };
-        let inside = (folders.iter())
-            .filter_map(|folder| Some((folder, below(Path::new(&folder.path), &real)?)))
-            .max_by_key(|(folder, _)| folder.path.len());
-        if let Some((folder, mut names)) = inside {
-            names.extend(
-                components[index + 1..]
-                    .iter()
-                    .map(|name| name.as_os_str().to_string_lossy().into_owned()),
-            );
-            return Ok((folder, names));
-        }
-    }
-    Err(DriverError::OutsideLinkedFolders(typed))
-}
-
-fn lexical(path: &Path) -> PathBuf {
-    let mut normal = PathBuf::new();
-    for component in path.components() {
-        match component {
+    let mut symlinks = 0;
+    while let Some(component) = components.pop_front() {
+        match Path::new(&component).components().next().unwrap() {
             Component::CurDir => {}
             Component::ParentDir => {
-                normal.pop();
+                if folders
+                    .iter()
+                    .any(|folder| prefix.starts_with(&folder.path))
+                    && !std::fs::symlink_metadata(&prefix).is_ok_and(|metadata| metadata.is_dir())
+                {
+                    return Err(DriverError::NotOnServer(path.to_owned()));
+                }
+                prefix.pop();
             }
-            other => normal.push(other),
+            Component::Normal(name) => {
+                let inside = folders
+                    .iter()
+                    .any(|folder| prefix.starts_with(&folder.path));
+                prefix.push(name);
+                let metadata = std::fs::symlink_metadata(&prefix);
+                if inside {
+                    if metadata.is_ok_and(|metadata| {
+                        metadata.file_type().is_symlink()
+                            || (!components.is_empty() && !metadata.is_dir())
+                    }) {
+                        return Err(DriverError::NotOnServer(path.to_owned()));
+                    }
+                    continue;
+                }
+                let metadata = metadata.map_err(|_| outside())?;
+                if metadata.file_type().is_symlink() {
+                    symlinks += 1;
+                    if symlinks > 40 {
+                        return Err(outside());
+                    }
+                    let target = std::fs::read_link(&prefix).map_err(|_| outside())?;
+                    prefix.pop();
+                    for component in target.components().rev() {
+                        components.push_front(component.as_os_str().to_owned());
+                    }
+                } else if !metadata.is_dir() {
+                    return Err(outside());
+                }
+            }
+            other => prefix.push(other),
         }
     }
-    normal
+    folders
+        .iter()
+        .filter_map(|folder| Some((folder, below(Path::new(&folder.path), &prefix)?)))
+        .max_by_key(|(folder, _)| folder.path.len())
+        .ok_or_else(outside)
 }
 
 fn below(root: &Path, path: &Path) -> Option<Vec<String>> {
@@ -464,9 +503,15 @@ async fn server_tree(auth: &Auth, space_id: &str) -> Result<Vec<NodeState>, Driv
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::symlink;
+    use std::time::Duration;
+
+    use koidrive_net::{Api, Credentials};
+    use koidrive_proto::v1::{AccessToken, RpcResponse, ShareLinkList, SpaceList, TreePage};
+    use prost::Message;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
-    use crate::{FolderState, Paths};
+    use crate::Paths;
 
     const SPACE: &str = "space-1";
 
@@ -511,6 +556,82 @@ mod tests {
 
     fn names(path: &str) -> Vec<String> {
         path.split('/').map(str::to_owned).collect()
+    }
+
+    async fn serve(replies: Vec<(String, u16, Vec<u8>)>) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = format!("http://{}/", listener.local_addr().unwrap());
+        let served = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(10), async move {
+                for (expected, status, body) in replies {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let mut buffer = [0; 4096];
+                    let head_end = loop {
+                        let read = socket.read(&mut buffer).await.unwrap();
+                        assert_ne!(read, 0);
+                        request.extend_from_slice(&buffer[..read]);
+                        if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break at + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&request[..head_end]);
+                    assert_eq!(head.lines().next().unwrap(), format!("{expected} HTTP/1.1"));
+                    let length: usize = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .unwrap_or(0);
+                    while request.len() < head_end + length {
+                        let read = socket.read(&mut buffer).await.unwrap();
+                        assert_ne!(read, 0);
+                        request.extend_from_slice(&buffer[..read]);
+                    }
+                    let head = format!(
+                        "HTTP/1.1 {status} Reply\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    socket.write_all(head.as_bytes()).await.unwrap();
+                    socket.write_all(&body).await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        });
+        (server, served)
+    }
+
+    fn auth(server: &str) -> Auth {
+        Auth::new(
+            Api::local_development(server.parse().unwrap()).unwrap(),
+            Credentials {
+                user_id: "user".into(),
+                device_id: "device".into(),
+                refresh_credential: "refresh".into(),
+            },
+        )
+        .with_token(AccessToken {
+            token: "token".into(),
+            expires_at_ms: i64::MAX,
+            ..AccessToken::default()
+        })
+    }
+
+    fn cache(driver: &Driver, space_id: &str, nodes: &[NodeState]) {
+        let path = driver.paths().store(space_id).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        Store::open(path)
+            .unwrap()
+            .transaction(|tx| {
+                for node in nodes {
+                    tx.put_remote_node(node)?;
+                }
+                Ok::<_, koidrive_store::Error>(())
+            })
+            .unwrap();
     }
 
     #[test]
@@ -650,10 +771,10 @@ mod tests {
 
         let located = |path: &Path| locate(&folders, path).map(|(_, names)| names);
         assert_eq!(located(&linked).unwrap(), Vec::<String>::new());
-        assert_eq!(
-            located(&linked.join("Docs/away/x.txt")).unwrap(),
-            names("Docs/away/x.txt")
-        );
+        assert!(matches!(
+            located(&linked.join("Docs/away/x.txt")),
+            Err(DriverError::NotOnServer(_))
+        ));
         assert_eq!(
             located(&root.join("shortcut/new.txt")).unwrap(),
             names("Docs/new.txt")
@@ -670,6 +791,371 @@ mod tests {
             located(Path::new("Sync/x.txt")),
             Err(DriverError::RelativePath(_))
         ));
+    }
+
+    #[test]
+    fn external_symlinks_are_resolved_before_parent_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let linked = root.join("Sync");
+        std::fs::create_dir_all(linked.join("Docs")).unwrap();
+        symlink(linked.join("Docs"), root.join("shortcut")).unwrap();
+        symlink("Sync/Docs", root.join("relative")).unwrap();
+        symlink("relative", root.join("chain")).unwrap();
+        let folders = [folder(&linked)];
+
+        for alias in ["shortcut", "relative", "chain"] {
+            let (_, found) = locate(&folders, &root.join(alias).join("../Sync")).unwrap();
+            assert_eq!(found, names("Sync"));
+            let (_, found) =
+                locate(&folders, &root.join(alias).join("../server-only/note.txt")).unwrap();
+            assert_eq!(found, names("server-only/note.txt"));
+        }
+    }
+
+    #[test]
+    fn parent_components_can_leave_and_reenter_linked_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let linked = root.join("Sync");
+        let other = root.join("Other");
+        std::fs::create_dir_all(linked.join("Docs")).unwrap();
+        std::fs::create_dir_all(other.join("Docs")).unwrap();
+        symlink(linked.join("Docs"), root.join("shortcut")).unwrap();
+        std::fs::write(root.join("file"), b"file").unwrap();
+        symlink("cycle", root.join("cycle")).unwrap();
+        let folders = [folder(&linked), folder(&other)];
+
+        for path in [
+            linked.join("../shortcut/../Sync"),
+            linked.join("Docs/../../shortcut/../Sync"),
+        ] {
+            let (found, names) = locate(&folders, &path).unwrap();
+            assert_eq!(found.path, linked.to_str().unwrap());
+            assert_eq!(names, vec!["Sync"]);
+        }
+        let (found, names) = locate(&folders, &linked.join("../Other/Docs/../file")).unwrap();
+        assert_eq!(found.path, other.to_str().unwrap());
+        assert_eq!(names, vec!["file"]);
+        for path in [
+            "server-only/..",
+            "server-only/../Docs",
+            "Docs/missing/../..",
+        ] {
+            assert!(matches!(
+                locate(&folders, &linked.join(path)),
+                Err(DriverError::NotOnServer(_))
+            ));
+        }
+        for path in [
+            linked.join(".."),
+            linked.join("../missing/../Sync"),
+            root.join("file/../Sync"),
+            root.join("cycle/../Sync"),
+        ] {
+            assert!(matches!(
+                locate(&folders, &path),
+                Err(DriverError::OutsideLinkedFolders(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn internal_symlinks_are_rejected_even_when_parent_components_cancel_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let linked = root.join("Sync");
+        std::fs::create_dir_all(linked.join("Docs")).unwrap();
+        std::fs::create_dir(root.join("Elsewhere")).unwrap();
+        symlink(root.join("Elsewhere"), linked.join("away")).unwrap();
+        symlink("Docs", linked.join("inside")).unwrap();
+        symlink("missing", linked.join("broken")).unwrap();
+        symlink("cycle", linked.join("cycle")).unwrap();
+        symlink(linked.join("away"), root.join("shortcut")).unwrap();
+        let folders = [folder(&linked)];
+
+        for name in ["away", "inside", "broken", "cycle"] {
+            for suffix in ["", "/child", "/..", "/../Docs", "/../../Sync"] {
+                assert!(matches!(
+                    locate(&folders, &linked.join(format!("{name}{suffix}"))),
+                    Err(DriverError::NotOnServer(_))
+                ));
+            }
+        }
+        for suffix in ["shortcut", "shortcut/..", "shortcut/../../Sync"] {
+            assert!(matches!(
+                locate(&folders, &root.join(suffix)),
+                Err(DriverError::NotOnServer(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn an_internal_file_cannot_be_traversed_or_cancelled_into_a_broader_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let linked = root.join("Sync");
+        std::fs::create_dir(&linked).unwrap();
+        std::fs::write(linked.join("file.txt"), b"file").unwrap();
+        let folders = [folder(&linked)];
+
+        assert_eq!(
+            locate(&folders, &linked.join("file.txt")).unwrap().1,
+            names("file.txt")
+        );
+        for path in ["file.txt/child", "file.txt/..", "file.txt/../other.txt"] {
+            assert!(matches!(
+                locate(&folders, &linked.join(path)),
+                Err(DriverError::NotOnServer(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn folders_that_are_not_up_to_date_describe_current_server_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Driver::open(Paths::under(dir.path())).unwrap();
+        let space = SpaceInfo {
+            space_id: "a1".into(),
+            name: "Team".into(),
+            ..SpaceInfo::default()
+        };
+        cache(
+            &driver,
+            &space.space_id,
+            &[
+                node("docs", "a1", "Before", NodeKind::Dir, NodeStatus::Live),
+                node(
+                    "file",
+                    "docs",
+                    "before.txt",
+                    NodeKind::File,
+                    NodeStatus::Live,
+                ),
+                node("trash", "a1", "Trash", NodeKind::Dir, NodeStatus::Live),
+                node(
+                    "child",
+                    "trash",
+                    "child.txt",
+                    NodeKind::File,
+                    NodeStatus::Live,
+                ),
+                node("gone", "a1", "gone.txt", NodeKind::File, NodeStatus::Live),
+            ],
+        );
+        for state in [
+            FolderState::Stopped,
+            FolderState::Connecting,
+            FolderState::Bootstrapping,
+            FolderState::CatchingUp,
+            FolderState::Offline,
+            FolderState::Halted,
+        ] {
+            let reply = RpcResponse {
+                result: Some(rpc_response::Result::Tree(TreePage {
+                    nodes: vec![
+                        node("docs", "a1", "After", NodeKind::Dir, NodeStatus::Live),
+                        node("file", "a1", "moved.txt", NodeKind::File, NodeStatus::Live),
+                        node("trash", "a1", "Trash", NodeKind::Dir, NodeStatus::Trashed),
+                        node(
+                            "child",
+                            "trash",
+                            "child.txt",
+                            NodeKind::File,
+                            NodeStatus::Live,
+                        ),
+                    ],
+                    ..TreePage::default()
+                })),
+                ..RpcResponse::default()
+            };
+            let (server, served) = serve(vec![(
+                "POST /v1/spaces/a1/rpc".into(),
+                200,
+                reply.encode_to_vec(),
+            )])
+            .await;
+            let mut folder = folder(dir.path());
+            folder.space_id = space.space_id.clone();
+            folder.state = state;
+            let links = ["docs", "file", "child", "gone"].map(|node| ShareLink {
+                space_id: space.space_id.clone(),
+                ..link("AAAAAAAAAAAAAAAAAAAAAA", node)
+            });
+            let described = tokio::time::timeout(
+                Duration::from_secs(10),
+                driver.describe(&auth(&server), &[folder], &space, links.into()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(described[0].target.as_ref().unwrap().path, "After");
+            assert_eq!(described[1].target.as_ref().unwrap().path, "moved.txt");
+            assert_eq!(described[2].target, None);
+            assert_eq!(described[3].target, None);
+            served.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn up_to_date_folders_use_cached_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Driver::open(Paths::under(dir.path())).unwrap();
+        let space = SpaceInfo {
+            space_id: "a1".into(),
+            name: "Team".into(),
+            ..SpaceInfo::default()
+        };
+        cache(
+            &driver,
+            &space.space_id,
+            &[node(
+                "file",
+                "a1",
+                "file.txt",
+                NodeKind::File,
+                NodeStatus::Live,
+            )],
+        );
+        let mut folder = folder(dir.path());
+        folder.space_id = space.space_id.clone();
+        let links = vec![ShareLink {
+            space_id: space.space_id.clone(),
+            ..link("AAAAAAAAAAAAAAAAAAAAAA", "file")
+        }];
+        let described = driver
+            .describe(&auth("http://127.0.0.1:1/"), &[folder], &space, links)
+            .await
+            .unwrap();
+        assert_eq!(described[0].target.as_ref().unwrap().path, "file.txt");
+    }
+
+    #[tokio::test]
+    async fn up_to_date_folders_refresh_targets_missing_from_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Driver::open(Paths::under(dir.path())).unwrap();
+        let space = SpaceInfo {
+            space_id: "a1".into(),
+            name: "Team".into(),
+            ..SpaceInfo::default()
+        };
+        cache(&driver, &space.space_id, &[]);
+        let reply = RpcResponse {
+            result: Some(rpc_response::Result::Tree(TreePage {
+                nodes: vec![node(
+                    "file",
+                    "a1",
+                    "file.txt",
+                    NodeKind::File,
+                    NodeStatus::Live,
+                )],
+                ..TreePage::default()
+            })),
+            ..RpcResponse::default()
+        };
+        let (server, served) = serve(vec![(
+            "POST /v1/spaces/a1/rpc".into(),
+            200,
+            reply.encode_to_vec(),
+        )])
+        .await;
+        let mut folder = folder(dir.path());
+        folder.space_id = space.space_id.clone();
+        let links = ["file", "unknown"].map(|node| ShareLink {
+            space_id: space.space_id.clone(),
+            ..link("AAAAAAAAAAAAAAAAAAAAAA", node)
+        });
+        let described = tokio::time::timeout(
+            Duration::from_secs(10),
+            driver.describe(&auth(&server), &[folder], &space, links.into()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(described[0].target.as_ref().unwrap().path, "file.txt");
+        assert_eq!(described[1].target, None);
+        served.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn revocation_succeeds_when_target_metadata_is_unavailable_including_on_retry() {
+        for revoked_at_ms in [0, 900] {
+            for node_id in ["file", SPACE] {
+                let shared = ShareLink {
+                    revoked_at_ms,
+                    ..link("AAAAAAAAAAAAAAAAAAAAAA", node_id)
+                };
+                let mut replies = vec![
+                    (
+                        "POST /v1/token".into(),
+                        200,
+                        AccessToken {
+                            token: "token".into(),
+                            expires_at_ms: i64::MAX,
+                            ..AccessToken::default()
+                        }
+                        .encode_to_vec(),
+                    ),
+                    (
+                        "GET /v1/spaces".into(),
+                        200,
+                        SpaceList {
+                            spaces: vec![SpaceInfo {
+                                space_id: SPACE.into(),
+                                name: "Team".into(),
+                                ..SpaceInfo::default()
+                            }],
+                            ..SpaceList::default()
+                        }
+                        .encode_to_vec(),
+                    ),
+                    (
+                        format!("GET /v1/spaces/{SPACE}/links"),
+                        200,
+                        ShareLinkList {
+                            links: vec![shared.clone()],
+                            ..ShareLinkList::default()
+                        }
+                        .encode_to_vec(),
+                    ),
+                ];
+                if revoked_at_ms == 0 {
+                    replies.push((
+                        format!("DELETE /v1/spaces/{SPACE}/links/{}", shared.link_id),
+                        200,
+                        Vec::new(),
+                    ));
+                }
+                replies.push((format!("POST /v1/spaces/{SPACE}/rpc"), 403, Vec::new()));
+                let (server, served) = serve(replies).await;
+                let dir = tempfile::tempdir().unwrap();
+                let paths = Paths::under(dir.path());
+                crate::Credential {
+                    server,
+                    user_id: "user".into(),
+                    user_name: None,
+                    device_id: "device".into(),
+                    device_name: "test".into(),
+                    refresh_credential: "refresh".into(),
+                }
+                .save_new(&paths.credential())
+                .unwrap();
+                let driver = Driver::open(paths).unwrap();
+                let revoked = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    driver.revoke_share_link(&Secret(shared.link_id)),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(revoked.link.state, LinkState::Revoked);
+                assert_eq!(revoked.already, revoked_at_ms != 0);
+                assert_eq!(revoked.link.target, None);
+                assert_eq!(revoked.link.node_id, node_id);
+                assert!(revoked.link.revoked_at_ms.unwrap() > 0);
+                served.await.unwrap();
+            }
+        }
     }
 
     #[tokio::test]

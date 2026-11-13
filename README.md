@@ -75,7 +75,7 @@ Dropbox does much more, and charges per person for it. Koidrive does the core of
 | **Files on demand** | Planned after 0.1 | Online-only files |
 | **Windows, iPhone and Android** | No | Yes |
 | **Web interface** | No | Yes |
-| **Share links** | No | Yes, with passwords and expiry |
+| **Share links** | Yes, read-only. | Yes, with passwords and expiry |
 | **Admin tools** | No | Device approvals, remote wipe and account transfer |
 | **Support** | GitHub issues | Yes |
 

@@ -791,8 +791,8 @@ pub struct ShareLinkData {
     /// The linked folder that syncs the space on this device.
     pub folder: Option<String>,
     pub node_id: String,
-    /// The path of the shared file or folder in its space, empty for the whole space, or null once it is in the trash
-    /// or gone.
+    /// The path of the shared file or folder in its space, empty for the whole space, or null if it is in the trash,
+    /// gone, or unavailable after revocation.
     pub path: Option<String>,
     pub kind: Option<NodeType>,
     pub created_at_ms: i64,
@@ -1070,7 +1070,7 @@ pub enum Auth {
     Cloudflare,
 }
 
-/// What it prints on stdout with `--json`. It never reads stdin then.
+/// What it prints on stdout with `--json`. Only `share create --password` reads stdin, or asks on a terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Output {

@@ -527,7 +527,7 @@
       ]
     },
     "Output": {
-      "description": "What it prints on stdout with `--json`. It never reads stdin then.",
+      "description": "What it prints on stdout with `--json`. Only `share create --password` reads stdin, or asks on a terminal.",
       "oneOf": [
         {
           "const": "envelope",
@@ -584,7 +584,7 @@
           "type": "string"
         },
         "path": {
-          "description": "The path of the shared file or folder in its space, empty for the whole space, or null once it is in the trash\nor gone.",
+          "description": "The path of the shared file or folder in its space, empty for the whole space, or null if it is in the trash,\ngone, or unavailable after revocation.",
           "type": [
             "string",
             "null"
