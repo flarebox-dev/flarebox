@@ -597,8 +597,10 @@ impl Commits {
     /// pending name: one node of the cycle moves to a free name first and to its own name last, in
     /// the same commit when the commit holds the whole cycle. Otherwise a create or move that only
     /// waits for a name is sent anyway, for the server to rename, except that a folder created
-    /// where a moving file or folder still is takes a pending name first, and a folder it may be
-    /// merged into is not deleted in the same commit. A delete waits until nothing that survives is
+    /// where a moving file or folder still is takes a pending name first. A folder is not deleted
+    /// in a commit that creates a folder beside it, since another device may have renamed it to
+    /// the created folder's name since R, and the server would then merge the created folder into
+    /// it. A delete waits until nothing that survives is
     /// left under it, a create or move until its parent exists, and a move that would close a cycle
     /// against R is reverted: the node is marked in [`Trees::reverted`], and the effects move it
     /// back to its R position on disk, bringing back the folders L deleted on its way. A parked or
@@ -2312,6 +2314,10 @@ fn plan(
         }
         let op = match want {
             Want::Create { id, shape } => {
+                if shape.kind == Kind::Dir {
+                    let folders = scratch.folders(&shape.parent);
+                    scratch.merged.extend(folders);
+                }
                 scratch.place(&id, &shape.parent, &shape.name, shape.kind);
                 match shape.kind {
                     Kind::Dir => op::Op::CreateDir(proto::CreateDir {
@@ -2471,22 +2477,18 @@ fn plan(
         }
         if let Some(Want::Create { id, shape }) = slot.as_mut()
             && shape.kind == Kind::Dir
+            && (scratch.holders(&shape.parent, &shape.name)).any(|other| moving.contains(other))
         {
-            if (scratch.holders(&shape.parent, &shape.name)).any(|other| moving.contains(other)) {
-                let sent = scratch.free_name(&shape.parent, &shape.name);
-                let name = std::mem::replace(&mut shape.name, sent.clone());
-                pending.insert(
-                    id.clone(),
-                    Pending {
-                        sent,
-                        name,
-                        landed: false,
-                    },
-                );
-            } else {
-                let held = scratch.held(&shape.parent, &shape.name);
-                scratch.merged.extend(held);
-            }
+            let sent = scratch.free_name(&shape.parent, &shape.name);
+            let name = std::mem::replace(&mut shape.name, sent.clone());
+            pending.insert(
+                id.clone(),
+                Pending {
+                    sent,
+                    name,
+                    landed: false,
+                },
+            );
         }
         emit(slot.take().expect("checked"), &mut scratch, &mut moving);
     };
@@ -2567,8 +2569,10 @@ struct Scratch {
     nodes: BTreeMap<NodeId, Entry>,
     /// Live children by parent, then by name key.
     children: BTreeMap<NodeId, BTreeMap<String, BTreeSet<NodeId>>>,
-    /// Folders a forced create will be merged into (MERGED_INTO). Deleting one in the same
-    /// commit would trash what the create brings, so their deletes wait for the next commit.
+    /// Folders a created folder may be merged into (MERGED_INTO): every folder under its parent,
+    /// since the server merges by the names it holds when the commit applies, and another device
+    /// may have renamed one of them since R. Deleting one in the same commit would trash what the
+    /// create brings, so their deletes wait for the next commit.
     merged: BTreeSet<NodeId>,
     /// For each node a queued restore names, how many wants that change it are not emitted yet,
     /// and one more while the node is not settled: this build leaves it out, so its changes are
@@ -2739,10 +2743,9 @@ impl Scratch {
             .flatten()
     }
 
-    /// The live folders named `name` under `parent`, which a created folder of that name merges
-    /// into.
-    fn held(&self, parent: &str, name: &str) -> Vec<NodeId> {
-        (self.holders(parent, name))
+    fn folders(&self, parent: &str) -> Vec<NodeId> {
+        (self.children.get(parent).into_iter())
+            .flat_map(|keys| keys.values().flatten())
             .filter(|id| self.nodes[*id].kind == Kind::Dir)
             .cloned()
             .collect()
