@@ -45,6 +45,7 @@ fn main() {
             syn::Item::Struct(s) => (format!("struct:{}", s.ident), "helper"),
             syn::Item::Enum(e) => (format!("enum:{}", e.ident), "helper"),
             syn::Item::Type(t) => (format!("type:{}", t.ident), "helper"),
+            syn::Item::Mod(m) => (format!("mod:{}", m.ident), "module"),
             syn::Item::Use(u) => (format!("use:{}", u.tree.to_token_stream()), "helper"),
             syn::Item::Impl(i) => (
                 format!(

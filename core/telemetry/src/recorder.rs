@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use crate::schema::{Counter, DailyReport, Event, Histogram, Level, Measure};
+use crate::schema::{Counter, DailyReport, Event, Level, Measure};
 
 /// A cheap handle that code passes around to record. One made with [`Recorder::off`] records nothing and costs one
 /// branch per call. Recording takes a short lock on the sums and does no I/O.
@@ -87,7 +87,7 @@ impl Recorder {
         });
     }
 
-    pub(crate) fn count_on(&self, day: u32, counter: Counter, by: u64) {
+    pub fn count_on(&self, day: u32, counter: Counter, by: u64) {
         let (metric, label) = counter.key();
         self.with(|pending| {
             let report = pending.days.entry(day).or_insert_with(|| DailyReport {
@@ -121,8 +121,8 @@ impl Recorder {
         });
     }
 
-    pub(crate) fn measure_on(&self, day: u32, measure: Measure, value: u64) {
-        let (metric, label, shift) = measure.key();
+    pub fn measure_on(&self, day: u32, measure: Measure, value: u64) {
+        let (metric, label, _) = measure.key();
         self.with(|pending| {
             let report = pending.days.entry(day).or_insert_with(|| DailyReport {
                 day,
@@ -131,7 +131,7 @@ impl Recorder {
             let labels = report.histograms.entry(metric.to_owned()).or_default();
             labels
                 .entry(label.to_owned())
-                .or_insert_with(|| Histogram::new(shift))
+                .or_insert_with(|| measure.histogram())
                 .record(value);
         });
     }

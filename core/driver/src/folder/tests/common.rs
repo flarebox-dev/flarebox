@@ -50,6 +50,7 @@ fn eventually(what: &str, mut done: impl FnMut() -> bool) {
 
 /// The server: the space, the bytes of the chunks devices uploaded, and the result of each commit by its ID.
 struct Remote {
+    now_ms: i64,
     space: SpaceDo,
     chunks: Server,
     results: HashMap<String, CommitResult>,
@@ -57,8 +58,13 @@ struct Remote {
 
 impl Remote {
     fn new() -> Remote {
+        Self::new_at(NOW)
+    }
+
+    fn new_at(now_ms: i64) -> Remote {
         Remote {
-            space: SpaceDo::new(1, NOW),
+            now_ms,
+            space: SpaceDo::new(1, now_ms),
             chunks: Server::default(),
             results: HashMap::new(),
         }
@@ -100,7 +106,10 @@ impl Remote {
         let request = PrepareUpload {
             chunks: chunks.clone(),
         };
-        let plan = self.space.prepare_upload(caller, NOW, &request).unwrap();
+        let plan = self
+            .space
+            .prepare_upload(caller, self.now_ms, &request)
+            .unwrap();
         let wanted = |chunk: &ChunkRef| {
             plan.chunks.iter().any(|plan| {
                 plan.hash == chunk.hash && plan.action == chunk_plan::Action::Upload as i32
@@ -113,14 +122,15 @@ impl Remote {
             self.chunks
                 .chunks
                 .insert(chunk.hash.clone(), bytes.to_vec());
-            receipts.push(self.space.put_chunk(&chunk.hash, chunk.size, NOW));
+            receipts.push(self.space.put_chunk(&chunk.hash, chunk.size, self.now_ms));
+            crate::timing::add_bytes(&upload.timing_bytes, u64::from(chunk.size));
         }
         receipts
     }
 
     /// What `Session::commit` does.
     fn commit(&mut self, caller: &Caller, commit: &Commit) -> Result<CommitResult, CallError> {
-        match self.space.commit(caller, NOW, commit) {
+        match self.space.commit(caller, self.now_ms, commit) {
             Ok(committed) => {
                 let id = commit.commit_id.clone();
                 self.results.insert(id, committed.result.clone());
@@ -280,6 +290,9 @@ impl Device {
     fn take(&mut self, step: Result<Vec<Work>, Stop>) -> Result<(), Stop> {
         self.work.extend(step?);
         let folder = &mut self.folder;
+        if folder.timing.is_on() || folder.timing.has_first() {
+            folder.record_status(folder.view().state);
+        }
         let stored = folder
             .store
             .transaction(|tx| Engine::load(tx, &folder.link.space_id))
@@ -1157,6 +1170,7 @@ fn answered_then_lost(given: Answer) -> (Site, Remote) {
     let mut chunks = Server::default();
     chunks.chunks.clone_from(&remote.chunks.chunks);
     let mut restored = Remote {
+        now_ms: remote.now_ms,
         space: remote.space.clone(),
         chunks,
         results: remote.results.clone(),
@@ -1240,6 +1254,7 @@ fn keep_original_lost_by_a_restore(deleted_on_c: bool) -> (Remote, Site, Vec<Com
     let mut chunks = Server::default();
     chunks.chunks.clone_from(&remote.chunks.chunks);
     let mut restored = Remote {
+        now_ms: remote.now_ms,
         space: remote.space.clone(),
         chunks,
         results: remote.results.clone(),
@@ -1297,6 +1312,7 @@ fn keep_original_lost_below_a_removed_folder(deleted_on_c: bool) -> (Remote, Com
     let mut chunks = Server::default();
     chunks.chunks.clone_from(&remote.chunks.chunks);
     let mut restored = Remote {
+        now_ms: remote.now_ms,
         space: remote.space.clone(),
         chunks,
         results: remote.results.clone(),
@@ -1356,6 +1372,7 @@ fn keep_original_lost_then_its_folder_removed(original_moved_out: bool) -> (Remo
     let mut chunks = Server::default();
     chunks.chunks.clone_from(&remote.chunks.chunks);
     let mut restored = Remote {
+        now_ms: remote.now_ms,
         space: remote.space.clone(),
         chunks,
         results: remote.results.clone(),
@@ -1388,6 +1405,7 @@ fn keep_original_lost_after_the_original_was_deleted(deleted_on_b: bool) -> (Rem
     let mut chunks = Server::default();
     chunks.chunks.clone_from(&remote.chunks.chunks);
     let mut restored = Remote {
+        now_ms: remote.now_ms,
         space: remote.space.clone(),
         chunks,
         results: remote.results.clone(),

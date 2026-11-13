@@ -60,6 +60,11 @@ struct Run {
 
 static RUN: OnceLock<Run> = OnceLock::new();
 
+pub fn recorder() -> Recorder {
+    RUN.get()
+        .map_or_else(Recorder::off, |run| run.recorder.clone())
+}
+
 fn var(name: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(name)
 }
@@ -258,7 +263,10 @@ pub async fn run_daemon(stop: tokio::sync::oneshot::Receiver<()>, driver: Driver
     let Some(run) = RUN.get() else { return };
     let mut last = Volume::default();
     let mut failed = BTreeMap::new();
+    let mut cpu = koidrive_telemetry::Cpu::default();
+    cpu.sample(&run.recorder);
     let tick = || {
+        cpu.sample(&run.recorder);
         record_sync(
             &run.recorder,
             &mut last,

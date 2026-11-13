@@ -259,6 +259,7 @@ pub(crate) struct Disk {
 
 /// A planned effect the store holds.
 pub(crate) struct Pending {
+    pub timing_bytes: crate::timing::Bytes,
     space: Arc<Space>,
     record: EffectRecord,
     effect: Effect,
@@ -460,6 +461,7 @@ impl Disk {
             engine.checkpoint(tx)?;
             hook(Cut::BeforePlan);
             Ok(Some(Pending {
+                timing_bytes: None,
                 space: space.clone(),
                 record,
                 effect,
@@ -657,6 +659,7 @@ impl Disk {
     /// updates, the file of its node in L and the offset of each chunk in it.
     pub fn upload(&self, commit: &Commit, engine: &Engine) -> Upload {
         let mut upload = Upload {
+            timing_bytes: None,
             space: self.space.clone(),
             chunks: Vec::new(),
             sources: HashMap::new(),
@@ -709,6 +712,7 @@ impl Disk {
 
 /// The chunks a commit adds to the server and where the bytes of each are in the folder.
 pub(crate) struct Upload {
+    pub timing_bytes: crate::timing::Bytes,
     space: Arc<Space>,
     /// Every chunk of every content the commit creates or updates, in the order of its ops.
     pub chunks: Vec<ChunkRef>,
@@ -804,6 +808,7 @@ impl Pending {
                 for offset in manifest.offsets.get(&chunk.hash).into_iter().flatten() {
                     file.write_all_at(bytes, *offset)?;
                 }
+                crate::timing::add_bytes(&self.timing_bytes, bytes.len() as u64);
                 received += 1;
                 Ok(())
             })

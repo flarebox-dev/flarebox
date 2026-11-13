@@ -269,6 +269,7 @@ pub struct Driver {
 }
 
 struct Inner {
+    telemetry: koidrive_telemetry::Recorder,
     paths: Paths,
     _lock: Flock,
     matcher: Arc<dyn Matcher>,
@@ -317,6 +318,7 @@ impl Drop for Inner {
 /// A linked folder. It stays in the driver's map until unlinking it has finished, so a stop, an unlink or a sign-out
 /// that starts later still finds its task and its cleanup, also after an earlier caller gave up waiting.
 struct Folder {
+    linked_started: Option<crate::timing::Time>,
     link: Link,
     status: Arc<crate::lifecycle::Lifecycle>,
     /// The folder's task, from its start until a stop has seen it end.
@@ -424,6 +426,13 @@ impl Driver {
     /// Opens the profile at `paths`: takes its lock, reads its configuration and credential, and finds its linked
     /// folders. Nothing syncs until [`Driver::start`].
     pub fn open(paths: Paths) -> Result<Self, DriverError> {
+        Self::open_with_telemetry(paths, koidrive_telemetry::Recorder::off())
+    }
+
+    pub fn open_with_telemetry(
+        paths: Paths,
+        telemetry: koidrive_telemetry::Recorder,
+    ) -> Result<Self, DriverError> {
         DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -482,6 +491,7 @@ impl Driver {
         );
         Ok(Driver {
             inner: Arc::new(Inner {
+                telemetry,
                 matcher,
                 local,
                 trash_cap: config.trash.cap(),
@@ -1169,6 +1179,7 @@ impl Driver {
             .map_err(io_error(&root))?,
         }
         claim::set_owner(&root, &owner).map_err(io_error(&root))?;
+        let linked_started = crate::timing::Time::now();
         let link = Link {
             space_id: space.space_id.clone(),
             space_name: space.name.clone(),
@@ -1176,7 +1187,7 @@ impl Driver {
             root,
             server_url: credential.server.clone(),
             device_id: credential.device_id.clone(),
-            linked_at_ms: now_ms(),
+            linked_at_ms: linked_started.unix_ms,
         };
         let store_path = self.inner.paths.store(&link.space_id)?;
         let store_dir = store_path.parent().expect("a store path has a parent");
@@ -1188,6 +1199,7 @@ impl Driver {
         Store::open(&store_path)
             .and_then(|mut store| store.transaction(|tx| tx.set_link(&link)))
             .map_err(store_error(&store_path))?;
+        crate::timing::Timing::initialize(&store_path, link.linked_at_ms);
         tracing::info!(space_id = link.space_id, path = %koidrive_fs::quoted(&link.root), "linked a folder");
         let status = Arc::new(
             crate::lifecycle::Lifecycle::open(&store_path, folder_status(&link, None, 0, 0))
@@ -1195,6 +1207,7 @@ impl Driver {
         );
         let linked = roots(&folders);
         let mut folder = Folder {
+            linked_started: Some(linked_started),
             link,
             status: status.clone(),
             run: None,
@@ -1710,6 +1723,8 @@ impl Driver {
             .store(&folder.link.space_id)
             .map_err(|error| error.to_string())?;
         Ok(FolderTask {
+            linked_started: folder.linked_started,
+            telemetry: self.inner.telemetry.clone(),
             link: folder.link.clone(),
             store,
             auth,
@@ -1914,6 +1929,7 @@ fn load_folders(paths: &Paths) -> Result<BTreeMap<String, Folder>, DriverError> 
             (
                 link.space_id.clone(),
                 Folder {
+                    linked_started: None,
                     status,
                     link,
                     run: None,

@@ -148,6 +148,28 @@ class SplitTests(unittest.TestCase):
         with patch.object(split, "git_source", return_value=branch):
             split.verify(self.executable, self.mapping, "branch")
 
+    def test_port_preserves_modules_in_root(self):
+        for module in [
+            b'#[path = "other_tests.rs"]\nmod telemetry;',
+            b'#[cfg(test)]\nmod telemetry { #[test] fn nested() {} }',
+        ]:
+            with self.subTest(module=module):
+                self.generate()
+                branch = self.source + b"\n" + module + b"\n"
+                self.mapping["tests.rs"]["mod:telemetry"] = "root"
+                with patch.object(split, "git_source", side_effect=lambda ref, path: self.source if ref == "base" else branch):
+                    split.port(self.executable, self.mapping, "base", "branch")
+                self.assertIn(module, self.path.read_bytes())
+                with patch.object(split, "git_source", return_value=branch):
+                    split.verify(self.executable, self.mapping, "branch")
+
+    def test_modules_cannot_move_to_scenarios(self):
+        source = self.source + b'\n#[path = "other_tests.rs"]\nmod telemetry;\n'
+        self.mapping["tests.rs"]["mod:telemetry"] = "common"
+        with self.assertRaisesRegex(ValueError, "keep modules in root"):
+            split.render(self.executable, self.mapping, {"tests.rs": source})
+        self.assertEqual(self.path.read_bytes(), self.source)
+
     def test_port_refuses_overlapping_edits_without_writes(self):
         self.generate()
         scenario = self.root / "tests/scenario.rs"

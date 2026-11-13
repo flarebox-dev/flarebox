@@ -298,7 +298,8 @@
     "fn:a_first_link_records_its_proven_cause_with_the_stored_question": "first_link_and_held_files",
     "fn:a_file_moved_over_another_out_of_a_removed_folder_leaves_the_server_across_a_restart_during_a_bounded_search": "moves_and_name_collisions",
     "fn:a_file_moved_into_an_ignored_folder_while_its_overwrite_is_held_stays_on_the_other_device": "ignored_entries_and_moves",
-    "fn:a_bulk_delete_with_a_file_moved_over_another_keeps_the_file_at_its_path": "moves_and_name_collisions"
+    "fn:a_bulk_delete_with_a_file_moved_over_another_keeps_the_file_at_its_path": "moves_and_name_collisions",
+    "mod:telemetry_tests": "root"
   },
   "core/engine/tests/commit.rs": {
     "fn:resend": "common",

@@ -69,13 +69,16 @@ impl From<StoredReport> for DailyReport {
                     .insert(label.to_owned(), value);
             }
         }
-        for (metric, label, shift) in Measure::all().map(Measure::key) {
+        for measure in Measure::all() {
+            let (metric, label, shift) = measure.key();
             if let Some(histogram) = (stored.histograms.get(metric))
                 .and_then(|labels| labels.get(label))
                 .filter(|histogram| histogram.shift == shift)
             {
+                let mut kept = measure.histogram();
+                kept.merge(histogram);
                 (report.histograms.entry(metric.to_owned()).or_default())
-                    .insert(label.to_owned(), histogram.clone());
+                    .insert(label.to_owned(), kept);
             }
         }
         report
@@ -121,7 +124,8 @@ pub struct Histogram {
     pub shift: u8,
     pub buckets: [u64; 16],
     pub count: u64,
-    pub sum: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sum: Option<u64>,
 }
 
 impl Histogram {
@@ -130,7 +134,7 @@ impl Histogram {
             shift,
             buckets: [0; 16],
             count: 0,
-            sum: 0,
+            sum: Some(0),
         }
     }
 
@@ -139,7 +143,7 @@ impl Histogram {
         let bucket = (64 - scaled.leading_zeros()).min(15) as usize;
         self.buckets[bucket] += 1;
         self.count += 1;
-        self.sum = self.sum.saturating_add(value);
+        self.sum = self.sum.map(|sum| sum.saturating_add(value));
     }
 
     /// Adds `other` when it has the same shift. One with another shift comes from a different layout and is dropped.
@@ -151,7 +155,10 @@ impl Histogram {
             *into = into.saturating_add(from);
         }
         self.count = self.count.saturating_add(other.count);
-        self.sum = self.sum.saturating_add(other.sum);
+        self.sum = self
+            .sum
+            .zip(other.sum)
+            .map(|(sum, other)| sum.saturating_add(other));
     }
 }
 
@@ -244,6 +251,7 @@ pub enum Outcome {
 /// A daily sum: a metric and the label it is counted under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Counter {
+    CpuMilliseconds,
     /// A CLI command ran. Only its name; never its arguments.
     Command(Command),
     /// What the daemon synced, over all its linked folders.
@@ -258,10 +266,12 @@ impl Counter {
         (Command::ALL.into_iter().map(Counter::Command))
             .chain(Synced::ALL.map(Counter::Sync))
             .chain(Failure::all().map(Counter::Failure))
+            .chain([Counter::CpuMilliseconds])
     }
 
     pub(crate) fn key(self) -> (&'static str, &'static str) {
         match self {
+            Counter::CpuMilliseconds => ("process", "cpu_ms"),
             Counter::Command(command) => ("command", command.name()),
             Counter::Sync(synced) => ("sync", synced.name()),
             Counter::Failure(failure) => failure.key(),
@@ -535,16 +545,93 @@ impl Level {
 
 /// A daily distribution of durations or sizes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Measure {}
+pub enum Measure {
+    FirstSync(FileCount),
+    DownloadFilesPerSecond,
+    DownloadBytesPerSecond,
+    UploadFilesPerSecond,
+    UploadBytesPerSecond,
+    RemoteApplyMilliseconds,
+    SyncingMilliseconds,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileCount(u8);
+
+impl FileCount {
+    pub fn bucket(files: u64) -> Self {
+        Self(magnitude(files).min(21))
+    }
+
+    fn name(self) -> &'static str {
+        [
+            "0",
+            "1",
+            "2_3",
+            "4_7",
+            "8_15",
+            "16_31",
+            "32_63",
+            "64_127",
+            "128_255",
+            "256_511",
+            "512_1023",
+            "1024_2047",
+            "2048_4095",
+            "4096_8191",
+            "8192_16383",
+            "16384_32767",
+            "32768_65535",
+            "65536_131071",
+            "131072_262143",
+            "262144_524287",
+            "524288_1048575",
+            "1048576_plus",
+        ][usize::from(self.0)]
+    }
+}
 
 impl Measure {
+    pub(crate) fn histogram(self) -> Histogram {
+        let (_, _, shift) = self.key();
+        Histogram {
+            sum: match self {
+                Measure::FirstSync(_)
+                | Measure::RemoteApplyMilliseconds
+                | Measure::SyncingMilliseconds => None,
+                Measure::DownloadFilesPerSecond
+                | Measure::DownloadBytesPerSecond
+                | Measure::UploadFilesPerSecond
+                | Measure::UploadBytesPerSecond => Some(0),
+            },
+            ..Histogram::new(shift)
+        }
+    }
+
     pub fn all() -> impl Iterator<Item = Measure> {
-        std::iter::empty()
+        (0..=21)
+            .map(|bucket| Measure::FirstSync(FileCount(bucket)))
+            .chain([
+                Measure::DownloadFilesPerSecond,
+                Measure::DownloadBytesPerSecond,
+                Measure::UploadFilesPerSecond,
+                Measure::UploadBytesPerSecond,
+                Measure::RemoteApplyMilliseconds,
+                Measure::SyncingMilliseconds,
+            ])
     }
 
     /// The metric, the label and the histogram's shift.
     pub(crate) fn key(self) -> (&'static str, &'static str, u8) {
-        match self {}
+        match self {
+            Measure::FirstSync(files) => ("first_sync_ms", files.name(), 10),
+            Measure::DownloadFilesPerSecond => ("download_per_second", "files", 0),
+            Measure::DownloadBytesPerSecond => ("download_per_second", "bytes", 15),
+            Measure::UploadFilesPerSecond => ("upload_per_second", "files", 0),
+            Measure::UploadBytesPerSecond => ("upload_per_second", "bytes", 15),
+            Measure::RemoteApplyMilliseconds => ("remote_apply_ms", "effect", 10),
+            Measure::SyncingMilliseconds => ("syncing_ms", "completed", 10),
+        }
     }
 }
 
@@ -855,7 +942,7 @@ mod tests {
         expected[15] = 2;
         assert_eq!(histogram.buckets, expected);
         assert_eq!(histogram.count, 8);
-        assert_eq!(histogram.sum, u64::MAX);
+        assert_eq!(histogram.sum, Some(u64::MAX));
     }
 
     #[test]
@@ -958,6 +1045,164 @@ mod tests {
         assert_eq!(counters.len(), Counter::all().count());
         let levels: std::collections::BTreeSet<_> = Level::all().map(Level::key).collect();
         assert_eq!(levels.len(), Level::ALL.len());
+    }
+
+    #[test]
+    fn timing_measures_have_closed_unique_keys_and_separate_large_file_counts() {
+        let keys: std::collections::BTreeSet<_> = Measure::all().map(Measure::key).collect();
+        assert_eq!(keys.len(), Measure::all().count());
+        assert_eq!(FileCount::bucket(0).name(), "0");
+        assert_eq!(FileCount::bucket(1).name(), "1");
+        assert_eq!(FileCount::bucket(100_000).name(), "65536_131071");
+        assert_eq!(FileCount::bucket(400_000).name(), "262144_524287");
+        assert_eq!(FileCount::bucket(u64::MAX).name(), "1048576_plus");
+    }
+
+    #[test]
+    fn duration_histograms_never_emit_sums_even_from_stored_reports() {
+        let recorder = crate::Recorder::on();
+        for measure in Measure::all() {
+            recorder.measure_on(1, measure, 90_000);
+            recorder.measure_on(1, measure, 600_000);
+        }
+        let report = recorder.take().days.remove(&1).unwrap();
+        let original = serde_json::to_value(&report).unwrap();
+        let mut stored = original.clone();
+        for measure in Measure::all() {
+            let (metric, label, _) = measure.key();
+            let histogram = &original["histograms"][metric][label];
+            assert_eq!(histogram["count"], 2);
+            if matches!(
+                measure,
+                Measure::FirstSync(_)
+                    | Measure::RemoteApplyMilliseconds
+                    | Measure::SyncingMilliseconds
+            ) {
+                assert!(histogram.get("sum").is_none());
+                stored["histograms"][metric][label]["sum"] = serde_json::json!(1794527123456u64);
+            } else {
+                assert_eq!(histogram["sum"], 690_000);
+            }
+        }
+        let restored: DailyReport = serde_json::from_value(stored).unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), original);
+        let mut merged = DailyReport {
+            day: 1,
+            ..DailyReport::default()
+        };
+        merged.merge(report);
+        merged.merge(restored);
+        let merged = serde_json::to_value(merged).unwrap();
+        for measure in Measure::all() {
+            let (metric, label, _) = measure.key();
+            let histogram = &merged["histograms"][metric][label];
+            assert_eq!(histogram["count"], 4);
+            for (index, count) in original["histograms"][metric][label]["buckets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .enumerate()
+            {
+                assert_eq!(histogram["buckets"][index], count.as_u64().unwrap() * 2);
+            }
+            if matches!(
+                measure,
+                Measure::FirstSync(_)
+                    | Measure::RemoteApplyMilliseconds
+                    | Measure::SyncingMilliseconds
+            ) {
+                assert!(histogram.get("sum").is_none());
+            } else {
+                assert_eq!(histogram["sum"], 1_380_000);
+            }
+        }
+    }
+
+    #[test]
+    fn duration_histograms_distinguish_minutes_and_round_trip_with_shift_ten() {
+        let recorder = crate::Recorder::on();
+        for measure in Measure::all().filter(|measure| {
+            matches!(
+                measure,
+                Measure::FirstSync(_)
+                    | Measure::RemoteApplyMilliseconds
+                    | Measure::SyncingMilliseconds
+            )
+        }) {
+            let (metric, label, shift) = measure.key();
+            assert_eq!(shift, 10);
+            for millis in [1023, 60_000, 600_000, 5_280_000, 16_777_215, 16_777_216] {
+                recorder.measure_on(1, measure, millis);
+            }
+            let mut report = recorder.take().days.remove(&1).unwrap();
+            let histogram = &report.histograms[metric][label];
+            assert_eq!(histogram.buckets[0], 1);
+            assert_eq!(histogram.buckets[6], 1);
+            assert_eq!(histogram.buckets[10], 1);
+            assert_eq!(histogram.buckets[13], 1);
+            assert_eq!(histogram.buckets[14], 1);
+            assert_eq!(histogram.buckets[15], 1);
+            assert_eq!(histogram.count, 6);
+            let stored = serde_json::to_value(&report).unwrap();
+            assert_eq!(
+                serde_json::from_value::<DailyReport>(stored).unwrap(),
+                report
+            );
+            report
+                .histograms
+                .get_mut(metric)
+                .unwrap()
+                .get_mut(label)
+                .unwrap()
+                .shift = 0;
+            let rejected =
+                serde_json::from_value::<DailyReport>(serde_json::to_value(report).unwrap())
+                    .unwrap();
+            assert!(rejected.is_empty());
+        }
+    }
+
+    #[test]
+    fn byte_rate_histograms_distinguish_one_ten_and_one_hundred_mebibytes_per_second() {
+        for measure in [
+            Measure::UploadBytesPerSecond,
+            Measure::DownloadBytesPerSecond,
+        ] {
+            let recorder = crate::Recorder::on();
+            for rate in [1 << 20, 10 << 20, 100 << 20] {
+                recorder.measure_on(1, measure, rate);
+            }
+            let report = recorder.take().days.remove(&1).unwrap();
+            let (metric, label, _) = measure.key();
+            let histogram = &report.histograms[metric][label];
+            for bucket in [6, 9, 12] {
+                assert_eq!(histogram.buckets[bucket], 1);
+            }
+            assert_eq!(histogram.buckets[15], 0);
+        }
+    }
+
+    #[test]
+    fn stored_unfinished_span_counters_and_active_ages_are_dropped() {
+        for shift in [0, 10] {
+            let report: DailyReport = serde_json::from_value(serde_json::json!({
+                "day": 1,
+                "counters": { "sync": { "unfinished": 2 } },
+                "histograms": { "syncing_ms": { "active_age": {
+                    "shift": shift,
+                    "buckets": vec![0; 16],
+                    "count": 1,
+                    "sum": 1794527123456u64,
+                } } },
+            }))
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(report).unwrap(),
+                serde_json::json!({
+                    "day": 1,
+                })
+            );
+        }
     }
 
     #[test]

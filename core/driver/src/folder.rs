@@ -51,6 +51,7 @@ use crate::ignore::Matcher;
 use crate::observe::{FsObserver, Observer};
 use crate::policy::{self, Disposition};
 use crate::status::{FolderState, Wait, WaitKind};
+use crate::timing::{Time, Timing};
 
 /// The highest space format this build reads (spec v0 section 9.2).
 pub const MAX_FORMAT: u32 = 1;
@@ -92,6 +93,7 @@ const OTHER_FOLDER: &str = "the folder at this path is not the one this device s
 
 /// One linked folder while it syncs.
 pub(crate) struct Folder {
+    timing: Timing,
     link: Link,
     engine: Engine,
     store: Store,
@@ -270,6 +272,7 @@ impl Folder {
     /// which the store does not hold; the rules files follow with the observer's first batch, and nothing is planned
     /// before that (design §5.10).
     pub fn open(link: Link, lock: &File, store: &Path, local: LocalRules) -> Result<Folder, Stop> {
+        let timing = Timing::open(store, link.linked_at_ms);
         let mut store = Store::open(store)?;
         let mut engine = store.transaction(|tx| Engine::load(tx, &link.space_id))?;
         engine.trees.set_local_rules(local);
@@ -291,6 +294,7 @@ impl Folder {
             .map(|question| question.id.clone())
             .collect();
         Ok(Folder {
+            timing,
             link,
             engine,
             store,
@@ -521,8 +525,22 @@ impl Folder {
             }
             Err(Stall::Halt(stop)) => return Err(stop),
         };
-        let node = (self.engine.effects.in_flight()).map(|record| record.node.clone());
+        let node = self
+            .engine
+            .effects
+            .in_flight()
+            .map(|record| record.node.clone());
+        let effect_id = self
+            .engine
+            .effects
+            .in_flight()
+            .filter(|_| self.timing.is_on())
+            .map(|record| record.effect_id.clone());
         let settled = self.disk.apply(staged, &mut self.engine, &mut self.store)?;
+        if let Some(effect_id) = effect_id {
+            self.timing
+                .applied(&effect_id, settled == Settled::Done, Time::now());
+        }
         if self.engine.asked {
             self.questions = self.store.transaction(unanswered)?;
         }
@@ -1111,6 +1129,14 @@ impl Folder {
 
     /// Commits of the log. A gap subscribes again from the last commit applied.
     fn changes(&mut self, records: &[CommitRecord], work: &mut Vec<Work>) -> Result<(), Stop> {
+        let before = match &self.stream {
+            Stream::Replaying(staging) => staging.last_seq(),
+            _ => self
+                .engine
+                .cursor
+                .as_ref()
+                .map_or(0, |cursor| cursor.last_seq),
+        };
         let (applied, since) = match &mut self.stream {
             Stream::Connecting | Stream::Listing { .. } => return Ok(()),
             Stream::Replaying(staging) => (
@@ -1126,6 +1152,18 @@ impl Folder {
                 (applied, resume(&cursor.history_id, &cursor.base()))
             }
         };
+        let through = match &self.stream {
+            Stream::Replaying(staging) => staging.last_seq(),
+            _ => self
+                .engine
+                .cursor
+                .as_ref()
+                .map_or(0, |cursor| cursor.last_seq),
+        };
+        if self.timing.is_on() {
+            self.timing
+                .records(records, before, through, &self.link.device_id, Time::now());
+        }
         crate::volume::commits_received(records.len());
         if applied == Applied::Gap {
             tracing::warn!(
@@ -1145,6 +1183,20 @@ impl Folder {
         let ours = (self.engine.commits.in_flight())
             .is_some_and(|flight| flight.commit.commit_id == commit_id && flight.result.is_none());
         let flight = self.engine.commits.in_flight().filter(|_| ours);
+        let next = match &self.stream {
+            Stream::Replaying(staging) => result.seq == staging.last_seq() + 1,
+            _ => self
+                .engine
+                .cursor
+                .as_ref()
+                .is_some_and(|cursor| result.seq == cursor.last_seq + 1),
+        };
+        if next {
+            self.timing.forget(&result.changes);
+        }
+        if let Some(flight) = flight {
+            self.timing.uploaded(&flight.commit, &result);
+        }
         if let Some(refused) = flight.map(|flight| not_applied(&flight.commit, &result)) {
             let problems = self.engine.commits.problems();
             self.refused_nodes.retain(|id, _| problems.contains(id));
@@ -1325,6 +1377,7 @@ impl Folder {
     /// Bootstraps again (design §4.4): the tree is listed and replayed into a staging tree that replaces R, while L
     /// and S stay.
     fn list_again(&mut self, work: &mut Vec<Work>) {
+        self.timing.clear_origins();
         if let Stream::Listing { superseded } = &mut self.stream {
             *superseded = true;
             return;
@@ -1345,7 +1398,10 @@ impl Folder {
 
     /// Starts the upload of what `commit` adds, or its send when it adds no content.
     fn start(&mut self, commit: Commit, work: &mut Vec<Work>) {
-        let upload = self.disk.upload(&commit, &self.engine);
+        let mut upload = self.disk.upload(&commit, &self.engine);
+        if self.timing.is_on() {
+            upload.timing_bytes = self.timing.uploading(&commit, Time::now());
+        }
         if upload.chunks.is_empty() {
             self.flight = Flight::Sending(commit.clone());
             work.push(Work::Send(commit));
@@ -1400,11 +1456,47 @@ impl Folder {
 
     /// Plans the next effect, if there is one, and asks for its staging.
     fn plan_effect(&mut self, work: &mut Vec<Work>) -> Result<bool, Stop> {
-        let Some(pending) = self.disk.next(&mut self.engine, &mut self.store)? else {
+        let Some(mut pending) = self.disk.next(&mut self.engine, &mut self.store)? else {
             return Ok(false);
         };
+        if self.timing.is_on()
+            && let Some(record) = self.engine.effects.in_flight()
+        {
+            pending.timing_bytes = self.timing.planned(
+                record,
+                self.engine.trees.remote().get(&record.node),
+                Time::now(),
+            );
+        }
         work.push(Work::Stage(pending));
         Ok(true)
+    }
+
+    fn record_status(&mut self, state: FolderState) {
+        if !self.timing.is_on() && !self.timing.has_first() {
+            return;
+        }
+        if state == FolderState::UpToDate && self.retry_at.is_some() {
+            return;
+        }
+        let at = Time::now();
+        self.timing.status(state, at);
+        if state == FolderState::UpToDate {
+            self.timing.drained(at);
+            let files = if self.timing.first_pending() {
+                self.engine
+                    .trees
+                    .remote()
+                    .iter()
+                    .filter(|(_, node)| {
+                        !node.trashed && node.shape.kind == koidrive_engine::tree::Kind::File
+                    })
+                    .count() as u64
+            } else {
+                0
+            };
+            self.timing.first_sync(files, at);
+        }
     }
 }
 
@@ -1425,6 +1517,8 @@ pub(crate) enum FromDisk {
 }
 
 pub(crate) struct FolderTask {
+    pub linked_started: Option<Time>,
+    pub telemetry: koidrive_telemetry::Recorder,
     pub link: Link,
     pub store: PathBuf,
     pub auth: Arc<Auth>,
@@ -1680,6 +1774,8 @@ impl FolderTask {
             Ok(folder) => folder,
             Err(stop) => return stop.into(),
         };
+        folder.timing.linked(self.linked_started);
+        folder.timing.enable(self.telemetry.clone());
         let mut from_disk = self.observe(lock.clone(), folder.sections(), folder.snapshot());
         let mut config = SessionConfig::new(
             &self.link.space_id,
@@ -1949,6 +2045,7 @@ impl FolderTask {
     /// Shows what the folder knows in the status, and marks the status changed when it differs or a question changed.
     fn publish(&self, folder: &mut Folder) {
         let view = folder.view();
+        folder.record_status(view.state);
         let asked = folder.take_questions_changed();
         let mut status = self.status.lock().unwrap();
         let shown = View {
@@ -2097,7 +2194,12 @@ async fn upload_chunks(
     transfer: &Transfer,
     upload: Upload,
 ) -> Result<Vec<UploadReceipt>, ChunkError> {
-    upload_counted(session, transfer, upload, crate::volume::uploaded).await
+    let bytes = upload.timing_bytes.clone();
+    upload_counted(session, transfer, upload, |count| {
+        crate::volume::uploaded(count);
+        crate::timing::add_bytes(&bytes, count);
+    })
+    .await
 }
 
 /// Uploads the chunks of `upload` the server lacks, each read on a thread that may block, and passes the size of each
