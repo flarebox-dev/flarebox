@@ -614,13 +614,32 @@ async fn scripted(
     }
     let folder = crate::absolute(&expanded(folder)?)?;
     let local = inspect(&folder).map_err(CliError::usage)?;
-    if local == Local::Files && !script.accept_existing_files {
-        return Err(CliError::usage(format!(
-            "{} already holds files, which would upload to the shared folder while its files download here; add --accept-existing-files to link it",
-            printable(&folder.display().to_string())
-        )));
-    }
     let credential = Credential::load(&paths.credential()).map_err(|error| error.to_string())?;
+    if local == Local::Files && !script.accept_existing_files {
+        let linked = if credential.is_some() {
+            let root = std::fs::canonicalize(&folder).map_err(|error| {
+                CliError::usage(format!(
+                    "{}: {error}",
+                    printable(&folder.display().to_string())
+                ))
+            })?;
+            match ipc::run(paths, Request::Status).await? {
+                Response::Status { status } => status
+                    .folders
+                    .iter()
+                    .any(|folder| Path::new(&folder.path) == root),
+                other => return Err(crate::unexpected(other)),
+            }
+        } else {
+            false
+        };
+        if !linked {
+            return Err(CliError::usage(format!(
+                "{} already holds files, which would upload to the shared folder while its files download here; add --accept-existing-files to link it",
+                printable(&folder.display().to_string())
+            )));
+        }
+    }
     let code = match script.pairing_code_stdin {
         true => Some(read_code().await?),
         false => None,

@@ -299,7 +299,11 @@ impl Home {
     }
 
     fn scripted(&self, stdin: &str, args: &[&str]) -> (i32, serde_json::Value) {
-        let daemon = self.daemon(true);
+        self.script(stdin, args, true)
+    }
+
+    fn script(&self, stdin: &str, args: &[&str], daemon: bool) -> (i32, serde_json::Value) {
+        let daemon = daemon.then(|| self.daemon(true));
         let mut child = koi(self.path())
             .arg("setup")
             .args(args)
@@ -311,7 +315,9 @@ impl Home {
             .unwrap();
         let _ = child.stdin.take().unwrap().write_all(stdin.as_bytes());
         let output = child.wait_with_output().unwrap();
-        daemon.finish();
+        if let Some(daemon) = daemon {
+            daemon.finish();
+        }
         let envelope: serde_json::Value =
             serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
                 panic!(
@@ -1411,6 +1417,153 @@ fn scripted_setup_on_a_connected_device_links_without_pairing() {
     );
     assert_eq!(exit, 2, "{envelope:#}");
     assert_eq!(home.links().len(), 2);
+}
+
+#[test]
+fn scripted_setup_replays_a_linked_folder_after_files_arrive() {
+    let home = Home::new(&["Work"]);
+    home.connect();
+    let folder = home.path().join("Work");
+    let args = ["--folder", folder.to_str().unwrap(), "--space", "Work"];
+    let (exit, envelope) = home.script("", &args, false);
+    assert_eq!(exit, 0, "{envelope:#}");
+    assert!(folder.join(".koidrive").is_dir());
+    fs::write(folder.join("report.docx"), "downloaded report").unwrap();
+    let before = fs::read(folder.join(".koidrive/space.json")).unwrap();
+    let (exit, envelope) = home.script("", &args, false);
+    assert_eq!(exit, 0, "{envelope:#}");
+    assert_eq!(envelope["outcome"], "unchanged");
+    assert_eq!(
+        fs::read(folder.join(".koidrive/space.json")).unwrap(),
+        before
+    );
+    let driver = koidrive_driver::Driver::open(home.paths()).unwrap();
+    let folders = driver.status().folders;
+    assert_eq!(folders.len(), 1);
+    assert_eq!(
+        Path::new(&folders[0].path),
+        fs::canonicalize(&folder).unwrap()
+    );
+    assert_eq!(
+        fs::read(folder.join("report.docx")).unwrap(),
+        b"downloaded report"
+    );
+    assert!(!home.requests().contains(&"pair".to_owned()));
+}
+
+#[test]
+fn scripted_setup_replays_canonical_roots_but_requires_consent_after_an_alias_moves() {
+    let home = Home::new(&["Work"]);
+    home.connect();
+    let folder = home.path().join("Work");
+    let space = home.space_id("Work");
+    let (exit, envelope) = home.script(
+        "",
+        &["--folder", folder.to_str().unwrap(), "--space", &space],
+        false,
+    );
+    assert_eq!(exit, 0, "{envelope:#}");
+    fs::write(folder.join("report.docx"), "downloaded report").unwrap();
+    let alias = home.path().join("Alias");
+    std::os::unix::fs::symlink(&folder, &alias).unwrap();
+    let root = fs::canonicalize(&folder).unwrap();
+    for path in [&folder, &root, &alias] {
+        let (exit, envelope) = home.script(
+            "",
+            &["--folder", path.to_str().unwrap(), "--space", &space],
+            false,
+        );
+        assert_eq!(exit, 0, "{envelope:#}");
+        assert_eq!(envelope["outcome"], "unchanged");
+        assert_eq!(
+            envelope["data"]["folder"]["path"],
+            root.display().to_string()
+        );
+    }
+    let unlinked = home.path().join("Unlinked");
+    fs::create_dir(&unlinked).unwrap();
+    fs::create_dir(unlinked.join(".koidrive")).unwrap();
+    fs::write(unlinked.join("report.docx"), "unlinked report").unwrap();
+    fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink(&unlinked, &alias).unwrap();
+    let requests = home.requests();
+    let (exit, envelope) = home.script(
+        "CODE@files.example.com\n",
+        &[
+            "--pairing-code-stdin",
+            "--folder",
+            alias.to_str().unwrap(),
+            "--space",
+            &space,
+        ],
+        false,
+    );
+    assert_eq!(exit, 2, "{envelope:#}");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--accept-existing-files"),
+        "{envelope:#}"
+    );
+    assert_eq!(home.requests(), requests);
+    assert_eq!(
+        fs::read(unlinked.join("report.docx")).unwrap(),
+        b"unlinked report"
+    );
+}
+
+#[test]
+fn scripted_setup_replay_keeps_driver_space_validation() {
+    let home = Home::new(&["Work", "Other"]);
+    home.connect();
+    let folder = home.path().join("Work");
+    let space_id = home.space_id("Work");
+    let args = ["--folder", folder.to_str().unwrap(), "--space", &space_id];
+    let (exit, envelope) = home.script("", &args, false);
+    assert_eq!(exit, 0, "{envelope:#}");
+    fs::write(folder.join("report.docx"), "downloaded report").unwrap();
+    for space in ["Other", &home.space_id("Other")] {
+        let (exit, envelope) = home.script(
+            "",
+            &["--folder", folder.to_str().unwrap(), "--space", space],
+            false,
+        );
+        assert_eq!(exit, 2, "{envelope:#}");
+        assert!(
+            envelope["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("overlaps the linked folder"),
+            "{envelope:#}"
+        );
+    }
+    let duplicate = space(2, "Work");
+    home.spaces.lock().unwrap().push(duplicate.clone());
+    let (exit, envelope) = home.script(
+        "",
+        &["--folder", folder.to_str().unwrap(), "--space", "Work"],
+        false,
+    );
+    assert_eq!(exit, 2, "{envelope:#}");
+    let message = envelope["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("several spaces are called"),
+        "{envelope:#}"
+    );
+    assert!(message.contains(&space_id), "{envelope:#}");
+    assert!(message.contains(&duplicate.space_id), "{envelope:#}");
+    let (exit, envelope) = home.script("", &args, false);
+    assert_eq!(exit, 0, "{envelope:#}");
+    assert_eq!(envelope["outcome"], "unchanged");
+    let driver = koidrive_driver::Driver::open(home.paths()).unwrap();
+    let folders = driver.status().folders;
+    assert_eq!(folders.len(), 1);
+    assert_eq!(folders[0].space_id, space_id);
+    assert_eq!(
+        fs::read(folder.join("report.docx")).unwrap(),
+        b"downloaded report"
+    );
 }
 
 #[test]
