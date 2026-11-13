@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 import argparse
 import bisect
+import functools
+import json
+import os
 import re
 import subprocess
 import sys
@@ -28,7 +31,7 @@ IDENT = re.compile(r"[A-Za-z0-9_$]+")
 RUST_RAW = re.compile(r'[bc]?r(#*)"')
 RUST_CHAR = re.compile(r"'(\\.[^'\n]*|[^\\'\n])'")
 SWIFT_RAW = re.compile(r'(#+)("""|")')
-RUST_FN = re.compile(r'^\s*(pub(?:\([^)]*\))?\s+)?(?:(?:const|async|unsafe|extern\s+"[^"]*")\s+)*fn\s+(\w+)')
+FN_DOCS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fn-docs", "Cargo.toml")
 REGEX_BEFORE = set("(,=:[!&|?{};+-*%<>~^") | {"", "return", "typeof", "case", "in", "of", "delete", "void", "throw", "yield", "await"}
 
 MESSAGES = {
@@ -40,7 +43,7 @@ MESSAGES = {
 }
 
 
-def comment_spans(src, lang, tokens=None, starts=None):
+def comment_spans(src, lang, tokens=None):
     found = []
     n = len(src)
     tokens_end = [None]
@@ -50,8 +53,6 @@ def comment_spans(src, lang, tokens=None, starts=None):
         joint = bool(tokens and tokens_end[0] == start)
         tokens.append((text, lang == "js" and tokens_end[0] is not None and "\n" in src[tokens_end[0]:start], joint))
         tokens_end[0] = end
-        if starts is not None:
-            starts.append(start)
 
     def block(i):
         depth, j = 1, i + 2
@@ -188,59 +189,42 @@ def comment_lines(src, lang):
     return lines
 
 
+@functools.cache
+def fn_docs():
+    if os.environ.get("FN_DOCS"):
+        return os.environ["FN_DOCS"]
+    build = subprocess.run(
+        ["cargo", "build", "--quiet", "--release", "--message-format=json", "--manifest-path", FN_DOCS],
+        cwd=os.path.dirname(FN_DOCS),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return next(
+        message["executable"]
+        for message in map(json.loads, build.stdout.splitlines())
+        if message.get("reason") == "compiler-artifact" and message.get("executable")
+    )
+
+
 def rust_fns(src):
+    run = subprocess.run([fn_docs()], input=src.encode(), capture_output=True)
+    if run.returncode:
+        return None
     lines = src.split("\n")
-    tokens, starts = [], []
-    spans = comment_spans(src, "rust", tokens, starts)
-    docs = [(start, src[start:end]) for start, end in spans if is_doc(src[start:end], "rust") and not src.startswith(("//!", "/*!"), start)]
-    events = sorted([(start, None, text) for start, text in docs] + [(start, text, None) for start, (text, *_) in zip(starts, tokens)])
-    events = [(src.count("\n", 0, start) + 1, text, doc) for start, text, doc in events]
     fns, seen = {}, {}
-    docs = []
-    i = 0
-    while i < len(events):
-        line, text, doc = events[i]
-        if text is None:
-            docs.append((line, doc))
-            i += 1
-            continue
-        if text == "#":
-            j = i + 1 + (events[i + 1][1] == "!" if i + 1 < len(events) else 0)
-            if j < len(events) and events[j][1] == "[":
-                depth = 0
-                while j < len(events):
-                    depth += {"[": 1, "]": -1}.get(events[j][1], 0)
-                    j += 1
-                    if not depth:
-                        break
-                i = j
-                continue
-        j, public = i, False
-        if text == "pub":
-            public = True
-            j += 1
-            if j < len(events) and events[j][1] == "(":
-                public = False
-                while j < len(events) and events[j][1] != ")":
-                    j += 1
-                j += 1
-        while j < len(events) and (events[j][1] in ("const", "async", "unsafe", "extern") or (events[j - 1][1] == "extern" and (events[j][1] or "").startswith('"'))):
-            j += 1
-        name = events[j + 1][1] if j + 1 < len(events) and events[j][1] == "fn" else None
-        if name and IDENT.fullmatch(name):
-            seen[name] = seen.get(name, 0) + 1
-            doc_text = "\n".join(part.strip() for _, doc in docs for part in doc.split("\n"))
-            fns[(name, seen[name])] = (public, doc_text, line, lines[line - 1], docs[0][0] if docs else line)
-            i = j + 2
-        else:
-            i += 1
-        docs = []
+    for record in run.stdout.decode().splitlines():
+        scope, name, public, number, top, docs = record.split("\t")
+        seen[scope, name] = seen.get((scope, name), 0) + 1
+        fns[(scope, name, seen[scope, name])] = (public == "true", docs, int(number), lines[int(number) - 1], int(top))
     return fns
 
 
 def moved_docs(path, old_src, new_src):
     old = rust_fns(old_src) if old_src is not None else {}
     new = rust_fns(new_src)
+    if old is None or new is None:
+        return []
 
     def has(fns, key, docs):
         return key in fns and fns[key][1].startswith(docs)

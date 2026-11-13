@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
+import importlib.util
 import os
 import subprocess
 import sys
@@ -8,6 +9,13 @@ import textwrap
 import unittest
 
 CHECK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check-new-comments.py")
+
+
+def setUpModule():
+    spec = importlib.util.spec_from_file_location("check", CHECK)
+    check = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(check)
+    os.environ["FN_DOCS"] = check.fn_docs()
 
 
 class NewComments(unittest.TestCase):
@@ -339,6 +347,19 @@ class NewComments(unittest.TestCase):
         self.assertFlags(
             {"core/a/src/main.rs": "#!/usr/bin/env rust-script\npub fn a() {}\n"},
             {"core/a/src/main.rs": "#!/usr/bin/env rust-script\npub fn a() { let _x = 1; }\n"},
+        )
+
+    def test_reordering_modules_with_same_named_documented_fns_passes(self):
+        a = "mod a {\n    /// Runs a.\n    pub fn run() {}\n}\n"
+        b = "mod b {\n    /// Runs b.\n    pub fn run() {}\n}\n"
+        self.assertFlags({"core/a/src/lib.rs": a + b}, {"core/a/src/lib.rs": b + a})
+
+    def test_a_pub_trait_method_doc_moved_onto_a_helper_fails(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "pub trait Api {\n    /// Calls.\n    fn call(&self);\n}\nfn helper() {}\n"},
+            {"core/a/src/lib.rs": "pub trait Api {\n    fn call(&self);\n}\n/// Calls.\nfn helper() {}\n"},
+            ("core/a/src/lib.rs", 2),
+            ("core/a/src/lib.rs", 5),
         )
 
     def test_deleting_a_pub_fn_doc_comment_passes(self):
