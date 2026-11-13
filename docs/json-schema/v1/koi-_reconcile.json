@@ -739,6 +739,12 @@
             "path": {
               "type": "string"
             },
+            "preserved": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "problem": {
               "type": [
                 "string",

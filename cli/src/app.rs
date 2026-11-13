@@ -63,6 +63,8 @@ pub(crate) enum Report {
         retired: Vec<PathBuf>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         residue: Vec<PathBuf>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        preserved: Vec<PathBuf>,
     },
     Failed {
         problem: String,
@@ -113,12 +115,19 @@ impl Report {
                 path,
                 version,
                 problem,
+                preserved,
                 ..
             } => {
-                let installed = format!(
+                let mut installed = format!(
                     "Koidrive {version} is installed in {}.\n",
                     crate::printable(&path.display().to_string())
                 );
+                for path in preserved {
+                    installed.push_str(&format!(
+                        "An older Koidrive app remains in {}.\n",
+                        crate::printable(&path.display().to_string())
+                    ));
+                }
                 match problem {
                     Some(problem) => format!(
                         "{installed}App setup is incomplete: {}\nRetry: koi setup\n",
@@ -158,68 +167,74 @@ pub(crate) struct Prepared {
 }
 
 pub(crate) async fn prepare(target: &Version, launch: AppLaunch, deadline: Instant) -> Prepared {
-    #[cfg(target_os = "macos")]
-    let mut retained = Vec::new();
-    let report = match app_install::ensure(target, launch, deadline).await {
-        Ok(AppInstall::Skipped(reason)) => Report::skipped(match reason {
-            AppSkip::Ci => "ci",
-            AppSkip::Platform => "platform",
-            AppSkip::Architecture => "architecture",
-        }),
-        #[cfg(target_os = "macos")]
-        Ok(AppInstall::Present {
-            change,
-            path,
-            version,
-            launch,
-            retired,
-            residue,
-        }) => {
-            let mut problem = match &launch {
-                AppLaunchResult::Failed(problem) => Some(problem.clone()),
-                _ => None,
-            };
-            if !residue.is_empty() {
-                problem.get_or_insert_with(|| {
-                    "Installer cleanup is incomplete; the listed residue was preserved.".into()
-                });
-            }
-            let retired_paths = retired.iter().map(|old| old.bundle.clone()).collect();
-            retained = retired;
-            Report::Present {
-                path,
-                version: version.to_string(),
-                change: match change {
-                    AppChange::Unchanged => Change::Unchanged,
-                    AppChange::Installed => Change::Installed,
-                    AppChange::Replaced => Change::Replaced,
-                },
-                launch: match launch {
-                    AppLaunchResult::NotRequested => Launch::NotRequested,
-                    AppLaunchResult::Requested => Launch::Requested,
-                    AppLaunchResult::Failed(_) => Launch::Failed,
-                },
-                problem,
-                retired: retired_paths,
-                residue,
-            }
-        }
-        #[cfg(target_os = "macos")]
-        Err(error) => Report::Failed {
-            problem: error.to_string(),
-            residue: error.residue,
-        },
-        #[cfg(not(target_os = "macos"))]
-        Err(error) => match error {},
-    };
-    Prepared {
-        report,
-        #[cfg(target_os = "macos")]
-        retired: retained,
-    }
+    Prepared::from_install(app_install::ensure(target, launch, deadline).await)
 }
 
 impl Prepared {
+    fn from_install(result: Result<AppInstall, app_install::AppInstallError>) -> Self {
+        #[cfg(target_os = "macos")]
+        let mut retained = Vec::new();
+        let report = match result {
+            Ok(AppInstall::Skipped(reason)) => Report::skipped(match reason {
+                AppSkip::Ci => "ci",
+                AppSkip::Platform => "platform",
+                AppSkip::Architecture => "architecture",
+            }),
+            #[cfg(target_os = "macos")]
+            Ok(AppInstall::Present {
+                change,
+                path,
+                version,
+                launch,
+                retired,
+                residue,
+                preserved,
+            }) => {
+                let mut problem = match &launch {
+                    AppLaunchResult::Failed(problem) => Some(problem.clone()),
+                    _ => None,
+                };
+                if !residue.is_empty() {
+                    problem.get_or_insert_with(|| {
+                        "Installer cleanup is incomplete; the listed residue was preserved.".into()
+                    });
+                }
+                let retired_paths = retired.iter().map(|old| old.bundle.clone()).collect();
+                retained = retired;
+                Report::Present {
+                    path,
+                    version: version.to_string(),
+                    change: match change {
+                        AppChange::Unchanged => Change::Unchanged,
+                        AppChange::Installed => Change::Installed,
+                        AppChange::Replaced => Change::Replaced,
+                    },
+                    launch: match launch {
+                        AppLaunchResult::NotRequested => Launch::NotRequested,
+                        AppLaunchResult::Requested => Launch::Requested,
+                        AppLaunchResult::Failed(_) => Launch::Failed,
+                    },
+                    problem,
+                    retired: retired_paths,
+                    residue,
+                    preserved,
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Err(error) => Report::Failed {
+                problem: error.to_string(),
+                residue: error.residue,
+            },
+            #[cfg(not(target_os = "macos"))]
+            Err(error) => match error {},
+        };
+        Prepared {
+            report,
+            #[cfg(target_os = "macos")]
+            retired: retained,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn fixture(report: Report) -> Self {
         Self {
@@ -421,6 +436,100 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn preserved_alternatives_do_not_fail_app_setup() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("user/Koidrive.app");
+        let preserved = home.path().join("system/Koidrive.app");
+        let service: service::Report = serde_json::from_value(serde_json::json!({
+            "manager": "launchd", "name": "fixture", "state": "running"
+        }))
+        .unwrap();
+        for change in [AppChange::Installed, AppChange::Unchanged] {
+            let prepared = Prepared::from_install(Ok(AppInstall::Present {
+                path: path.clone(),
+                version: Version::parse("99.0.0").unwrap(),
+                change,
+                launch: AppLaunchResult::Requested,
+                retired: Vec::new(),
+                residue: Vec::new(),
+                preserved: vec![preserved.clone()],
+            }));
+            assert!(!prepared.report.failed());
+            assert_eq!(prepared.helper(), Some(path.join("Contents/Helpers/koi")));
+            let report = prepared
+                .finish(&Paths::under(home.path()), Ok(&service), Instant::now())
+                .await;
+            assert!(!report.failed());
+            assert_eq!(report.problem(), None);
+            assert_eq!(
+                report.text(),
+                format!(
+                    "Koidrive 99.0.0 is installed in {}.\nAn older Koidrive app remains in {}.\n",
+                    path.display(),
+                    preserved.display()
+                )
+            );
+            let mut encoded = serde_json::to_value(&report).unwrap();
+            assert_eq!(encoded["preserved"], serde_json::json!([preserved]));
+            assert!(encoded.get("problem").is_none());
+            assert!(encoded.get("residue").is_none());
+            assert_eq!(
+                serde_json::from_value::<Report>(encoded.clone()).unwrap(),
+                report
+            );
+            encoded.as_object_mut().unwrap().remove("preserved");
+            let compatible = serde_json::from_value::<Report>(encoded).unwrap();
+            assert!(!compatible.failed());
+            assert!(
+                serde_json::to_value(compatible)
+                    .unwrap()
+                    .get("preserved")
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn preserved_alternatives_do_not_mask_installer_problems() {
+        let home = tempfile::tempdir().unwrap();
+        for cleanup_failed in [false, true] {
+            let residue = if cleanup_failed {
+                vec![home.path().join("owned-stage")]
+            } else {
+                Vec::new()
+            };
+            let prepared = Prepared::from_install(Ok(AppInstall::Present {
+                path: home.path().join("user/Koidrive.app"),
+                version: Version::parse("99.0.0").unwrap(),
+                change: AppChange::Installed,
+                launch: if cleanup_failed {
+                    AppLaunchResult::Requested
+                } else {
+                    AppLaunchResult::Failed("Launch failed".into())
+                },
+                retired: Vec::new(),
+                residue: residue.clone(),
+                preserved: vec![home.path().join("system/Koidrive.app")],
+            }));
+            assert!(prepared.report.failed());
+            let Report::Present {
+                problem,
+                residue: remaining,
+                preserved,
+                ..
+            } = prepared.report
+            else {
+                panic!()
+            };
+            assert!(problem.is_some());
+            assert_eq!(remaining, residue);
+            assert_eq!(preserved.len(), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn a_supplied_handoff_failure_is_reported_without_another_reconcile() {
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join("Koidrive.app");
@@ -435,6 +544,7 @@ mod tests {
             problem: None,
             retired: Vec::new(),
             residue: Vec::new(),
+            preserved: Vec::new(),
         });
         let report = prepared
             .finish(
@@ -468,6 +578,7 @@ mod tests {
                 problem: None,
                 retired: retired.clone(),
                 residue: Vec::new(),
+                preserved: Vec::new(),
             });
             assert_eq!(prepared.needs_handoff(), pending);
             let report = prepared
@@ -566,6 +677,7 @@ mod tests {
                     problem: None,
                     retired: pending.clone(),
                     residue: Vec::new(),
+                    preserved: Vec::new(),
                 },
                 retired,
             };

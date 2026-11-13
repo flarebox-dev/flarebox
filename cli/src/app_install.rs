@@ -26,6 +26,7 @@ pub(crate) enum AppInstall {
         launch: AppLaunchResult,
         retired: Vec<RetiredApp>,
         residue: Vec<PathBuf>,
+        preserved: Vec<PathBuf>,
     },
 }
 
@@ -509,6 +510,20 @@ function run(args) {
         parts.iter().map(|part| part.to_os_string()).collect()
     }
 
+    fn signature_args(path: &Path, requirement: &str, deep: bool) -> Vec<OsString> {
+        let mut arguments = args(&[OsStr::new("--verify")]);
+        if deep {
+            arguments.push("--deep".into());
+        }
+        arguments.extend(args(&[
+            OsStr::new("--strict"),
+            OsStr::new("-R"),
+            OsStr::new(&format!("={requirement}")),
+            path.as_os_str(),
+        ]));
+        arguments
+    }
+
     fn directory(path: &Path, create: bool) -> Result<File, AppInstallError> {
         let mut fd = rustix::fs::open(
             "/",
@@ -950,14 +965,7 @@ function run(args) {
         let id = identity(&fs::symlink_metadata(path).map_err(io_error)?);
         process(
             &config.codesign,
-            &args(&[
-                OsStr::new("--verify"),
-                OsStr::new("--deep"),
-                OsStr::new("--strict"),
-                OsStr::new("-R"),
-                OsStr::new(REQUIREMENT),
-                path.as_os_str(),
-            ]),
+            &signature_args(path, REQUIREMENT, true),
             control,
         )
         .await
@@ -1081,6 +1089,21 @@ function run(args) {
             }
         }
         Ok(installed)
+    }
+
+    async fn unchanged_bundle(
+        config: &Config,
+        app: &VerifiedBundle,
+        control: &Control,
+    ) -> Result<(), AppInstallError> {
+        let confirmed = verify(config, &app.path, None, control).await?;
+        if confirmed.identity != app.identity || confirmed.version != app.version {
+            return Err(failure(
+                AppInstallFailure::ConcurrentChange,
+                "App changed since verification",
+            ));
+        }
+        Ok(())
     }
 
     fn current<'a>(
@@ -2770,13 +2793,7 @@ function run(args) {
         if previous.is_some() {
             process(
                 &config.codesign,
-                &args(&[
-                    OsStr::new("--verify"),
-                    OsStr::new("--strict"),
-                    OsStr::new("-R"),
-                    OsStr::new(SIGNER),
-                    config.updater.as_os_str(),
-                ]),
+                &signature_args(&config.updater, SIGNER, false),
                 control,
             )
             .await
@@ -2850,9 +2867,10 @@ function run(args) {
         chosen: &VerifiedBundle,
         control: &Control,
         cleanup_deadline: Instant,
-    ) -> Result<(Vec<RetiredApp>, bool), AppInstallError> {
+    ) -> Result<(Vec<RetiredApp>, Vec<PathBuf>, bool), AppInstallError> {
         let installed = inventory(config, control).await?;
         let mut tokens = Vec::new();
+        let mut preserved = Vec::new();
         let mut reopened = false;
         for app in installed
             .iter()
@@ -2877,6 +2895,15 @@ function run(args) {
             };
             let root_path = app.path.parent().unwrap();
             let root = directory(root_path, false).map_err(preserve)?;
+            if !writable(root_path).map_err(preserve)? {
+                unchanged_directory(root_path, &root).map_err(preserve)?;
+                unchanged_bundle(config, app, &work)
+                    .await
+                    .map_err(preserve)?;
+                unchanged_directory(root_path, &root).map_err(preserve)?;
+                preserved.push(app.path.clone());
+                continue;
+            }
             let _root_lock = lock(&root, &work).await.map_err(preserve)?;
             let receipt = begin_receipt(config, work_root, chosen.version.as_ref().unwrap())
                 .map_err(preserve)?;
@@ -2927,7 +2954,7 @@ function run(args) {
                 }
             }
         }
-        Ok((tokens, reopened))
+        Ok((tokens, preserved, reopened))
     }
 
     async fn transaction(
@@ -2944,16 +2971,11 @@ function run(args) {
                 if let Some(app) = current(&installed, &target)
                     && !installed.iter().any(|other| older(other, &target))
                 {
+                    unchanged_bundle(&config, app, &control).await?;
                     let launch_result =
                         open(&config, &app.path, launch == AppLaunch::Open, &control).await;
                     if launch == AppLaunch::Open {
-                        let confirmed = verify(&config, &app.path, None, &control).await?;
-                        if confirmed.identity != app.identity || confirmed.version != app.version {
-                            return Err(failure(
-                                AppInstallFailure::ConcurrentChange,
-                                "Current app changed during launch",
-                            ));
-                        }
+                        unchanged_bundle(&config, app, &control).await?;
                     }
                     return Ok(AppInstall::Present {
                         change: AppChange::Unchanged,
@@ -2962,6 +2984,7 @@ function run(args) {
                         launch: launch_result,
                         retired: Vec::new(),
                         residue: Vec::new(),
+                        preserved: Vec::new(),
                     });
                 }
             }
@@ -2974,7 +2997,7 @@ function run(args) {
         let mut retired = recover(&config, &work_root, &control).await?;
         let installed = inventory(&config, &control).await?;
         if let Some(app) = current(&installed, &target) {
-            let (pending, reopened) = upgrade_alternatives(
+            let (pending, preserved, reopened) = upgrade_alternatives(
                 &config,
                 &work_root,
                 &target,
@@ -2984,19 +3007,14 @@ function run(args) {
             )
             .await?;
             retired.extend(pending);
+            unchanged_bundle(&config, app, &control).await?;
             let launch_result = if reopened {
                 AppLaunchResult::Requested
             } else {
                 open(&config, &app.path, launch == AppLaunch::Open, &control).await
             };
-            let confirmed = verify(&config, &app.path, None, &control).await?;
-            if confirmed.identity != app.identity || confirmed.version != app.version {
-                return Err(failure(
-                    AppInstallFailure::ConcurrentChange,
-                    "Current app changed during launch",
-                ));
-            }
             let retired = refresh_tokens(retired, &config, &control).await?;
+            unchanged_bundle(&config, app, &control).await?;
             return Ok(AppInstall::Present {
                 change: AppChange::Unchanged,
                 path: app.path.clone(),
@@ -3004,6 +3022,7 @@ function run(args) {
                 launch: launch_result,
                 retired,
                 residue: Vec::new(),
+                preserved,
             });
         }
         control.deadline = cleanup_deadline.checked_sub(CLEANUP).ok_or_else(|| {
@@ -3040,6 +3059,7 @@ function run(args) {
                 stage_copy(&config, &receipt, &root, &root_fd, &incoming, &control).await?;
             let installed = inventory(&config, &control).await?;
             if let Some(app) = current(&installed, &target) {
+                unchanged_bundle(&config, app, &control).await?;
                 return Ok(AppInstall::Present {
                     change: AppChange::Unchanged,
                     path: app.path.clone(),
@@ -3047,6 +3067,7 @@ function run(args) {
                     launch: open(&config, &app.path, launch == AppLaunch::Open, &control).await,
                     retired: Vec::new(),
                     residue: Vec::new(),
+                    preserved: Vec::new(),
                 });
             }
             let destination = root.join(BUNDLE);
@@ -3072,6 +3093,7 @@ function run(args) {
                 launch: launch_result,
                 retired: Vec::new(),
                 residue: Vec::new(),
+                preserved: Vec::new(),
             })
         }
         .await;
@@ -3091,8 +3113,8 @@ function run(args) {
             Ok(AppInstall::Present {
                 change, mut launch, ..
             }) => {
-                let mut preserved = residue.clone();
-                preserved.extend(retired.iter().map(|token| token.bundle.clone()));
+                let mut cleanup_paths = residue.clone();
+                cleanup_paths.extend(retired.iter().map(|token| token.bundle.clone()));
                 let finished = async {
                     let installed = inventory(&config, &cleanup_control).await?;
                     let app = current(&installed, &target).ok_or_else(|| {
@@ -3102,7 +3124,7 @@ function run(args) {
                         )
                     })?;
                     drop(_root_lock);
-                    let (pending, reopened) = upgrade_alternatives(
+                    let (pending, preserved, reopened) = upgrade_alternatives(
                         &config,
                         &work_root,
                         &target,
@@ -3113,6 +3135,7 @@ function run(args) {
                     .await?;
                     retired.extend(pending);
                     let retired = refresh_tokens(retired, &config, &cleanup_control).await?;
+                    unchanged_bundle(&config, app, &cleanup_control).await?;
                     if reopened && launch == AppLaunchResult::NotRequested {
                         launch = AppLaunchResult::Requested;
                     }
@@ -3123,11 +3146,12 @@ function run(args) {
                         launch,
                         retired,
                         residue,
+                        preserved,
                     })
                 }
                 .await;
                 finished.map_err(|mut error: AppInstallError| {
-                    error.residue.extend(preserved);
+                    error.residue.extend(cleanup_paths);
                     error
                 })
             }

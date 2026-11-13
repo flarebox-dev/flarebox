@@ -177,6 +177,230 @@ async fn review_signed_development_copy_without_release_version_is_upgraded() {
 use super::*;
 
 #[tokio::test]
+async fn native_codesign_accepts_inline_pins_in_bundle_and_updater_modes() {
+    let executable = std::env::current_exe().unwrap();
+    let mut magic = [0; 4];
+    File::open(&executable)
+        .unwrap()
+        .read_exact(&mut magic)
+        .unwrap();
+    assert_eq!(magic, [0xcf, 0xfa, 0xed, 0xfe]);
+    let (_tx, cancel) = watch::channel(false);
+    let control = Control {
+        deadline: Instant::now() + Duration::from_secs(20),
+        cancel,
+    };
+    let codesign = Path::new("/usr/bin/codesign");
+    let display = process(
+        codesign,
+        &args(&[
+            OsStr::new("--display"),
+            OsStr::new("--verbose=4"),
+            executable.as_os_str(),
+        ]),
+        &control,
+    )
+    .await
+    .unwrap();
+    let display = String::from_utf8(display).unwrap();
+    let hashes: Vec<_> = display
+        .lines()
+        .filter_map(|line| line.strip_prefix("CDHash="))
+        .collect();
+    assert_eq!(hashes.len(), 1, "{display}");
+    let requirement = format!("cdhash H\"{}\"", hashes[0]);
+    for deep in [true, false] {
+        process(
+            codesign,
+            &signature_args(&executable, &requirement, deep),
+            &control,
+        )
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn native_codesign_parses_production_requirements_and_rejects_the_wrong_signer() {
+    let executable = std::env::current_exe().unwrap();
+    let (_tx, cancel) = watch::channel(false);
+    let control = Control {
+        deadline: Instant::now() + Duration::from_secs(20),
+        cancel,
+    };
+    for (requirement, deep) in [(REQUIREMENT, true), (SIGNER, false)] {
+        let error = process(
+            Path::new("/usr/bin/codesign"),
+            &signature_args(&executable, requirement, deep),
+            &control,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, AppInstallFailure::Command);
+        assert!(error.message.contains("failed to satisfy"), "{error:?}");
+        let error = verification_error(error, "signature rejected");
+        assert_eq!(error.kind, AppInstallFailure::Verification);
+    }
+}
+
+#[tokio::test]
+async fn review_readonly_old_system_copy_allows_user_fallback() {
+    let f = Fixture::new(None, DMG.to_vec(), 200).await;
+    f.old();
+    fs::set_permissions(&f.config.system, fs::Permissions::from_mode(0o500)).unwrap();
+    let result = f.run().await;
+    fs::set_permissions(&f.config.system, fs::Permissions::from_mode(0o700)).unwrap();
+    f.preserved();
+    assert_eq!(
+        fs::read(f.config.user.join(BUNDLE).join("Contents/Helpers/koi")).unwrap(),
+        TARGET.as_bytes()
+    );
+    assert!(
+        matches!(result, Ok(AppInstall::Present { .. })),
+        "The user copy installed, but the result was {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn readonly_verified_system_alternatives_are_advisory_for_installs_and_reuse() {
+    for reuse in [false, true] {
+        let f = Fixture::new(None, DMG.to_vec(), 200).await;
+        f.old();
+        let old_identity = observed(&f.installed()).unwrap();
+        let user = f.config.user.join(BUNDLE);
+        if reuse {
+            bundle(&user, Some(TARGET));
+        }
+        let profile_helper = f.base().join("another-profile-helper");
+        std::os::unix::fs::symlink(f.installed().join("Contents/Helpers/koi"), &profile_helper)
+            .unwrap();
+        fs::set_permissions(&f.config.system, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = f.run().await;
+        fs::set_permissions(&f.config.system, fs::Permissions::from_mode(0o700)).unwrap();
+        let AppInstall::Present {
+            change,
+            path,
+            version,
+            preserved,
+            retired,
+            residue,
+            ..
+        } = result.unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            change,
+            if reuse {
+                AppChange::Unchanged
+            } else {
+                AppChange::Installed
+            }
+        );
+        assert_eq!(path, user);
+        assert_eq!(version, Version::parse(TARGET).unwrap());
+        assert_eq!(preserved, vec![f.installed()]);
+        assert!(retired.is_empty());
+        assert!(residue.is_empty());
+        assert_eq!(observed(&f.installed()).unwrap(), old_identity);
+        assert_eq!(fs::read(profile_helper).unwrap(), b"0.1.0");
+        assert_eq!(
+            fs::read(user.join("Contents/Helpers/koi")).unwrap(),
+            TARGET.as_bytes()
+        );
+        assert!(!f.config.system.join(".koidrive-app-install.lock").exists());
+        assert_eq!(f.requests.lock().unwrap().is_empty(), reuse);
+        f.unmounted();
+    }
+}
+
+#[tokio::test]
+async fn preserving_a_readonly_alternative_revalidates_the_chosen_app() {
+    for reuse in [false, true] {
+        for launch in [AppLaunch::Open, AppLaunch::Preserve] {
+            let f = Fixture::new(None, DMG.to_vec(), 200).await;
+            f.old();
+            let user = f.config.user.join(BUNDLE);
+            if reuse {
+                bundle(&user, Some(TARGET));
+            }
+            let accepting = f.base().join("accepting-codesign");
+            fs::copy(&f.config.codesign, &accepting).unwrap();
+            script(
+                &f.config.codesign,
+                &format!(
+                    r#"'{}' "$@" || exit $?
+for last do :; done
+if [ "$last" = '{}' ] && [ -d '{}' ]; then
+    n=0
+    [ ! -f '{}' ] || n=$(/bin/cat '{}')
+    n=$((n + 1))
+    printf '%s' "$n" > '{}'
+    if [ "$n" = 4 ]; then printf OTHERTEAM > '{}/Signer'; fi
+fi"#,
+                    accepting.display(), f.installed().display(), user.display(),
+                    f.base().join("checks").display(), f.base().join("checks").display(),
+                    f.base().join("checks").display(), user.display()
+                ),
+            );
+            script(
+                &f.config.open,
+                &format!(
+                    "for last do :; done\n/bin/cat \"$last/Signer\" >> '{}'",
+                    f.base().join("opened-signers").display()
+                ),
+            );
+            fs::set_permissions(&f.config.system, fs::Permissions::from_mode(0o500)).unwrap();
+            let result = ensure_with(
+                f.config.clone(), Version::parse(TARGET).unwrap(), launch,
+                Instant::now() + Duration::from_secs(60),
+            ).await;
+            fs::set_permissions(&f.config.system, fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(
+                fs::read(user.join("Signer")).unwrap(), b"OTHERTEAM",
+                "The source-change probe did not run: reuse={reuse}, launch={launch:?}"
+            );
+            assert_eq!(result.unwrap_err().kind, AppInstallFailure::Verification);
+            let opened = fs::read_to_string(f.base().join("opened-signers")).unwrap_or_default();
+            assert!(!opened.contains("OTHERTEAM"), "Opened a changed app: {opened}");
+            f.preserved();
+        }
+    }
+}
+
+#[tokio::test]
+async fn readonly_alternatives_with_unknown_identity_still_fail() {
+    for invalid in ["signer", "identifier"] {
+        let f = Fixture::new(None, DMG.to_vec(), 200).await;
+        f.old();
+        let user = f.config.user.join(BUNDLE);
+        bundle(&user, Some(TARGET));
+        if invalid == "signer" {
+            fs::write(f.installed().join("Signer"), "OTHERTEAM").unwrap();
+        } else {
+            let path = f.installed().join("Contents/Info.plist");
+            let mut info = plist::Value::from_file(&path).unwrap();
+            info.as_dictionary_mut().unwrap().insert(
+                "CFBundleIdentifier".into(),
+                plist::Value::String("unrelated.app".into()),
+            );
+            info.to_file_xml(path).unwrap();
+        }
+        fs::set_permissions(&f.config.system, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = f.run().await;
+        fs::set_permissions(&f.config.system, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(result.unwrap_err().kind, AppInstallFailure::Verification);
+        assert_eq!(
+            fs::read(user.join("Contents/Helpers/koi")).unwrap(),
+            TARGET.as_bytes()
+        );
+        f.preserved();
+        assert!(f.requests.lock().unwrap().is_empty());
+        f.unmounted();
+    }
+}
+
+#[tokio::test]
 async fn a_changed_copy_source_is_not_opened_after_upgrading_an_alternative() {
     let mut f = Fixture::new(None, DMG.to_vec(), 200).await;
     f.old();
@@ -215,7 +439,11 @@ async fn an_alternative_upgrade_preserves_another_profiles_helper_path() {
     let current_service = crate::service::Service::new(&current, &f.base(), &old_helper).unwrap();
     let other_service = crate::service::Service::new(&other, &f.base(), &old_helper).unwrap();
     assert_ne!(current_service.label(), other_service.label());
-    assert!(current_service.plist().contains(old_helper.to_str().unwrap()));
+    assert!(
+        current_service
+            .plist()
+            .contains(old_helper.to_str().unwrap())
+    );
     assert!(other_service.plist().contains(old_helper.to_str().unwrap()));
     assert_eq!(
         crate::service::version_of(&old_helper),
@@ -265,7 +493,10 @@ printf 'source=%s\n' "$(cat "$last/Notarization")"
         fs::read(f.installed().join("Contents/Helpers/koi")).unwrap(),
         b"0.4.0"
     );
-    assert_eq!(fs::read(user.join("Contents/Helpers/koi")).unwrap(), b"0.4.0");
+    assert_eq!(
+        fs::read(user.join("Contents/Helpers/koi")).unwrap(),
+        b"0.4.0"
+    );
     assert_eq!(retired.len(), 1);
     assert_eq!(retired[0].version, Some(Version::parse("0.1.0").unwrap()));
     assert_eq!(
@@ -275,7 +506,13 @@ printf 'source=%s\n' "$(cat "$last/Notarization")"
     assert!(f.requests.lock().unwrap().is_empty());
     assert!(!f.base().join("hdi.log").exists());
     let assessed = fs::read_to_string(f.base().join("spctl.log")).unwrap();
-    assert!(assessed.lines().next().unwrap().contains("/.koidrive-retired-"));
+    assert!(
+        assessed
+            .lines()
+            .next()
+            .unwrap()
+            .contains("/.koidrive-retired-")
+    );
     assert!(!assessed.contains(user.to_str().unwrap()));
     retired[0].discard().unwrap();
     assert_eq!(
@@ -483,7 +720,11 @@ echo stopped
         );
         assert_eq!(
             fs::read(f.installed().join("Contents/Helpers/koi")).unwrap(),
-            if swapped { b"0.4.0".as_slice() } else { b"0.1.0" }
+            if swapped {
+                b"0.4.0".as_slice()
+            } else {
+                b"0.1.0"
+            }
         );
         let AppInstall::Present {
             change,
@@ -589,18 +830,30 @@ async fn review_partial_symlink_copy_does_not_wedge_recovery() {
     symlink("A", f.incoming().join("Contents/Versions/Current")).unwrap();
     let ditto = f.config.ditto.clone();
     f.config.ditto = f.base().join("partial-symlink-copy");
-    script(&f.config.ditto, r#"
+    script(
+        &f.config.ditto,
+        r#"
 for last do :; done
 /bin/mkdir -p "$last/Contents/Versions"
 /bin/ln -s A "$last/Contents/Versions/Current"
 exit 73
-"#);
+"#,
+    );
     let first = f.run().await.unwrap_err();
     assert_eq!(first.kind, AppInstallFailure::Command);
     f.preserved();
     f.config.ditto = ditto;
     let retry = f.run().await;
-    assert!(matches!(retry, Ok(AppInstall::Present { change: AppChange::Replaced, .. })), "{retry:?}");
+    assert!(
+        matches!(
+            retry,
+            Ok(AppInstall::Present {
+                change: AppChange::Replaced,
+                ..
+            })
+        ),
+        "{retry:?}"
+    );
 }
 
 #[tokio::test]
@@ -611,14 +864,19 @@ async fn review_interrupted_retirement_with_dangling_symlink_can_finish() {
     fs::write(versions.join("A/data"), "owned").unwrap();
     symlink("A", versions.join("Current")).unwrap();
     let (_tx, cancel) = watch::channel(false);
-    let control = Control { deadline: Instant::now() + Duration::from_secs(10), cancel };
+    let control = Control {
+        deadline: Instant::now() + Duration::from_secs(10),
+        cancel,
+    };
     safe_tree(&token.bundle, &control).unwrap();
     let mut data = token.ownership.receipt.data();
     data.lifecycle = Lifecycle::Retiring;
     token.ownership.receipt.save(&data).unwrap();
     fs::remove_dir_all(versions.join("A")).unwrap();
     drop(token);
-    let AppInstall::Present { retired, .. } = f.run().await.unwrap() else { panic!() };
+    let AppInstall::Present { retired, .. } = f.run().await.unwrap() else {
+        panic!()
+    };
     assert_eq!(retired.len(), 1);
     retired[0].discard().unwrap();
 }
@@ -1297,8 +1555,13 @@ async fn an_immovable_older_alternative_is_reported_and_preserved() {
     fs::set_permissions(&f.config.user, fs::Permissions::from_mode(0o500)).unwrap();
     let result = f.run().await;
     fs::set_permissions(&f.config.user, fs::Permissions::from_mode(0o700)).unwrap();
-    let error = result.unwrap_err();
-    assert!(error.residue.contains(&user));
+    let AppInstall::Present { path, preserved, residue, retired, .. } = result.unwrap() else {
+        panic!()
+    };
+    assert_eq!(path, f.installed());
+    assert_eq!(preserved, vec![user.clone()]);
+    assert!(residue.is_empty());
+    assert!(retired.is_empty());
     assert_eq!(
         fs::read(user.join("Contents/Helpers/koi")).unwrap(),
         b"0.1.0"

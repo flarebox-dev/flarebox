@@ -1036,6 +1036,7 @@ echo "==> brew $1"
             problem,
             retired: Vec::new(),
             residue: Vec::new(),
+            preserved: Vec::new(),
         })
     }
 
@@ -1111,6 +1112,7 @@ echo "==> brew $1"
                     problem: None,
                     retired: vec![old.clone()],
                     residue: vec![residue.clone()],
+                    preserved: Vec::new(),
                 });
                 let manager = service::system();
                 let service = if valid_service {
@@ -1242,6 +1244,7 @@ echo "==> brew $1"
             problem: None,
             retired: vec![old.clone()],
             residue: Vec::new(),
+            preserved: Vec::new(),
         });
         let app = prepared.finish(&paths, Ok(&report), deadline).await;
         assert!(
