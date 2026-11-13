@@ -2310,3 +2310,24 @@ fn a_lost_write_kept_beside_a_later_edit_survives_a_delete_of_the_copy_on_anothe
         assert_eq!(copies, 1, "{entries:?}");
     }
 }
+
+#[test]
+fn the_author_of_a_lost_first_edit_sends_it_again_at_its_name() {
+    let mut world = converge(
+        2,
+        &[vec![(1, file("a"))], vec![(0, BACKUP), (0, overwrite(0))]],
+    )
+    .unwrap();
+    let mut steps = vec![(0, RESTORE), (0, Step::Connect)];
+    steps.extend([(0, DELIVER); 8]);
+    steps.extend(commit(0));
+    steps.push((1, Step::Connect));
+    steps.extend([(1, DELIVER); 8]);
+    world.phase(2, &steps).unwrap();
+    for device in &world.devices {
+        let names: Vec<&str> = (device.disk.entries().values())
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["a"]);
+    }
+}
