@@ -76,7 +76,7 @@ pub struct TreesState {
     /// identity L held for it, and the files of `halves` that left L. L holds none of them, and R holds each live
     /// unless it waits in `halves`.
     pub displaced: BTreeMap<NodeId, FileIdentity>,
-    /// The files that wait for the other half of a move, each with when the wait began (section 5.10): one a scan of
+    /// The files that wait for the other half of a move, each with when the wait began (section 5.1): one a scan of
     /// part of the tree found gone, which `displaced` keeps meanwhile, and one L holds as a new link of a file at
     /// another path.
     pub halves: BTreeMap<NodeId, u64>,

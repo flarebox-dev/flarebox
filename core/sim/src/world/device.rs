@@ -187,7 +187,7 @@ impl Engine {
 
     /// A scan of the folders entries left, before the scan of the folders they went to: a node whose entry is gone
     /// or sits at another place leaves L with everything below it, and a file among them waits for the other half
-    /// of its move (design section 5.10). Returns how many files wait.
+    /// of its move (design section 5.1). Returns how many files wait.
     pub fn scan_left(&mut self, disk: &Disk, at_ms: u64) -> usize {
         let local = self.trees.local();
         let in_place = |node: &LocalNode| {

@@ -32,7 +32,7 @@ pub const REPLACED_VERSIONS_KEPT: usize = 64;
 pub const PAST_POSITIONS_KEPT: usize = 64;
 
 /// How long a file that left L in a scan of part of the tree, or a file a link made at another path, waits for the
-/// other half of a move to arrive in a later scan before it counts as deleted or as created (section 5.10).
+/// other half of a move to arrive in a later scan before it counts as deleted or as created (section 5.1).
 pub const HALF_WAIT_MS: u64 = 2_000;
 
 /// An S update of an acknowledged op that waits until S stays a valid tree with it
