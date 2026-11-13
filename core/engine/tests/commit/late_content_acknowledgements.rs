@@ -118,3 +118,43 @@ fn an_edit_undone_while_its_upload_is_out_is_sent_after_an_acknowledgement_that_
     );
     assert!(trees.state().local_changes.contains("n"));
 }
+
+#[test]
+fn a_rename_returned_to_its_waiting_shape_stays_a_change_when_its_commit_is_lost() {
+    let mut trees = trees(&[
+        (
+            "h",
+            Some(file(ROOT, "x", 9)),
+            Some(file(ROOT, "x", 9)),
+            Some(remote(file(ROOT, "y", 9))),
+        ),
+        synced("n", file(ROOT, "old", 0)),
+    ]);
+    trees.set_local(
+        "h".into(),
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "x", 9), 1)
+        },
+    );
+    trees.set_local_changed("n".into(), local(file(ROOT, "x", 1), 2));
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    build(&mut commits, &mut trees, &mut ids).unwrap();
+    trees.set_remote("n".into(), remote(file(ROOT, "x", 1)));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied); 2],
+    );
+    assert_eq!(
+        trees.waiting().get("n").map(|waiting| &waiting.shape),
+        Some(&Some(file(ROOT, "x", 1)))
+    );
+    trees.set_local_changed("n".into(), local(file(ROOT, "z", 1), 2));
+    trees.set_local_changed("n".into(), local(file(ROOT, "x", 1), 2));
+    trees.set_remote("n".into(), remote(file(ROOT, "old", 0)));
+    trees.forget_lost(vec![], vec![], vec![], vec![], vec![], Default::default(), 0, 0);
+    assert!(trees.waiting().get("n").is_none());
+    assert!(trees.state().local_changes.contains("n"));
+}

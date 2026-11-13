@@ -787,11 +787,10 @@ impl Trees {
 
     /// Sets L as this device's user made it: from a scan of the disk, or as the copy that keeps a
     /// change of the user. A shape other than the one L holds is recorded as a change of the user
-    /// ([`TreesState::local_changes`]), and a change back to the shape S holds, or the waiting update
-    /// S takes, ends the record.
+    /// ([`TreesState::local_changes`]), and a change back to the shape S holds ends the record.
     pub fn set_local_changed(&mut self, id: NodeId, node: LocalNode) {
         if !(self.l.get(&id)).is_some_and(|old| old.shape.same(&node.shape)) {
-            if same(Some(&node.shape), self.acknowledged(&id)) {
+            if same(Some(&node.shape), self.s.live(&id)) {
                 self.local_changes.remove(&id);
             } else {
                 self.local_changes.insert(id.clone());
