@@ -109,6 +109,8 @@ fn migrations_apply_from_empty() {
             "recorded_nodes",
             "remote_cursor",
             "remote_nodes",
+            "replaced_versions",
+            "resends",
             "restore_intents",
             "restore_requests",
             "synced_nodes",
@@ -465,6 +467,14 @@ fn engine_state() -> EngineState {
             )]),
             edited_here: BTreeMap::from([("e".into(), 6)]),
             unsent_edits: nodes(["u"]),
+            resends: nodes(["u"]),
+            replaced_versions: BTreeMap::from([(
+                "e".into(),
+                vec![
+                    "0190a6b2-0000-7000-8000-000000000001".into(),
+                    "0190a6b2-0000-7000-8000-000000000002".into(),
+                ],
+            )]),
         },
         commits: CommitsState {
             accepted: 4,
@@ -665,7 +675,7 @@ fn engine_state_survives_a_reopen() {
 }
 
 /// The tables of the engine state besides the nodes of R, L and S.
-const ENGINE_TABLES: [&str; 26] = [
+const ENGINE_TABLES: [&str; 28] = [
     "node_sets",
     "node_maps",
     "waiting_updates",
@@ -678,6 +688,8 @@ const ENGINE_TABLES: [&str; 26] = [
     "recorded_nodes",
     "commit_slots",
     "edited_here",
+    "replaced_versions",
+    "resends",
     "effect_state",
     "failed_effects",
     "restore_intents",
@@ -1046,6 +1058,8 @@ fn a_cursor_stored_before_it_could_record_a_server_behind_it_records_none() {
     conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.execute_batch("DROP TABLE pending_names;").unwrap();
     drop_ino_high(&conn);
+    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
+        .unwrap();
     conn.pragma_update(None, "user_version", 4).unwrap();
     drop(conn);
 
@@ -1096,6 +1110,8 @@ fn a_store_from_before_contents_were_watched_opens_with_nothing_watched() {
     conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.execute_batch("DROP TABLE pending_names;").unwrap();
     drop_ino_high(&conn);
+    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
+        .unwrap();
     conn.pragma_update(None, "user_version", 5).unwrap();
     drop(conn);
 
@@ -1105,6 +1121,8 @@ fn a_store_from_before_contents_were_watched_opens_with_nothing_watched() {
     before.trees.trashed_here.clear();
     before.trees.discarded.clear();
     before.trees.edited_here.clear();
+    before.trees.replaced_versions.clear();
+    before.trees.resends.clear();
     before.trees.watched_positions.clear();
     before.commits.slots.clear();
     before.commits.questions.clear();
@@ -1147,12 +1165,16 @@ fn a_store_from_before_edits_were_recorded_opens_with_none_recorded() {
     conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.execute_batch("DROP TABLE pending_names;").unwrap();
     drop_ino_high(&conn);
+    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
+        .unwrap();
     conn.pragma_update(None, "user_version", 10).unwrap();
     drop(conn);
 
     let mut store = Store::open(&path).unwrap();
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     before.trees.edited_here.clear();
+    before.trees.replaced_versions.clear();
+    before.trees.resends.clear();
     before.trees.watched_positions.clear();
     before.trees.lost.clear();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
@@ -1190,6 +1212,8 @@ fn a_store_from_before_deletes_were_recorded_opens_with_none_recorded() {
     conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.execute_batch("DROP TABLE pending_names;").unwrap();
     drop_ino_high(&conn);
+    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
+        .unwrap();
     conn.pragma_update(None, "user_version", 6).unwrap();
     drop(conn);
 
@@ -1198,6 +1222,8 @@ fn a_store_from_before_deletes_were_recorded_opens_with_none_recorded() {
     before.trees.trashed_here.clear();
     before.trees.discarded.clear();
     before.trees.edited_here.clear();
+    before.trees.replaced_versions.clear();
+    before.trees.resends.clear();
     before.trees.watched_positions.clear();
     before.commits.slots.clear();
     before.commits.questions.clear();
@@ -1240,6 +1266,8 @@ fn a_store_from_before_the_guard_opens_with_an_empty_guard() {
     conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.execute_batch("DROP TABLE pending_names;").unwrap();
     drop_ino_high(&conn);
+    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
+        .unwrap();
     conn.pragma_update(None, "user_version", 7).unwrap();
     drop(conn);
 
@@ -1250,6 +1278,8 @@ fn a_store_from_before_the_guard_opens_with_an_empty_guard() {
     before.trees.lost.clear();
     before.trees.displaced.clear();
     before.trees.edited_here.clear();
+    before.trees.replaced_versions.clear();
+    before.trees.resends.clear();
     before.trees.watched_positions.clear();
     before.commits.questions.clear();
     before.commits.guard = GuardState::default();
@@ -1278,6 +1308,8 @@ fn a_store_from_before_questions_showed_local_shapes_keeps_its_questions() {
     before.trees.lost.clear();
     before.trees.displaced.clear();
     before.trees.edited_here.clear();
+    before.trees.replaced_versions.clear();
+    before.trees.resends.clear();
     before.trees.watched_positions.clear();
     Store::open(&path)
         .unwrap()
@@ -1297,6 +1329,8 @@ fn a_store_from_before_questions_showed_local_shapes_keeps_its_questions() {
     conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.execute_batch("DROP TABLE pending_names;").unwrap();
     drop_ino_high(&conn);
+    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
+        .unwrap();
     conn.pragma_update(None, "user_version", 8).unwrap();
     drop(conn);
 
@@ -1336,6 +1370,8 @@ fn a_store_from_before_nodes_in_ignored_folders_were_stored_opens_with_none_reco
     conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.execute_batch("DROP TABLE pending_names;").unwrap();
     drop_ino_high(&conn);
+    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
+        .unwrap();
     conn.pragma_update(None, "user_version", 9).unwrap();
     drop(conn);
 
@@ -1346,6 +1382,8 @@ fn a_store_from_before_nodes_in_ignored_folders_were_stored_opens_with_none_reco
     before.trees.lost.clear();
     before.trees.displaced.clear();
     before.trees.edited_here.clear();
+    before.trees.replaced_versions.clear();
+    before.trees.resends.clear();
     before.trees.watched_positions.clear();
     assert!(!after.trees.outside.is_empty() && !after.trees.displaced.is_empty());
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
@@ -1364,6 +1402,8 @@ fn a_store_from_before_remote_removals_were_counted_opens_with_none_counted() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let mut before = engine_state();
+    before.trees.replaced_versions.clear();
+    before.trees.resends.clear();
     before.commits.published.clear();
     before.trees.unsent_edits.clear();
     before.commits.pending.clear();
@@ -1383,6 +1423,8 @@ fn a_store_from_before_remote_removals_were_counted_opens_with_none_counted() {
     conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.execute_batch("DROP TABLE pending_names;").unwrap();
     drop_ino_high(&conn);
+    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
+        .unwrap();
     conn.pragma_update(None, "user_version", 11).unwrap();
     drop(conn);
 
@@ -1403,6 +1445,8 @@ fn a_store_from_before_positions_were_watched_opens_with_none_watched() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let mut before = engine_state();
+    before.trees.replaced_versions.clear();
+    before.trees.resends.clear();
     Store::open(&path)
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
@@ -1420,6 +1464,8 @@ fn a_store_from_before_positions_were_watched_opens_with_none_watched() {
     conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.execute_batch("DROP TABLE pending_names;").unwrap();
     drop_ino_high(&conn);
+    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
+        .unwrap();
     conn.pragma_update(None, "user_version", 12).unwrap();
     drop(conn);
 
@@ -1465,6 +1511,8 @@ fn a_store_from_before_waiting_updates_kept_their_origin_takes_the_accepted_slot
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let mut before = engine_state();
+    before.trees.replaced_versions.clear();
+    before.trees.resends.clear();
     before.trees.waiting = BTreeMap::from([
         (
             "w".into(),
@@ -1504,6 +1552,8 @@ fn a_store_from_before_waiting_updates_kept_their_origin_takes_the_accepted_slot
     conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.execute_batch("DROP TABLE pending_names;").unwrap();
     drop_ino_high(&conn);
+    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
+        .unwrap();
     conn.pragma_update(None, "user_version", 13).unwrap();
     drop(conn);
 
@@ -1563,7 +1613,7 @@ fn a_cursor_stored_before_commit_tokens_opens_with_none() {
         .unwrap();
     drop_cursor_tokens(&conn);
     conn.execute_batch(
-        "DROP TABLE published_nodes; DROP TABLE taken_answers; DROP TABLE unsent_edits;",
+        "DROP TABLE published_nodes; DROP TABLE taken_answers; DROP TABLE unsent_edits; DROP TABLE replaced_versions; DROP TABLE resends;",
     )
     .unwrap();
     conn.execute_batch("DROP TABLE pending_names;").unwrap();
@@ -1591,6 +1641,8 @@ fn a_store_from_before_watched_positions_were_kept_takes_them_from_s() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let mut before = engine_state();
+    before.trees.replaced_versions.clear();
+    before.trees.resends.clear();
     before.trees.watched_positions.insert(
         "lost".into(),
         Some(Agreed {
@@ -1623,6 +1675,8 @@ fn a_store_from_before_watched_positions_were_kept_takes_them_from_s() {
     conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.execute_batch("DROP TABLE pending_names;").unwrap();
     drop_ino_high(&conn);
+    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
+        .unwrap();
     conn.pragma_update(None, "user_version", 14).unwrap();
     drop(conn);
 
@@ -1648,14 +1702,17 @@ fn a_store_from_before_lost_folders_were_marked_opens_with_none_marked() {
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
         .unwrap();
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
         .unwrap();
+    conn.pragma_update(None, "user_version", 21).unwrap();
     drop(conn);
 
     let mut store = Store::open(&path).unwrap();
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     let after = before.clone();
     before.trees.lost.clear();
+    before.trees.replaced_versions.clear();
+    before.trees.resends.clear();
     assert!(!after.trees.lost.is_empty());
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
     store
@@ -1673,6 +1730,8 @@ fn a_store_from_before_published_entries_were_recorded_opens_with_none_recorded(
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let mut before = engine_state();
+    before.trees.replaced_versions.clear();
+    before.trees.resends.clear();
     Store::open(&path)
         .unwrap()
         .transaction(|tx| tx.set_engine_state(&before))
@@ -1681,7 +1740,7 @@ fn a_store_from_before_published_entries_were_recorded_opens_with_none_recorded(
     conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
         .unwrap();
     conn.execute_batch(
-        "DROP TABLE published_nodes; DROP TABLE taken_answers; DROP TABLE unsent_edits;",
+        "DROP TABLE published_nodes; DROP TABLE taken_answers; DROP TABLE unsent_edits; DROP TABLE replaced_versions; DROP TABLE resends;",
     )
     .unwrap();
     conn.execute_batch("DROP TABLE pending_names;").unwrap();
@@ -1721,6 +1780,8 @@ fn a_store_from_before_unsent_edits_were_recorded_opens_with_none_recorded() {
     conn.execute_batch("DROP TABLE unsent_edits;").unwrap();
     conn.execute_batch("DROP TABLE pending_names;").unwrap();
     drop_ino_high(&conn);
+    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
+        .unwrap();
     conn.pragma_update(None, "user_version", 18).unwrap();
     drop(conn);
 
@@ -1730,6 +1791,8 @@ fn a_store_from_before_unsent_edits_were_recorded_opens_with_none_recorded() {
     before.trees.unsent_edits.clear();
     before.commits.pending.clear();
     before.trees.lost.clear();
+    before.trees.replaced_versions.clear();
+    before.trees.resends.clear();
     assert!(!after.trees.unsent_edits.is_empty());
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
     store
@@ -1746,6 +1809,8 @@ fn a_store_from_before_inodes_took_128_bits_keeps_every_identity() {
     let path = dir.path().join("state.db");
     let mut state = engine_state();
     state.commits.pending.clear();
+    state.trees.replaced_versions.clear();
+    state.trees.resends.clear();
     let local =
         [("a", u64::MAX), ("b", 1 << 63), ("c", 42), ("d", 0)].map(|(node_id, ino)| LocalNode {
             node_id: node_id.into(),
@@ -1772,6 +1837,8 @@ fn a_store_from_before_inodes_took_128_bits_keeps_every_identity() {
     conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
         .unwrap();
     drop_ino_high(&conn);
+    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
+        .unwrap();
     conn.pragma_update(None, "user_version", 19).unwrap();
     let stored: i64 = conn
         .query_row(
@@ -1869,8 +1936,9 @@ fn a_store_from_before_pending_names_were_recorded_opens_with_none_recorded() {
     conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
         .unwrap();
     conn.execute_batch("DROP TABLE pending_names;").unwrap();
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 2)
+    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
         .unwrap();
+    conn.pragma_update(None, "user_version", 20).unwrap();
     drop(conn);
 
     let mut store = Store::open(&path).unwrap();
@@ -1878,7 +1946,40 @@ fn a_store_from_before_pending_names_were_recorded_opens_with_none_recorded() {
     let after = before.clone();
     before.commits.pending.clear();
     before.trees.lost.clear();
+    before.trees.replaced_versions.clear();
+    before.trees.resends.clear();
     assert!(!after.commits.pending.is_empty());
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
+    store
+        .transaction(|tx| tx.update_engine_state(&before, &after))
+        .unwrap();
+    drop(store);
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), after);
+}
+
+#[test]
+fn a_store_from_before_replaced_versions_were_recorded_opens_with_none_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let mut before = engine_state();
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| tx.set_engine_state(&before))
+        .unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
+        .unwrap();
+    conn.pragma_update(None, "user_version", 22).unwrap();
+    drop(conn);
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    let after = before.clone();
+    before.trees.replaced_versions.clear();
+    before.trees.resends.clear();
+    assert!(!after.trees.replaced_versions.is_empty());
+    assert!(!after.trees.resends.is_empty());
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
     store
         .transaction(|tx| tx.update_engine_state(&before, &after))
@@ -1903,6 +2004,8 @@ fn a_version_3_store_opens_with_empty_restore_tables() {
     before.trees.trashed_here.clear();
     before.trees.discarded.clear();
     before.trees.edited_here.clear();
+    before.trees.replaced_versions.clear();
+    before.trees.resends.clear();
     before.trees.watched_positions.clear();
     before.commits.slots.clear();
     before.commits.restores.clear();
@@ -1937,6 +2040,8 @@ fn a_version_3_store_opens_with_empty_restore_tables() {
     conn.execute_batch("DROP TABLE taken_answers;").unwrap();
     conn.execute_batch("DROP TABLE pending_names;").unwrap();
     drop_ino_high(&conn);
+    conn.execute_batch("DROP TABLE replaced_versions; DROP TABLE resends;")
+        .unwrap();
     conn.pragma_update(None, "user_version", 3).unwrap();
     drop(conn);
 

@@ -4212,10 +4212,8 @@ fn a_folder_moved_into_a_folder_the_server_lost_is_moved_there_again() {
     assert_eq!(b.state(), FolderState::UpToDate);
 }
 
-/// The server lost a's edit of `one.txt` that `b` had downloaded. `b` keeps that content as a conflict copy beside
-/// the server's older content, instead of replacing it.
 #[test]
-fn an_edit_the_server_lost_is_kept_as_a_conflict_copy() {
+fn an_edit_the_server_lost_is_sent_again_by_a_device_that_downloaded_it() {
     let mut remote = Remote::new();
     let (site_a, mut a) = linked(&mut remote, "a");
     a.create(&mut remote, &site_a.root.join("one.txt"), b"v1");
@@ -4234,23 +4232,13 @@ fn an_edit_the_server_lost_is_kept_as_a_conflict_copy() {
     b.run(&mut remote);
     b.settle();
     b.run(&mut remote);
-    let copy = "one (conflict from b 2023-11-14).txt";
-    assert_eq!(
-        files(&site.root),
-        [
-            (copy.to_owned(), "v2".to_owned()),
-            ("one.txt".to_owned(), "v1".to_owned())
-        ]
-    );
-    assert_eq!(remote.names(), [copy, "one.txt"]);
+    assert_eq!(files(&site.root), [("one.txt".to_owned(), "v2".to_owned())]);
+    assert_eq!(remote.names(), ["one.txt"]);
     assert_eq!(b.state(), FolderState::UpToDate);
 }
 
-/// As above, and then `a`, which made the edit, lists the tree again too. It sends its edit again as an edit, so
-/// `one.txt` holds `v2` again on the server and on both devices. `b`'s copy is the one conflict copy left: `b` did
-/// not make the edit, so it cannot tell that `a` will send it again.
 #[test]
-fn an_edit_the_server_lost_leaves_one_copy_on_the_device_that_did_not_make_it() {
+fn an_edit_the_server_lost_leaves_no_copy_when_both_devices_send_it_again() {
     let mut remote = Remote::new();
     let (site_a, mut a) = linked(&mut remote, "a");
     a.create(&mut remote, &site_a.root.join("one.txt"), b"v1");
@@ -4274,12 +4262,8 @@ fn an_edit_the_server_lost_leaves_one_copy_on_the_device_that_did_not_make_it() 
     b.pull(&remote);
     b.run(&mut remote);
     b.settle();
-    let copy = "one (conflict from b 2023-11-14).txt";
-    let both = [
-        (copy.to_owned(), "v2".to_owned()),
-        ("one.txt".to_owned(), "v2".to_owned()),
-    ];
-    assert_eq!(remote.names(), [copy, "one.txt"]);
+    let both = [("one.txt".to_owned(), "v2".to_owned())];
+    assert_eq!(remote.names(), ["one.txt"]);
     assert_eq!(files(&site.root), both);
     assert_eq!(files(&site_a.root), both);
     assert_eq!(

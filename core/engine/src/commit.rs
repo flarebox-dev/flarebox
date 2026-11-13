@@ -285,7 +285,19 @@ impl Commits {
     /// this commit is among them, so a node state of a seq at or below it is from before the loss
     /// (section 4.4).
     pub fn held_through(&self) -> u64 {
-        self.slots.last_key_value().map_or(0, |(_, &seq)| seq)
+        (self.slots.range(..=self.accepted).next_back()).map_or(0, |(_, &seq)| seq)
+    }
+
+    /// Whether one of this device's last [`SLOTS_KEPT`] acknowledged commits has seq `seq`, a
+    /// commit the server lost included until R is listed again ([`Commits::forget_lost_slots`]).
+    pub fn made_here(&self, seq: u64) -> bool {
+        self.slots.values().any(|&made| made == seq)
+    }
+
+    /// Forgets the slots above the accepted counter, those of the commits a loss took, once R is
+    /// listed again and [`Trees::forget_lost`] no longer needs them.
+    pub fn forget_lost_slots(&mut self) {
+        self.slots.split_off(&(self.accepted + 1));
     }
 
     /// The accepted counter *a* of section 2.8: the `device_seq` of the last commit whose result
@@ -716,6 +728,8 @@ impl Commits {
             .map(ToOwned::to_owned),
         );
 
+        let require_head = (ops.iter().filter_map(|op| op.op.as_ref()))
+            .any(|op| trees.resends().contains(op_node(op)));
         let commit_id = ids.uuid_v7(now_ms);
         for question in &mut self.questions {
             if let QuestionKind::Conflict { sent_in, .. } = &mut question.kind
@@ -733,6 +747,7 @@ impl Commits {
                 ops,
                 history_id: history_id.to_owned(),
                 device_seq: self.accepted + 1,
+                require_head,
                 ..Default::default()
             },
             deletes,
@@ -1428,8 +1443,10 @@ impl Commits {
     /// under a policy halt resends nothing whatever the `Welcome` says, but *w* < *a* is a loss
     /// there too: *a* takes *w*, the refused commit is dropped, since its slot is no longer the one
     /// after the server's count, and R is listed again, while the halt stays. The slots above *w*
-    /// are forgotten with every loss, so that [`Commits::held_through`] does not count commits the
-    /// server lost, and a later `Welcome` finds *w* = *a*, so a loss is handled once. Whether R
+    /// stay until R is listed again ([`Commits::forget_lost_slots`]), so that
+    /// [`Commits::made_here`] still names the commits the server lost, while
+    /// [`Commits::held_through`] counts none above *a*. A later `Welcome` finds *w* = *a*, so a
+    /// loss is handled once. Whether R
     /// itself belongs to the `Welcome`'s history is checked where R is kept.
     ///
     /// Recovery keeps the queued restores with the commit in flight: nothing is built under that
@@ -1458,7 +1475,6 @@ impl Commits {
         if reconnect == Reconnect::AheadOfServer {
             self.accepted = w;
             self.in_flight = None;
-            self.slots.split_off(&(w + 1));
         }
         if policy {
             return reconnect;

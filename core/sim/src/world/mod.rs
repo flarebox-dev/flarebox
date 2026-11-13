@@ -171,6 +171,9 @@ pub enum Step {
     /// server, so every connection breaks. The commits since the copy are lost, and the server
     /// gives their seqs and device slots again (design section 2.8).
     Restore,
+    /// Restores the server's storage from the copy before the last one, as [`Step::Restore`]
+    /// does with the last.
+    RestoreEarlier,
     /// Rewinds the space to the last copy of the server's storage with a new history, as its
     /// owner can (RFC 0003), so every connection breaks and every device recovers (section 6.4).
     Rewind,
@@ -421,6 +424,7 @@ pub struct World {
     copied: BTreeSet<i64>,
     /// The last copy of the server's storage.
     backup: Option<Backup>,
+    earlier_backup: Option<Backup>,
     /// The writes that a restore took from the server while no disk held them. The server may
     /// stay without them, or hold them again in a file for each device that placed one from R.
     retired: BTreeSet<i64>,
@@ -481,6 +485,7 @@ impl World {
             unasked: None,
             copied: BTreeSet::new(),
             backup: None,
+            earlier_backup: None,
             retired: BTreeSet::new(),
             exposed: BTreeMap::new(),
             rolled_back: BTreeMap::new(),
@@ -564,13 +569,14 @@ impl World {
         match step {
             Step::User(action) => self.act(d, action),
             Step::Backup => {
-                self.backup = Some(Backup {
+                self.earlier_backup = self.backup.replace(Backup {
                     space: self.space.clone(),
                     held: self.held.clone(),
                     in_history: self.in_history.clone(),
                 });
             }
-            Step::Restore => self.restore(),
+            Step::Restore => self.restore(false),
+            Step::RestoreEarlier => self.restore(true),
             Step::Rewind => self.rewind(),
             Step::CopyStore => {
                 let device = &mut self.devices[d];
@@ -760,8 +766,13 @@ impl World {
     /// Restores the server from the last copy. A write is lost with the restore when the server
     /// held it only after the copy, or when a file of the server held it before the restore and
     /// no longer holds it after: it is exposed, and retired as well when no disk holds it.
-    fn restore(&mut self) {
-        let Some(backup) = &self.backup else {
+    fn restore(&mut self, earlier: bool) {
+        let backup = if earlier {
+            &self.earlier_backup
+        } else {
+            &self.backup
+        };
+        let Some(backup) = backup else {
             return;
         };
         if backup.space.head_seq() < self.space.head_seq() {
@@ -1249,6 +1260,7 @@ impl World {
                 } = &mut self.devices[d].engine;
                 let trashed = trees.trashed_here();
                 let edited = trees.edited_here();
+                let synced = trees.taken_from_others(|seq| commits.made_here(seq));
                 let root = trees.remote().root.clone();
                 let mut listed = BTreeMap::new();
                 for state in nodes.iter().filter(|state| state.node_id != root) {
@@ -1267,11 +1279,18 @@ impl World {
                 }
                 for (id, node) in listed {
                     if trees.remote().get(&id) != Some(&node) {
-                        trees.set_remote(id, node);
+                        trees.set_listed_remote(id, node);
                     }
                 }
                 if *behind {
-                    trees.forget_lost(trashed, edited, commits.held_through(), commits.accepted());
+                    trees.forget_lost(
+                        trashed,
+                        edited,
+                        synced,
+                        commits.held_through(),
+                        commits.accepted(),
+                    );
+                    commits.forget_lost_slots();
                 }
                 *cursor = head;
                 *behind = false;
@@ -1516,7 +1535,26 @@ impl World {
                                                 && held.and_then(|held| held.get(write)) == digest
                                     })
                                 };
-                                if asked(&self.removed[d]) {
+                                let resent = (sent.ops.iter()).any(|op| match &op.op {
+                                    Some(op::Op::UpdateContent(update)) => {
+                                        update.node_id == *node
+                                            && self.rolled_back.contains_key(node)
+                                            && ((update.content.as_ref()).is_some_and(|content| {
+                                                held.is_some_and(|held| {
+                                                    held.contains_key(&content.mtime_ns)
+                                                })
+                                            }) || (self.exposed.iter()).any(
+                                                |(write, exposure)| {
+                                                    exposure.nodes.contains_key(node)
+                                                        && self.removed[d].contains(write)
+                                                },
+                                            ))
+                                    }
+                                    _ => false,
+                                });
+                                if asked(&self.removed[d])
+                                    || resent && self.removed.iter().any(asked)
+                                {
                                     continue;
                                 }
                                 let why = if self.removed.iter().any(asked) {

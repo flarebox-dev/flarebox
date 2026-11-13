@@ -412,6 +412,18 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE recorded_nodes ADD COLUMN lost INTEGER NOT NULL DEFAULT 0 CHECK (lost IN (0, 1));
 ",
+    "
+    CREATE TABLE replaced_versions (
+        node_id TEXT NOT NULL,
+        position INTEGER NOT NULL CHECK (position >= 0),
+        version_id TEXT NOT NULL,
+        PRIMARY KEY (node_id, position)
+    ) STRICT, WITHOUT ROWID;
+
+    CREATE TABLE resends (
+        node_id TEXT PRIMARY KEY
+    ) STRICT, WITHOUT ROWID;
+",
 ];
 
 /// The schema version this build writes.

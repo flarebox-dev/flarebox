@@ -33,6 +33,7 @@ fn remote(shape: Shape) -> RemoteNode {
         content_rev: 1,
         meta_rev: 1,
         trash_group: String::new(),
+        version_id: String::new(),
     }
 }
 
@@ -101,6 +102,8 @@ fn trees_state() -> TreesState {
         displaced: Default::default(),
         edited_here: [("a".into(), 1)].into(),
         unsent_edits: Default::default(),
+        resends: Default::default(),
+        replaced_versions: [("a".into(), vec!["v1".into()])].into(),
     }
 }
 
@@ -165,6 +168,13 @@ fn an_unsent_edit_restores_while_l_holds_the_file_and_it_is_dirty() {
         trees.restore(state),
         Err(StateError::NotUnsentEdit("g".into()))
     );
+}
+
+#[test]
+fn a_resend_restores_only_while_l_holds_the_node() {
+    let (mut trees, mut state) = unsent();
+    state.resends.insert("g".into());
+    assert_eq!(trees.restore(state), Err(StateError::NotResend("g".into())));
 }
 
 /// A restore of the trashed node `n`.
@@ -453,6 +463,16 @@ fn trees_restore_a_valid_state_and_refuse_each_broken_one() {
                 state.edited_here.insert("a".into(), 2);
             }),
             StateError::NotEditedHere("a".into()),
+        ),
+        (
+            "versions replaced in a node R does not hold",
+            trees(),
+            broken(trees_state(), |state| {
+                state
+                    .replaced_versions
+                    .insert("gone".into(), vec!["v1".into()]);
+            }),
+            StateError::NotRemote("gone".into()),
         ),
     ];
     for (name, mut trees, state, error) in cases {

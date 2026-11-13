@@ -4076,6 +4076,7 @@ fn a_local_delete_keeps_a_recorded_entry_and_the_folders_above_it_as_the_driver_
                 content_rev: 1,
                 meta_rev: 1,
                 trash_group: String::new(),
+                version_id: String::new(),
             },
         );
     }
