@@ -1093,8 +1093,8 @@ impl Commits {
     ///
     /// Once R holds the record of the commit in flight and its result has not arrived
     /// ([`Commits::own_record`]), what the record shows of the commit is recorded as the result
-    /// would record it: the nodes its deletes trashed, the content its edits set and the positions
-    /// its creates and moves set, also when a listing brought the record instead of the log. A loss
+    /// would record it: the nodes its deletes trashed and the positions its creates and moves set,
+    /// as its edits are recorded when the record arrives ([`Commits::edits_in_flight`]). A loss
     /// that drops the commit before its result then sends those changes again as this device's own
     /// ([`Trees::forget_lost`]).
     pub fn acknowledge(&mut self, trees: &mut Trees, last_seq: u64) -> bool {
@@ -1123,14 +1123,6 @@ impl Commits {
                         .filter(|id| **id != delete.node_id)
                     {
                         trees.record_trashed(id, seq, None);
-                    }
-                }
-                op::Op::UpdateContent(update)
-                    if self.edits_in_flight(&flight.commit.commit_id, &update.node_id) =>
-                {
-                    let id = &update.node_id;
-                    if (trees.remote().get(id)).is_some_and(|remote| remote.edit_rev == seq) {
-                        trees.record_edited(id, update.content.as_ref());
                     }
                 }
                 op::Op::CreateDir(_) | op::Op::CreateFile(_) | op::Op::Move(_) => {

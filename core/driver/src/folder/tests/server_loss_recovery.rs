@@ -327,6 +327,53 @@ fn a_server_that_lost_a_commit_of_this_device_gets_it_back_after_others_committe
     assert_eq!(a.state(), FolderState::UpToDate);
 }
 
+fn created_in_a_folder_then_listed_and_lost(result_arrives: bool) -> (Vec<(String, String)>, Vec<String>) {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site.root.join("docs")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.run(&mut remote);
+    let mut restored = backup(&remote, &a);
+    a.create(&mut remote, &site.root.join("one.txt"), b"one");
+    fs::write(site.root.join("docs/n.txt"), b"only on a").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    let upload = a.work.pop_front().unwrap();
+    a.perform(upload, &mut remote).unwrap();
+    let Some(Work::Send(commit)) = a.work.pop_front() else {
+        panic!("the commit is sent after its upload");
+    };
+    let result = remote.commit(&a.caller, &commit);
+    if result_arrives {
+        let step = a.folder.sent(result);
+        a.take(step).unwrap();
+    }
+    a.event(Event::ResyncRequired(ResyncRequired {
+        reason: Reason::LogTruncated as i32,
+        ..ResyncRequired::default()
+    }))
+    .unwrap();
+    a.run(&mut remote);
+    let (other, mut b) = linked(&mut restored, "b");
+    b.settle();
+    fs::remove_dir(other.root.join("docs")).unwrap();
+    b.scan_until(|b| !b.work.is_empty());
+    b.run(&mut restored);
+    let welcome = restored.space.welcome(&a.caller);
+    assert!(welcome.device_seq < a.folder.engine.commits.accepted());
+    a.event(Event::Connected(welcome)).unwrap();
+    a.run(&mut restored);
+    a.settle();
+    a.run(&mut restored);
+    (files(&site.root), restored.names())
+}
+
+#[test]
+fn a_create_whose_result_never_came_is_sent_again_after_a_listing_whose_pages_held_it() {
+    let received = created_in_a_folder_then_listed_and_lost(true);
+    assert!(received.0.contains(&("docs/n.txt".into(), "only on a".into())), "{received:?}");
+    assert_eq!(created_in_a_folder_then_listed_and_lost(false), received);
+}
+
 /// The server's storage is restored from a backup taken before `a` deleted `one.txt` (GUN-359). `a` lists the tree
 /// again, which holds `one.txt` live as it was deleted, and sends the delete again instead of downloading the file.
 #[test]

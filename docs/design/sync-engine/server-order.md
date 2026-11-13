@@ -61,6 +61,7 @@ After `LOG_TRUNCATED` or `AHEAD_OF_SERVER`, the engine lists the tree (spec §7.
 
 - The listing is collected into a staging tree while the old R stays in use. It reads every `ListTrash` page after every `ListTree` page, merged by rev like the replay, and ends only at the `CaughtUp` sent after both (RFC 0002 §6). So a node another device trashed counts as trashed, and is never created again under an ID the server holds in its trash.
 - The staging tree replaces R only after the log has been replayed up to the highest `head_seq` of any page and the result is a valid tree. Until then the planner does not run.
+- While the server may hold the commit in flight, because it was sent and no refusal came back, the staging tree also waits for that commit's result. A page can hold the commit's changes without naming the commit, so only the result gives the commit's seq, which the loss rules below need. A device under a halt resends nothing, so its staging tree does not wait.
 - S and L are kept, and the normal classification decides what moves in which direction, with the loss rules below.
 
 ### Commits the server lost
@@ -75,7 +76,7 @@ The server lost commits this device applied when it reports `AHEAD_OF_SERVER`, i
 
 The bound is the seq of the newest commit of this device that the server still counts. The engine keeps the seq of each of its last 1,000 acknowledged commits by slot, and slot *w* is a commit the restored server holds, so every seq at or below its seq is from before the loss.
 
-The commit's own record counts as its result for these records. When the record of the commit in flight arrives before its result, through the log or in the replay that catches up a listing, the commit's slot takes the record's seq, and the nodes the record shows the commit trashed, edited or positioned are recorded as above. So a loss that drops the commit before its result reaches the device sends its changes again as this device's own, rather than taking them for another device's change.
+The commit's own record counts as its result for these records. When the record of the commit in flight arrives before its result, the commit's slot takes the record's seq, and the nodes the record shows the commit trashed, edited or positioned are recorded as above. So a loss that drops the commit before its result reaches the device sends its changes again as this device's own, rather than taking them for another device's change.
 
 A delete this device made in a lost commit is sent again:
 

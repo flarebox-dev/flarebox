@@ -354,7 +354,10 @@ impl Folder {
     pub fn event(&mut self, event: Event) -> Result<Vec<Work>, Stop> {
         let mut work = Vec::new();
         match event {
-            Event::Connected(welcome) => self.connected(&welcome, &mut work)?,
+            Event::Connected(welcome) => {
+                self.connected(&welcome, &mut work)?;
+                self.publish_remote()?;
+            }
             Event::Changes(records) => self.changes(&records, &mut work)?,
             Event::Committed(committed) => self.result(&committed.commit_id, committed.result)?,
             Event::CaughtUp(caught_up) => {
@@ -745,6 +748,7 @@ impl Folder {
                 return Err(Stop::Protocol(format!("sending a commit failed: {error}")));
             }
         }
+        self.publish_remote()?;
         self.drive(&mut work)?;
         Ok(work)
     }
@@ -1258,7 +1262,11 @@ impl Folder {
         let Stream::Replaying(staging) = &self.stream else {
             return Ok(());
         };
-        if !staging.ready() {
+        let commits = &self.engine.commits;
+        let unanswered = (commits.in_flight()).is_some_and(|flight| flight.result.is_none());
+        let server_may_hold_it = matches!(self.flight, Flight::Sending(_) | Flight::Unknown)
+            && commits.halted().is_none();
+        if !staging.ready() || (unanswered && server_may_hold_it) {
             return Ok(());
         }
         let first_link = self.engine.cursor.is_none();

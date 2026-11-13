@@ -5,7 +5,6 @@ enum Served {
     ResultFirst,
     RecordOnly,
     RecordOnlyThenRestart,
-    RecordInAListing,
 }
 
 fn served_at_5_then_lost(
@@ -27,12 +26,10 @@ fn served_at_5_then_lost(
         commits.received(result(5, results)).unwrap();
     }
     assert!(commits.own_record(5, &commit.commit_id));
-    match served {
-        Served::RecordInAListing => trees.set_listed_remote("n".into(), applied),
-        _ if commits.edits_in_flight(&commit.commit_id, "n") => {
-            trees.set_remote_edited_here("n".into(), applied);
-        }
-        _ => trees.set_remote_made_here("n".into(), applied),
+    if commits.edits_in_flight(&commit.commit_id, "n") {
+        trees.set_remote_edited_here("n".into(), applied);
+    } else {
+        trees.set_remote_made_here("n".into(), applied);
     }
     let acknowledged = commits.acknowledge(&mut trees, 5);
     assert_eq!(acknowledged, matches!(served, Served::ResultFirst));
@@ -94,11 +91,7 @@ fn served_at_5_then_lost_with_or_without_its_result(
 ) -> (Vec<Effect>, Vec<op::Op>) {
     let run = |served| served_at_5_then_lost(rows, &change, applied.clone(), listed, served);
     let reference = run(Served::ResultFirst);
-    for served in [
-        Served::RecordOnly,
-        Served::RecordOnlyThenRestart,
-        Served::RecordInAListing,
-    ] {
+    for served in [Served::RecordOnly, Served::RecordOnlyThenRestart] {
         assert_eq!(run(served), reference, "{served:?} changed the outcome");
     }
     reference
