@@ -352,124 +352,6 @@ async fn every<W: Future>(
     tick();
 }
 
-#[cfg(test)]
-mod tests {
-    use std::cell::Cell;
-
-    use super::*;
-
-    #[test]
-    fn the_daemon_records_the_failures_counted_since_its_last_tick() {
-        use koidrive_telemetry::schema::{Asked, Halted};
-
-        let recorder = Recorder::on();
-        let halted = Failure::Halted(Halted::StoreBehind);
-        let asked = Failure::Asked(Asked::Conflict);
-        let mut last = BTreeMap::from([(halted, 2)]);
-        let now = BTreeMap::from([(halted, 3), (asked, 4)]);
-        record_failures(&recorder, &mut last, now.clone());
-        record_failures(&recorder, &mut last, now.clone());
-        assert_eq!(last, now);
-        let day = recorder.take().days.into_values().next().unwrap();
-        let report = serde_json::to_value(day).unwrap();
-        assert_eq!(
-            report["counters"],
-            serde_json::json!({
-                "asked": { "conflict": 4 },
-                "halted": { "store_behind": 1 },
-            })
-        );
-    }
-
-    #[test]
-    fn the_daemon_records_what_was_synced_since_its_last_tick() {
-        let recorder = Recorder::on();
-        let folder = |remote_nodes| koidrive_driver::FolderStatus {
-            space_id: "s".into(),
-            space_name: "Alice Notes".into(),
-            path: "/home/alice/Notes".into(),
-            state: koidrive_driver::FolderState::UpToDate,
-            history_id: None,
-            last_seq: None,
-            head_seq: None,
-            remote_nodes,
-            local_entries: None,
-            questions: 0,
-            problem: None,
-            wait: None,
-        };
-        let status = Status {
-            account: None,
-            running: true,
-            folders: vec![folder(1_000), folder(500)],
-            ..Status::default()
-        };
-        let mut last = Volume {
-            bytes_uploaded: 100,
-            ..Volume::default()
-        };
-        let now = Volume {
-            commits_sent: 3,
-            bytes_uploaded: 4_196,
-            ..Volume::default()
-        };
-        record_sync(&recorder, &mut last, now, &status);
-        record_sync(
-            &recorder,
-            &mut last,
-            now,
-            &Status {
-                folders: vec![],
-                ..status
-            },
-        );
-        assert_eq!(last, now);
-        let day = recorder.take().days.into_values().next().unwrap();
-        let report = serde_json::to_value(day).unwrap();
-        assert_eq!(
-            report["counters"]["sync"],
-            serde_json::json!({ "commits_sent": 3, "bytes_uploaded": 4_096 })
-        );
-        assert_eq!(
-            report["levels"]["sync"],
-            serde_json::json!({ "spaces": 2, "nodes": 1_500 })
-        );
-        let text = report.to_string();
-        for private in ["Alice", "/home"] {
-            assert!(!text.contains(private), "{private} in {text}");
-        }
-    }
-
-    #[tokio::test]
-    async fn stopping_drops_a_send_in_progress_and_flushes_once_more() {
-        let (stop_daemon, stop) = tokio::sync::oneshot::channel();
-        let (sending, sent) = tokio::sync::oneshot::channel();
-        let mut sending = Some(sending);
-        let ticks = Cell::new(0);
-        let looping = every(
-            Duration::from_millis(1),
-            stop,
-            || ticks.set(ticks.get() + 1),
-            || {
-                if let Some(sending) = sending.take() {
-                    let _ = sending.send(());
-                }
-                std::future::pending::<()>()
-            },
-        );
-        let stopper = async {
-            sent.await.unwrap();
-            stop_daemon.send(()).unwrap();
-        };
-        tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(looping, stopper)
-        })
-        .await
-        .expect("stopping waited for the send");
-        assert_eq!(ticks.get(), 2);
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum TelemetryMode {
@@ -641,5 +523,123 @@ pub fn command(paths: &Paths, action: TelemetryAction) -> Result<Done, CliError>
                 Ok(Done::ok(data, text))
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn the_daemon_records_the_failures_counted_since_its_last_tick() {
+        use koidrive_telemetry::schema::{Asked, Halted};
+
+        let recorder = Recorder::on();
+        let halted = Failure::Halted(Halted::StoreBehind);
+        let asked = Failure::Asked(Asked::Conflict);
+        let mut last = BTreeMap::from([(halted, 2)]);
+        let now = BTreeMap::from([(halted, 3), (asked, 4)]);
+        record_failures(&recorder, &mut last, now.clone());
+        record_failures(&recorder, &mut last, now.clone());
+        assert_eq!(last, now);
+        let day = recorder.take().days.into_values().next().unwrap();
+        let report = serde_json::to_value(day).unwrap();
+        assert_eq!(
+            report["counters"],
+            serde_json::json!({
+                "asked": { "conflict": 4 },
+                "halted": { "store_behind": 1 },
+            })
+        );
+    }
+
+    #[test]
+    fn the_daemon_records_what_was_synced_since_its_last_tick() {
+        let recorder = Recorder::on();
+        let folder = |remote_nodes| koidrive_driver::FolderStatus {
+            space_id: "s".into(),
+            space_name: "Alice Notes".into(),
+            path: "/home/alice/Notes".into(),
+            state: koidrive_driver::FolderState::UpToDate,
+            history_id: None,
+            last_seq: None,
+            head_seq: None,
+            remote_nodes,
+            local_entries: None,
+            questions: 0,
+            problem: None,
+            wait: None,
+        };
+        let status = Status {
+            account: None,
+            running: true,
+            folders: vec![folder(1_000), folder(500)],
+            ..Status::default()
+        };
+        let mut last = Volume {
+            bytes_uploaded: 100,
+            ..Volume::default()
+        };
+        let now = Volume {
+            commits_sent: 3,
+            bytes_uploaded: 4_196,
+            ..Volume::default()
+        };
+        record_sync(&recorder, &mut last, now, &status);
+        record_sync(
+            &recorder,
+            &mut last,
+            now,
+            &Status {
+                folders: vec![],
+                ..status
+            },
+        );
+        assert_eq!(last, now);
+        let day = recorder.take().days.into_values().next().unwrap();
+        let report = serde_json::to_value(day).unwrap();
+        assert_eq!(
+            report["counters"]["sync"],
+            serde_json::json!({ "commits_sent": 3, "bytes_uploaded": 4_096 })
+        );
+        assert_eq!(
+            report["levels"]["sync"],
+            serde_json::json!({ "spaces": 2, "nodes": 1_500 })
+        );
+        let text = report.to_string();
+        for private in ["Alice", "/home"] {
+            assert!(!text.contains(private), "{private} in {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stopping_drops_a_send_in_progress_and_flushes_once_more() {
+        let (stop_daemon, stop) = tokio::sync::oneshot::channel();
+        let (sending, sent) = tokio::sync::oneshot::channel();
+        let mut sending = Some(sending);
+        let ticks = Cell::new(0);
+        let looping = every(
+            Duration::from_millis(1),
+            stop,
+            || ticks.set(ticks.get() + 1),
+            || {
+                if let Some(sending) = sending.take() {
+                    let _ = sending.send(());
+                }
+                std::future::pending::<()>()
+            },
+        );
+        let stopper = async {
+            sent.await.unwrap();
+            stop_daemon.send(()).unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(looping, stopper)
+        })
+        .await
+        .expect("stopping waited for the send");
+        assert_eq!(ticks.get(), 2);
     }
 }
