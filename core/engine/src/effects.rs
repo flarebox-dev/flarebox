@@ -501,9 +501,7 @@ pub(crate) fn kept_out(trees: &Trees, id: &str) -> bool {
 /// A node the planner considers: one whose only change is remote, one that is parked, one whose
 /// local position is reverted, or one whose S update waits and that R no longer has. A reverted or
 /// waiting node that R no longer has is removed only when it holds no unuploaded edit; otherwise
-/// the commit layer makes it a new node, so the edit is uploaded. A reverted node that L does not
-/// hold is created only as a folder that a node L holds needs on its way to the root: otherwise the
-/// user deleted it, and that delete is committed instead. A node whose waiting update forgets S
+/// the commit layer makes it a new node, so the edit is uploaded. A node whose waiting update forgets S
 /// ([`Trees::forget_lost`]) is never one: once the update is made, L holds a node S does not,
 /// which is created again. An excluded node is never one.
 fn candidate(trees: &Trees, id: &str) -> bool {
@@ -511,7 +509,9 @@ fn candidate(trees: &Trees, id: &str) -> bool {
     let changed = remote_only(trees, id)
         || trees.local().get(id).is_some_and(|node| node.parked)
         || (trees.reverted().contains(id)
-            && (trees.local().get(id).is_some() || holds_below(trees, id))
+            && (trees.local().get(id).is_some()
+                || holds_below(trees, id)
+                || arrives_below(trees, id))
             && (trees.remote().live(id).is_some() || !trees.edited(id)))
         || (trees.waiting().contains_key(id)
             && trees.remote().live(id).is_none()
@@ -608,6 +608,24 @@ pub fn stuck(
                 .map(|(id, root)| (id, Stuck::Behind(root))),
         );
     }
+}
+
+fn arrives_below(trees: &Trees, id: &str) -> bool {
+    let remote = trees.remote();
+    remote.iter().any(|(node, _)| {
+        if !remote_only(trees, node) || trees.excluded(node) {
+            return false;
+        }
+        let mut up = remote.live(node);
+        for _ in 0..=remote.len() {
+            match up {
+                Some(shape) if shape.parent == id => return true,
+                Some(shape) => up = remote.live(&shape.parent),
+                None => return false,
+            }
+        }
+        false
+    })
 }
 
 /// Whether L holds a node whose way to the root passes `id`. Each node on that way goes to its R
