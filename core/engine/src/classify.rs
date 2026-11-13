@@ -487,7 +487,9 @@ impl Trees {
                 old.content_rev != node.content_rev || old.meta_rev != node.meta_rev
             });
         let placed_here = no_user_change
-            && old.is_some_and(|old| old.meta_rev != node.meta_rev)
+            && old.is_some_and(|old| {
+                old.content_rev == node.content_rev && old.meta_rev != node.meta_rev
+            })
             && local.is_some_and(|local| {
                 !local.parked && synced.is_some_and(|synced| synced.same(&local.shape))
             });
@@ -842,6 +844,7 @@ impl Trees {
         self.unsent_edits.remove(id);
         self.resends.remove(id);
         self.local_changes.remove(id);
+        self.reverted.remove(id);
         if let Some(old) = self.l.remove(id) {
             if !old.parked {
                 self.l_names.remove(id, &old.shape);

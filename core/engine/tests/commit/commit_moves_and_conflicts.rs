@@ -1110,3 +1110,24 @@ fn a_delete_made_after_a_move_was_sent_goes_out_after_the_moves_own_record() {
         .cloned();
     assert_eq!(next.as_ref().map(ops), Some(vec![delete("n")]));
 }
+
+#[test]
+fn another_devices_resend_of_a_place_and_its_content_sends_nothing_back() {
+    let mut trees = trees(&[synced("n", file(ROOT, "a", 1))]);
+    trees.set_remote(
+        "n".into(),
+        RemoteNode {
+            content_rev: 2,
+            meta_rev: 2,
+            edit_rev: 1,
+            meta_edit_rev: 1,
+            ..remote(file(ROOT, "b", 2))
+        },
+    );
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let sent = commits
+        .build(&mut trees, &mut ids, NOW, HISTORY, 2)
+        .cloned();
+    assert_eq!(sent.as_ref().map(ops), None);
+}

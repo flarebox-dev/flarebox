@@ -5038,3 +5038,40 @@ fn a_folder_revived_before_its_owed_rename_is_answered_keeps_converging() {
     ]);
     world.phase(1, &steps).unwrap();
 }
+
+#[test]
+fn a_folder_deleted_on_a_device_that_hears_its_owed_rename_before_a_scan_stays_deleted() {
+    let user = |kind, target, parent, name| {
+        Step::User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text: 0,
+        })
+    };
+    let mut steps = vec![(0, folder("A")), (0, rename(0, 1, "a"))];
+    steps.extend([(0, Step::Work(0)); 5]);
+    steps.extend([(1, Step::Work(0)); 8]);
+    steps.extend([
+        (0, user(2, 0, 0, 0)),
+        (0, Step::Connect),
+        (0, Step::Work(199110312177959156)),
+        (1, user(3, 4702980891840035612, 3578894644795361832, 2)),
+        (1, user(4, 1, 0, 0)),
+        (2, user(3, 0, 0, 0)),
+        (0, Step::Work(0)),
+        (1, Step::Work(3854247624805571084)),
+        (1, Step::Work(1799778900217984966)),
+        (1, Step::Work(4891621672650151491)),
+        (2, user(0, 0, 0, 0)),
+        (1, COMMIT),
+        (0, user(0, 0, 9397246827782143146, 0)),
+        (0, user(2, 0, 0, 0)),
+        (0, Step::Work(0)),
+        (0, user(0, 0, 6206047745663626968, 0)),
+        (0, user(0, 0, 5057020370265126714, 0)),
+        (0, user(2, 0, 0, 0)),
+    ]);
+    converge(3, &[vec![(0, file("a"))], steps]).unwrap();
+}
