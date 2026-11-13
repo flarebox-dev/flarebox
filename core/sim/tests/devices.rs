@@ -3838,3 +3838,26 @@ fn a_folder_deleted_while_its_creator_writes_into_it_takes_its_own_name() {
     world.phase(1, &steps).unwrap();
     assert_eq!(names(&world), [["A", "c.txt"], ["A", "c.txt"]]);
 }
+
+#[test]
+fn a_folder_delete_superseded_behind_a_name_that_differs_only_in_case_brings_the_folder_back() {
+    let made = vec![(0, folder("a")), (2, file("C.TXT"))];
+    let filled = vec![(0, user(1, 0, 1, "ß"))];
+    let racing = vec![
+        (2, rename(2, 0, "c.txt")),
+        (2, delete(1)),
+        (0, rename(1, 1, "a")),
+        (2, Step::Work(0)),
+        (2, Step::Work(0)),
+        (0, folder("ß")),
+        (0, Step::Work(0)),
+    ];
+    let world = converge(3, &[made, filled, racing]).unwrap();
+    for device in &world.devices {
+        let mut paths: Vec<String> = (device.disk.visible().into_iter())
+            .filter_map(|ino| Some(device.disk.path(ino)?.join("/")))
+            .collect();
+        paths.sort();
+        assert_eq!(paths, ["a", "a/a", "c.txt", "ß"]);
+    }
+}

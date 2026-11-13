@@ -626,3 +626,111 @@ fn a_folder_delete_waits_while_a_resent_answer_delete_below_it_requires_the_orig
     let commit = build(&mut Commits::default(), &mut trees, &mut IdGen::new(1)).unwrap();
     assert_eq!(ops(&commit), [required]);
 }
+
+fn a_superseded_folder_delete_behind(h: LocalNode, moved_to: &str) {
+    let h_shape = h.shape.clone();
+    let mut trees = trees(&[
+        ("d", None, Some(dir(ROOT, "d")), Some(remote(dir(ROOT, "d")))),
+        (
+            "c",
+            Some(file(ROOT, moved_to, 1)),
+            Some(file("d", "c", 1)),
+            Some(remote(file("d", "c", 1))),
+        ),
+        (
+            "h",
+            Some(h_shape.clone()),
+            Some(h_shape.clone()),
+            Some(remote(h_shape)),
+        ),
+    ]);
+    trees.set_local("h".into(), h);
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    let mut sent = ops(&commit);
+    sent.sort_by_key(|op| matches!(op, op::Op::Delete(_)));
+    assert_eq!(sent, [mv("c", ROOT, moved_to), delete("d")]);
+    let results = (ops(&commit).iter())
+        .map(|op| match op {
+            op::Op::Delete(_) => outcome(op_result::Code::Superseded),
+            _ => outcome(op_result::Code::Applied),
+        })
+        .collect();
+    trees.set_remote("c".into(), remote(file(ROOT, moved_to, 1)));
+    trees.set_remote("h".into(), remote(file("d", "h", 9)));
+    acknowledge(&mut commits, &mut trees, results);
+    assert_eq!(
+        trees.waiting().keys().collect::<Vec<_>>(),
+        ["c", "d"]
+    );
+    d_comes_back_for_h(&mut commits, &mut trees, &mut ids);
+}
+
+fn d_comes_back_for_h(commits: &mut Commits, trees: &mut Trees, ids: &mut IdGen) {
+    assert_eq!(build(commits, trees, ids), None);
+    let effects = effects_for(trees, ids, "d");
+    assert!(
+        matches!(effects[..], [Effect::CreateDir { .. }]),
+        "{effects:?}"
+    );
+    assert_eq!(trees.waiting(), &Default::default());
+    let h = trees.local().get("h").unwrap();
+    assert_eq!((&h.shape, h.parked), (&file("d", "h", 9), false));
+    assert_eq!(build(commits, trees, ids), None);
+    for id in ["d", "c", "h"] {
+        assert_eq!(trees.class(id), Class::InSync, "{id}");
+    }
+}
+
+#[test]
+fn a_superseded_folder_delete_behind_a_name_that_differs_only_in_case_is_brought_back() {
+    a_superseded_folder_delete_behind(local(file(ROOT, "C.TXT", 9), 3), "c.txt");
+}
+
+#[test]
+fn a_superseded_folder_delete_behind_a_parked_file_is_brought_back() {
+    a_superseded_folder_delete_behind(
+        LocalNode {
+            parked: true,
+            ..local(file(ROOT, "y", 9), 3)
+        },
+        "y",
+    );
+}
+
+#[test]
+fn a_removed_folder_r_restored_behind_a_name_that_differs_only_in_case_is_brought_back() {
+    let mut trees = trees(&[
+        ("d", Some(dir(ROOT, "d")), Some(dir(ROOT, "d")), None),
+        ("c", Some(file(ROOT, "c.txt", 1)), Some(file("d", "c", 1)), None),
+        synced("h", file(ROOT, "C.TXT", 9)),
+    ]);
+    let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
+    let record = effects.plan(&trees, None, &mut ids, NOW).unwrap().clone();
+    assert!(
+        matches!(record.effect, Effect::RemoveDir { .. }),
+        "{record:?}"
+    );
+    trees.set_remote("d".into(), remote(dir(ROOT, "d")));
+    trees.set_remote("c".into(), remote(file("d", "c", 1)));
+    trees.set_remote("h".into(), remote(file("d", "h", 9)));
+    effects
+        .done(&mut trees, None, &record.effect_id, None)
+        .unwrap();
+    trees.settle();
+    let mut commits = Commits::default();
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("c", ROOT, "c.txt")]);
+    trees.set_remote("c".into(), remote(file(ROOT, "c.txt", 1)));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    assert_eq!(
+        trees.waiting().keys().collect::<Vec<_>>(),
+        ["c", "d"]
+    );
+    d_comes_back_for_h(&mut commits, &mut trees, &mut ids);
+}
