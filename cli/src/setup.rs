@@ -26,6 +26,7 @@ use koidrive_cloudflare::{
     Script, Secret, UploadPlan,
 };
 use koidrive_driver::Paths;
+use koidrive_ipc::{Code, Next, Request, Response};
 use koidrive_net::{Api, ApiError};
 use koidrive_proto::v1::ServerInfo;
 use tokio::signal::unix::{SignalKind, signal};
@@ -34,10 +35,10 @@ use url::Url;
 use koidrive_telemetry::schema::{SetupFlow, SetupStep};
 
 use crate::DeviceArgs;
-use crate::error::{CliError, Code};
-use crate::ipc::{self, Request, Response};
+use crate::error::CliError;
+use crate::ipc;
 use crate::printable;
-use crate::report::{Choice, ChoicesData, Done, Next};
+use crate::report::{Choice, ChoicesData, Done};
 use claim::Claim;
 use state::{SetupState, StateFile, Step};
 

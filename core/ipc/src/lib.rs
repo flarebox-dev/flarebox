@@ -1,0 +1,603 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! The protocol of the daemon's local socket and its client. A client sends one [`Request`] as a JSON line and reads
+//! one [`Response`] line back, one exchange per connection. The socket is the owner's only: [`bind`] makes its
+//! directory 0700 and the socket 0600, and [`send`] refuses a socket that another user serves.
+
+mod bind;
+
+use std::io;
+use std::path::{Path, PathBuf};
+
+use koidrive_driver::{
+    Account, Answer, Credential, FolderStatus, Paths, Question, RestoreRequest, RestoreStatus,
+    Status,
+};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+
+pub use bind::bind;
+
+/// The longest request or response line the socket accepts.
+const MAX_LINE: u64 = 16 << 20;
+
+/// The most bytes a request ID has.
+const MAX_ID: usize = 128;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "request", rename_all = "snake_case")]
+pub enum Request {
+    Status,
+    Pair {
+        server: String,
+        code: String,
+        name: String,
+    },
+    /// Claims a new server with the one-time code from its log.
+    Claim {
+        server: String,
+        code: String,
+        user_name: String,
+        name: String,
+    },
+    /// Stores the credential that `koi setup` claimed.
+    SaveCredential {
+        credential: Credential,
+    },
+    /// Removes the credential of `device_id`, which the server no longer accepts, unlinking every folder; their files
+    /// stay. Revoking the device on the server is best effort, since the server already refuses the credential. A
+    /// credential saved for another device meanwhile is kept.
+    SignOut {
+        device_id: String,
+    },
+    Link {
+        folder: PathBuf,
+        space: String,
+    },
+    Unlink {
+        folder: PathBuf,
+    },
+    Restart {
+        folder: PathBuf,
+    },
+    /// `Driver::lift`: `Lift::Replan` when `replan`, else `Lift::Resend`.
+    Lift {
+        folder: PathBuf,
+        replan: bool,
+    },
+    Questions,
+    /// `Driver::answered_question`.
+    AnsweredQuestion {
+        question_id: String,
+    },
+    Answer {
+        question_id: String,
+        answer: Answer,
+    },
+    /// Records a restore in the folder of `space_id`, for its engine to send. `space_id`, `folder` and `path`, the folder's
+    /// root and the path in it, come back in the response, so that the record of a request ID can report the restore again
+    /// when the folder is no longer linked.
+    Restore {
+        space_id: String,
+        restore: RestoreRequest,
+        folder: String,
+        path: String,
+    },
+    Restores {
+        space_id: String,
+    },
+    /// The linked folders that this process may not read.
+    Access,
+    /// Runs `run` once for `request_id`: a later request with the same ID and key gets the first response, and one
+    /// with another key fails as stale.
+    Once {
+        request_id: RequestId,
+        key: Key,
+        run: Box<Request>,
+    },
+}
+
+impl Request {
+    /// This request run once for `request_id`, or as it is without one.
+    pub fn once(self, request_id: Option<RequestId>, key: Key) -> Request {
+        match request_id {
+            Some(request_id) => Request::Once {
+                request_id,
+                key,
+                run: Box::new(self),
+            },
+            None => self,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "response", rename_all = "snake_case")]
+pub enum Response {
+    Status {
+        status: Status,
+    },
+    Paired {
+        account: Account,
+    },
+    Linked {
+        folder: FolderStatus,
+    },
+    /// The folder was already linked to the space.
+    AlreadyLinked {
+        folder: FolderStatus,
+    },
+    Unlinked {
+        space_id: String,
+        path: PathBuf,
+    },
+    /// The folder to unlink was not linked.
+    NotLinked {
+        path: PathBuf,
+    },
+    Restarted {
+        folder: FolderStatus,
+    },
+    Questions {
+        questions: Vec<Question>,
+    },
+    AnsweredQuestion {
+        question: Option<Question>,
+    },
+    Answered,
+    /// The decision was answered before with the same answer.
+    AlreadyAnswered,
+    Restore {
+        id: String,
+        space_id: String,
+        folder: String,
+        path: String,
+    },
+    Restores {
+        restores: Vec<RestoreStatus>,
+    },
+    SignedOut,
+    Access {
+        blocked: Vec<Blocked>,
+    },
+    /// A failed request. An older daemon sends only `message`, which reads as [`Code::Failed`].
+    Error {
+        message: String,
+        #[serde(default)]
+        code: Code,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        next: Vec<Next>,
+    },
+}
+
+/// What kind of failure an error is. Each code has one exit status.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Code {
+    /// No more specific code applies.
+    #[default]
+    Failed,
+    /// The arguments are invalid, or input the command needs is missing.
+    Usage,
+    /// `status --check` found a decision that needs a choice.
+    DecisionRequired,
+    /// Credentials are missing or refused, or a person must log in.
+    AuthRequired,
+    /// Sync is halted or stopped, and the command cannot go on until that is fixed.
+    Halted,
+    /// The server or the network is offline, unavailable or limits the rate for now.
+    Unavailable,
+    /// The decision answered no longer exists, or a request ID was used before with other arguments or for a pairing
+    /// code that has expired.
+    StaleDecision,
+    /// A signal stopped the command, or an earlier run with the same request ID has no recorded outcome.
+    Interrupted,
+}
+
+impl Code {
+    pub fn exit(self) -> u8 {
+        match self {
+            Code::Failed => 1,
+            Code::Usage => 2,
+            Code::DecisionRequired => 3,
+            Code::AuthRequired => 4,
+            Code::Halted => 5,
+            Code::Unavailable => 6,
+            Code::StaleDecision => 7,
+            Code::Interrupted => 130,
+        }
+    }
+
+    /// Whether the same command may succeed later without a change.
+    pub fn retryable(self) -> bool {
+        self == Code::Unavailable
+    }
+}
+
+/// A command to run next, as the arguments to pass.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Next {
+    pub argv: Vec<String>,
+}
+
+impl Next {
+    pub fn of(argv: &[&str]) -> Self {
+        Next {
+            argv: argv.iter().map(|arg| (*arg).to_owned()).collect(),
+        }
+    }
+}
+
+/// A folder that the daemon may not read, as its `access` request finds it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Blocked {
+    pub folder: String,
+    /// The read still waits after two seconds, usually because macOS is asking the person. Otherwise macOS refused it.
+    pub waiting: bool,
+}
+
+/// An ID an agent picks for one change: 1 to 128 ASCII letters, digits, `-` and `_`. IDs that differ in case are
+/// different IDs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct RequestId(String);
+
+impl RequestId {
+    /// The value parser of `--request-id`.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let shaped = (1..=MAX_ID).contains(&text.len())
+            && (text.chars()).all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        match shaped {
+            true => Ok(RequestId(text.to_owned())),
+            false => Err(format!(
+                "a request ID has 1 to {MAX_ID} ASCII letters, digits, - and _"
+            )),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for RequestId {
+    type Error = String;
+
+    fn try_from(text: String) -> Result<Self, String> {
+        RequestId::parse(&text)
+    }
+}
+
+impl From<RequestId> for String {
+    fn from(id: RequestId) -> Self {
+        id.0
+    }
+}
+
+impl std::fmt::Display for RequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// What a request ID was used for: the command path, such as `folder restart`, and its arguments, normalized. The same
+/// ID with another key is a stale request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Key {
+    pub command: String,
+    pub arguments: Value,
+}
+
+impl Key {
+    pub fn new(command: &str, arguments: Value) -> Self {
+        Key {
+            command: command.to_owned(),
+            arguments,
+        }
+    }
+
+    pub fn restart(folder: &Path) -> Self {
+        Key::new(
+            "folder restart",
+            json!({ "folder": folder.as_os_str().as_encoded_bytes() }),
+        )
+    }
+
+    pub fn retry(folder: &Path, replan: bool) -> Self {
+        Key::new(
+            "folder retry",
+            json!({
+                "folder": folder.as_os_str().as_encoded_bytes(),
+                "how": if replan { "replan" } else { "resend" },
+            }),
+        )
+    }
+
+    pub fn restore(path: &Path, version: Option<&str>, node: Option<&str>) -> Self {
+        Key::new(
+            "history restore",
+            json!({
+                "path": path.as_os_str().as_encoded_bytes(),
+                "version": version,
+                "node": node,
+            }),
+        )
+    }
+}
+
+/// Sends a request to the daemon at `socket`, or returns `None` when no daemon listens there. A socket served by
+/// anyone but the user `owner` gets nothing: requests carry pairing codes and the credential.
+pub async fn send(socket: &Path, request: &Request, owner: u32) -> io::Result<Option<Response>> {
+    let stream = match UnixStream::connect(socket).await {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let peer = stream.peer_cred()?.uid();
+    if peer != owner {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("it is served by another user (uid {peer})"),
+        ));
+    }
+    let (reader, mut writer) = stream.into_split();
+    write_line(&mut writer, request).await?;
+    let line = read_line(reader).await?;
+    serde_json::from_str(&line)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+/// Runs a request in the daemon, or returns `None` when no daemon answers on the profile's socket.
+pub async fn ask(paths: &Paths, request: &Request) -> Result<Option<Response>, String> {
+    let socket = paths.socket();
+    send(&socket, request, rustix::process::getuid().as_raw())
+        .await
+        .map_err(|error| format!("the daemon's socket {} failed: {error}", socket.display()))
+}
+
+/// Reads one line of at most the socket's line limit.
+pub async fn read_line(reader: impl tokio::io::AsyncRead + Unpin) -> io::Result<String> {
+    let mut line = String::new();
+    BufReader::new(reader.take(MAX_LINE))
+        .read_line(&mut line)
+        .await?;
+    Ok(line)
+}
+
+/// Writes `value` as one JSON line and shuts the writer down.
+pub async fn write_line(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    value: &impl Serialize,
+) -> io::Result<()> {
+    let mut line = serde_json::to_vec(value)?;
+    line.push(b'\n');
+    writer.write_all(&line).await?;
+    writer.shutdown().await
+}
+
+#[cfg(test)]
+mod tests {
+    use koidrive_driver::RestoreRequest;
+    use tokio::net::UnixListener;
+
+    use super::*;
+
+    #[test]
+    fn an_error_from_an_older_daemon_reads_as_unclassified() {
+        let response: Response =
+            serde_json::from_str(r#"{"response":"error","message":"it failed"}"#).unwrap();
+        assert_eq!(
+            response,
+            Response::Error {
+                message: "it failed".into(),
+                code: Code::Failed,
+                next: Vec::new(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_socket_served_by_another_user_gets_no_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let daemon = UnixListener::bind(&socket).unwrap();
+        let received = tokio::spawn(async move {
+            let (stream, _) = daemon.accept().await.unwrap();
+            read_line(stream).await.unwrap()
+        });
+        let someone_else = rustix::process::getuid().as_raw() + 1;
+        let request = Request::Pair {
+            server: "https://example.com".into(),
+            code: "AAAA-BBBB".into(),
+            name: "laptop".into(),
+        };
+        let error = send(&socket, &request, someone_else).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("another user"), "{error}");
+        assert_eq!(received.await.unwrap(), "");
+    }
+
+    #[test]
+    fn requests_are_tagged_json() {
+        let request = Request::Answer {
+            question_id: "q1".into(),
+            answer: Answer::Restore,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            json,
+            r#"{"request":"answer","question_id":"q1","answer":"restore"}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+
+        let request = Request::Restore {
+            space_id: "s1".into(),
+            restore: RestoreRequest::Version {
+                node_id: "n1".into(),
+                version_id: "v1".into(),
+            },
+            folder: "/home/ada/Docs".into(),
+            path: "a.txt".into(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            json,
+            r#"{"request":"restore","space_id":"s1","restore":{"type":"version","node_id":"n1","version_id":"v1"},"folder":"/home/ada/Docs","path":"a.txt"}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+    }
+
+    #[test]
+    fn the_wire_format_is_pinned() {
+        fn pinned<T>(value: T, json: &str)
+        where
+            T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+        {
+            assert_eq!(serde_json::to_string(&value).unwrap(), json);
+            assert_eq!(serde_json::from_str::<T>(json).unwrap(), value);
+        }
+        pinned(Request::Status, r#"{"request":"status"}"#);
+        pinned(
+            Request::Pair {
+                server: "https://files.example.com".into(),
+                code: "AAAA-BBBB".into(),
+                name: "laptop".into(),
+            },
+            r#"{"request":"pair","server":"https://files.example.com","code":"AAAA-BBBB","name":"laptop"}"#,
+        );
+        pinned(
+            Request::SaveCredential {
+                credential: Credential {
+                    server: "https://files.example.com".into(),
+                    user_id: "u1".into(),
+                    user_name: None,
+                    device_id: "d1".into(),
+                    device_name: "laptop".into(),
+                    refresh_credential: "secret".into(),
+                },
+            },
+            r#"{"request":"save_credential","credential":{"server":"https://files.example.com","user_id":"u1","device_id":"d1","device_name":"laptop","refresh_credential":"secret"}}"#,
+        );
+        pinned(
+            Request::Lift {
+                folder: "/home/ada/Docs".into(),
+                replan: true,
+            },
+            r#"{"request":"lift","folder":"/home/ada/Docs","replan":true}"#,
+        );
+        pinned(
+            Request::Restart {
+                folder: "/a".into(),
+            }
+            .once(
+                Some(RequestId::parse("r1").unwrap()),
+                Key::restart(Path::new("/a")),
+            ),
+            r#"{"request":"once","request_id":"r1","key":{"command":"folder restart","arguments":{"folder":[47,97]}},"run":{"request":"restart","folder":"/a"}}"#,
+        );
+        pinned(Request::Access, r#"{"request":"access"}"#);
+
+        pinned(
+            Response::Status {
+                status: Status {
+                    account: Some(Account {
+                        server: "https://files.example.com".into(),
+                        user_id: "u1".into(),
+                        user_name: Some("Ada".into()),
+                        device_id: "d1".into(),
+                        device_name: "laptop".into(),
+                    }),
+                    running: true,
+                    folders: Vec::new(),
+                },
+            },
+            r#"{"response":"status","status":{"account":{"server":"https://files.example.com","user_id":"u1","user_name":"Ada","device_id":"d1","device_name":"laptop"},"running":true,"folders":[]}}"#,
+        );
+        pinned(
+            Response::Unlinked {
+                space_id: "s1".into(),
+                path: "/home/ada/Docs".into(),
+            },
+            r#"{"response":"unlinked","space_id":"s1","path":"/home/ada/Docs"}"#,
+        );
+        pinned(
+            Response::AnsweredQuestion { question: None },
+            r#"{"response":"answered_question","question":null}"#,
+        );
+        pinned(
+            Response::AlreadyAnswered,
+            r#"{"response":"already_answered"}"#,
+        );
+        pinned(
+            Response::Access {
+                blocked: vec![Blocked {
+                    folder: "/home/ada/Documents".into(),
+                    waiting: true,
+                }],
+            },
+            r#"{"response":"access","blocked":[{"folder":"/home/ada/Documents","waiting":true}]}"#,
+        );
+        pinned(
+            Response::Error {
+                message: "no unanswered question has the id \"q1\"".into(),
+                code: Code::StaleDecision,
+                next: vec![Next::of(&["koi", "resolve", "--json"])],
+            },
+            r#"{"response":"error","message":"no unanswered question has the id \"q1\"","code":"stale_decision","next":[{"argv":["koi","resolve","--json"]}]}"#,
+        );
+        pinned(
+            Response::Error {
+                message: "it failed".into(),
+                code: Code::Failed,
+                next: Vec::new(),
+            },
+            r#"{"response":"error","message":"it failed","code":"failed"}"#,
+        );
+    }
+
+    #[test]
+    fn every_code_has_its_exit_status_and_only_unavailable_is_retryable() {
+        let all = [
+            (Code::Failed, 1, "failed"),
+            (Code::Usage, 2, "usage"),
+            (Code::DecisionRequired, 3, "decision_required"),
+            (Code::AuthRequired, 4, "auth_required"),
+            (Code::Halted, 5, "halted"),
+            (Code::Unavailable, 6, "unavailable"),
+            (Code::StaleDecision, 7, "stale_decision"),
+            (Code::Interrupted, 130, "interrupted"),
+        ];
+        for (code, exit, name) in all {
+            assert_eq!(code.exit(), exit, "{code:?}");
+            assert_eq!(serde_json::to_value(code).unwrap(), name);
+            assert_eq!(code.retryable(), code == Code::Unavailable, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn a_request_id_is_a_file_name() {
+        for good in [
+            "r1",
+            "019b2c4e-7d1f-7000-8000-000000000001",
+            "deploy_2",
+            &"a".repeat(128),
+        ] {
+            assert!(RequestId::parse(good).is_ok(), "{good}");
+        }
+        for bad in ["", "..", "a/b", "a.json", "r 1", "ré", &"a".repeat(129)] {
+            assert!(RequestId::parse(bad).is_err(), "{bad:?}");
+        }
+        assert!(serde_json::from_value::<RequestId>(json!("../x")).is_err());
+    }
+}

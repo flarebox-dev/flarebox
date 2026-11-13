@@ -1235,6 +1235,7 @@ dependencies = [
  "koidrive-cloudflare",
  "koidrive-driver",
  "koidrive-engine",
+ "koidrive-ipc",
  "koidrive-net",
  "koidrive-proto",
  "koidrive-store",
@@ -1362,6 +1363,19 @@ dependencies = [
  "proptest",
  "tempfile",
  "unicode-normalization",
+]
+
+[[package]]
+name = "koidrive-ipc"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "koidrive-driver",
+ "rustix",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

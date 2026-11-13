@@ -14,6 +14,7 @@ use koidrive_driver::{
     RestoreState, RestoreStatus, RestoreWait,
 };
 use koidrive_engine::names::name_key;
+use koidrive_ipc::{Key, Request, RequestId, Response};
 use koidrive_net::Auth;
 use koidrive_proto::v1::{
     ListTrash, ListTree, ListVersions, NodeKind, NodeState, VersionInfo, rpc_request::Call,
@@ -21,12 +22,12 @@ use koidrive_proto::v1::{
 };
 
 use crate::error::CliError;
-use crate::ipc::{self, Request, Response};
+use crate::ipc;
 use crate::report::{
     Done, NodeType, Outcome, RequestData, RequestsData, RestoreAskedData, TrashData, TrashEntry,
     VersionData, VersionsData,
 };
-use crate::request::{self, Key, RequestId};
+use crate::request;
 use crate::{ago, now_ms, printable, signed_in, size, unexpected};
 
 /// The most entries asked for in one page; the server sends at most this many.
@@ -427,7 +428,7 @@ fn trashed_at<'a>(
 /// The folders the profile links, from the daemon, or from the profile's stores read without writing anything when no
 /// daemon runs.
 async fn linked_folders(paths: &Paths) -> Result<Vec<FolderStatus>, CliError> {
-    match ipc::ask(paths, &Request::Status).await? {
+    match koidrive_ipc::ask(paths, &Request::Status).await? {
         Some(Response::Status { status }) => Ok(status.folders),
         Some(other) => Err(unexpected(other)),
         None => Driver::linked_folders(paths).map_err(|error| match error {
@@ -1139,7 +1140,7 @@ mod tests {
         assert_eq!(done.text, "restore-1\n");
         assert_eq!(
             done.next,
-            [crate::report::Next::of(&[
+            [koidrive_ipc::Next::of(&[
                 "koi",
                 "history",
                 "requests",
@@ -1157,7 +1158,7 @@ mod tests {
         };
         drop(claim);
         let error = restore_again(&paths, &root, "going").await.unwrap_err();
-        assert_eq!(error.code, crate::error::Code::Interrupted, "{error:?}");
+        assert_eq!(error.code, koidrive_ipc::Code::Interrupted, "{error:?}");
 
         let called =
             tokio::time::timeout(std::time::Duration::from_millis(100), silent.accept()).await;
@@ -1186,10 +1187,10 @@ mod tests {
 
         assert_eq!(
             trashed.code,
-            crate::error::Code::AuthRequired,
+            koidrive_ipc::Code::AuthRequired,
             "{trashed:?}"
         );
-        assert_eq!(kept.code, crate::error::Code::AuthRequired, "{kept:?}");
+        assert_eq!(kept.code, koidrive_ipc::Code::AuthRequired, "{kept:?}");
         assert!(!dir.path().join("profile").exists());
     }
 

@@ -9,12 +9,13 @@ use koidrive_driver::{
     RestoreRejection, RestoreRequest, RestoreState, RestoreStatus, RestoreWait, Status, Wait,
     WaitKind,
 };
+use koidrive_ipc::{Code, Next};
 use koidrive_proto::v1::{DeviceInfo, SpaceInfo, SpaceUsage, device_info::Kind};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
-use crate::error::{CliError, Code};
+use crate::error::CliError;
 
 /// The only schema `--json` speaks.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -29,20 +30,6 @@ pub enum Outcome {
     /// The state the command asks for already held, or the command repeated an accepted answer, so nothing changed.
     Unchanged,
     Error,
-}
-
-/// A command to run next, as the arguments to pass.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct Next {
-    pub argv: Vec<String>,
-}
-
-impl Next {
-    pub fn of(argv: &[&str]) -> Self {
-        Next {
-            argv: argv.iter().map(|arg| (*arg).to_owned()).collect(),
-        }
-    }
 }
 
 /// What a finished command produced: the text it prints without `--json`, and the data, decisions and next commands

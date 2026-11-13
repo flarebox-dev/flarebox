@@ -18,99 +18,12 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 use koidrive_driver::Paths;
+use koidrive_ipc::{Code, Key, RequestId};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::error::{CliError, Code};
-
-/// The most bytes a request ID has.
-const MAX_ID: usize = 128;
-
-/// An ID an agent picks for one change: 1 to 128 ASCII letters, digits, `-` and `_`. IDs that differ in case are
-/// different IDs.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct RequestId(String);
-
-impl RequestId {
-    /// The value parser of `--request-id`.
-    pub fn parse(text: &str) -> Result<Self, String> {
-        let shaped = (1..=MAX_ID).contains(&text.len())
-            && (text.chars()).all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-        match shaped {
-            true => Ok(RequestId(text.to_owned())),
-            false => Err(format!(
-                "a request ID has 1 to {MAX_ID} ASCII letters, digits, - and _"
-            )),
-        }
-    }
-}
-
-impl TryFrom<String> for RequestId {
-    type Error = String;
-
-    fn try_from(text: String) -> Result<Self, String> {
-        RequestId::parse(&text)
-    }
-}
-
-impl From<RequestId> for String {
-    fn from(id: RequestId) -> Self {
-        id.0
-    }
-}
-
-impl std::fmt::Display for RequestId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// What a request ID was used for: the command path, such as `folder restart`, and its arguments, normalized. The same
-/// ID with another key is a stale request.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Key {
-    pub command: String,
-    pub arguments: Value,
-}
-
-impl Key {
-    pub fn new(command: &str, arguments: Value) -> Self {
-        Key {
-            command: command.to_owned(),
-            arguments,
-        }
-    }
-
-    pub fn restart(folder: &Path) -> Self {
-        Key::new(
-            "folder restart",
-            json!({ "folder": folder.as_os_str().as_encoded_bytes() }),
-        )
-    }
-
-    pub fn retry(folder: &Path, replan: bool) -> Self {
-        Key::new(
-            "folder retry",
-            json!({
-                "folder": folder.as_os_str().as_encoded_bytes(),
-                "how": if replan { "replan" } else { "resend" },
-            }),
-        )
-    }
-
-    pub fn restore(path: &Path, version: Option<&str>, node: Option<&str>) -> Self {
-        Key::new(
-            "history restore",
-            json!({
-                "path": path.as_os_str().as_encoded_bytes(),
-                "version": version,
-                "node": node,
-            }),
-        )
-    }
-}
+use crate::error::CliError;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Record {
@@ -205,7 +118,7 @@ impl Claim {
 }
 
 pub(crate) fn request_file(paths: &Paths, id: &RequestId) -> PathBuf {
-    let name: String = (Sha256::digest(id.0.as_bytes()).iter())
+    let name: String = (Sha256::digest(id.as_str().as_bytes()).iter())
         .map(|byte| format!("{byte:02x}"))
         .collect();
     paths.requests().join(format!("{name}.json"))
@@ -238,6 +151,8 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
 
+    use serde_json::json;
+
     use super::*;
 
     fn id(text: &str) -> RequestId {
@@ -250,22 +165,6 @@ mod tests {
 
     fn mode(path: &Path) -> u32 {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
-    }
-
-    #[test]
-    fn a_request_id_is_a_file_name() {
-        for good in [
-            "r1",
-            "019b2c4e-7d1f-7000-8000-000000000001",
-            "deploy_2",
-            &"a".repeat(128),
-        ] {
-            assert!(RequestId::parse(good).is_ok(), "{good}");
-        }
-        for bad in ["", "..", "a/b", "a.json", "r 1", "ré", &"a".repeat(129)] {
-            assert!(RequestId::parse(bad).is_err(), "{bad:?}");
-        }
-        assert!(serde_json::from_value::<RequestId>(json!("../x")).is_err());
     }
 
     #[test]
@@ -400,7 +299,7 @@ mod tests {
         );
         assert_eq!(
             error.next,
-            [crate::report::Next::of(&["koi", "status", "--json"])]
+            [koidrive_ipc::Next::of(&["koi", "status", "--json"])]
         );
     }
 

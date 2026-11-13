@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use koidrive_cloudflare::Secret;
 use koidrive_driver::{Credential, Paths};
+use koidrive_ipc::{Request, Response};
 use koidrive_net::ApiError;
 use koidrive_proto::v1::ClaimRequest;
 use koidrive_proto::v1::error::Code;
@@ -15,7 +16,7 @@ use koidrive_proto::v1::error::Code;
 use super::state::{SetupState, StateFile};
 use super::{Cloud, Found, Session, report_paired, server_api};
 use crate::error::CliError;
-use crate::ipc::{self, Request, Response};
+use crate::ipc;
 use url::Url;
 
 pub const KEY_NAME: &str = "KOIDRIVE_RECOVERY_KEY";
@@ -187,7 +188,7 @@ impl<'a> Claim<'a> {
             };
             if started.elapsed() + wait > window {
                 return Err(CliError::new(
-                    crate::error::Code::Unavailable,
+                    koidrive_ipc::Code::Unavailable,
                     format!(
                         "the server did not accept the claim within {} seconds; run the command again to continue",
                         window.as_secs()
@@ -346,7 +347,7 @@ mod tests {
                 .unwrap();
             let refusal = Response::Error {
                 message: "the disk is full".into(),
-                code: crate::error::Code::Failed,
+                code: koidrive_ipc::Code::Failed,
                 next: Vec::new(),
             };
             let line = format!("{}\n", serde_json::to_string(&refusal).unwrap());
