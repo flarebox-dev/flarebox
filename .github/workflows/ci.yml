@@ -642,6 +642,8 @@ jobs:
           fetch-depth: 2
       - name: Test the new-comment check
         run: python3 scripts/test-check-new-comments.py -v
+      - name: Test the design-document splitter
+        run: python3 scripts/test-split-sync-design.py -v
       - name: Fail on comments that this change adds
         env:
           EVENT: ${{ github.event_name }}
@@ -653,8 +655,6 @@ jobs:
             BASE=$(git rev-parse HEAD^1)
           fi
           python3 scripts/check-new-comments.py "$BASE" HEAD
-      - name: Test the design-document splitter
-        run: python3 scripts/test-split-sync-design.py -v
 
   ci-report:
     name: ci-report
