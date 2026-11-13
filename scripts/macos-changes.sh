@@ -36,13 +36,12 @@ normalize() {
 
 includes="$(
   for rev in "$base" "$head"; do
-    git grep -I -o -E 'include!\("[^"]+"\)' "$rev" -- '*.rs' || true
-  done | awk '{
-    sub(/^[^:]*:/, "")
-    i = index($0, ":include!(\"")
-    printf "%s\t%s\n", substr($0, 1, i - 1), substr($0, i + 11, length($0) - i - 12)
-  }' | while IFS=$'\t' read -r includer included; do
-    printf '%s\t%s\n' "$includer" "$(normalize "$(dirname "$includer")/$included")"
+    git grep -l -I -E 'include!' "$rev" -- '*.rs' || true
+  done | while IFS= read -r entry; do
+    includer=${entry#*:}
+    git show "$entry" | perl -0777 -ne 'print "$1\n" while /include!\s*\(\s*"([^"]+)"\s*\)/g' | while IFS= read -r included; do
+      printf '%s\t%s\n' "$includer" "$(normalize "$(dirname "$includer")/$included")"
+    done
   done | sort -u
 )"
 
