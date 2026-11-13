@@ -16,8 +16,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::classify::Waiting;
 use crate::commit::{Halt, InFlight};
 use crate::effects::{Effect, EffectRecord};
-use crate::guard::GuardState;
-use crate::question::Question;
+use crate::guard::{Counted, GuardState, RemoteDeletion};
+use crate::question::{Held, Limit, Question};
 use crate::restore::{Resolved, RestoreId, RestoreIntent};
 use crate::tree::{FileIdentity, NodeId, Shape, TreeError};
 
@@ -163,6 +163,224 @@ pub struct EffectsState {
     pub cleared: u64,
     /// The effect that failed last for each blocked node.
     pub failed: BTreeMap<NodeId, Effect>,
+}
+
+/// What changed in a set since its changes were last taken: each key whose membership changed,
+/// with whether the set holds it now.
+pub type SetChanges<K> = Vec<(K, bool)>;
+
+/// What changed in a map since its changes were last taken: each key whose value changed, with
+/// its value now, or `None` when the map no longer holds the key.
+pub type MapChanges<K, V> = Vec<(K, Option<V>)>;
+
+/// What changed in [`TreesState`] since the changes were last taken
+/// ([`Trees::take_changes`](crate::classify::Trees::take_changes)), field by field.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TreesChanges {
+    pub dirty: SetChanges<NodeId>,
+    pub unsearched: SetChanges<NodeId>,
+    pub reverted: SetChanges<NodeId>,
+    pub parked_as: MapChanges<NodeId, NodeId>,
+    pub waiting: MapChanges<NodeId, Waiting>,
+    pub watched: MapChanges<NodeId, bool>,
+    pub watched_positions: MapChanges<NodeId, Option<Agreed>>,
+    pub trashed_here: MapChanges<NodeId, u64>,
+    pub discarded: MapChanges<NodeId, Shape>,
+    pub outside: SetChanges<NodeId>,
+    pub lost: SetChanges<NodeId>,
+    pub displaced: MapChanges<NodeId, FileIdentity>,
+    pub edited_here: MapChanges<NodeId, u64>,
+    pub moved_here: MapChanges<NodeId, MovedHere>,
+    pub past_positions: MapChanges<NodeId, Vec<Agreed>>,
+    pub unsent_edits: SetChanges<NodeId>,
+    pub replaced_versions: MapChanges<NodeId, Vec<String>>,
+    pub resends: SetChanges<NodeId>,
+    pub kept_originals: MapChanges<NodeId, NodeId>,
+}
+
+impl TreesChanges {
+    /// The changes that take `before` to `after`.
+    pub fn between(before: &TreesState, after: &TreesState) -> Self {
+        let TreesState {
+            dirty,
+            unsearched,
+            reverted,
+            parked_as,
+            waiting,
+            watched,
+            watched_positions,
+            trashed_here,
+            discarded,
+            outside,
+            lost,
+            displaced,
+            edited_here,
+            moved_here,
+            past_positions,
+            unsent_edits,
+            replaced_versions,
+            resends,
+            kept_originals,
+        } = after;
+        Self {
+            dirty: set_changes(&before.dirty, dirty),
+            unsearched: set_changes(&before.unsearched, unsearched),
+            reverted: set_changes(&before.reverted, reverted),
+            parked_as: map_changes(&before.parked_as, parked_as),
+            waiting: map_changes(&before.waiting, waiting),
+            watched: map_changes(&before.watched, watched),
+            watched_positions: map_changes(&before.watched_positions, watched_positions),
+            trashed_here: map_changes(&before.trashed_here, trashed_here),
+            discarded: map_changes(&before.discarded, discarded),
+            outside: set_changes(&before.outside, outside),
+            lost: set_changes(&before.lost, lost),
+            displaced: map_changes(&before.displaced, displaced),
+            edited_here: map_changes(&before.edited_here, edited_here),
+            moved_here: map_changes(&before.moved_here, moved_here),
+            past_positions: map_changes(&before.past_positions, past_positions),
+            unsent_edits: set_changes(&before.unsent_edits, unsent_edits),
+            replaced_versions: map_changes(&before.replaced_versions, replaced_versions),
+            resends: set_changes(&before.resends, resends),
+            kept_originals: map_changes(&before.kept_originals, kept_originals),
+        }
+    }
+}
+
+/// What changed in [`CommitsState`] since the changes were last taken
+/// ([`Commits::take_changes`](crate::commit::Commits::take_changes)). A value the store keeps
+/// whole is `Some` when it changed.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CommitsChanges {
+    pub accepted: Option<u64>,
+    pub in_flight: Option<Option<InFlight>>,
+    pub problems: SetChanges<NodeId>,
+    pub halted: Option<Option<Halt>>,
+    pub cap: Option<Option<usize>>,
+    pub split: SetChanges<NodeId>,
+    pub aliases: MapChanges<NodeId, NodeId>,
+    pub restores: Option<BTreeMap<RestoreId, RestoreIntent>>,
+    pub resolved: Option<Vec<Resolved>>,
+    pub slots: MapChanges<u64, u64>,
+    pub questions: Option<Vec<Question>>,
+    pub published: SetChanges<NodeId>,
+    pub pending: MapChanges<NodeId, Pending>,
+    pub guard: GuardChanges,
+}
+
+impl CommitsChanges {
+    /// The changes that take `before` to `after`.
+    pub fn between(before: &CommitsState, after: &CommitsState) -> Self {
+        let CommitsState {
+            accepted,
+            in_flight,
+            problems,
+            halted,
+            cap,
+            split,
+            aliases,
+            restores,
+            resolved,
+            slots,
+            questions,
+            published,
+            pending,
+            guard,
+        } = after;
+        Self {
+            accepted: value_change(&before.accepted, accepted),
+            in_flight: value_change(&before.in_flight, in_flight),
+            problems: set_changes(&before.problems, problems),
+            halted: value_change(&before.halted, halted),
+            cap: value_change(&before.cap, cap),
+            split: set_changes(&before.split, split),
+            aliases: map_changes(&before.aliases, aliases),
+            restores: value_change(&before.restores, restores),
+            resolved: value_change(&before.resolved, resolved),
+            slots: map_changes(&before.slots, slots),
+            questions: value_change(&before.questions, questions),
+            published: set_changes(&before.published, published),
+            pending: map_changes(&before.pending, pending),
+            guard: GuardChanges::between(&before.guard, guard),
+        }
+    }
+}
+
+/// What changed in [`GuardState`] since the changes were last taken.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GuardChanges {
+    pub ledger: MapChanges<NodeId, Counted>,
+    pub confirmed: MapChanges<NodeId, Held>,
+    pub confirmed_limits: Option<BTreeSet<Limit>>,
+    pub remote: MapChanges<RemoteDeletion, Counted>,
+    pub dismissed: SetChanges<RemoteDeletion>,
+}
+
+impl GuardChanges {
+    /// The changes that take `before` to `after`.
+    pub fn between(before: &GuardState, after: &GuardState) -> Self {
+        let GuardState {
+            ledger,
+            confirmed,
+            confirmed_limits,
+            remote,
+            dismissed,
+        } = after;
+        Self {
+            ledger: map_changes(&before.ledger, ledger),
+            confirmed: map_changes(&before.confirmed, confirmed),
+            confirmed_limits: value_change(&before.confirmed_limits, confirmed_limits),
+            remote: map_changes(&before.remote, remote),
+            dismissed: set_changes(&before.dismissed, dismissed),
+        }
+    }
+}
+
+/// What changed in [`EffectsState`] since the changes were last taken
+/// ([`Effects::take_changes`](crate::effects::Effects::take_changes)).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EffectsChanges {
+    pub in_flight: Option<Option<EffectRecord>>,
+    pub cleared: Option<u64>,
+    pub failed: MapChanges<NodeId, Effect>,
+}
+
+impl EffectsChanges {
+    /// The changes that take `before` to `after`.
+    pub fn between(before: &EffectsState, after: &EffectsState) -> Self {
+        let EffectsState {
+            in_flight,
+            cleared,
+            failed,
+        } = after;
+        Self {
+            in_flight: value_change(&before.in_flight, in_flight),
+            cleared: value_change(&before.cleared, cleared),
+            failed: map_changes(&before.failed, failed),
+        }
+    }
+}
+
+fn set_changes<K: Ord + Clone>(before: &BTreeSet<K>, after: &BTreeSet<K>) -> SetChanges<K> {
+    (before.symmetric_difference(after))
+        .map(|key| (key.clone(), after.contains(key)))
+        .collect()
+}
+
+fn map_changes<K: Ord + Clone, V: Clone + PartialEq>(
+    before: &BTreeMap<K, V>,
+    after: &BTreeMap<K, V>,
+) -> MapChanges<K, V> {
+    let keys: BTreeSet<&K> = before.keys().chain(after.keys()).collect();
+    (keys.into_iter())
+        .filter_map(|key| {
+            let value = after.get(key);
+            (before.get(key) != value).then(|| (key.clone(), value.cloned()))
+        })
+        .collect()
+}
+
+fn value_change<T: Clone + PartialEq>(before: &T, after: &T) -> Option<T> {
+    (before != after).then(|| after.clone())
 }
 
 /// An invariant a restored state breaks.

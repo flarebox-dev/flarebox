@@ -25,7 +25,7 @@ use koidrive_fs::{Entry, EntryKind, FileId, Known, Snapshot};
 use koidrive_proto::v1::{
     CaughtUp, ChangeRecord, CommitRecord, NodeKind, NodeState, TrashPage, TreePage, change_record,
 };
-use koidrive_store::{Cursor, EngineState, Error, StoredQuestion, SyncedNode, Tx};
+use koidrive_store::{Cursor, EngineChanges, Error, StoredQuestion, SyncedNode, Tx};
 
 use crate::disk::Stop;
 use crate::observe::{Observed, Reset, RulesChange};
@@ -38,8 +38,8 @@ pub(crate) struct Engine {
     pub ids: IdGen,
     /// The history R belongs to and the seq of the last commit R holds. `None` until the first bootstrap.
     pub cursor: Option<Cursor>,
-    /// The engine state as the store holds it, which the next checkpoint changes row by row.
-    pub stored: EngineState,
+    /// The open questions as the store holds them, which [`Engine::ask`] compares with the engine's.
+    pub stored_questions: Vec<engine::Question>,
     /// Whether [`Engine::ask`] changed the stored questions since the folder last showed them, also when their
     /// number did not, as when a question is asked again under a new id or a notice's counts grow.
     pub asked: bool,
@@ -82,14 +82,15 @@ impl Engine {
         }
         let stored = tx.engine_state()?;
         trees
-            .restore(stored.trees.clone())
+            .restore(stored.trees)
             .map_err(|error| invalid(format!("{error:?}")))?;
         trees.take_changed();
-        let commits = Commits::from_state(stored.commits.clone())
-            .map_err(|error| invalid(format!("{error:?}")))?;
+        let stored_questions = stored.commits.questions.clone();
+        let commits =
+            Commits::from_state(stored.commits).map_err(|error| invalid(format!("{error:?}")))?;
         commits.hold(&mut trees);
-        let effects = Effects::from_state(stored.effects.clone())
-            .map_err(|error| invalid(format!("{error:?}")))?;
+        let effects =
+            Effects::from_state(stored.effects).map_err(|error| invalid(format!("{error:?}")))?;
         let ids = match tx.id_generator()? {
             Some(bytes) => {
                 let state = <[u8; 8]>::try_from(bytes.as_slice()).map_err(|_| {
@@ -108,7 +109,7 @@ impl Engine {
             commits,
             ids,
             cursor: tx.cursor()?,
-            stored,
+            stored_questions,
             asked: false,
             recovery_cause: None,
             unscanned: None,
@@ -138,13 +139,15 @@ impl Engine {
                 }
             }
         }
-        let state = EngineState {
-            trees: self.trees.state(),
-            commits: self.commits.state(),
-            effects: self.effects.state(),
+        let changes = EngineChanges {
+            trees: self.trees.take_changes(),
+            commits: self.commits.take_changes(),
+            effects: self.effects.take_changes(),
         };
-        tx.update_engine_state(&self.stored, &state)?;
-        self.stored = state;
+        tx.write_engine_changes(&changes)?;
+        if let Some(questions) = changes.commits.questions {
+            self.stored_questions = questions;
+        }
         tx.set_id_generator(&self.ids.state.to_le_bytes())
     }
 
@@ -174,7 +177,7 @@ impl Engine {
     /// question whose answer the engine dropped, as it does for a conflict whose answer the server refused, is shown
     /// again without it. A conflict is shown again when the paths of its files change, as when a folder above them is renamed.
     pub fn ask(&mut self, tx: &Tx<'_>, space_id: &str) -> Result<(), Error> {
-        let asked = &self.stored.commits.questions;
+        let asked = &self.stored_questions;
         let asking = self.commits.questions();
         let open = |questions: &[engine::Question], id: &str| questions.iter().any(|q| q.id == id);
         let mut changed = false;
@@ -1435,6 +1438,9 @@ fn same_kind(before: &engine::QuestionKind, after: &engine::QuestionKind) -> boo
 }
 
 #[cfg(test)]
+mod first_sync;
+
+#[cfg(test)]
 mod tests {
     use koidrive_engine::commit::InFlight;
     use koidrive_engine::effects::{Base, Effect, EffectRecord, Location};
@@ -1444,7 +1450,7 @@ mod tests {
     use std::fs;
 
     use koidrive_fs::Change;
-    use koidrive_store::Store;
+    use koidrive_store::{EngineState, Store};
     use proptest::prelude::*;
 
     use super::*;
@@ -1718,12 +1724,16 @@ mod tests {
             };
             store
                 .transaction(|tx| {
+                    let before = tx.engine_state()?;
+                    let after = EngineState {
+                        commits: CommitsState {
+                            questions: vec![asking.clone()],
+                            ..Default::default()
+                        },
+                        ..before.clone()
+                    };
+                    tx.update_engine_state(&before, &after)?;
                     let mut engine = Engine::load(tx, ROOT)?;
-                    engine.commits = Commits::from_state(CommitsState {
-                        questions: vec![asking.clone()],
-                        ..Default::default()
-                    })
-                    .unwrap();
                     engine.recovery_cause = cause.clone();
                     engine.ask(tx, ROOT)?;
                     engine.checkpoint(tx)?;
@@ -1733,8 +1743,14 @@ mod tests {
             store
                 .transaction(|tx| {
                     let mut engine = Engine::load(tx, ROOT)?;
+                    let before = tx.engine_state()?;
                     let mut state = engine.commits.state();
                     state.questions[0].id = "recovery-2".into();
+                    let after = EngineState {
+                        commits: state.clone(),
+                        ..before.clone()
+                    };
+                    tx.update_engine_state(&before, &after)?;
                     engine.commits = Commits::from_state(state).unwrap();
                     engine.ask(tx, ROOT)?;
                     let rows = tx.questions()?;
@@ -1782,7 +1798,7 @@ mod tests {
         store
             .transaction(|tx| {
                 let mut engine = Engine::load(tx, ROOT)?;
-                engine.stored.commits.questions = vec![answered];
+                engine.stored_questions = vec![answered];
                 engine.commits = Commits::from_state(CommitsState {
                     questions: vec![asking],
                     ..Default::default()
@@ -1892,7 +1908,7 @@ mod tests {
             commits: Commits::default(),
             ids,
             cursor: None,
-            stored: EngineState::default(),
+            stored_questions: Vec::new(),
             asked: false,
             recovery_cause: None,
             unscanned: None,

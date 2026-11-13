@@ -8,7 +8,8 @@ use koidrive_ignore::Status;
 
 use crate::ignore::{LocalRules, Matcher, RuleFile, is_rules_file};
 use crate::names::name_key;
-use crate::state::{Agreed, MovedHere, StateError, TreesState};
+use crate::state::{Agreed, MovedHere, StateError, TreesChanges, TreesState};
+use crate::tracked::{TrackedMap, TrackedSet};
 use crate::tree::{
     Content, FileIdentity, Kind, LocalNode, Names, Node, NodeId, RemoteNode, Shape, Tree,
     TreeError, same, same_content,
@@ -181,40 +182,40 @@ pub struct Trees {
     held_trash: BTreeMap<String, u64>,
     /// The nodes R holds trashed, counted by trash group.
     trashed: BTreeMap<String, u64>,
-    dirty: BTreeSet<NodeId>,
-    unsearched: BTreeSet<NodeId>,
-    reverted: BTreeSet<NodeId>,
-    parked_as: BTreeMap<NodeId, NodeId>,
-    waiting: BTreeMap<NodeId, Waiting>,
+    dirty: TrackedSet<NodeId>,
+    unsearched: TrackedSet<NodeId>,
+    reverted: TrackedSet<NodeId>,
+    parked_as: TrackedMap<NodeId, NodeId>,
+    waiting: TrackedMap<NodeId, Waiting>,
     /// The nodes whose content the commit in flight creates or updates, each with whether S's content
     /// changed since the commit was built.
-    watched: BTreeMap<NodeId, bool>,
+    watched: TrackedMap<NodeId, bool>,
     /// The nodes the commit in flight creates or moves, each with the latest position L and R
     /// agreed on since the commit was built.
-    watched_positions: BTreeMap<NodeId, Option<Agreed>>,
+    watched_positions: TrackedMap<NodeId, Option<Agreed>>,
     /// The nodes a delete of this device trashed, each with the seq of its commit, while R holds
     /// them trashed by that commit.
-    trashed_here: BTreeMap<NodeId, u64>,
+    trashed_here: TrackedMap<NodeId, u64>,
     /// See [`TreesState::discarded`].
-    discarded: BTreeMap<NodeId, Shape>,
+    discarded: TrackedMap<NodeId, Shape>,
     /// The files whose content an edit of this device set, each with the seq of its commit, while
     /// R holds that content.
-    edited_here: BTreeMap<NodeId, u64>,
-    moved_here: BTreeMap<NodeId, MovedHere>,
-    past_positions: BTreeMap<NodeId, Vec<Agreed>>,
+    edited_here: TrackedMap<NodeId, u64>,
+    moved_here: TrackedMap<NodeId, MovedHere>,
+    past_positions: TrackedMap<NodeId, Vec<Agreed>>,
     /// See [`TreesState::unsent_edits`].
-    unsent_edits: BTreeSet<NodeId>,
-    replaced_versions: BTreeMap<NodeId, Vec<String>>,
-    resends: BTreeSet<NodeId>,
-    kept_originals: BTreeMap<NodeId, NodeId>,
+    unsent_edits: TrackedSet<NodeId>,
+    replaced_versions: TrackedMap<NodeId, Vec<String>>,
+    resends: TrackedSet<NodeId>,
+    kept_originals: TrackedMap<NodeId, NodeId>,
     ignore: Matcher,
     /// Nodes whose local copy the user moved into an ignored folder that is no node. L keeps the
     /// entry each had before the move.
-    outside: BTreeSet<NodeId>,
-    lost: BTreeSet<NodeId>,
+    outside: TrackedSet<NodeId>,
+    lost: TrackedSet<NodeId>,
     /// The nodes of `outside`, and those L held under them, that left L because another entry took their name
     /// ([`Trees::displace_local`]), each with the identity L held for it.
-    displaced: BTreeMap<NodeId, FileIdentity>,
+    displaced: TrackedMap<NodeId, FileIdentity>,
     /// False from a restore until the rules of a full scan are in force.
     rules_known: bool,
     /// The folders whose rules the last scan of each could not read, by node: a folder renamed is the same folder,
@@ -266,26 +267,26 @@ impl Trees {
             s_files: 0,
             held_trash: BTreeMap::new(),
             trashed: BTreeMap::new(),
-            dirty: BTreeSet::new(),
-            unsearched: BTreeSet::new(),
-            reverted: BTreeSet::new(),
-            parked_as: BTreeMap::new(),
-            waiting: BTreeMap::new(),
-            watched: BTreeMap::new(),
-            watched_positions: BTreeMap::new(),
-            trashed_here: BTreeMap::new(),
-            discarded: BTreeMap::new(),
-            edited_here: BTreeMap::new(),
-            moved_here: BTreeMap::new(),
-            past_positions: BTreeMap::new(),
-            unsent_edits: BTreeSet::new(),
-            replaced_versions: BTreeMap::new(),
-            resends: BTreeSet::new(),
-            kept_originals: BTreeMap::new(),
+            dirty: TrackedSet::default(),
+            unsearched: TrackedSet::default(),
+            reverted: TrackedSet::default(),
+            parked_as: TrackedMap::default(),
+            waiting: TrackedMap::default(),
+            watched: TrackedMap::default(),
+            watched_positions: TrackedMap::default(),
+            trashed_here: TrackedMap::default(),
+            discarded: TrackedMap::default(),
+            edited_here: TrackedMap::default(),
+            moved_here: TrackedMap::default(),
+            past_positions: TrackedMap::default(),
+            unsent_edits: TrackedSet::default(),
+            replaced_versions: TrackedMap::default(),
+            resends: TrackedSet::default(),
+            kept_originals: TrackedMap::default(),
             ignore: Matcher::new(LocalRules::default()),
-            outside: BTreeSet::new(),
-            lost: BTreeSet::new(),
-            displaced: BTreeMap::new(),
+            outside: TrackedSet::default(),
+            lost: TrackedSet::default(),
+            displaced: TrackedMap::default(),
             rules_known: true,
             unknown_rules: BTreeSet::new(),
             asked: BTreeSet::new(),
@@ -450,7 +451,7 @@ impl Trees {
             .map(|old| &old.version_id)
             .filter(|old| !old.is_empty() && **old != node.version_id)
         {
-            let versions = self.replaced_versions.entry(id.clone()).or_default();
+            let versions = (self.replaced_versions).get_or_insert_with(id.clone(), Vec::new);
             if !versions.contains(replaced) {
                 versions.push(replaced.clone());
             }
@@ -521,7 +522,7 @@ impl Trees {
                 parent: old.shape.parent.clone(),
                 name: old.shape.name.clone(),
             };
-            let earlier = self.past_positions.entry(id.clone()).or_default();
+            let earlier = self.past_positions.get_or_insert_with(id.clone(), Vec::new);
             if !earlier.contains(&past) {
                 earlier.push(past);
             }
@@ -798,12 +799,14 @@ impl Trees {
         if let Some(shape) = self.discarded.remove(from) {
             self.discarded.insert(to.to_owned(), shape);
         }
-        for shape in self
-            .discarded
-            .values_mut()
-            .filter(|shape| shape.parent == from)
-        {
-            shape.parent = to.to_owned();
+        let children: Vec<NodeId> = (self.discarded.iter())
+            .filter(|(_, shape)| shape.parent == from)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in children {
+            if let Some(shape) = self.discarded.get_mut(&id) {
+                shape.parent = to.to_owned();
+            }
         }
     }
 
@@ -1171,7 +1174,8 @@ impl Trees {
     /// Watches S's content of `ids`, the nodes whose content the commit just built creates or updates, and
     /// stops watching any other node.
     pub fn watch_content(&mut self, ids: impl IntoIterator<Item = NodeId>) {
-        self.watched = ids.into_iter().map(|id| (id, false)).collect();
+        self.watched.clear();
+        self.watched.extend(ids.into_iter().map(|id| (id, false)));
     }
 
     /// Whether S's content of `id` changed since [`Trees::watch_content`] started watching it,
@@ -1183,7 +1187,8 @@ impl Trees {
     /// Watches the position L and R agree on for `ids`, the nodes the commit just built creates or
     /// moves, and stops watching any other node.
     pub fn watch_positions(&mut self, ids: impl IntoIterator<Item = NodeId>) {
-        self.watched_positions = ids.into_iter().map(|id| (id, None)).collect();
+        self.watched_positions.clear();
+        (self.watched_positions).extend(ids.into_iter().map(|id| (id, None)));
     }
 
     /// The latest position of `id` that L and R agreed on since [`Trees::watch_positions`] started
@@ -1193,7 +1198,7 @@ impl Trees {
     }
 
     pub(crate) fn take_waiting(&mut self) -> BTreeMap<NodeId, Waiting> {
-        std::mem::take(&mut self.waiting)
+        self.waiting.take_all()
     }
 
     pub(crate) fn wait(&mut self, id: NodeId, shape: Option<Shape>, origin: Origin) {
@@ -1272,13 +1277,26 @@ impl Trees {
     /// that [`Commits::held_through`] can still name, except the newest of them, which a commit at
     /// `rev` or later may have replaced.
     pub fn forget_past_positions_below(&mut self, rev: u64) {
-        self.past_positions.retain(|_, past| {
-            let newest_below = (past.iter().map(|position| position.rev))
-                .filter(|&past_rev| past_rev < rev)
-                .max();
-            past.retain(|position| position.rev >= rev || Some(position.rev) == newest_below);
-            !past.is_empty()
-        });
+        let forgotten: Vec<(NodeId, Vec<Agreed>)> = (self.past_positions.iter())
+            .filter_map(|(id, past)| {
+                let newest_below = (past.iter().map(|position| position.rev))
+                    .filter(|&past_rev| past_rev < rev)
+                    .max();
+                let keep =
+                    |position: &&Agreed| position.rev >= rev || Some(position.rev) == newest_below;
+                if past.iter().all(|position| keep(&position)) {
+                    return None;
+                }
+                Some((id.clone(), past.iter().filter(keep).cloned().collect()))
+            })
+            .collect();
+        for (id, kept) in forgotten {
+            if kept.is_empty() {
+                self.past_positions.remove(&id);
+            } else {
+                self.past_positions.insert(id, kept);
+            }
+        }
     }
 
     /// The nodes whose position a create or a move of this device set, and whose position S and R
@@ -1906,7 +1924,8 @@ impl Trees {
     /// exists. Returns the nodes it updated, or an empty set.
     fn take_remote_together(&mut self, pending: &[NodeId]) -> BTreeSet<NodeId> {
         let (taken, unsearched) = self.search_together(pending);
-        self.unsearched = unsearched;
+        self.unsearched.clear();
+        self.unsearched.extend(unsearched);
         for id in &taken {
             let next = self.r.live(id).cloned();
             self.set_synced_unmarked(id, next);
@@ -2225,25 +2244,89 @@ impl Trees {
     /// What the store keeps besides the nodes of R, L and S.
     pub fn state(&self) -> TreesState {
         TreesState {
-            dirty: self.dirty.clone(),
-            unsearched: self.unsearched.clone(),
-            reverted: self.reverted.clone(),
-            parked_as: self.parked_as.clone(),
-            waiting: self.waiting.clone(),
-            watched: self.watched.clone(),
-            watched_positions: self.watched_positions.clone(),
-            trashed_here: self.trashed_here.clone(),
-            discarded: self.discarded.clone(),
-            outside: self.outside.clone(),
-            lost: self.lost.clone(),
-            displaced: self.displaced.clone(),
-            edited_here: self.edited_here.clone(),
-            moved_here: self.moved_here.clone(),
-            past_positions: self.past_positions.clone(),
-            unsent_edits: self.unsent_edits.clone(),
-            replaced_versions: self.replaced_versions.clone(),
-            resends: self.resends.clone(),
-            kept_originals: self.kept_originals.clone(),
+            dirty: (*self.dirty).clone(),
+            unsearched: (*self.unsearched).clone(),
+            reverted: (*self.reverted).clone(),
+            parked_as: (*self.parked_as).clone(),
+            waiting: (*self.waiting).clone(),
+            watched: (*self.watched).clone(),
+            watched_positions: (*self.watched_positions).clone(),
+            trashed_here: (*self.trashed_here).clone(),
+            discarded: (*self.discarded).clone(),
+            outside: (*self.outside).clone(),
+            lost: (*self.lost).clone(),
+            displaced: (*self.displaced).clone(),
+            edited_here: (*self.edited_here).clone(),
+            moved_here: (*self.moved_here).clone(),
+            past_positions: (*self.past_positions).clone(),
+            unsent_edits: (*self.unsent_edits).clone(),
+            replaced_versions: (*self.replaced_versions).clone(),
+            resends: (*self.resends).clone(),
+            kept_originals: (*self.kept_originals).clone(),
+        }
+    }
+
+    /// What changed in [`Trees::state`] since the last call, for the store to write.
+    pub fn take_changes(&mut self) -> TreesChanges {
+        let Self {
+            r: _,
+            l: _,
+            s: _,
+            s_files: _,
+            held_trash: _,
+            trashed: _,
+            dirty,
+            unsearched,
+            reverted,
+            parked_as,
+            waiting,
+            watched,
+            watched_positions,
+            trashed_here,
+            discarded,
+            edited_here,
+            moved_here,
+            past_positions,
+            unsent_edits,
+            replaced_versions,
+            resends,
+            kept_originals,
+            ignore: _,
+            outside,
+            lost,
+            displaced,
+            rules_known: _,
+            unknown_rules: _,
+            asked: _,
+            unsettled: _,
+            same: _,
+            changed: _,
+            l_names: _,
+            l_identities: _,
+            s_names: _,
+            orphaned: _,
+            remote_rules_files: _,
+        } = self;
+        TreesChanges {
+            dirty: dirty.take_changes(),
+            unsearched: unsearched.take_changes(),
+            reverted: reverted.take_changes(),
+            parked_as: parked_as.take_changes(),
+            waiting: waiting.take_changes(),
+            watched: watched.take_changes(),
+            watched_positions: watched_positions.take_changes(),
+            trashed_here: trashed_here.take_changes(),
+            discarded: discarded.take_changes(),
+            outside: outside.take_changes(),
+            lost: lost.take_changes(),
+            displaced: displaced.take_changes(),
+            edited_here: edited_here.take_changes(),
+            moved_here: moved_here.take_changes(),
+            past_positions: past_positions.take_changes(),
+            unsent_edits: unsent_edits.take_changes(),
+            replaced_versions: replaced_versions.take_changes(),
+            resends: resends.take_changes(),
+            kept_originals: kept_originals.take_changes(),
         }
     }
 
@@ -2349,25 +2432,25 @@ impl Trees {
         self.unsettled = dirty.clone();
         self.same.clear();
         self.orphaned.clear();
-        self.dirty = dirty;
-        self.unsearched = unsearched;
-        self.reverted = reverted;
-        self.parked_as = parked_as;
-        self.waiting = waiting;
-        self.watched = watched;
-        self.watched_positions = watched_positions;
-        self.trashed_here = trashed_here;
-        self.discarded = discarded;
-        self.outside = outside;
-        self.lost = lost;
-        self.displaced = displaced;
-        self.edited_here = edited_here;
-        self.moved_here = moved_here;
-        self.past_positions = past_positions;
-        self.unsent_edits = unsent_edits;
-        self.replaced_versions = replaced_versions;
-        self.resends = resends;
-        self.kept_originals = kept_originals;
+        self.dirty = dirty.into();
+        self.unsearched = unsearched.into();
+        self.reverted = reverted.into();
+        self.parked_as = parked_as.into();
+        self.waiting = waiting.into();
+        self.watched = watched.into();
+        self.watched_positions = watched_positions.into();
+        self.trashed_here = trashed_here.into();
+        self.discarded = discarded.into();
+        self.outside = outside.into();
+        self.lost = lost.into();
+        self.displaced = displaced.into();
+        self.edited_here = edited_here.into();
+        self.moved_here = moved_here.into();
+        self.past_positions = past_positions.into();
+        self.unsent_edits = unsent_edits.into();
+        self.replaced_versions = replaced_versions.into();
+        self.resends = resends.into();
+        self.kept_originals = kept_originals.into();
         self.rules_known = false;
         self.unknown_rules.clear();
         Ok(())

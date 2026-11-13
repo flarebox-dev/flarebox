@@ -51,6 +51,7 @@ use koidrive_engine::effects::Effects;
 use koidrive_engine::guard::{WINDOW_MS, Window};
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::question::{Answer, QuestionKind};
+use koidrive_engine::state::{CommitsChanges, TreesChanges};
 use koidrive_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
 
 const ROOT: &str = "root";
@@ -246,7 +247,21 @@ impl World {
             world.server.nodes.insert(id, node);
         }
         world.trees.settle();
+        world.trees.take_changes();
+        world.commits.take_changes();
         world
+    }
+
+    fn take_changes(&mut self, before: &World) -> Result<(), String> {
+        let taken = (self.trees.take_changes(), self.commits.take_changes());
+        let expected = (
+            TreesChanges::between(&before.trees.state(), &self.trees.state()),
+            CommitsChanges::between(&before.commits.state(), &self.commits.state()),
+        );
+        match taken == expected {
+            true => Ok(()),
+            false => Err(format!("took {taken:?}, the states differ by {expected:?}")),
+        }
     }
 
     fn enabled(&self) -> Vec<Event> {
@@ -793,7 +808,7 @@ fn explore(
         let mut next = world.clone();
         next.apply(event);
         path.push(event);
-        match next.check() {
+        match next.take_changes(world).and_then(|()| next.check()) {
             Err(error) => failures.push(format!("{path:?}: {error}")),
             Ok(()) if depth > 1 && seen.get(&next.key()).is_none_or(|&left| left < depth - 1) => {
                 seen.insert(next.key(), depth - 1);
@@ -853,9 +868,9 @@ fn try_run(groups: Groups, events: &[Event]) -> Result<World, String> {
     let mut world = World::new(groups);
     for (index, event) in events.iter().enumerate() {
         assert!(world.enabled().contains(event), "{event:?} at {index}");
+        let before = world.clone();
         world.apply(*event);
-        world
-            .check()
+        (world.take_changes(&before).and_then(|()| world.check()))
             .map_err(|error| format!("{:?}: {error}", &events[..=index]))?;
     }
     Ok(world)
