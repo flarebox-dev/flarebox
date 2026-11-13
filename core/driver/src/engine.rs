@@ -537,7 +537,10 @@ impl Engine {
                 pending.push((at, child.clone()));
             }
         }
-        Snapshot { entries }
+        Snapshot {
+            entries,
+            ..Snapshot::default()
+        }
     }
 
     /// The path of a node L holds, relative to the root. `None` for a node L does not hold under the root, such as

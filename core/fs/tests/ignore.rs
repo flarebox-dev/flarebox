@@ -3162,3 +3162,110 @@ fn a_held_removal_whose_path_the_rules_then_leave_out_is_decided() {
         }
     }
 }
+
+#[test]
+fn an_entry_a_rule_left_out_is_removed_once_it_leaves_the_disk() {
+    let (dir, mut snapshot, mut rules) = tree_without_rules();
+    let root = dir.path();
+    write(root, RULES_FILE, "*.tmp\ncache/\n");
+    snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    fs::remove_dir_all(root.join("sub/cache")).unwrap();
+    fs::remove_file(root.join("c.tmp")).unwrap();
+
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(
+        rescan.changes,
+        [removed("c.tmp", File), removed("sub/cache", Dir)]
+    );
+    assert_eq!(
+        snapshot.left_out.keys().collect::<Vec<_>>(),
+        [Path::new("sub/a.tmp")]
+    );
+}
+
+#[test]
+fn an_entry_a_rule_left_out_moved_to_an_included_name_is_renamed() {
+    let (dir, mut snapshot, mut rules) = tree_without_rules();
+    let root = dir.path();
+    write(root, RULES_FILE, "cache/\n");
+    snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    fs::rename(root.join("sub/cache"), root.join("sub/kept")).unwrap();
+
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(
+        rescan.changes,
+        [
+            Change::Renamed {
+                from: "sub/cache".into(),
+                to: "sub/kept".into(),
+                kind: Dir,
+            },
+            created("sub/kept/x", Dir),
+            created("sub/kept/x/y.txt", File),
+        ]
+    );
+    assert!(snapshot.left_out.is_empty());
+}
+
+#[test]
+fn a_reset_to_an_entry_the_rules_leave_out_that_is_gone_reports_it_removed() {
+    let (dir, mut snapshot, mut rules) = tree_with_an_ignored_folder();
+    let root = dir.path();
+    let held: BTreeMap<PathBuf, Known> = (Snapshot::scan(root).unwrap().entries.iter())
+        .map(|(path, entry)| {
+            (
+                path.clone(),
+                Known {
+                    kind: entry.kind,
+                    id: entry.id,
+                },
+            )
+        })
+        .collect();
+    fs::remove_dir_all(root.join("ig")).unwrap();
+
+    snapshot.reset(Path::new(""), held);
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    let gone: Vec<&Change> = (rescan.changes.iter())
+        .filter(|change| matches!(change, Change::Removed { .. }))
+        .collect();
+    assert_eq!(gone, [&removed("ig", Dir)]);
+    assert_eq!(known(&snapshot), [RULES_FILE, "d", "d/g.txt", "f.txt"]);
+    assert!(snapshot.left_out.is_empty());
+}
+
+#[test]
+fn a_rescan_of_a_sibling_reports_an_entry_a_rule_left_out_as_removed_once_it_is_gone() {
+    let (dir, mut snapshot, mut rules) = tree_without_rules();
+    let root = dir.path();
+    write(root, RULES_FILE, "cache/\n");
+    snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    fs::remove_dir_all(root.join("sub/cache")).unwrap();
+    write(root, "sub/b.txt", "edited");
+
+    let rescan = snapshot
+        .rescan_with_rules(root, [PathBuf::from("sub/b.txt")], &mut rules)
+        .unwrap();
+    assert_eq!(
+        rescan.changes,
+        [
+            removed("sub/cache", Dir),
+            Change::Modified {
+                path: "sub/b.txt".into()
+            },
+        ]
+    );
+    assert!(snapshot.left_out.is_empty());
+}

@@ -7989,3 +7989,81 @@ fn a_file_moved_over_another_out_of_a_removed_folder_with_an_older_link_in_an_ig
     );
     assert_eq!(a.folder.engine.trees.check(), Ok(()));
 }
+
+fn a_file_parked_behind_an_excluded_folder() -> (Remote, Site, Device, PathBuf) {
+    let mut remote = Remote::new();
+    let (site_a, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site_a.root.join("a"), b"moved on a");
+    let (site, mut b) = linked(&mut remote, "b");
+    fs::rename(site_a.root.join("a"), site_a.root.join("x")).unwrap();
+    a.settle();
+    a.run(&mut remote);
+    fs::create_dir(site_a.root.join("a")).unwrap();
+    fs::rename(site_a.root.join("x"), site_a.root.join("a/ß")).unwrap();
+    a.settle();
+    a.run(&mut remote);
+    let parked = site.root.join(".koidrive/parked").join(node_named(&b, "a"));
+    b.pull_at_once(&remote);
+    while !site.root.join("a").is_dir() {
+        let work = b.work.pop_front().expect("the folder is created");
+        b.perform(work, &mut remote).unwrap();
+    }
+    fs::create_dir(site.root.join("a/ß")).unwrap();
+    fs::write(site.root.join("a/ß/inner.txt"), b"only on b").unwrap();
+    b.scan_until(|b| {
+        (b.folder.engine.trees.local().iter()).any(|(_, node)| node.shape.name == "ß")
+    });
+    drop(b);
+    let sync = SyncRules {
+        include: Vec::new(),
+        exclude: vec!["ss/".into()],
+    };
+    let mut b = site.start_with(&sync);
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    for _ in 0..2 {
+        b.run(&mut remote);
+        b.settle();
+    }
+    assert_eq!(fs::read(&parked).unwrap(), b"moved on a");
+    assert!(b.folder.view().problem.is_some());
+    (remote, site, b, parked)
+}
+
+#[test]
+fn removing_an_excluded_folder_lets_the_file_parked_behind_it_take_its_name() {
+    let (mut remote, site, mut b, parked) = a_file_parked_behind_an_excluded_folder();
+    fs::remove_dir_all(site.root.join("a/ß")).unwrap();
+    for _ in 0..3 {
+        b.settle();
+        b.run(&mut remote);
+    }
+    assert_eq!(fs::read(site.root.join("a/ß")).unwrap(), b"moved on a");
+    assert!(!parked.exists());
+    assert_eq!(b.folder.view().problem, None);
+    assert!(b.sent.iter().all(|commit| commit.ops.is_empty()));
+    assert_eq!(remote.names(), ["a", "ß"]);
+}
+
+#[test]
+fn an_excluded_folder_removed_while_the_device_is_stopped_frees_its_name_for_the_parked_file() {
+    let (mut remote, site, b, parked) = a_file_parked_behind_an_excluded_folder();
+    drop(b);
+    fs::remove_dir_all(site.root.join("a/ß")).unwrap();
+    let sync = SyncRules {
+        include: Vec::new(),
+        exclude: vec!["ss/".into()],
+    };
+    let mut b = site.start_with(&sync);
+    b.connect(&remote);
+    b.scan_until(|b| b.folder.scanned);
+    for _ in 0..3 {
+        b.run(&mut remote);
+        b.settle();
+    }
+    assert_eq!(fs::read(site.root.join("a/ß")).unwrap(), b"moved on a");
+    assert!(!parked.exists());
+    assert_eq!(b.folder.view().problem, None);
+    assert!(b.sent.iter().all(|commit| commit.ops.is_empty()));
+    assert_eq!(remote.names(), ["a", "ß"]);
+}

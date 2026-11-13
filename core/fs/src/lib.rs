@@ -55,14 +55,17 @@
 //! the caller's matcher ([`Ignore`]) before it judges the folder's entries.
 //! Being left out is never a removal. An entry a changed rule leaves out
 //! leaves the snapshot without a change, and one a changed rule includes
-//! again is reported as created. An entry that disappeared is looked for by
-//! identity at and below the entries a rule leaves out, with listings and
-//! stats only. Found there, it was moved and nothing was deleted, so it is
-//! reported as [`Change::Ignored`]. A miss is reported as a removal, although
-//! a file saved again after such a move has a new identity and is missed.
-//! Design §5.10 holds a miss for a question to the user while any entry is
-//! left out, and the engine cannot ask that question yet. The search does not
-//! look in [`PRIVATE_DIR`] or in the built-in platform files.
+//! again is reported as created. While the entry stays on disk, the snapshot
+//! keeps it in [`Snapshot::left_out`] without what is below it, and an entry
+//! there that leaves the disk is reported as removed, or as renamed when the
+//! scan finds its identity at an included path. An entry that disappeared is
+//! looked for by identity at and below the entries a rule leaves out, with
+//! listings and stats only. Found there, it was moved and nothing was
+//! deleted, so it is reported as [`Change::Ignored`]. A miss is reported as a
+//! removal, although a file saved again after such a move has a new identity
+//! and is missed. Design §5.10 holds a miss for a question to the user while
+//! any entry is left out, and the engine cannot ask that question yet. The
+//! search does not look in [`PRIVATE_DIR`] or in the built-in platform files.
 //!
 //! The engine's private folder [`PRIVATE_DIR`] at the root is never scanned.
 //! The [`check_root`] of design §6.2, the root [`Marker`] and the rename that
@@ -360,6 +363,7 @@ struct Scan<'c> {
     /// Folders the scan may not open or list. What lies below them stays as
     /// it was known.
     unreadable: Vec<PathBuf>,
+    left_out: BTreeMap<PathBuf, Entry>,
     /// The rules that leave entries out, for a scan that applies any.
     rules: Option<Pending<'c>>,
     cut: &'c mut dyn FnMut(Cut<'_>),
@@ -385,6 +389,7 @@ impl Scan<'_> {
         if let Some(rules) = &mut self.rules
             && rules.leaves_out(&rel, entry.kind)
         {
+            self.left_out.insert(rel, entry);
             return Ok(());
         }
         self.new.insert(rel.clone(), entry);
@@ -488,6 +493,9 @@ pub enum Change {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub entries: BTreeMap<PathBuf, Entry>,
+    /// The entries the snapshot knew that the rules now leave out, as each was
+    /// last known. What is below them is not known.
+    pub left_out: BTreeMap<PathBuf, Entry>,
 }
 
 /// What one [`Snapshot::rescan`] found.
@@ -576,6 +584,9 @@ impl Snapshot {
     /// [`Rescan::rules`]. A changed rules file widens the scan to everything
     /// below its folder. An entry the rules now leave out leaves the snapshot
     /// without a change, and one they include again is reported as created.
+    /// One of [`Snapshot::left_out`] that is no longer on disk is reported as
+    /// removed, or as renamed when the scan finds its identity at an included
+    /// path.
     /// A removal whose entry the scan finds under a left-out entry is reported
     /// as [`Change::Ignored`]. Each rescan looks at a bounded number of
     /// left-out entries ([`Rules::with_search_budget`]). A removal the search
@@ -634,6 +645,7 @@ impl Snapshot {
         for path in held {
             self.entries.remove(&path);
         }
+        self.left_out.retain(|path, _| !path.starts_with(scope));
         self.entries.extend(
             known
                 .into_iter()
@@ -684,6 +696,7 @@ impl Snapshot {
             bindings: Vec::new(),
             replaced: Vec::new(),
             unreadable: Vec::new(),
+            left_out: BTreeMap::new(),
             rules: rules.map(Pending::new),
             cut,
             stopped,
@@ -790,10 +803,18 @@ impl Snapshot {
                     .map(|(path, entry)| (path.clone(), *entry)),
             );
         }
-        let left_out = match &scan.rules {
-            Some(rules) => take_left_out(&mut old, &scan.new, rules),
-            None => Vec::new(),
-        };
+        let mut was_left_out = Vec::new();
+        for prefix in &scan.replaced {
+            for (path, entry) in (self.left_out.range(prefix.clone()..))
+                .take_while(|(path, _)| path.starts_with(prefix))
+            {
+                was_left_out.push(path.clone());
+                if !scan.new.contains_key(path) {
+                    old.insert(path.clone(), *entry);
+                }
+            }
+        }
+        let (left_out, still_left_out) = take_left_out(&mut old, &scan.left_out);
         let unreadable = std::mem::take(&mut scan.unreadable);
         for blocked in &unreadable {
             scan.new
@@ -887,6 +908,10 @@ impl Snapshot {
             self.entries.remove(path);
         }
         self.entries.append(&mut scan.new);
+        for path in &was_left_out {
+            self.left_out.remove(path);
+        }
+        self.left_out.extend(still_left_out);
         let (rules, read) = match scan.rules.take() {
             Some(rules) => rules.finish(|dir| {
                 self.entries
@@ -944,15 +969,16 @@ impl Snapshot {
         for name in focus.difference(&names) {
             scan.replaced.push(parent.join(name));
         }
-        let known_children = self
-            .entries
-            .range(parent.to_path_buf()..)
-            .take_while(|(path, _)| path.starts_with(parent))
-            .filter(|(path, _)| path.parent() == Some(parent))
-            .filter(|(path, _)| !path.file_name().is_some_and(|name| names.contains(name)));
-        for (path, _) in known_children {
-            scan.replaced.push(path.clone());
-        }
+        let known = |entries: &BTreeMap<PathBuf, Entry>| {
+            (entries.range(parent.to_path_buf()..))
+                .take_while(|(path, _)| path.starts_with(parent))
+                .filter(|(path, _)| path.parent() == Some(parent))
+                .filter(|(path, _)| !path.file_name().is_some_and(|name| names.contains(name)))
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>()
+        };
+        scan.replaced.extend(known(&self.entries));
+        scan.replaced.extend(known(&self.left_out));
         Ok(())
     }
 
@@ -1184,33 +1210,32 @@ fn open_attached(
     Ok(Some((dir, chain)))
 }
 
-/// Takes out of `old` every entry the rules now leave out, with everything
-/// below it, and returns their paths. Such an entry is still on disk, so it is
-/// neither a removal nor a disappearance to confirm.
+/// Takes out of `old` every entry the scan found left out at its path, with
+/// everything below it, and returns their paths and the entries the snapshot
+/// keeps as left out. An entry the scan did not find, left out or not, has
+/// left the disk, so it stays in `old` to be reported as removed.
 fn take_left_out(
     old: &mut BTreeMap<PathBuf, Entry>,
-    new: &BTreeMap<PathBuf, Entry>,
-    rules: &Pending<'_>,
-) -> Vec<PathBuf> {
+    found: &BTreeMap<PathBuf, Entry>,
+) -> (Vec<PathBuf>, Vec<(PathBuf, Entry)>) {
     let mut left_out = Vec::new();
+    let mut kept = Vec::new();
     let mut folder: Option<PathBuf> = None;
     old.retain(|path, entry| {
         if !folder
             .as_ref()
             .is_some_and(|folder| path.starts_with(folder))
         {
-            // The scan judged what it recorded, so only the rest is asked about.
-            if new.get(path).is_some_and(|after| after.kind == entry.kind)
-                || rules.status(path, entry.kind) == Ignored::No
-            {
+            let Some(now) = found.get(path).filter(|now| now.kind == entry.kind) else {
                 return true;
-            }
+            };
+            kept.push((path.clone(), *now));
             folder = (entry.kind == EntryKind::Dir).then(|| path.clone());
         }
         left_out.push(path.clone());
         false
     });
-    left_out
+    (left_out, kept)
 }
 
 /// Turns each removal whose entry now sits at or below an entry the rules
