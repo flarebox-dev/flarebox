@@ -521,6 +521,7 @@ struct Device {
     /// Whether the folders the user creates take names nothing else has, so none is merged.
     fresh_dir_names: bool,
     rules: Rules,
+    touched: BTreeSet<String>,
 }
 
 impl Device {
@@ -628,14 +629,19 @@ impl Device {
                     return;
                 }
                 node.shape.content = Some(content(1, action.text));
+                self.touched.insert(id.clone());
                 self.trees.set_local(id, node);
             }
             (3, Some((id, mut node))) if !taken(&id) && !self.holds(&id, &parent) => {
                 let kind = node.shape.kind;
                 match (unseen(&id, kind), lands_unseen(kind)) {
                     (true, true) => {}
-                    (false, true) if into_ignored => self.trees.ignore_local(&id),
+                    (false, true) if into_ignored => {
+                        self.touched.insert(id.clone());
+                        self.trees.ignore_local(&id)
+                    }
                     _ => {
+                        self.touched.insert(id.clone());
                         node.shape.parent = parent;
                         node.shape.name = name.into();
                         self.trees.set_local(id, node);
@@ -891,6 +897,38 @@ fn waits_on_excluded(trees: &Trees, id: &str, waiting: &BTreeSet<String>) -> boo
     false
 }
 
+fn kept_by_gun_526(
+    trees: &Trees,
+    id: &str,
+    discarded: &BTreeMap<String, koidrive_engine::tree::Shape>,
+) -> bool {
+    let local = trees.local();
+    let below = |node: &str, folder: &str| {
+        let mut at = node;
+        for _ in 0..=local.len() {
+            match local.get(at) {
+                Some(held) if held.shape.parent == folder => return true,
+                Some(held) => at = &held.shape.parent,
+                None => return false,
+            }
+        }
+        false
+    };
+    let mut at = id;
+    for _ in 0..=local.len() {
+        if discarded.contains_key(at)
+            && (local.iter()).any(|(other, _)| trees.excluded(other) && below(other, at))
+        {
+            return true;
+        }
+        match local.get(at) {
+            Some(held) => at = &held.shape.parent,
+            None => return false,
+        }
+    }
+    false
+}
+
 /// Whether S cannot take `id` at its R position because the S entry of a node that waits still
 /// holds that name. The entry moves only once its node is placed, which the excluded node keeps
 /// from happening.
@@ -959,6 +997,7 @@ fn run_ignoring(
         inos: 0,
         fresh_dir_names,
         rules: Rules::default(),
+        touched: BTreeSet::new(),
     };
     for state in space.nodes().iter().filter(|n| n.node_id != root) {
         let (id, node) = RemoteNode::from_state(state).unwrap();
@@ -1184,6 +1223,9 @@ fn run_ignoring(
                 let contents = (question.shown.values()).map(|shape| shape.content.clone());
                 let contents = written(contents, 1);
                 local_writes.retain(|write| !contents.contains(write));
+                for id in question.shown.keys() {
+                    device.touched.remove(id);
+                }
                 discarded.extend(question.shown);
             }
         }
@@ -1191,8 +1233,7 @@ fn run_ignoring(
         // did not discard there, is the user's, and so is every discarded folder above it.
         let trees = &device.trees;
         let reclaimed = |id: &&String| {
-            let changed =
-                (trees.local().get(id)).is_some_and(|node| !node.shape.same(&discarded[*id]));
+            let changed = device.touched.contains(*id) && trees.local().get(id).is_some();
             changed
                 || (trees.local_children(id)).any(|child| {
                     !trees.excluded(child)
@@ -1241,13 +1282,10 @@ fn run_ignoring(
             // A discarded entry the user changed, or a discarded folder the user put an entry in,
             // before the effects moved it to the local trash is the user's new change, which syncs
             // like any other from then on (section 5.2).
-            let changed = |shown: &koidrive_engine::tree::Shape| {
-                revived.contains(id)
-                    || (device.trees.local().get(id)).is_some_and(|node| !node.shape.same(shown))
-            };
+            let changed = revived.contains(id) || device.touched.contains(id);
             if held_once.contains(id) && !confirmed.contains(id) {
                 prop_assert!(
-                    discarded.get(id).is_some_and(changed),
+                    discarded.contains_key(id) && changed,
                     "{} was held and sent before the person said so",
                     id
                 );
@@ -1360,7 +1398,8 @@ fn run_ignoring(
             .filter(|id| {
                 !waiting.contains(*id)
                     && (waits_on_excluded(&device.trees, id, &waiting)
-                        || waits_on_synced(&device.trees, id, &waiting))
+                        || waits_on_synced(&device.trees, id, &waiting)
+                        || kept_by_gun_526(&device.trees, id, &discarded))
             })
             .cloned()
             .collect();
@@ -1626,11 +1665,150 @@ proptest! {
             0..6,
         ),
         rulings in prop::collection::vec(ruling(), 0..7),
+        answer in prop_oneof![Just(Answer::Publish), Just(Answer::Discard)],
         cut in prop::sample::select(CUTS.to_vec()),
     ) {
-        let answer = Answer::Publish;
         run_ignoring(&seed, &local, &[], fits, false, &during, cut, &rulings, answer, true)?;
     }
+}
+
+#[test]
+fn a_discarded_entry_the_rules_leave_out_for_a_while_stays_discarded_once_they_let_it_in() {
+    let stories = [
+        (
+            vec![act(0, 0, 0, 2, 0)],
+            vec![
+                act(0, 0, 0, 0, 0),
+                act(1, 0, 4673039444926547263, 2, 0),
+                act(0, 0, 13266476644652416267, 0, 0),
+            ],
+            vec![
+                (false, vec![act(0, 0, 0, 0, 0)]),
+                (
+                    true,
+                    vec![act(3, 479216393097091650, 3374702992589535782, 5, 0)],
+                ),
+                (false, vec![act(0, 0, 0, 0, 0)]),
+            ],
+            vec![
+                Ruling::Include(vec!["a"]),
+                Ruling::File(vec![]),
+                Ruling::File(vec![]),
+                Ruling::Include(vec!["ß"]),
+            ],
+        ),
+        (
+            vec![act(1, 0, 0, 2, 0), act(0, 0, 0, 0, 0), act(0, 0, 0, 0, 0)],
+            vec![
+                act(0, 0, 0, 2, 0),
+                act(0, 0, 1161139680209233225, 2, 0),
+                act(0, 0, 4190000043942595171, 3, 0),
+            ],
+            vec![
+                (false, vec![act(0, 0, 0, 0, 0)]),
+                (false, vec![act(0, 0, 0, 3, 0)]),
+                (false, vec![act(0, 0, 0, 0, 0)]),
+                (false, vec![act(0, 0, 0, 0, 0)]),
+            ],
+            vec![
+                Ruling::File(vec![]),
+                Ruling::File(vec![]),
+                Ruling::File(vec!["c.txt"]),
+                Ruling::Include(vec!["ß"]),
+                Ruling::Include(vec![]),
+            ],
+        ),
+    ];
+    for (seed, local, during, rulings) in stories {
+        run_ignoring(
+            &seed,
+            &local,
+            &[],
+            MAX_OPS,
+            false,
+            &during,
+            Cut::None,
+            &rulings,
+            Answer::Discard,
+            true,
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn a_discarded_folder_the_user_moves_a_server_folder_into_is_sent_without_what_the_rules_leave_out()
+{
+    let seed = [
+        act(0, 0, 0, 1, 0),
+        act(0, 0, 1589386142481282302, 3, 0),
+        act(1, 0, 337024389968201276, 0, 0),
+    ];
+    let local = [
+        act(0, 0, 0, 5, 0),
+        act(0, 0, 5550223642493787941, 0, 0),
+        act(0, 0, 818620885751826322, 3, 0),
+    ];
+    let during = [
+        (
+            true,
+            vec![act(3, 8557033530543547932, 53783006680222902, 2, 0)],
+        ),
+        (false, vec![act(0, 0, 0, 0, 0)]),
+    ];
+    let rulings = [
+        Ruling::Include(vec!["a", "ß"]),
+        Ruling::Exclude(vec!["*.txt"]),
+        Ruling::File(vec![]),
+    ];
+    run_ignoring(
+        &seed,
+        &local,
+        &[],
+        MAX_OPS,
+        false,
+        &during,
+        Cut::None,
+        &rulings,
+        Answer::Discard,
+        true,
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_discarded_folder_parked_where_an_excluded_folder_holds_its_name_goes_to_the_local_trash() {
+    let seed = [act(0, 0, 0, 5, 0), act(0, 0, 0, 0, 0)];
+    let local = [
+        act(0, 0, 0, 6, 0),
+        act(0, 0, 371774925241157815, 0, 0),
+        act(0, 0, 930660811337546809, 2, 0),
+    ];
+    let during = [
+        (false, vec![act(0, 0, 0, 0, 0)]),
+        (false, vec![act(0, 0, 0, 0, 0)]),
+        (false, vec![act(0, 0, 0, 0, 0)]),
+        (false, vec![act(0, 0, 0, 0, 0)]),
+    ];
+    let rulings = [
+        Ruling::Include(vec!["ß"]),
+        Ruling::Exclude(vec![]),
+        Ruling::File(vec!["a"]),
+        Ruling::Include(vec!["a"]),
+    ];
+    run_ignoring(
+        &seed,
+        &local,
+        &[],
+        MAX_OPS,
+        false,
+        &during,
+        Cut::None,
+        &rulings,
+        Answer::Discard,
+        true,
+    )
+    .unwrap();
 }
 
 #[test]
@@ -4081,6 +4259,7 @@ fn a_local_delete_keeps_a_recorded_entry_and_the_folders_above_it_as_the_driver_
         inos: 0,
         fresh_dir_names: false,
         rules: Rules::default(),
+        touched: BTreeSet::new(),
     };
     for (id, parent, name) in [("d", "root", "d"), ("m", "d", "m"), ("c", "m", "c")] {
         let shape = koidrive_engine::tree::Shape {

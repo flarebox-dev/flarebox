@@ -513,7 +513,7 @@ impl Commits {
             Some(question) => {
                 self.questions.remove(index);
                 if question.answer == Some(Answer::Discard) {
-                    trees.discard(question.shown.keys().cloned());
+                    trees.discard(question.shown.clone());
                     let updates = (question.shown.into_iter())
                         .map(|(id, shape)| (id, Some(shape)))
                         .collect();
@@ -1730,6 +1730,7 @@ pub(crate) fn rekey(trees: &mut Trees, from: &str, to: &str) {
         .collect();
     let parked_name = trees.parked_name(from).to_owned();
     let parked = node.parked;
+    trees.rekey_discarded(from, to);
     trees.remove_local(from);
     trees.set_local(to.to_owned(), node);
     if parked {
@@ -2163,7 +2164,7 @@ fn plan(
             None => local,
         };
         let Some(remote) = trees.remote().get(id) else {
-            if !trees.reverted().contains(id) {
+            if !trees.reverted().contains(id) && !trees.is_discarded(id) {
                 wants.push(Want::Create {
                     id: id.clone(),
                     shape: local.clone(),

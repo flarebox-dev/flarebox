@@ -227,9 +227,12 @@ impl Engine {
                 changed = true;
             }
         }
+        let unshown = |question: &engine::Question| {
+            question.answer.is_none() && !rows.contains_key(&question.id)
+        };
         for question in asking
             .iter()
-            .filter(|question| !open(asked, &question.id) || dropped(question))
+            .filter(|question| !open(asked, &question.id) || dropped(question) || unshown(question))
         {
             let continued = (replaced.iter())
                 .find(|(before, _)| same_kind(&before.kind, &question.kind))

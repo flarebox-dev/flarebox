@@ -125,12 +125,18 @@ impl Tx<'_> {
         while let Some(row) = rows.next()? {
             state.trees.trashed_here.insert(row.get(0)?, row.get(1)?);
         }
-        let mut stmt = self
-            .0
-            .prepare_cached("SELECT node_id FROM discarded_nodes")?;
+        let mut stmt = self.0.prepare_cached(
+            "SELECT node_id, parent_id, name, kind, content FROM discarded_nodes",
+        )?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
-            state.trees.discarded.insert(row.get(0)?);
+            let shape = Shape {
+                parent: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                name: row.get(2)?,
+                kind: kind(row.get(3)?)?,
+                content: decode(row.get(4)?)?,
+            };
+            state.trees.discarded.insert(row.get(0)?, shape);
         }
         let mut stmt = self
             .0
@@ -420,18 +426,25 @@ impl Tx<'_> {
         for (node, seq) in changed {
             put.execute(params![node, seq])?;
         }
-        let (old, new) = (&before.trees.discarded, &after.trees.discarded);
         let mut remove = self
             .0
             .prepare_cached("DELETE FROM discarded_nodes WHERE node_id = ?1")?;
-        for node in old.difference(new) {
+        let mut put = self.0.prepare_cached(
+            "INSERT OR REPLACE INTO discarded_nodes (node_id, parent_id, name, kind, content)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        let (removed, changed) = differences(&before.trees.discarded, &after.trees.discarded);
+        for node in removed {
             remove.execute([node])?;
         }
-        let mut insert = self
-            .0
-            .prepare_cached("INSERT INTO discarded_nodes (node_id) VALUES (?1)")?;
-        for node in new.difference(old) {
-            insert.execute([node])?;
+        for (node, shape) in changed {
+            put.execute(params![
+                node,
+                non_empty(&shape.parent),
+                shape.name,
+                node_kind(shape.kind),
+                shape.content.as_ref().map(Content::encode_to_vec),
+            ])?;
         }
         let recorded = |trees: &TreesState| -> BTreeMap<NodeId, (Option<FileIdentity>, bool)> {
             let kept = (trees.outside.iter())

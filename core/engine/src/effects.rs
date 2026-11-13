@@ -519,7 +519,8 @@ fn candidate(trees: &Trees, id: &str) -> bool {
             && (trees.remote().live(id).is_some() || !trees.edited(id)))
         || (trees.waiting().contains_key(id)
             && trees.remote().live(id).is_none()
-            && !trees.edited(id));
+            && !trees.edited(id))
+        || trees.is_discarded(id);
     changed && !forgets && !trees.excluded(id) && !trees.reclaimed(id)
 }
 
@@ -737,6 +738,7 @@ impl<'a> View<'a> {
             (Some(local), None)
                 if local.parked
                     && !remote_only(self.trees, id)
+                    && !self.trees.is_discarded(id)
                     && (!(self.trees.reverted().contains(id)
                         || self.trees.waiting().contains_key(id))
                         || self.trees.edited(id)) =>
