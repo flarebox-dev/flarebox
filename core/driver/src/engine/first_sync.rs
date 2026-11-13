@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! How the work of a first sync grows with its files: the driver's loop, which plans one effect, does it, and ends
+//! How the work of a first sync grows with its files: the driver's loop, which plans a batch of effects, does it, and ends
 //! each step with [`Engine::checkpoint`] in a store transaction, run until every remote file is on an empty disk.
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -54,10 +54,10 @@ fn allocated() -> u64 {
     ALLOCATED.with(Cell::get)
 }
 
-fn remote(id: String, parent: &str, name: String, kind: NodeKind) -> NodeState {
+fn remote(id: String, parent: &str, name: String, kind: NodeKind, size: u64) -> NodeState {
     let current = (kind == NodeKind::File).then(|| VersionInfo {
         content: Some(Content {
-            size: 3,
+            size,
             manifest_digest: vec![7; 32],
             ..Default::default()
         }),
@@ -76,8 +76,9 @@ fn remote(id: String, parent: &str, name: String, kind: NodeKind) -> NodeState {
     }
 }
 
-/// Downloads `files` remote files, `per_dir` to a folder, onto an empty disk, in one transaction of a store on disk.
-fn first_sync(files: usize, per_dir: usize) -> u64 {
+/// Downloads `files` remote files of `size` bytes, `per_dir` to a folder, onto an empty disk in batches of `limit`, in
+/// one transaction of a store on disk.
+fn first_sync(files: usize, per_dir: usize, size: u64, limit: BatchLimit) -> u64 {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(dir.path().join("store.sqlite")).unwrap();
     store
@@ -91,6 +92,7 @@ fn first_sync(files: usize, per_dir: usize) -> u64 {
                     ROOT,
                     format!("folder {d}"),
                     NodeKind::Dir,
+                    0,
                 )
             });
             let parent = |f: usize| {
@@ -103,6 +105,7 @@ fn first_sync(files: usize, per_dir: usize) -> u64 {
                     &parent(f),
                     format!("file {f}"),
                     NodeKind::File,
+                    size,
                 )
             });
             for state in folders.chain(nodes) {
@@ -120,24 +123,26 @@ fn first_sync(files: usize, per_dir: usize) -> u64 {
                     ids,
                     ..
                 } = &mut engine;
-                let Some(record) = effects
-                    .plan(trees, None, ids, NOW, BatchLimit::ONE)
-                    .first()
-                    .cloned()
-                else {
+                let batch = effects.plan(trees, None, ids, NOW, limit).to_vec();
+                if batch.is_empty() {
                     break;
-                };
+                }
                 engine.checkpoint(tx)?;
-                planned += 1;
-                let identity = FileIdentity {
-                    dev: 1,
-                    ino: planned as u128,
-                    birth_ns: Some(0),
-                };
-                (engine
-                    .effects
-                    .done(&mut engine.trees, None, &record.effect_id, Some(identity)))
-                .unwrap();
+                for record in &batch {
+                    planned += 1;
+                    let identity = FileIdentity {
+                        dev: 1,
+                        ino: planned as u128,
+                        birth_ns: Some(0),
+                    };
+                    (engine.effects.done(
+                        &mut engine.trees,
+                        None,
+                        &record.effect_id,
+                        Some(identity),
+                    ))
+                    .unwrap();
+                }
                 engine.checkpoint(tx)?;
             }
             let work = allocated() - before;
@@ -154,12 +159,20 @@ fn first_sync(files: usize, per_dir: usize) -> u64 {
 
 #[test]
 fn a_first_sync_with_its_checkpoints_takes_work_in_proportion_to_its_files() {
-    for per_dir in [100, 4000] {
-        let (small, large) = (first_sync(500, per_dir), first_sync(2000, per_dir));
+    let runs = [
+        (100, 3, BatchLimit::ONE),
+        (4000, 3, BatchLimit::ONE),
+        (100, 3, crate::disk::BATCH),
+        (100, 4 << 20, crate::disk::BATCH),
+    ];
+    for (per_dir, size, limit) in runs {
+        let small = first_sync(500, per_dir, size, limit);
+        let large = first_sync(2000, per_dir, size, limit);
         let bytes = large as f64 / small as f64;
         assert!(
             bytes < 8.0,
-            "{per_dir} per folder: 500 files allocated {small} bytes and 2000 files {large}, {bytes:.1} times as many"
+            "{per_dir} per folder, {size} bytes a file, {limit:?}: 500 files allocated {small} bytes and 2000 files \
+             {large}, {bytes:.1} times as many"
         );
     }
 }

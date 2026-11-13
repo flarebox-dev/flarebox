@@ -377,8 +377,10 @@ impl Effects {
                         Effect::WriteFile { content, .. } => content.size,
                         _ => 0,
                     };
-                    let fits = chosen.is_empty() || bytes + size <= limit.bytes;
-                    if fits && claim.as_ref().is_none_or(|claim| !claimed.contains(claim)) {
+                    if !chosen.is_empty() && bytes + size > limit.bytes {
+                        break;
+                    }
+                    if claim.as_ref().is_none_or(|claim| !claimed.contains(claim)) {
                         bytes += size;
                         claimed.extend(claim);
                         chosen.push((id.clone(), effect, after));

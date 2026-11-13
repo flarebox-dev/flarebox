@@ -73,7 +73,7 @@ const SPANS: usize = 1024;
 const STAGE_AGAIN: Duration = Duration::from_secs(30);
 /// The most effects one batch holds: as many as one call for download targets takes chunks, with the contents of its
 /// writes after the first within 64 MiB.
-const BATCH: BatchLimit = BatchLimit {
+pub(crate) const BATCH: BatchLimit = BatchLimit {
     effects: koidrive_net::MAX_CHUNKS_PER_CALL,
     bytes: 64 << 20,
 };
