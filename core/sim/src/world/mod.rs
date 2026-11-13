@@ -1583,7 +1583,6 @@ impl World {
                         )
                     });
                 }
-                let gun_548_own_unsent_edits = device.engine.trees.unsent_edits().clone();
                 let trashed: BTreeSet<NodeId> = (self.space.nodes().into_iter())
                     .filter(|node| node.status == NodeStatus::Trashed as i32)
                     .map(|node| node.node_id)
@@ -1634,21 +1633,12 @@ impl World {
                                     })
                             });
                             if let Some(node) = revived {
-                                let why = format!(
+                                return Err(Failure::Broken(format!(
                                     "a commit of device {d} brought back node {} as {:?}, which a \
                                      user deleted, and the user of device {d} never changed it or \
                                      put anything in it since: {:?}",
                                     node.node_id, node.name, sent.ops
-                                );
-                                let resent_own_edit = (sent.ops.iter()).any(|op| {
-                                    matches!(&op.op, Some(op::Op::UpdateContent(update)) if update.node_id == node.node_id)
-                                });
-                                if !(resent_own_edit
-                                    && gun_548_own_unsent_edits.contains(&node.node_id))
-                                {
-                                    return Err(Failure::Broken(why));
-                                }
-                                self.unasked.get_or_insert(why);
+                                )));
                             }
                             let inos: Vec<u128> = (sent.ops.iter())
                                 .zip(&committed.result.results)
