@@ -1100,8 +1100,12 @@ impl Commits {
             .filter(|question| matches!(question.kind, QuestionKind::Recovery { group, .. } if group == intents))
             .flat_map(|question| question.held.keys())
             .collect();
+        let held_ops: Vec<&proto::Restore> = (self.restores.iter())
+            .filter(|(id, _)| held_restores.contains(id))
+            .map(|(_, intent)| intent.op())
+            .collect();
         let restores = (self.restores.iter())
-            .filter(|(id, _)| !held_restores.contains(id))
+            .filter(|(_, intent)| !held_ops.contains(&intent.op()))
             .map(|(id, intent)| (id.clone(), intent.clone()))
             .collect();
         let answers = released.iter().flat_map(Question::holds).cloned().collect();
@@ -1432,8 +1436,11 @@ impl Commits {
     /// that drops the commit before its result then sends those changes again as this device's own
     /// ([`Trees::forget_lost`]).
     pub fn acknowledge(&mut self, trees: &mut Trees, last_seq: u64) -> bool {
-        self.record_served(trees, last_seq);
-        let acknowledged = self.acknowledge_flight(trees, last_seq);
+        let recovering = matches!(*self.halted, Some(Halt::Recovery(_)));
+        if !recovering {
+            self.record_served(trees, last_seq);
+        }
+        let acknowledged = !recovering && self.acknowledge_flight(trees, last_seq);
         self.retire_pending(trees);
         acknowledged
     }
@@ -3043,7 +3050,8 @@ fn plan(
             && (trees.synced().get(id).is_some() || trees.is_removed_here(id))
     };
     let mut emit = |want: Want, scratch: &mut Scratch, moving: &mut BTreeSet<NodeId>| {
-        for node in want.nodes() {
+        let generated = matches!(want, Want::Retrash { .. });
+        for node in want.nodes().filter(|_| !generated) {
             if let Some(left) = scratch.unsent.get_mut(node) {
                 *left -= 1;
                 if *left == 0 {
@@ -3178,8 +3186,10 @@ fn plan(
     let fits = |emitted: usize, bytes: usize, ops: usize, cost: usize| {
         emitted + ops <= cap && (emitted == 0 || bytes + cost <= MAX_COMMIT_BYTES)
     };
-    let room = |emitted: &mut usize, bytes: &mut usize, want: &Want| {
-        let cost = cost(trees, want);
+    let priced =
+        |scratch: &Scratch, want: &Want| cost(trees, want) + scratch.revival(want, answers, trees);
+    let room = |emitted: &mut usize, bytes: &mut usize, scratch: &Scratch, want: &Want| {
+        let cost = priced(scratch, want);
         if !fits(*emitted, *bytes, want.ops(), cost) {
             return false;
         }
@@ -3208,6 +3218,7 @@ fn plan(
                 if !room(
                     &mut emitted,
                     &mut bytes,
+                    &scratch,
                     wants[before].as_ref().expect("checked"),
                 ) {
                     full = true;
@@ -3225,8 +3236,8 @@ fn plan(
             }
             let want = wants[at].as_ref().expect("checked");
             let ops = want.ops() + bundle.iter().map(Want::ops).sum::<usize>();
-            let cost =
-                cost(trees, want) + bundle.iter().map(|other| cost(trees, other)).sum::<usize>();
+            let cost = priced(&scratch, want)
+                + bundle.iter().map(|other| cost(trees, other)).sum::<usize>();
             let alone = emitted == 0 && !bundle.is_empty();
             if !alone && !fits(emitted, bytes, ops, cost) {
                 full = true;
@@ -3277,13 +3288,21 @@ fn plan(
             };
             let all: usize = (cycle.iter())
                 .filter_map(|at| wants[*at].as_ref())
-                .map(|want| cost(trees, want))
+                .map(|want| priced(&scratch, want))
                 .sum();
-            let whole = fits(emitted, bytes, cycle.len() + 1, all + cost(trees, &aside));
+            let whole = fits(
+                emitted,
+                bytes,
+                cycle.len() + 1,
+                all + priced(&scratch, &aside),
+            );
             let bundled = scratch
                 .compensation(&aside, answers, trees)
                 .is_none_or(|bundle| !bundle.is_empty());
-            if bundled || (emitted > 0 && !whole) || !room(&mut emitted, &mut bytes, &aside) {
+            if bundled
+                || (emitted > 0 && !whole)
+                || !room(&mut emitted, &mut bytes, &scratch, &aside)
+            {
                 break true;
             }
             let id = id.clone();
@@ -3299,6 +3318,7 @@ fn plan(
             if !room(
                 &mut emitted,
                 &mut bytes,
+                &scratch,
                 wants[at].as_ref().expect("checked"),
             ) {
                 break true;
@@ -3336,7 +3356,8 @@ fn plan(
         };
         let want = slot.as_ref().expect("checked");
         let ops = want.ops() + bundle.iter().map(Want::ops).sum::<usize>();
-        let cost = cost(trees, want) + bundle.iter().map(|other| cost(trees, other)).sum::<usize>();
+        let cost =
+            priced(&scratch, want) + bundle.iter().map(|other| cost(trees, other)).sum::<usize>();
         if !(emitted == 0 && !bundle.is_empty()) && !fits(emitted, bytes, ops, cost) {
             break true;
         }
@@ -3859,6 +3880,44 @@ impl Scratch {
             }
             self.unlink(&node);
         }
+    }
+
+    fn revival(&self, want: &Want, answers: &BTreeSet<NodeId>, trees: &Trees) -> usize {
+        let record = |id: &str| record_cost(trees.remote().get(id).map(|node| &node.shape));
+        let (mut current, group) = match want {
+            Want::Create { shape, .. } => (shape.parent.clone(), None),
+            Want::Move { id, parent, .. } => {
+                let group = self.group(id).filter(|_| answers.contains(id));
+                (parent.clone(), group.map(|group| (id, group)))
+            }
+            Want::Content { id, .. } => match self.nodes.get(id) {
+                Some(entry) => (entry.parent.clone(), None),
+                None => return 0,
+            },
+            Want::Delete { .. } | Want::Retrash { .. } | Want::Restore { .. } => return 0,
+        };
+        let mut bytes = 0;
+        for _ in 0..=self.nodes.len() {
+            let Some(entry) = self.nodes.get(&current).filter(|entry| !entry.live) else {
+                break;
+            };
+            bytes += record(&current);
+            current = entry.parent.clone();
+        }
+        let Some((id, group)) = group else {
+            return bytes;
+        };
+        let mut below = vec![id];
+        while let Some(parent) = below.pop() {
+            for child in self.trashed.get(parent).into_iter().flatten() {
+                let entry = &self.nodes[child];
+                if !entry.live && entry.group.as_ref() == Some(group) {
+                    bytes += record(child);
+                    below.push(child);
+                }
+            }
+        }
+        bytes
     }
 
     /// The wants that must go into the same commit right after `want`, so that what it brings

@@ -159,6 +159,20 @@ fn a_folder_is_adopted_under_its_pending_name_when_a_file_holds_its_name() {
 }
 
 #[test]
+fn a_folder_is_not_adopted_under_a_name_the_engine_never_gives_as_pending() {
+    for name in ["docs (pending2)", "docs (pending 1)", "docs (pending  2)"] {
+        let mut trees = trees(
+            &[("l-docs", dir(ROOT, "docs"))],
+            &[
+                ("r-file", file(ROOT, "docs", 1)),
+                ("r-docs", dir(ROOT, name)),
+            ],
+        );
+        assert_eq!(adopt(&mut trees, false), ["l-docs"], "{name}");
+    }
+}
+
+#[test]
 fn a_folder_two_pending_names_could_belong_to_is_held() {
     let mut trees = trees(
         &[("l-docs", dir(ROOT, "docs"))],
@@ -1153,6 +1167,99 @@ fn a_reclaimed_folder_that_cannot_leave_s_yet_keeps_its_childs_waiting_update() 
     );
     assert_eq!(trees.check(), Ok(()));
     assert_eq!(trees.waiting().get("c"), Some(&waiting));
+}
+
+fn reclaim_with_waiting(
+    synced: &[(&str, Shape)],
+    remote: &[(&str, Shape)],
+    waiting: &[(&str, Shape)],
+) -> Trees {
+    let mut trees = Trees::new(ROOT);
+    for (ino, (id, shape)) in synced.iter().enumerate() {
+        trees.set_synced((*id).into(), Some(shape.clone()));
+        let identity = FileIdentity {
+            dev: 1,
+            ino: ino as u128 + 1,
+            birth_ns: Some(0),
+        };
+        let local = LocalNode {
+            shape: shape.clone(),
+            identity,
+            parked: false,
+        };
+        trees.set_local((*id).into(), local);
+    }
+    for (id, shape) in remote {
+        let node = RemoteNode {
+            shape: shape.clone(),
+            trashed: false,
+            content_rev: 1,
+            edit_rev: 1,
+            meta_rev: 1,
+            meta_edit_rev: 1,
+            trash_group: String::new(),
+            version_id: String::new(),
+        };
+        trees.set_remote((*id).into(), node);
+    }
+    trees.settle();
+    let mut state = trees.state();
+    state.discarded.insert("f".into(), dir(ROOT, "a"));
+    for (id, shape) in waiting {
+        let waiting = Waiting {
+            shape: Some(shape.clone()),
+            origin: Origin::Commit(7),
+        };
+        state.waiting.insert((*id).into(), waiting);
+    }
+    trees.restore(state).unwrap();
+    trees.rules_scanned();
+    assert!(trees.reclaimed("f"));
+    let mut commits = Commits::from_state(CommitsState {
+        accepted: 7,
+        ..Default::default()
+    })
+    .unwrap();
+    commits.build(
+        &mut trees,
+        &mut IdGen::new(7),
+        1_794_268_740_000,
+        "history",
+        1,
+    );
+    assert_eq!(trees.check(), Ok(()));
+    trees
+}
+
+#[test]
+fn a_reclaimed_folder_leaves_s_with_its_childs_waiting_move_while_another_update_waits() {
+    let trees = reclaim_with_waiting(
+        &[
+            ("f", dir(ROOT, "a")),
+            ("c", dir("f", "child")),
+            ("u", file(ROOT, "u", 1)),
+        ],
+        &[
+            ("c", dir(ROOT, "a")),
+            ("q", dir(ROOT, "q")),
+            ("u", file("q", "u", 1)),
+        ],
+        &[("c", dir(ROOT, "a")), ("u", file("q", "u", 1))],
+    );
+    assert_eq!(trees.synced().live("f"), None);
+    assert_eq!(trees.synced().live("c"), Some(&dir(ROOT, "a")));
+    assert!(trees.waiting().contains_key("u"));
+}
+
+#[test]
+fn a_reclaimed_folder_leaves_s_although_its_own_update_waits() {
+    let trees = reclaim_with_waiting(
+        &[("f", dir(ROOT, "a")), ("c", dir("f", "child"))],
+        &[("c", dir(ROOT, "a"))],
+        &[("c", dir(ROOT, "a")), ("f", dir("q", "a"))],
+    );
+    assert_eq!(trees.synced().live("f"), None);
+    assert!(!trees.waiting().contains_key("f"));
 }
 
 #[test]

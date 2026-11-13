@@ -1095,24 +1095,58 @@ impl Trees {
     }
 
     fn drop_together(&mut self, ids: &[NodeId]) -> bool {
-        let updates: Vec<(NodeId, Option<Shape>)> = (ids.iter())
-            .map(|id| (id.clone(), None))
-            .chain((self.waiting.iter()).map(|(id, waiting)| (id.clone(), waiting.shape.clone())))
+        let mut offered: BTreeMap<NodeId, Option<Shape>> = (self.waiting.iter())
+            .map(|(id, waiting)| (id.clone(), waiting.shape.clone()))
             .chain((self.same.iter()).map(|id| (id.clone(), self.r.live(id).cloned())))
+            .filter(|(id, _)| !ids.contains(id))
             .collect();
-        let mut s = self.s.clone();
-        for (id, shape) in &updates {
-            match shape {
-                Some(shape) => {
-                    s.insert(id.clone(), shape.clone());
-                }
-                None => {
-                    s.remove(id);
+        let mut updates: BTreeMap<NodeId, Option<Shape>> =
+            ids.iter().map(|id| (id.clone(), None)).collect();
+        loop {
+            let mut s = self.s.clone();
+            for (id, shape) in &updates {
+                match shape {
+                    Some(shape) => {
+                        s.insert(id.clone(), shape.clone());
+                    }
+                    None => {
+                        s.remove(id);
+                    }
                 }
             }
-        }
-        if s.check(Names::ByKey).is_err() {
-            return false;
+            let involved: Vec<NodeId> = match s.check(Names::ByKey) {
+                Ok(()) => break,
+                Err(TreeError::NameTaken { parent, name }) => (s.iter())
+                    .filter(|(_, shape)| {
+                        shape.parent == parent && name_key(&shape.name) == name_key(&name)
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect(),
+                Err(
+                    TreeError::MissingParent(id)
+                    | TreeError::ParentNotDir(id)
+                    | TreeError::Cycle(id),
+                ) => {
+                    let mut chain = vec![id];
+                    for _ in 0..s.len() {
+                        match s.get(chain.last().expect("the chain starts with a node")) {
+                            Some(shape) if !chain.contains(&shape.parent) => {
+                                chain.push(shape.parent.clone())
+                            }
+                            _ => break,
+                        }
+                    }
+                    chain
+                }
+                Err(TreeError::RootStored) => return false,
+            };
+            let needed: Vec<(NodeId, Option<Shape>)> = (involved.iter())
+                .filter_map(|id| offered.remove_entry(id))
+                .collect();
+            if needed.is_empty() {
+                return false;
+            }
+            updates.extend(needed);
         }
         for (id, shape) in updates {
             self.set_synced_unmarked(&id, shape);

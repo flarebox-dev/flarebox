@@ -548,9 +548,7 @@ impl Engine {
             ahead_of_server: false,
         };
         tx.set_cursor(&cursor)?;
-        if !recovering {
-            self.commits.acknowledge(&mut self.trees, cursor.last_seq);
-        }
+        self.commits.acknowledge(&mut self.trees, cursor.last_seq);
         self.cursor = Some(cursor);
         Ok(())
     }

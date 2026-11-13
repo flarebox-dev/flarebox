@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use koidrive_engine::classify::{Class, Trees};
+use koidrive_engine::classify::{Class, Origin, Trees, Waiting};
 use koidrive_engine::commit::{Base, Commits, Failure, Reconnect};
 use koidrive_engine::effects::{BatchLimit, Effect, Effects};
 use koidrive_engine::ids::IdGen;
@@ -595,6 +595,33 @@ fn the_commit_in_flight_before_the_reset_is_never_sent_again() {
 }
 
 #[test]
+fn a_result_that_arrives_after_the_recovery_starts_leaves_the_change_held() {
+    let mut trees = trees(
+        &[("n", file(ROOT, "a", 2))],
+        &[("n", file(ROOT, "a", 1))],
+        &[live("n", file(ROOT, "a", 1))],
+    );
+    let mut commits = Commits::default();
+    let mut ids = IdGen::new(7);
+    assert!(commits.build(&mut trees, &mut ids, NOW, OLD, 1).is_some());
+    commits.enter_recovery(rewind());
+    let applied = OpResult {
+        code: op_result::Code::Applied as i32,
+        ..Default::default()
+    };
+    let result = CommitResult {
+        seq: 2,
+        results: vec![applied],
+        ..Default::default()
+    };
+    commits.received(result).unwrap();
+    commits.acknowledge(&mut trees, 2);
+    commits.recover(&mut trees, 0, &rewind(), &mut ids, NOW);
+    trees.settle();
+    asked(&commits, RecoveryGroup::ChangedOnThisDevice, &["n"]);
+}
+
+#[test]
 fn a_restore_asked_for_before_the_reset_is_held_until_it_is_answered() {
     for answer in [Answer::Repeat, Answer::Cancel] {
         let mut trees = trees(
@@ -631,6 +658,53 @@ fn a_restore_asked_for_before_the_reset_is_held_until_it_is_answered() {
             assert!(commits.questions().is_empty());
         }
     }
+}
+
+#[test]
+fn a_restore_asked_for_again_after_the_reset_waits_for_the_answer_about_the_first() {
+    let mut trees = trees(
+        &[(NODE, file(ROOT, "a", 1))],
+        &[(NODE, file(ROOT, "a", 1))],
+        &[live(NODE, file(ROOT, "a", 1))],
+    );
+    let mut commits = Commits::default();
+    let mut ids = IdGen::new(7);
+    let intent = RestoreIntent::version(NODE.into(), NODE.into()).unwrap();
+    assert!(commits.restore("before".into(), intent.clone()));
+    commits.enter_recovery(rewind());
+    commits.recover(&mut trees, 0, &rewind(), &mut ids, NOW);
+    trees.settle();
+    let question = asked(&commits, RecoveryGroup::RequestedBeforeReset, &["before"]);
+    assert!(commits.restore("later".into(), intent));
+    assert_eq!(ops(&mut commits, &mut trees, &mut ids), []);
+    assert!(commits.decide(&question.id, Answer::Repeat));
+    let sent = ops(&mut commits, &mut trees, &mut ids);
+    assert_eq!(
+        sent,
+        [("restore", NODE.to_owned()), ("restore", NODE.to_owned())]
+    );
+    let applied = OpResult {
+        code: op_result::Code::Applied as i32,
+        ..Default::default()
+    };
+    let result = CommitResult {
+        seq: 2,
+        results: vec![applied; sent.len()],
+        ..Default::default()
+    };
+    commits.received(result).unwrap();
+    assert!(commits.acknowledge(&mut trees, 2));
+    assert!(commits.restores().is_empty());
+    let ended: Vec<(&str, &Outcome)> = (commits.resolved().iter())
+        .map(|ended| (ended.id.as_str(), &ended.outcome))
+        .collect();
+    assert_eq!(
+        ended,
+        [
+            ("before", &Outcome::Restored),
+            ("later", &Outcome::Restored)
+        ]
+    );
 }
 
 #[test]
@@ -1051,6 +1125,94 @@ fn a_child_an_answer_trashes_again_leaves_the_disk_and_is_not_sent_again() {
         "{done:?}"
     );
     assert_eq!(ops(&mut commits, &mut trees, &mut ids), []);
+}
+
+#[test]
+fn an_edit_sent_before_its_folder_is_published_is_not_trashed_again() {
+    let mut trees = trees(
+        &[("d", dir(ROOT, "new")), ("c", file("d", "child", 1))],
+        &[("d", dir(ROOT, "old")), ("c", file("d", "child", 1))],
+        &[
+            Remote("d", dir(ROOT, "old"), true, 1),
+            Remote("c", file("d", "child", 1), true, 1),
+        ],
+    );
+    let (mut commits, mut ids) = recovered(&mut trees, 0);
+    let question = asked(&commits, RecoveryGroup::ChangedOnThisDevice, &["d"]);
+    assert!(commits.decide(&question.id, Answer::Publish));
+    let mut edited = trees.local().get("c").unwrap().clone();
+    edited.shape = file("d", "child", 2);
+    trees.set_local("c".into(), edited);
+    trees.settle();
+    assert_eq!(
+        ops(&mut commits, &mut trees, &mut ids),
+        [("update", "c".into()), ("move", "d".into())]
+    );
+}
+
+#[test]
+fn a_restore_of_a_child_an_answer_trashes_again_waits_while_the_child_is_unsettled() {
+    let mut trees = trees(
+        &[("d", dir(ROOT, "new")), (NODE, file("d", "child", 1))],
+        &[("d", dir(ROOT, "old")), (NODE, file("d", "child", 1))],
+        &[
+            Remote("d", dir(ROOT, "old"), true, 1),
+            Remote(NODE, file("d", "child", 1), true, 1),
+        ],
+    );
+    let (mut commits, mut ids) = recovered(&mut trees, 0);
+    let mut state = trees.state();
+    let waiting = Waiting {
+        shape: Some(file("elsewhere", "child", 1)),
+        origin: Origin::Other,
+    };
+    state.waiting.insert(NODE.into(), waiting);
+    trees.restore(state).unwrap();
+    trees.rules_scanned();
+    trees.settle();
+    let intent = RestoreIntent::version(NODE.into(), NODE.into()).unwrap();
+    assert!(commits.restore("request".into(), intent));
+    let question = asked(&commits, RecoveryGroup::ChangedOnThisDevice, &["d"]);
+    assert!(commits.decide(&question.id, Answer::Publish));
+    let sent = ops(&mut commits, &mut trees, &mut ids);
+    assert!(!sent.iter().any(|(kind, _)| *kind == "restore"), "{sent:?}");
+}
+
+#[test]
+fn a_commit_counts_the_nodes_a_published_folder_brings_back_from_the_trash() {
+    let folders: Vec<(String, String)> = (0..900)
+        .map(|n| (format!("s{n}"), format!("g{n}")))
+        .collect();
+    let long = |n: &str| format!("{n}{}", "x".repeat(200));
+    let mut local = vec![("d".to_owned(), dir(ROOT, "new"))];
+    let mut synced = vec![("d".to_owned(), dir(ROOT, "old"))];
+    for (folder, edited) in &folders {
+        let shape = dir("d", &long(folder));
+        local.push((folder.clone(), shape.clone()));
+        synced.push((folder.clone(), shape));
+        local.push((edited.clone(), file(folder, "g", 2)));
+        synced.push((edited.clone(), file(folder, "g", 1)));
+    }
+    let remote: Vec<Remote> = (synced.iter())
+        .map(|(id, shape)| Remote(id, shape.clone(), true, 1))
+        .collect();
+    let local: Vec<(&str, Shape)> = local
+        .iter()
+        .map(|(id, s)| (id.as_str(), s.clone()))
+        .collect();
+    let synced: Vec<(&str, Shape)> = synced
+        .iter()
+        .map(|(id, s)| (id.as_str(), s.clone()))
+        .collect();
+    let mut trees = trees(&local, &synced, &remote);
+    let (mut commits, mut ids) = recovered(&mut trees, 0);
+    let [question] = commits.questions() else {
+        panic!("{:?}", commits.questions());
+    };
+    assert_eq!(question.holds().count(), 1 + folders.len());
+    assert!(commits.decide(&question.id.clone(), Answer::Publish));
+    let sent = ops(&mut commits, &mut trees, &mut ids);
+    assert_eq!(sent, [("move", "d".to_owned())]);
 }
 
 #[test]

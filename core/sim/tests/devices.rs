@@ -196,17 +196,25 @@ fn keep(devices: usize, phases: &[Vec<(usize, Step)>]) -> Result<World, Failure>
 
 const REWIND_SEED: u64 = 501;
 
-fn converges_from(seed: u64, cases: u32) {
+macro_rules! test_name {
+    ($test:ident) => {
+        concat!(module_path!(), "::", stringify!($test))
+    };
+}
+
+fn converges_from(test: &'static str, seed: u64, cases: u32) {
     converges_with(ProptestConfig {
         rng_seed: RngSeed::Fixed(seed),
         failure_persistence: None,
+        test_name: Some(test),
         ..ProptestConfig::with_cases(cases)
     });
 }
 
-fn converges_from_saved_cases(file: &'static str) {
+fn converges_from_saved_cases(test: &'static str, file: &'static str) {
     converges_with(ProptestConfig {
         failure_persistence: Some(Box::new(FileFailurePersistence::Direct(file))),
+        test_name: Some(test),
         ..ProptestConfig::with_cases(0)
     });
 }
@@ -291,58 +299,61 @@ proptest! {
 
 #[test]
 fn rewinds_converge_from_seed_122() {
-    converges_from(122, 4096);
+    converges_from(test_name!(rewinds_converge_from_seed_122), 122, 4096);
 }
 
 #[test]
 #[ignore = "a folder keeps a pending name no user gave until the server marks pending names (GUN-547)"]
 fn rewinds_converge_from_seed_605() {
-    converges_from(605, 4096);
+    converges_from(test_name!(rewinds_converge_from_seed_605), 605, 4096);
 }
 
 #[test]
 fn rewinds_converge_from_seed_301() {
-    converges_from(301, 4096);
+    converges_from(test_name!(rewinds_converge_from_seed_301), 301, 4096);
 }
 
 #[test]
 fn rewinds_converge_from_seed_313() {
-    converges_from(313, 4096);
+    converges_from(test_name!(rewinds_converge_from_seed_313), 313, 4096);
 }
 
 #[test]
 fn rewinds_converge_from_seed_319() {
-    converges_from(319, 4096);
+    converges_from(test_name!(rewinds_converge_from_seed_319), 319, 4096);
 }
 
 #[test]
 #[ignore = "a device goes quiet out of sync after a rewind (GUN-551)"]
 fn rewinds_converge_from_seed_824() {
-    converges_from(824, 4096);
+    converges_from(test_name!(rewinds_converge_from_seed_824), 824, 4096);
 }
 
 #[test]
 #[ignore = "a device goes quiet out of sync after a rewind (GUN-551)"]
 fn rewinds_converge_from_seed_1316() {
-    converges_from(1316, 4096);
+    converges_from(test_name!(rewinds_converge_from_seed_1316), 1316, 4096);
 }
 
 #[test]
 #[ignore = "a device goes quiet out of sync after a rewind (GUN-551)"]
 fn rewinds_converge_from_seed_3413() {
-    converges_from(3413, 4096);
+    converges_from(test_name!(rewinds_converge_from_seed_3413), 3413, 4096);
 }
 
 #[test]
 #[ignore = "a device goes quiet out of sync after a rewind (GUN-551)"]
 fn rewinds_converge_from_seed_3417() {
-    converges_from(3417, 4096);
+    converges_from(test_name!(rewinds_converge_from_seed_3417), 3417, 4096);
 }
 
 #[test]
 #[ignore = "a device goes quiet out of sync after a rewind, or keeps a write off the server while it waits (GUN-551)"]
 fn rewinds_converge_from_the_saved_gun_551_cases() {
-    converges_from_saved_cases("tests/gun-551.proptest-regressions");
+    converges_from_saved_cases(
+        test_name!(rewinds_converge_from_the_saved_gun_551_cases),
+        "tests/gun-551.proptest-regressions",
+    );
 }
 
 /// A fixed sample of the schedules reaches every fault and every way back from one that the
