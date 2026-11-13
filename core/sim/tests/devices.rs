@@ -1210,6 +1210,50 @@ fn a_restore_that_loses_an_edit_lets_its_file_be_revived() {
     converge(3, &phases).unwrap();
 }
 
+#[test]
+fn a_commit_applied_again_after_a_restore_hides_no_commit_before_it() {
+    let u = |kind, target, parent, name, text| {
+        Step::User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text,
+        })
+    };
+    let phases = vec![
+        vec![(1, u(1, 17503378262933104031, 8676797805769390255, 0, 0))],
+        vec![
+            (2, u(1, 14773020708250346160, 17688344867352952878, 1, 3)),
+            (1, u(1, 8739664364649419579, 10425898527117367920, 1, 1)),
+            (0, u(2, 2703697463063541661, 14694850271240265751, 4, 0)),
+        ],
+        vec![
+            (0, u(0, 14175073634118050617, 4546324325139635686, 6, 1)),
+            (1, u(3, 11841437895142882941, 7695071214306762243, 6, 3)),
+            (0, Step::Scan),
+            (0, Step::Work(17835076681416284481)),
+            (2, BACKUP),
+            (1, Step::Work(6804034245751716185)),
+            (1, Step::Work(8817138495063991201)),
+            (0, Step::Work(9139201847012193521)),
+            (1, Step::Deliver(5725093936307975295)),
+            (2, Step::Deliver(3760675399677619784)),
+            (2, u(2, 15632049101928360904, 15695858799699297419, 0, 3)),
+            (1, Step::Work(17555396458820976808)),
+            (2, Step::Scan),
+            (2, Step::Deliver(1503442958024575124)),
+            (0, u(0, 16916060028658482220, 3213220271578802601, 5, 3)),
+            (0, Step::Deliver(9182944446394345860)),
+            (2, Step::Commit(Reply::Served)),
+            (1, RESTORE),
+            (0, u(2, 9997817214443366706, 12996066320436592824, 5, 2)),
+        ],
+    ];
+    let world = converge(3, &phases).unwrap();
+    assert!(world.seen.contains_key("resume finds the server behind"));
+}
+
 /// Once the devices are quiet after a restore, a copy of a write the restore took from the server
 /// is refused like any other copy.
 #[test]

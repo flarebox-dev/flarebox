@@ -223,6 +223,7 @@ fn readable(disk: &Disk, trees: &Trees, node: &str, content: &Content) -> bool {
 fn upload(
     space: &mut SpaceDo,
     session: &Session,
+    now_ms: i64,
     disk: &Disk,
     trees: &Trees,
     commit: &Commit,
@@ -236,11 +237,11 @@ fn upload(
         return Vec::new();
     }
     let plan = space
-        .prepare_upload(session, NOW, &PrepareUpload { chunks })
+        .prepare_upload(session, now_ms, &PrepareUpload { chunks })
         .expect("chunks of three bytes");
     (plan.chunks.iter())
         .filter(|chunk| chunk.action == chunk_plan::Action::Upload as i32)
-        .map(|chunk| space.put_chunk(&chunk.hash, 3, NOW))
+        .map(|chunk| space.put_chunk(&chunk.hash, 3, now_ms))
         .collect()
 }
 
@@ -797,7 +798,7 @@ impl World {
             })
             .copied()
             .collect();
-        self.space.rewind(&backup.space, NOW);
+        self.space.rewind(&backup.space, self.server_now());
         self.in_history = backup.in_history.clone();
         self.rewound
             .retain(|write, _| !stored(&backup.in_history, *write));
@@ -1499,7 +1500,12 @@ impl World {
     /// Builds the next commit, or sends the one in flight, once the device is connected and
     /// caught up. With a reply other than `Reply::Served` a step does both. True when the
     /// trees changed or a commit was built or sent.
+    fn server_now(&self) -> i64 {
+        NOW + self.clock as i64
+    }
+
     fn commit(&mut self, d: usize, reply: Reply) -> Result<bool, Failure> {
+        let now_ms = self.server_now();
         let device = &mut self.devices[d];
         let Some(link) = device.link.as_mut() else {
             return Ok(false);
@@ -1563,6 +1569,7 @@ impl World {
                     _ => upload(
                         &mut self.space,
                         &device.session,
+                        now_ms,
                         &device.disk,
                         &device.engine.trees,
                         &commit,
@@ -1595,7 +1602,7 @@ impl World {
                     .filter(|node| node.status == NodeStatus::Trashed as i32)
                     .map(|node| node.node_id)
                     .collect();
-                match self.space.commit(&session, NOW, &sent) {
+                match self.space.commit(&session, now_ms, &sent) {
                     Ok(committed) => {
                         if let Some(record) = committed.record {
                             let built = self.built[d];
