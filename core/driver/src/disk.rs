@@ -388,14 +388,10 @@ impl Disk {
             let (effect, mut contents) = translate(&record)?;
             let marker = disk.counter(record.counter);
             let hook = &mut disk.hook;
-            let outcome = disk.space.recover(
-                &marker,
-                &effect,
-                &mut contents,
-                SystemTime::now(),
-                &mut |step| hook(Cut::Step(step)),
-            )?;
-            let outcome = confirmed(outcome, engine);
+            let mut step = |step| hook(Cut::Step(step));
+            let mut section = disk.space.section(&marker, &mut step)?;
+            section.recover(&effect, &mut contents, SystemTime::now())?;
+            let outcome = confirmed(only(section.finish()?), engine);
             acknowledge(&record, &outcome, true, &link.space_id, engine, store, hook)?;
             let (marker, cleared) = (disk.marker()?, engine.effects.cleared());
             if marker != cleared {
@@ -507,16 +503,16 @@ impl Disk {
         let hook = &mut self.hook;
         let mut step = |step| hook(Cut::Step(step));
         let now = SystemTime::now();
+        let mut section = self.space.section(&marker, &mut step)?;
         let outcome = match &unfetchable {
             None if record.applies(&engine.trees, engine.commits.in_flight()) => {
-                self.space
-                    .apply(&marker, &effect, &mut contents, now, &mut step)?
+                section.apply(&effect, &mut contents, now)?;
+                only(section.finish()?)
             }
-            _ => confirmed(
-                self.space
-                    .recover(&marker, &effect, &mut contents, now, &mut step)?,
-                engine,
-            ),
+            _ => {
+                section.recover(&effect, &mut contents, now)?;
+                confirmed(only(section.finish()?), engine)
+            }
         };
         let settled = acknowledge(
             &record,
@@ -1024,6 +1020,11 @@ fn acknowledge(
 /// `outcome` as recovery reports it for the effect in flight, unless L refutes a done
 /// ([`koidrive_engine::effects::Effects::confirms`]). Then the effect fails as it would have on the entry recovery
 /// found: a removal finds its entry missing, and a write or a new folder finds its name taken.
+fn only(outcomes: Vec<Outcome>) -> Outcome {
+    let [outcome] = <[Outcome; 1]>::try_from(outcomes).expect("a section of one effect");
+    outcome
+}
+
 fn confirmed(outcome: Outcome, engine: &Engine) -> Outcome {
     let Outcome::Done { identity } = &outcome else {
         return outcome;

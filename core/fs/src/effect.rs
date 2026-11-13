@@ -12,7 +12,7 @@ use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::resolve::{Folder, Location, Space, Unresolved, check_name};
-use crate::root::{Marker, flush, remove_if_present, rename_no_replace, write_marker_at};
+use crate::root::{Flush, Marker, flush, remove_if_present, rename_no_replace, write_marker_at};
 use crate::trash::TRASH_DIR;
 use crate::{Entry, EntryKind, FileId, Stat, list, stat_at, stat_fd};
 
@@ -84,7 +84,7 @@ pub trait Contents {
 /// reached once the step it names is complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
-    /// The root marker holds the effect's counter.
+    /// The root marker holds the section's counter.
     Marked,
     /// The folders resolved and the entry the effect acts on matched.
     Checked,
@@ -140,6 +140,64 @@ pub enum Reason {
     Holds(Vec<OsString>),
 }
 
+/// Effects whose steps become durable together (design §5.2), begun by
+/// [`Space::section`]. Each step is ordered on disk against the steps it must
+/// precede, and [`Section::finish`] makes all of them durable before it hands
+/// out the outcomes, so no outcome can be acknowledged before then.
+pub struct Section<'a> {
+    space: &'a Space,
+    hook: &'a mut dyn FnMut(Step),
+    outcomes: Vec<Outcome>,
+}
+
+impl Section<'_> {
+    /// Carries out `effect`.
+    ///
+    /// An error leaves the effect anywhere between its steps, and drops the
+    /// outcomes of the section's earlier effects: recover each effect of the
+    /// section in a new one before anything else. A replacement whose staged
+    /// file is missing fails with [`io::ErrorKind::NotFound`] before it changes
+    /// anything. A root that is no longer held fails the effect with
+    /// [`Unresolved::RootWithdrawn`] before the next change.
+    pub fn apply(
+        &mut self,
+        effect: &Effect,
+        contents: &mut dyn Contents,
+        now: SystemTime,
+    ) -> io::Result<()> {
+        let outcome = self.space.apply_effect(effect, contents, now, self.hook)?;
+        self.outcomes.push(outcome);
+        Ok(())
+    }
+
+    /// Recovers `effect` after a crash (design §5.3), from what the disk holds
+    /// at its target, its staging path and its quarantine path. The section's
+    /// marker covers it, since the crash may have come before the marker
+    /// write. Recovery is idempotent: a crash during it is recovered by running
+    /// it again. A root that is no longer held fails recovery with
+    /// [`Unresolved::RootWithdrawn`] before the next change, and recovery runs
+    /// again once the root is bound anew.
+    pub fn recover(
+        &mut self,
+        effect: &Effect,
+        contents: &mut dyn Contents,
+        now: SystemTime,
+    ) -> io::Result<()> {
+        let outcome = self
+            .space
+            .recover_effect(effect, contents, now, self.hook)?;
+        self.outcomes.push(outcome);
+        Ok(())
+    }
+
+    /// Makes every step of the section durable and returns the outcomes of its
+    /// effects, in the order they were applied or recovered.
+    pub fn finish(self) -> io::Result<Vec<Outcome>> {
+        flush(self.space.root(), Flush::Full)?;
+        Ok(self.outcomes)
+    }
+}
+
 fn failed(reason: Reason) -> Outcome {
     Outcome::Failed {
         reason,
@@ -185,7 +243,8 @@ impl Space {
 
     /// Sets the staged file's executable bit and flushes it, which design
     /// §5.2 requires before the file is renamed into place. The caller has
-    /// written and verified its content.
+    /// written and verified its content, and finishes the file before it
+    /// begins the [`Section`] that places it.
     pub fn finish_staged(&self, id: &str, executable: bool) -> io::Result<()> {
         check_name(OsStr::new(id))?;
         let staging = self.private(&[STAGING_DIR])?;
@@ -198,7 +257,7 @@ impl Space {
             mode & !0o111
         };
         rustix::fs::fchmod(&file, Mode::from_raw_mode(mode as _))?;
-        flush(rustix::fd::AsFd::as_fd(&file))
+        flush(rustix::fd::AsFd::as_fd(&file), Flush::Plain)
     }
 
     /// Deletes every staged file except `keep`, the effect in flight. Staged
@@ -217,17 +276,28 @@ impl Space {
         Ok(cleared)
     }
 
-    /// Carries out `effect` after writing `marker`, which holds the effect's
-    /// counter (design §2.8). `hook` runs at every [`Step`] reached.
-    ///
-    /// An error leaves the effect anywhere between its steps: run
-    /// [`Space::recover`] for it before anything else. A replacement whose
-    /// staged file is missing fails with [`io::ErrorKind::NotFound`] before it
-    /// changes anything. A root that is no longer held fails the effect with
-    /// [`Unresolved::RootWithdrawn`] before the next change.
-    pub fn apply(
-        &self,
+    /// Begins an effect section after checking that the root is held. It
+    /// writes `marker`, which holds the counter the store sets once it
+    /// acknowledges the section's effects (design §2.8), and orders the
+    /// marker and every staged file finished before it ahead of the section's
+    /// changes. `hook` runs at every [`Step`] the section reaches.
+    pub fn section<'a>(
+        &'a self,
         marker: &Marker,
+        hook: &'a mut dyn FnMut(Step),
+    ) -> io::Result<Section<'a>> {
+        self.check_held()?;
+        write_marker_at(self.root(), marker, Flush::Barrier)?;
+        hook(Step::Marked);
+        Ok(Section {
+            space: self,
+            hook,
+            outcomes: Vec::new(),
+        })
+    }
+
+    fn apply_effect(
+        &self,
         effect: &Effect,
         contents: &mut dyn Contents,
         now: SystemTime,
@@ -235,15 +305,13 @@ impl Space {
     ) -> io::Result<Outcome> {
         check_name(OsStr::new(&effect.id))?;
         self.check_held()?;
-        write_marker_at(self.root(), marker)?;
-        hook(Step::Marked);
         let outcome = match &effect.action {
             Action::CreateDir { at } => {
                 let (parent, name) = resolve!(self.parent(at));
                 hook(Step::Checked);
                 resolve!(self.recheck(&parent));
                 match rustix::fs::mkdirat(parent.fd(), name, Mode::from_raw_mode(0o755)) {
-                    Ok(()) => flush(parent.fd())?,
+                    Ok(()) => flush(parent.fd(), Flush::Plain)?,
                     Err(Errno::EXIST) => return Ok(failed(Reason::Taken)),
                     Err(err) => return Err(err.into()),
                 }
@@ -294,8 +362,8 @@ impl Space {
                     }
                     Err(err) => return Err(err),
                 }
-                flush(source.fd())?;
-                flush(target.fd())?;
+                flush(source.fd(), Flush::Plain)?;
+                flush(target.fd(), Flush::Plain)?;
                 hook(Step::Placed);
                 Outcome::Done { identity: None }
             }
@@ -350,8 +418,8 @@ impl Space {
             }
             Err(err) => return Err(err),
         }
-        flush(parent.fd())?;
-        flush(quarantine.fd())?;
+        flush(parent.fd(), Flush::Plain)?;
+        flush(quarantine.fd(), Flush::Barrier)?;
         hook(Step::Quarantined);
 
         let differs = differs(quarantine.fd(), id, &displaced.entry, contents)?;
@@ -397,8 +465,8 @@ impl Space {
             }
             Err(err) => return Err(err),
         }
-        flush(staging.fd())?;
-        flush(target.fd())?;
+        flush(staging.fd(), Flush::Plain)?;
+        flush(target.fd(), Flush::Plain)?;
         hook(Step::Placed);
         Ok(Outcome::Done {
             identity: Some(identity),
@@ -432,8 +500,8 @@ impl Space {
         };
         match rename_no_replace(quarantine.fd(), id, parent.fd(), name) {
             Ok(()) => {
-                flush(quarantine.fd())?;
-                flush(parent.fd())?;
+                flush(quarantine.fd(), Flush::Plain)?;
+                flush(parent.fd(), Flush::Barrier)?;
                 Ok(None)
             }
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
@@ -445,16 +513,8 @@ impl Space {
         }
     }
 
-    /// Recovers `effect` after a crash (design §5.3), from what the disk
-    /// holds at its target, its staging path and its quarantine path. It
-    /// writes `marker` again, since the crash may have come before the
-    /// marker write. Recovery is idempotent: a crash during it is recovered by
-    /// running it again. `hook` runs at every [`Step`] reached. A root that is
-    /// no longer held fails recovery with [`Unresolved::RootWithdrawn`] before
-    /// the next change, and recovery runs again once the root is bound anew.
-    pub fn recover(
+    fn recover_effect(
         &self,
-        marker: &Marker,
         effect: &Effect,
         contents: &mut dyn Contents,
         now: SystemTime,
@@ -462,8 +522,6 @@ impl Space {
     ) -> io::Result<Outcome> {
         check_name(OsStr::new(&effect.id))?;
         self.check_held()?;
-        write_marker_at(self.root(), marker)?;
-        hook(Step::Marked);
         let quarantine = self.private(&[QUARANTINE_DIR])?;
         let staging = self.private(&[STAGING_DIR])?;
         let id = OsStr::new(&effect.id);
@@ -643,7 +701,7 @@ fn clear_platform_files(quarantine: BorrowedFd<'_>, id: &OsStr) -> io::Result<()
     for name in PLATFORM_FILES {
         remove_if_present(dir.as_fd(), name)?;
     }
-    flush(dir.as_fd())
+    flush(dir.as_fd(), Flush::Plain)
 }
 
 fn lookup(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<Option<Stat>> {

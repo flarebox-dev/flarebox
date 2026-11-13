@@ -11,8 +11,8 @@ use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use common::{
-    Bytes, EDITED, ID, REMOTE, SCENARIOS, SYNCED, assert_settled, at, bind, contents, entries,
-    marker, now, prepare, private_names, rewrite_keeping_mtime, same, stage, trashed,
+    EDITED, ID, REMOTE, SCENARIOS, SYNCED, apply_one, assert_settled, at, bind, contents, entries,
+    marker, now, prepare, private_names, recover_one, rewrite_keeping_mtime, same, stage, trashed,
 };
 use koidrive_fs::{
     Action, Base, Displaced, Effect, Location, Outcome, PARKED_DIR, PRIVATE_DIR, QUARANTINE_DIR,
@@ -24,9 +24,7 @@ fn replace(root: &Path) -> Effect {
 }
 
 fn apply(root: &Path, effect: &Effect, mut hook: impl FnMut(Step)) -> Outcome {
-    bind(root)
-        .apply(&marker(), effect, &mut Bytes, now(), &mut hook)
-        .unwrap()
+    apply_one(&bind(root), effect, &mut hook).unwrap()
 }
 
 fn failed(reason: Reason) -> Outcome {
@@ -530,9 +528,7 @@ fn recovery_puts_back_a_file_written_through_an_old_descriptor_after_a_crash() {
     held.write_all_at(b"SYNCED", 0).unwrap();
 
     let space = bind(root);
-    let outcome = space
-        .recover(&marker(), &effect, &mut Bytes, now(), &mut |_| {})
-        .unwrap();
+    let outcome = recover_one(&space, &effect, &mut |_| {}).unwrap();
     assert_eq!(outcome, failed(Reason::Changed));
     assert_eq!(fs::read(root.join("docs/report.txt")).unwrap(), b"SYNCED");
     assert_settled(root);
@@ -544,9 +540,7 @@ fn replacement_without_a_staged_file_changes_nothing() {
     let root = dir.path();
     let effect = replace(root);
     fs::remove_file(root.join(PRIVATE_DIR).join(STAGING_DIR).join(ID)).unwrap();
-    let err = bind(root)
-        .apply(&marker(), &effect, &mut Bytes, now(), &mut |_| {})
-        .unwrap_err();
+    let err = apply_one(&bind(root), &effect, &mut |_| {}).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
     assert_eq!(fs::read(root.join("docs/report.txt")).unwrap(), SYNCED);
     assert!(private_names(root, QUARANTINE_DIR).is_empty());
@@ -594,9 +588,7 @@ fn effect_ids_must_be_single_names() {
     let space = bind(root);
     for id in ["", ".", "..", "../e1", "a/b"] {
         effect.id = id.into();
-        let err = space
-            .apply(&marker(), &effect, &mut Bytes, now(), &mut |_| {})
-            .unwrap_err();
+        let err = apply_one(&space, &effect, &mut |_| {}).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{id:?}");
         assert_eq!(
             space.stage(id).unwrap_err().kind(),
@@ -643,11 +635,7 @@ fn root_moved_during_an_effect_gets_nothing_at_its_path_and_recovers_where_it_we
         let root = dir.path().join("space");
         let effect = prepare(scenario, &root);
         let mut steps = Vec::new();
-        bind(&root)
-            .apply(&marker(), &effect, &mut Bytes, now(), &mut |step| {
-                steps.push(step)
-            })
-            .unwrap();
+        apply_one(&bind(&root), &effect, &mut |step| steps.push(step)).unwrap();
         let done_from = scenario
             .done_from
             .map(|from| steps.iter().position(|step| *step == from).unwrap());
@@ -658,7 +646,7 @@ fn root_moved_during_an_effect_gets_nothing_at_its_path_and_recovers_where_it_we
             let root = dir.path().join("space");
             let moved = dir.path().join("moved");
             let effect = prepare(scenario, &root);
-            let result = bind(&root).apply(&marker(), &effect, &mut Bytes, now(), &mut |reached| {
+            let result = apply_one(&bind(&root), &effect, &mut |reached| {
                 if reached == step {
                     withdraw(&root, &moved);
                 }
@@ -669,9 +657,7 @@ fn root_moved_during_an_effect_gets_nothing_at_its_path_and_recovers_where_it_we
             }
             assert!(listing(&root).is_empty(), "{context}");
 
-            let outcome = bind(&moved)
-                .recover(&marker(), &effect, &mut Bytes, now(), &mut |_| {})
-                .unwrap();
+            let outcome = recover_one(&bind(&moved), &effect, &mut |_| {}).unwrap();
             assert_eq!(
                 matches!(outcome, Outcome::Done { .. }),
                 done_from.is_some_and(|from| index >= from),
@@ -696,12 +682,8 @@ fn space_changes_nothing_once_its_root_is_moved_away() {
     assert!(!space.held().unwrap());
 
     let results = [
-        space
-            .apply(&marker(), &effect, &mut Bytes, now(), &mut |_| {})
-            .map(drop),
-        space
-            .recover(&marker(), &effect, &mut Bytes, now(), &mut |_| {})
-            .map(drop),
+        apply_one(&space, &effect, &mut |_| {}).map(drop),
+        recover_one(&space, &effect, &mut |_| {}).map(drop),
         space.stage("e2").map(drop),
         space.finish_staged(ID, true),
         space.clear_staging(None).map(drop),
@@ -717,9 +699,7 @@ fn space_changes_nothing_once_its_root_is_moved_away() {
     assert_eq!(private_names(&moved, STAGING_DIR), [ID]);
     assert_eq!(fs::read(moved.join("docs/report.txt")).unwrap(), SYNCED);
 
-    let outcome = bind(&moved)
-        .apply(&marker(), &effect, &mut Bytes, now(), &mut |_| {})
-        .unwrap();
+    let outcome = apply_one(&bind(&moved), &effect, &mut |_| {}).unwrap();
     assert_eq!(outcome, made(&moved, "docs/report.txt"));
     assert_settled(&moved);
     assert!(listing(&root).is_empty());
@@ -738,9 +718,7 @@ fn recovery_of_a_removal_whose_file_the_user_moved_first_fails() {
             _ => ("docs/empty", "docs/moved"),
         };
         fs::rename(root.join(from), root.join(to)).unwrap();
-        let outcome = bind(root)
-            .recover(&marker(), &effect, &mut Bytes, now(), &mut |_| {})
-            .unwrap();
+        let outcome = recover_one(&bind(root), &effect, &mut |_| {}).unwrap();
         assert_eq!(outcome, failed(Reason::Missing), "{scenario}");
         assert!(root.join(to).exists(), "{scenario}");
         assert!(trashed(root).is_empty(), "{scenario}");
@@ -771,9 +749,7 @@ fn recovery_of_a_replacement_whose_target_the_user_changed_is_overtaken() {
         }));
         assert!(crashed.is_err());
         change(&root.join("docs/report.txt"));
-        let outcome = bind(root)
-            .recover(&marker(), &effect, &mut Bytes, now(), &mut |_| {})
-            .unwrap();
+        let outcome = recover_one(&bind(root), &effect, &mut |_| {}).unwrap();
         assert_eq!(outcome, failed(Reason::Overtaken), "{kill:?}");
         assert_eq!(trashed(root), [SYNCED], "{kill:?}");
         assert_settled(root);
@@ -793,9 +769,7 @@ fn recovery_of_a_replacement_whose_name_was_taken_before_a_crash_after_the_trash
         })
     }));
     assert!(crashed.is_err());
-    let outcome = bind(root)
-        .recover(&marker(), &effect, &mut Bytes, now(), &mut |_| {})
-        .unwrap();
+    let outcome = recover_one(&bind(root), &effect, &mut |_| {}).unwrap();
     assert_eq!(outcome, failed(Reason::Overtaken));
     assert_eq!(fs::read(root.join("docs/report.txt")).unwrap(), EDITED);
     assert_eq!(trashed(root), [SYNCED]);

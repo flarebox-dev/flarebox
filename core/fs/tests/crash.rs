@@ -9,8 +9,8 @@ use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 
 use common::{
-    Bytes, RETURNS, SCENARIOS, Scenario, assert_settled, bind, decode, encode, entries, marker,
-    now, prepare, scenario,
+    RETURNS, SCENARIOS, Scenario, apply_one, assert_settled, bind, decode, encode, entries,
+    prepare, recover_one, scenario,
 };
 use koidrive_fs::{Effect, Outcome, Step};
 
@@ -48,8 +48,8 @@ fn child_process_for_crash_tests() {
         }
     };
     let result = match phase {
-        "apply" => space.apply(&marker(), &effect, &mut Bytes, now(), &mut hook),
-        _ => space.recover(&marker(), &effect, &mut Bytes, now(), &mut hook),
+        "apply" => apply_one(&space, &effect, &mut hook),
+        _ => recover_one(&space, &effect, &mut hook),
     };
     result.unwrap();
 }
@@ -76,11 +76,7 @@ fn steps(scenario: &Scenario) -> Vec<Step> {
     let root = dir.path().join("space");
     let effect = prepare(scenario, &root);
     let mut steps = Vec::new();
-    let outcome = bind(&root)
-        .apply(&marker(), &effect, &mut common::Bytes, now(), &mut |step| {
-            steps.push(step)
-        })
-        .unwrap();
+    let outcome = apply_one(&bind(&root), &effect, &mut |step| steps.push(step)).unwrap();
     assert_eq!(
         matches!(outcome, Outcome::Done { .. }),
         scenario.done_from.is_some(),
@@ -109,11 +105,7 @@ fn recovery_steps(scenario: &Scenario, kill: Step) -> Vec<Step> {
     let dir = tempfile::tempdir().unwrap();
     let (root, effect) = crash(scenario, dir.path(), kill);
     let mut steps = Vec::new();
-    bind(&root)
-        .recover(&marker(), &effect, &mut Bytes, now(), &mut |step| {
-            steps.push(step)
-        })
-        .unwrap();
+    recover_one(&bind(&root), &effect, &mut |step| steps.push(step)).unwrap();
     steps
 }
 
@@ -145,9 +137,7 @@ fn kill_at_every_step_then_recover(scenario: &Scenario) -> Vec<Step> {
             }
 
             let space = bind(&root);
-            let outcome = space
-                .recover(&marker(), &effect, &mut Bytes, now(), &mut |_| {})
-                .unwrap();
+            let outcome = recover_one(&space, &effect, &mut |_| {}).unwrap();
             let expected_done = done_from.is_some_and(|from| index >= from);
             assert_eq!(
                 matches!(outcome, Outcome::Done { .. }),
@@ -157,9 +147,7 @@ fn kill_at_every_step_then_recover(scenario: &Scenario) -> Vec<Step> {
             (scenario.check)(&root, &outcome);
             assert_settled(&root);
 
-            let again = space
-                .recover(&marker(), &effect, &mut Bytes, now(), &mut |_| {})
-                .unwrap();
+            let again = recover_one(&space, &effect, &mut |_| {}).unwrap();
             assert_eq!(
                 matches!(again, Outcome::Done { .. }),
                 expected_done,

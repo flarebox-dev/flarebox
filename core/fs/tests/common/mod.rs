@@ -66,6 +66,28 @@ pub fn bind(root: &Path) -> Space {
     Space::bind(File::open(root).unwrap().into(), root).unwrap()
 }
 
+pub fn apply_one(
+    space: &Space,
+    effect: &Effect,
+    hook: &mut dyn FnMut(Step),
+) -> std::io::Result<Outcome> {
+    let mut section = space.section(&marker(), hook)?;
+    section.apply(effect, &mut Bytes, now())?;
+    let [outcome] = section.finish()?.try_into().unwrap();
+    Ok(outcome)
+}
+
+pub fn recover_one(
+    space: &Space,
+    effect: &Effect,
+    hook: &mut dyn FnMut(Step),
+) -> std::io::Result<Outcome> {
+    let mut section = space.section(&marker(), hook)?;
+    section.recover(effect, &mut Bytes, now())?;
+    let [outcome] = section.finish()?.try_into().unwrap();
+    Ok(outcome)
+}
+
 pub fn assert_identity(root: &Path, outcome: &Outcome, path: Option<&str>) {
     if let Outcome::Done { identity } = outcome {
         let expected = path.map(|path| entries(root, &[path])[0].id);

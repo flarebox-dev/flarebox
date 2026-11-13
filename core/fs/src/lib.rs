@@ -82,10 +82,10 @@
 //! [`Space::reclaim_trash`] empties by age and size, turning an entry written
 //! to after it entered into a recovered file ([`recovered_name`]).
 //!
-//! [`Space::apply`] carries out one [`Effect`] with the quarantine protocol of
+//! A [`Section`] carries out [`Effect`]s with the quarantine protocol of
 //! design §5.2, writing the root marker first and calling a hook at every
-//! [`Step`], and [`Space::recover`] finishes or undoes the effect in flight
-//! after a crash (design §5.3).
+//! [`Step`], and recovers the effects in flight after a crash (design §5.3).
+//! Its outcomes come out once every step is durable ([`Section::finish`]).
 //!
 //! Symbolic links and special files are not synced in v0 (spec §5.1) and are
 //! skipped.
@@ -2369,7 +2369,8 @@ mod tests;
 mod trash;
 
 pub use effect::{
-    Action, Contents, Displaced, Effect, Outcome, QUARANTINE_DIR, Reason, STAGING_DIR, Step,
+    Action, Contents, Displaced, Effect, Outcome, QUARANTINE_DIR, Reason, STAGING_DIR, Section,
+    Step,
 };
 pub use ignore::{Ignore, Ignored, RULES_FILE, Rules};
 use ignore::{Key, Pending, RulesRead, Seeded, Wanted};

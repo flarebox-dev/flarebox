@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::resolve::{Folder, Space, Unresolved};
-use crate::root::{flush, rename_no_replace};
+use crate::root::{Flush, flush, rename_no_replace};
 
 const NAME_MAX: usize = 255;
 const ATTEMPTS: u32 = 10_000;
@@ -66,8 +66,8 @@ impl Space {
             let candidate = recovered_name(original, folder, &date, n);
             match rename_no_replace(from.fd(), name, to.fd(), &candidate) {
                 Ok(()) => {
-                    flush(from.fd())?;
-                    flush(to.fd())?;
+                    flush(from.fd(), Flush::Plain)?;
+                    flush(to.fd(), Flush::Barrier)?;
                     return Ok(to.path().join(candidate));
                 }
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => n += 1,

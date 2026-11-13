@@ -5,7 +5,7 @@
 //! the state it expects, sends the entry it displaces to quarantine, gives the new entry its
 //! name, and sends the quarantined entry to the local trash. A crash can stop it between these
 //! steps. Recovery then decides from the target, the staged download and the quarantine, as
-//! `koidrive_fs::Space::recover` does, and the disk keeps no record of the effects it has done.
+//! `koidrive_fs::Section::recover` does, and the disk keeps no record of the effects it has done.
 //!
 //! Two things differ from the fs driver. The disk checks a displaced entry before it moves it to
 //! quarantine, so a quarantined entry is never returned to its name. And it refuses to remove a

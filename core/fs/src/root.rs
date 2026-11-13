@@ -112,16 +112,21 @@ fn read_marker_at(root: BorrowedFd<'_>) -> io::Result<Option<Marker>> {
 /// it, before returning. The marker is replaced in one rename, so a crash
 /// leaves the old marker or the new one.
 pub fn write_marker(root: &Path, marker: &Marker) -> io::Result<()> {
-    write_marker_at(open_root(root)?.as_fd(), marker)
+    write_marker_at(open_root(root)?.as_fd(), marker, Flush::Full)
 }
 
-pub(crate) fn write_marker_at(root: BorrowedFd<'_>, marker: &Marker) -> io::Result<()> {
+pub(crate) fn write_marker_at(
+    root: BorrowedFd<'_>,
+    marker: &Marker,
+    then: Flush,
+) -> io::Result<()> {
     let private = private_dir(root)?;
     replace_file(
         private.as_fd(),
         MARKER,
         MARKER_TEMP,
         &serde_json::to_vec_pretty(marker)?,
+        then,
     )
 }
 
@@ -130,6 +135,7 @@ pub(crate) fn replace_file(
     name: &str,
     temp: &str,
     bytes: &[u8],
+    then: Flush,
 ) -> io::Result<()> {
     remove_if_present(dir, temp)?;
     let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
@@ -140,9 +146,9 @@ pub(crate) fn replace_file(
         Mode::from_raw_mode(0o644),
     )?);
     file.write_all(bytes)?;
-    file.sync_all()?;
+    flush(file.as_fd(), Flush::Barrier)?;
     rustix::fs::renameat(dir, temp, dir, name)?;
-    flush(dir)
+    flush(dir, then)
 }
 
 /// Whether the file system under `root` has a rename that fails instead of
@@ -160,7 +166,7 @@ pub fn probe_no_replace(root: &Path) -> io::Result<bool> {
 impl Space {
     /// Reads the root marker through the root descriptor, or returns `None`
     /// if there is none. It writes nothing, so the caller can read the counter
-    /// before [`Space::recover`] writes the marker again. It reads the root
+    /// before [`Space::section`] writes the marker again. It reads the root
     /// the space holds whether or not that root is still held.
     pub fn marker(&self) -> io::Result<Option<Marker>> {
         read_marker_at(self.root())
@@ -244,7 +250,7 @@ pub(crate) fn private_dir(root: BorrowedFd<'_>) -> io::Result<OwnedFd> {
 
 pub(crate) fn make_dir(dir: BorrowedFd<'_>, name: &str) -> io::Result<OwnedFd> {
     match rustix::fs::mkdirat(dir, name, Mode::from_raw_mode(0o755)) {
-        Ok(()) => flush(dir)?,
+        Ok(()) => flush(dir, Flush::Full)?,
         Err(Errno::EXIST) => {}
         Err(err) => return Err(err.into()),
     }
@@ -258,12 +264,36 @@ pub(crate) fn remove_if_present(dir: BorrowedFd<'_>, name: &str) -> io::Result<(
     }
 }
 
-/// On macOS `fsync` does not ask the drive to write its cache, so this uses
-/// `F_FULLFSYNC` there.
-pub(crate) fn flush(fd: BorrowedFd<'_>) -> io::Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Flush {
+    Plain,
+    Barrier,
+    Full,
+}
+
+/// On macOS `fsync` hands the data to the drive, which may write it late and
+/// out of order, so a barrier uses `F_BARRIERFSYNC` and a full flush
+/// `F_FULLFSYNC` there (Apple fcntl(2)). Elsewhere `fsync` is durable.
+pub(crate) fn flush(fd: BorrowedFd<'_>, how: Flush) -> io::Result<()> {
     #[cfg(target_vendor = "apple")]
-    rustix::fs::fcntl_fullfsync(fd)?;
+    match how {
+        Flush::Plain => rustix::fs::fsync(fd)?,
+        Flush::Barrier => barrier(fd)?,
+        Flush::Full => rustix::fs::fcntl_fullfsync(fd)?,
+    }
     #[cfg(not(target_vendor = "apple"))]
-    rustix::fs::fsync(fd)?;
+    {
+        let _ = how;
+        rustix::fs::fsync(fd)?;
+    }
     Ok(())
+}
+
+#[cfg(target_vendor = "apple")]
+fn barrier(fd: BorrowedFd<'_>) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    match unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_BARRIERFSYNC) } {
+        -1 => Err(io::Error::last_os_error()),
+        _ => Ok(()),
+    }
 }
