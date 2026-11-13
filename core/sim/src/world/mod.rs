@@ -1717,6 +1717,7 @@ impl World {
                     let device_seq = self.space.welcome(&self.devices[d].session).device_seq;
                     let device = &mut self.devices[d];
                     device.engine.scan(&device.disk);
+                    self.scanned[d] = self.clock;
                     let Engine {
                         trees,
                         commits,
@@ -3295,5 +3296,39 @@ mod tests {
             matches!(&removed, Err(Failure::Broken(why)) if why.contains("write 2")),
             "{removed:?}"
         );
+    }
+
+    #[test]
+    fn a_publish_after_a_rewind_spends_the_write_the_recovery_scan_read() {
+        let user = |kind| {
+            Step::User(Action {
+                kind,
+                target: 0,
+                parent: 0,
+                name: 0,
+                text: 0,
+            })
+        };
+        let mut world = World::new(2);
+        world.phase(0, &[(0, user(1))]).unwrap();
+        world
+            .run(
+                1,
+                &[
+                    (0, Step::Backup),
+                    (1, user(2)),
+                    (0, Step::Rewind),
+                    (1, Step::Connect),
+                    (1, Step::Deliver(0)),
+                    (1, Step::Answer(0)),
+                    (1, Step::Commit(Reply::Served)),
+                    (1, Step::Commit(Reply::Served)),
+                    (1, Step::Deliver(0)),
+                ],
+            )
+            .unwrap();
+        assert!(world.seen.contains_key("recovery classifies the trees"));
+        assert!(world.spent.iter().any(|spent| spent.device == 1));
+        assert!(world.touches[1].values().all(BTreeSet::is_empty));
     }
 }
