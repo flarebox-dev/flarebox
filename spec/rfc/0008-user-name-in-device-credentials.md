@@ -2,13 +2,7 @@
 
 Status: proposed. Applies to spec v0 (format_version 1).
 
-A device knows its user's name only if it claimed the server, because it sent that name in the claim. A device added by pairing or by an owner recovery gets no answer that carries the name. This RFC adds the name to `DeviceCredentials`. A bare section number such as section 1 refers to this RFC; sections of spec v0 are written as spec v0 §N.
-
-The schema change adds one field:
-
-| Message | Field | Section |
-|---|---|---|
-| `DeviceCredentials` | `user_name = 6` | 1 |
+A device knows its user's name only if it claimed the server, because it sent that name in the claim. A device added by pairing or by an owner recovery gets no answer that carries the name. This RFC adds the name to `DeviceCredentials` as `user_name = 6`.
 
 ## 1. user_name (spec v0 §15)
 

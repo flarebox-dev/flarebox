@@ -1,8 +1,8 @@
 # RFC 0005: Read-only share links
 
-Status: proposed. Applies to spec v0 (format_version 1). Tracks GUN-275.
+Status: proposed. Applies to spec v0 (format_version 1).
 
-The owner of a space can share one file or one folder through a link. A recipient opens the link in a browser, browses the folder, and downloads files. The recipient installs nothing and needs no account. Links are read-only. A link can have an expiry and a password. This RFC defines the owner API, the public API, the web viewer, and what a link can reach. A bare section number such as §4 refers to this RFC; sections of spec v0 are written as spec v0 §N. RFC 0001 §8 (password key derivation and lockout) applies, with one change: the public API reports an unknown, revoked or expired link as `NOT_FOUND` (404), where RFC 0001 §8.2 rule 1 says `FORBIDDEN`.
+The owner of a space can share one file or one folder through a link. A recipient opens the link in a browser, browses the folder, and downloads files. The recipient installs nothing and needs no account. Links are read-only. A link can have an expiry and a password. This RFC defines the owner API, the public API, the web viewer, and what a link can reach. A bare section number such as §4 refers to this RFC; sections of spec v0 are written as spec v0 §N. Passwords follow RFC 0001 §8, with the one change in §4.
 
 The schema changes add one file, `share.proto`, and one error code:
 
@@ -93,7 +93,7 @@ Unknown, revoked and expired links give the same reply, so the reply does not te
 
 ## 4. Passwords and sessions
 
-`POST /v1/share/{link_id}/unlock` checks the password exactly as RFC 0001 §8 describes, lockout included: 5 consecutive failures lock the link for 15 minutes, a locked link answers `RETRY_LATER` (429) without checking the password, and the state belongs to the link, not to the client. A wrong password answers `UNAUTHENTICATED` (401). An unlock of a link without a password answers 204 and sets no cookie. Only `/unlock` requests count as password attempts: an info, list or file request without a valid session gets 401 and changes neither the failure count nor the lock.
+`POST /v1/share/{link_id}/unlock` checks the password exactly as RFC 0001 §8 describes, lockout included, with one change: the public API reports an unknown, revoked or expired link as `NOT_FOUND` (404), where RFC 0001 §8.2 rule 1 says `FORBIDDEN`. A locked link answers `RETRY_LATER` (429). A wrong password answers `UNAUTHENTICATED` (401). An unlock of a link without a password answers 204 and sets no cookie. Only `/unlock` requests count as password attempts: an info, list or file request without a valid session gets 401 and changes neither the failure count nor the lock.
 
 A correct password sets a session cookie:
 
@@ -120,10 +120,9 @@ The Account DO counts public requests per client, in memory, in fixed windows. T
 - The table holds at most 10,000 clients. When it is full, windows that have ended are dropped first, then the oldest entries.
 - The password lockout of §4 is stored, changes atomically, and survives restarts. Rate limiting does not replace it.
 
-This RFC uses the Account DO rather than the Workers Rate Limiting binding, for three reasons:
+This RFC uses the Account DO rather than the Workers Rate Limiting binding, for two reasons:
 - every public API request already calls the Account DO to check revocation (§9), so the count costs no extra request;
-- [the binding's limits are approximate and apply separately in each Cloudflare location](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/) (accessed 2026-11-10);
-- whether the binding is available on the Workers Free plan is still unverified as of 2026-11-10.
+- [the binding's limits are approximate and apply separately in each Cloudflare location](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/) (accessed 2026-11-10).
 
 Turnstile is left for later: each deployment would need a widget registered for its hostname ([Turnstile plans](https://developers.cloudflare.com/turnstile/plans/), accessed 2026-11-10), which a one-click deploy cannot create.
 
@@ -169,7 +168,7 @@ The server tests for this section cover:
 
 ## 8. Web viewer
 
-The viewer is a page of the web package `server/web/`, a pnpm workspace package of the server that later web pages, such as an owner dashboard, will join. The package is TypeScript (strict, with the DOM library) built by Vite as a multi-page build, one entry per page, without a UI framework. Vite and TypeScript are build-time dependencies only: the built page holds no third-party code and makes no request to another origin. The build writes `server/web/dist/`, which Workers Static Assets serves; it is not committed. `wrangler.jsonc` names the build as its `build.command`, so `wrangler dev`, `wrangler deploy` and the deploy button always build it, and the package stays inside `server/`, the directory the deploy button copies. The build inlines nothing, since the CSP below forbids inline script and style: Vite's module preload polyfill is off and no asset becomes a `data:` URL. File names carry no hash, so the page's URLs stay `/viewer/viewer.js` and `/viewer/viewer.css`. The viewer is English only. It shows:
+`GET /s/{link_id}` serves the viewer page, and its assets are `/viewer/viewer.js` and `/viewer/viewer.css`. The page holds no third-party code and makes no request to another origin. It has no inline script or style, since the CSP below forbids both. [Build the share-link viewer](../../docs/share-links-web.md) describes the web package `server/web/` that builds it. The viewer is English only. It shows:
 - a password form when `ShareInfo.password_required` is set;
 - for a file link, the file's name, size and a download button;
 - for a folder link, the folder's entries with their size and modification time, a path bar, and a download button per file. Pages beyond the first load on request.
@@ -223,18 +222,9 @@ A file with more than 4,096 chunks (at least 4 GiB, and about 16 GiB with averag
 
 [Workers limits](https://developers.cloudflare.com/workers/platform/limits/#subrequests) (accessed 2026-11-10) give a Workers Free request 50 subrequests, and 1,000 to Cloudflare services such as R2 and Durable Objects. A Workers Paid request gets 10,000 by default. On the Free plan a download therefore stops after about 490 chunks, at least about 490 MiB. The Worker cannot tell which plan it runs on, so it cannot refuse such a download before it starts. The Free plan also gives a request 10 ms of CPU. Streaming copies bytes without hashing them, but whether a large download fits in that budget is unverified.
 
-## 12. Whole-folder download (proposed, not in v0)
+## 12. Not covered
 
-Downloading a whole folder as one zip file needs:
-- a streaming zip writer with ZIP64, because a folder can exceed 4 GiB;
-- names stored as UTF-8 with the zip's UTF-8 flag;
-- a bound on files and chunks per request, under the same subrequest and CPU limits as §11, or a way to split the work across requests;
-- the same chunk checks and fence check as §7.
-
-The zip would use the stored method (no compression), so the Worker only copies checked bytes. The open questions are the bound and what the recipient sees when a folder exceeds it. This RFC defers whole-folder download to a later RFC.
-
-## 13. Not covered
-
-- Creating links from the macOS app. The API in §2 is what the app and CLI call.
+- Creating links from the macOS app. `koi share` calls the API of §2.
+- Downloading a whole folder as one zip file.
 - Turnstile (§5), previews, `Range` and resumed downloads, bulk revocation, editing a link, and pruning old link records.
 - Links for members other than the owner. Spec v0 has one owner per space.

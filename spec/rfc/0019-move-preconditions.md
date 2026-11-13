@@ -2,9 +2,9 @@
 
 Status: proposed. Applies to spec v0 (format_version 1). Amends the `Move` op of spec v0 §6, spec v0 §6.2 R7, RFC 0001 §6, RFC 0017 §3, and RFC 0018 §4, §7 and §8, and adds a field to `NodeState`.
 
-Some moves carry no change of the sending device's user. A device that sent a folder under a pending name owes the rename to its own name (sync-engine design §2.6, RFC 0017). A device that finds after a server loss that the server lost a position another device set sends the move again (design §4.4). The server cannot tell such a move from a user's move, so it applies the move's spec v0 rules to it, and another device's user loses a change made after seeing the node:
+Some moves carry no change of the sending device's user. A device that sent a folder under a pending name owes the rename to its own name ([sync-engine design §2.6](../../docs/design/sync-engine/state-model.md#26-building-a-commit), RFC 0017). A device that finds after a server loss that the server lost a position another device set sends the move again (design §4.4). The server cannot tell such a move from a user's move, so it applies the move's spec v0 rules to it, and another device's user loses a change made after seeing the node:
 
-- When another device's `Delete` lands while the owed rename is already built, the rename revives the folder and its trash group (R8). When another device renamed the folder to `b` instead, the owed rename puts it back at its own name (R5). The device cannot avoid this, because the move is on the wire before it hears the change (GUN-597).
+- When another device's `Delete` lands while the owed rename is already built, the rename revives the folder and its trash group (R8). When another device renamed the folder to `b` instead, the owed rename puts it back at its own name (R5). The device cannot avoid this, because the move is on the wire before it hears the change.
 - When the owed rename lands first, a `Delete` built before it counts the rename as a change it did not see. R7 keeps the folder, and every device ends with the folder the user deleted, empty. A device that hears the rename before it sends its delete keeps the folder the same way (design §2.4).
 
 This RFC lets a `Move` name the place the sender expects the node at, and makes such a move yield to every change of the node that it did not see. A bare section number such as §2 refers to this RFC.
@@ -42,10 +42,12 @@ R7 reads the meta edit revision and its device where it read `meta_rev` and its 
 
 ## 4. Clients
 
+R, S and L are the engine's remote, synced and local trees (design §2.2).
+
 A device sets `from` on a `Move` that carries no change of its own user:
 
 - the rename of a node from its pending name to the name it waits for: the rename a device owes (design §2.6) and RFC 0017's finishing move;
-- a move that sends again a position the server lost and that this device's user did not set: the move of a node S forgot that L holds as S did (design §4.4, GUN-548).
+- a move that sends again a position the server lost and that this device's user did not set: the move of a node S forgot that L holds as S did (design §4.4).
 
 Every other `Move` goes without `from`, so a user's move keeps R5 and R8: it wins over a concurrent move it did not see and revives a node another device deleted.
 
@@ -55,7 +57,7 @@ A finish whose origin is a mark in R (RFC 0017 §3) no longer requires the head.
 
 The author of a lost move sends it again without `from` (design §4.4), also when R already holds the node at its target through a record whose `meta_edit_rev` is below its `meta_rev`. §3 then records the author's move, so it beats a later delete as before.
 
-A `SUPERSEDED` result of a `Move` with `from` ends what made the move: the owed rename, RFC 0017's finish, or the resend. The result is acknowledged once R holds every commit below its seq (design §2.7), so R already holds the change that superseded the move. When L holds the node at the move's target, S takes that place. S keeps the content it holds, or, when S forgot the node (design §4.4), takes the shape L held when the commit was built, content included, as design §4.4 does for such a node that R holds trashed (GUN-548). The change then reaches the disk as a remote change: the delete removes the folder, the rename moves it to the other device's name, and content R holds that S does not hold downloads over L's, as any remote edit does. When L holds the node anywhere else, the user moved or deleted it, and S stays, so that change is sent as usual. Either way the device ends as if it had heard the change before it built the move.
+A `SUPERSEDED` result of a `Move` with `from` ends what made the move: the owed rename, RFC 0017's finish, or the resend. The result is acknowledged once R holds every commit below its seq (design §2.7), so R already holds the change that superseded the move. When L holds the node at the move's target, S takes that place. S keeps the content it holds, or, when S forgot the node (design §4.4), takes the shape L held when the commit was built, content included, as design §4.4 does for such a node that R holds trashed. The change then reaches the disk as a remote change: the delete removes the folder, the rename moves it to the other device's name, and content R holds that S does not hold downloads over L's, as any remote edit does. When L holds the node anywhere else, the user moved or deleted it, and S stays, so that change is sent as usual. Either way the device ends as if it had heard the change before it built the move.
 
 A device whose user deleted a node it held as S plans the delete past a record of another device's commit when all of these hold:
 
@@ -71,7 +73,7 @@ A record of another device's commit that moves a node's meta edit revision but n
 
 - A resend of the same commit (RFC 0002 §2) keeps `from`, and its stored result answers it. Digest v1 (RFC 0006 §8) keeps `Move` fields 1 to 3 and digest v2 (RFC 0018 §6) adds only `UpdateContent` field 3, so neither covers `from`. As for RFC 0015's `requires`, a reuse of a `commit_id` that differs only in its precondition is not detected. A client never sends one: the engine sets `from` once, when it builds the commit, and resends that stored commit as it is.
 - A change planned again after the server lost commits goes out in a new commit, whose `from` the engine takes from the R it holds then. A place has no revisions, so a seq the restored server gives again cannot make the check hold by accident.
-- The meta edit revision does for places what RFC 0018's edit revision does for content. A move resent with `from` leaves it, as an `UpdateContent` with `resend` leaves the edit revision, so a delete made after the loss passes over both. This closes RFC 0018 §11's first item for a rename that keeps the parent (GUN-580). The author of a lost move sends it again without `from`, also after another device's resend put the node at its target (§3, §4), so its move still beats a later delete, as the author's lost edit does (RFC 0018 §3).
+- The meta edit revision does for places what RFC 0018's edit revision does for content. A move resent with `from` leaves it, as an `UpdateContent` with `resend` leaves the edit revision, so a delete made after the loss passes over both. This closes RFC 0018 §11's first item for a rename that keeps the parent. The author of a lost move sends it again without `from`, also after another device's resend put the node at its target (§3, §4), so its move still beats a later delete, as the author's lost edit does (RFC 0018 §3).
 
 ## 6. Mixed versions and stored state
 

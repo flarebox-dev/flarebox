@@ -2,7 +2,7 @@
 
 Status: proposed. Applies to spec v0 (format_version 1). Amends RFC 0006 §7.
 
-An owner who loses a computer, or has one stolen, removes it from the deployment so that it stops syncing. Adding a device through owner recovery (docs/design/deploy-and-upgrade.md §2) does not remove any device, and `koi setup` makes recovery the normal way to add one, so revocation ships in the same release. This RFC defines who may revoke a device, what a revocation stops and how fast, what the revoked device does, and when a device may revoke itself. It uses the routes of RFC 0006 §7 and changes no schema. A bare section number such as §2 refers to this RFC; sections of spec v0 are written as spec v0 §N.
+An owner who loses a computer, or has one stolen, removes it from the deployment so that it stops syncing. Adding a device through owner recovery ([deploy-and-upgrade design](../../docs/design/deploy-and-upgrade.md) §3) does not remove the lost device, and `koi setup` adds devices through recovery, so the owner needs a way to remove the lost one. This RFC defines who may revoke a device, what a revocation stops and how fast, what the revoked device does, and when a device may revoke itself. It uses the routes of RFC 0006 §7 and changes no schema. A bare section number such as §2 refers to this RFC; sections of spec v0 are written as spec v0 §N.
 
 ## 1. Who may revoke
 
@@ -16,7 +16,7 @@ The Account DO checks rule 1 again in the same step that stores the revocation, 
 
 Revoking a principal that is already revoked succeeds with 204 and changes nothing.
 
-An owner who has lost every device first adds a new one with owner recovery (deploy-and-upgrade.md §2), or with `koi setup`, which runs the same recovery after a Cloudflare login. The owner then lists the devices from the new one and revokes the lost ones.
+An owner who has lost every device first adds a new one with owner recovery (deploy-and-upgrade design §3), or with `koi setup`, which runs the same recovery after a Cloudflare login. The owner then lists the devices from the new one and revokes the lost ones.
 
 ## 2. What a revocation stops
 
@@ -61,11 +61,17 @@ A device revokes its own principal when the person signs it out, so that a copy 
 
 **The last device.** If no other principal of kind device of the user is active, a revocation leaves the owner without a device, and the only way back is owner recovery, which needs access to the Cloudflare account. The server therefore revokes the last active device only on a request that carries `?confirm=last-device`, and refuses one without it with `CONFIRMATION_REQUIRED`. A client sends the confirmation only after it has told the person that this is their last device and what getting back in takes. Principals of other kinds do not count, because they cannot pair a device.
 
-**Order and failure.** A client stops syncing, then sends the revocation without the confirmation, and only then unlinks its folders and deletes its credential. The server's answer decides, because only the server sees every device at once: a device list read earlier cannot tell two devices that sign out at the same time that one of them will be the last. A client takes any HTTP 409 as that refusal, whatever its body, because a body can be lost on the way. It then keeps its credential and folders, syncs again, and tells the person that this is their last device and that getting back in needs owner recovery outside the client. It sends the confirmation only after the person accepts, and once it has, a failed revocation, a 409 included, does not stop the sign-out on the device. If the server cannot be reached or does not answer in time, the client cannot tell whether this is the last device, so it also keeps everything and tells the person the same risk. If the person accepts, it signs out on the device without the server, and its principal stays active until another device revokes it, which the device list shows. An `UNAUTHENTICATED` answer means another device, or an earlier attempt of this sign-out, already revoked the device, and the sign-out goes on.
+**Order.** A client stops syncing, then sends the revocation without the confirmation, and only then unlinks its folders and deletes its credential. The server's answer decides, because only the server sees every device at once: a device list read earlier cannot tell two devices that sign out at the same time that one of them will be the last.
 
-## 6. Changes to RFC 0006 §7
+The client handles the answer as follows:
 
-In RFC 0006 §7, "**Revoke.**" paragraph, the sentence "A principal may revoke itself." is replaced by "A principal may revoke itself when it signs out. If it is its user's last active device, the request must carry `?confirm=last-device`, or it is refused with `CONFIRMATION_REQUIRED` and changes nothing (RFC 0009 §5)."
+- **Any HTTP 409, whatever its body.** The client takes it as the last-device refusal, because a body can be lost on the way. It keeps its credential and folders, syncs again, and tells the person that this is their last device and that getting back in needs owner recovery outside the client. It sends the confirmation only after the person accepts, and once it has, a failed revocation, a 409 included, does not stop the sign-out on the device.
+- **No answer in time, or no server.** The client cannot tell whether this is the last device, so it also keeps everything and tells the person the same risk. If the person accepts, it signs out on the device without the server, and its principal stays active until another device revokes it, which the device list shows.
+- **`UNAUTHENTICATED`.** Another device, or an earlier attempt of this sign-out, already revoked the device, and the sign-out goes on.
+
+## 6. RFC 0006 §7 holds the self-revocation rule
+
+RFC 0006 §7's **Revoke** paragraph already carries this RFC's change to it, the last-device confirmation of §5.
 
 ## 7. Clients in 0.1.0
 

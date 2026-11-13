@@ -1,6 +1,6 @@
 # RFC 0004: R2 export format
 
-Status: proposed. Applies to spec v0 (format_version 1). Tracks GUN-271.
+Status: proposed. Applies to spec v0 (format_version 1).
 
 Spec v0 §11 describes the R2 metadata export but leaves its file formats open, and names two records, `ExportHeader` and `NodeSnapshot`, that the schema lacks. RFC 0003 §7 moves the export under per-history prefixes. This RFC fixes the formats and the write order, so that an R2-only restore can read what any server wrote. Section numbers such as §11 refer to spec v0, and this RFC refers to its own sections as "section N".
 

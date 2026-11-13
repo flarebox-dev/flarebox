@@ -83,17 +83,19 @@ A client that gets `LIMIT_EXCEEDED` for a commit splits its changes into several
 - A server that does not support a link's `password_kdf` refuses to open the link, with `INTERNAL`, and does not fall back to another KDF.
 - A stronger KDF gets a new identifier. Existing links keep theirs and need no migration.
 
-Known deviation: the [OWASP Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html) recommends 600,000 iterations for PBKDF2-HMAC-SHA256. Cloudflare's production Workers runtime limits WebCrypto PBKDF2 to 100,000 iterations. Per [cloudflare/workerd#1346](https://github.com/cloudflare/workerd/issues/1346), standalone workerd made that limit configurable while production kept it. Whether production has raised the limit since is unverified as of 2026-11-10.
+Known deviation: the [OWASP Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html) recommends 600,000 iterations for PBKDF2-HMAC-SHA256. Cloudflare's production Workers runtime limits WebCrypto PBKDF2 to 100,000 iterations. Per [cloudflare/workerd#1346](https://github.com/cloudflare/workerd/issues/1346), standalone workerd made that limit configurable while production kept it.
 
 ### 8.2 Lockout
 
-Each protected link keeps `failed_attempts` and `locked_until`. This state belongs to the link alone, not to a link-and-client pair, and every caller shares it. Opening a link works as follows:
+Each protected link keeps `failed_attempts` and `locked_until_ms`. This state belongs to the link alone, not to a link-and-client pair, and every caller shares it. Opening a link works as follows:
 
 1. An unknown, revoked or expired link is refused with `FORBIDDEN` before any password check.
-2. While `now < locked_until`, the attempt returns `RETRY_LATER`. The password is not checked, and neither the counter nor the lock changes.
-3. Otherwise a missing or wrong password is a failure. Each failure adds one to `failed_attempts` and returns `UNAUTHENTICATED`. The fifth consecutive failure also sets `locked_until = now + 15 minutes` and resets `failed_attempts` to 0.
+2. While `now < locked_until_ms`, the attempt returns `RETRY_LATER`. The password is not checked, and neither the counter nor the lock changes.
+3. Otherwise a missing or wrong password is a failure. Each failure adds one to `failed_attempts` and returns `UNAUTHENTICATED`. The fifth consecutive failure also sets `locked_until_ms = now + 15 minutes` and resets `failed_attempts` to 0.
 4. A correct password resets `failed_attempts` to 0 and opens the link.
 5. When the lock expires, the counter is already 0, so five more failures are needed to lock the link again.
+
+The public share API answers rule 1's refusal with `NOT_FOUND` (RFC 0005 §4).
 
 The Account DO applies attempts on one link one at a time. After deriving the key, it re-reads the link, then checks the lock and updates the counter in one step with no other work in between. Concurrent attempts are therefore counted one by one, and any attempt that finishes after the lock is set gets `RETRY_LATER`. Because the counter is per link, anyone who knows a link can lock it for its legitimate users. v0 accepts this trade-off.
 

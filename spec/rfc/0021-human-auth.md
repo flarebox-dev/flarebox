@@ -2,7 +2,7 @@
 
 Status: proposed. Applies to spec v0 (format_version 1). Amends RFC 0006 §2 and §6, RFC 0009 §1 and RFC 0020 §2.2 and §3.1. Registers the features `human_auth`, `device_authorization` and `hosted_auth` (RFC 0022). Builds on RFC 0020 for users, roles and the fence on removed users.
 
-A person has no credential of their own today. A person is the set of their devices, and a new device joins only with a pairing code from a device the person already has (spec v0 §15.2), or as the owner's device through the claim or the recovery key (`docs/design/deploy-and-upgrade.md` §2). That works for a second laptop. It does not work for a browser, for a phone that should sign in to a deployment on any domain, or for an invited person whose first device is a browser.
+A person has no credential of their own today. A person is the set of their devices, and a new device joins only with a pairing code from a device the person already has (spec v0 §15.2), or as the owner's device through the claim or the recovery key (`docs/design/deploy-and-upgrade.md` §2 and §3). That works for a second laptop. It does not work for a browser, for a phone that should sign in to a deployment on any domain, or for an invited person whose first device is a browser.
 
 This RFC adds three things. A person can hold passkeys and sign in with them in a browser, which creates a browser principal with a session. A new client can ask to be approved from anywhere the person is already signed in, following the OAuth 2.0 Device Authorization Grant. A deployment that Koidrive hosts can let an external identity provider confirm who the person is. In every case the deployment's Account DO issues the credential: a device, browser or agent credential is never issued by another service.
 
@@ -121,7 +121,7 @@ A person who lost a way to sign in recovers in this order:
 1. Another passkey of theirs, in a browser.
 2. An active principal of theirs: it approves a new device (§5.3) or creates an enrollment link for a new passkey (§3.2).
 3. A recovery code from an admin (RFC 0020 §3.1), redeemed in a browser or by a client.
-4. The deployment's owner only: the recovery key set as a Worker secret (`docs/design/deploy-and-upgrade.md` §2), unchanged.
+4. The deployment's owner only: the recovery key set as a Worker secret (`docs/design/deploy-and-upgrade.md` §3), unchanged.
 
 There is no personal recovery code. A member who is not the owner never gets owner recovery. While `human_auth` is on, RFC 0009 §1's last-device warning counts the passkeys that sign in now: those whose RP ID is the stored one, while `hosted_auth` is off. It counts a browser principal only while its user also holds such a passkey, because a browser session ends within 24 hours. Revoking the last principal of a user who still has one of them does not warn. While `human_auth` is off, it counts neither, because both are refused. A provider binding does not count, because the server cannot tell whether the provider still lets the person sign in (§7).
 

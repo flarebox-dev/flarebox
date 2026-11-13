@@ -2,7 +2,7 @@
 
 Status: proposed. Applies to spec v0 (format_version 1). Amends spec v0 §15 (`GET /v1/server`) and defines `Welcome.features`. Adds a field to `ServerInfo`.
 
-A client can't tell whether the server it talks to offers a capability that a newer RFC adds. The owner upgrades the server on their own schedule (`docs/design/deploy-and-upgrade.md` §3.4), so a new client often meets an old server, and the protocol version alone does not say which routes exist. Work that ships before it is finished also needs a switch: a release can carry routes that stay off until the work is complete.
+A client can't tell whether the server it talks to offers a capability that a newer RFC adds. The owner upgrades the server on their own schedule (`docs/design/deploy-and-upgrade.md` §6), so a new client often meets an old server, and the protocol version alone does not say which routes exist. Work that ships before it is finished also needs a switch: a release can carry routes that stay off until the work is complete.
 
 This RFC lets the server announce the features it has turned on, under names that later RFCs register. A bare section number such as §2 refers to this RFC.
 
