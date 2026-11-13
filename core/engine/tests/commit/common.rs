@@ -1103,3 +1103,56 @@ fn kept_original_recorded() -> Trees {
 fn kept_originals(trees: &Trees) -> Vec<(String, String)> {
     trees.state().kept_originals.into_iter().collect()
 }
+
+fn reparent_a_folder_at_its_pending_name(answer_first: bool) {
+    let mut trees = trees(&[
+        (
+            "h",
+            Some(file("n", "a", 1)),
+            Some(file(ROOT, "a", 1)),
+            Some(remote(file(ROOT, "a", 1))),
+        ),
+        ("n", Some(dir(ROOT, "A")), None, None),
+        (
+            "x",
+            Some(dir(ROOT, "x")),
+            Some(dir(ROOT, "x")),
+            Some(remote(dir(ROOT, "x"))),
+        ),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let first = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(first.ops.len(), 2);
+    trees.set_remote("n".into(), remote_at(dir(ROOT, "A (pending)"), 8));
+    trees.set_remote("h".into(), remote_at(file("n", "a", 1), 8));
+    let answer = result(8, vec![outcome(op_result::Code::Applied); 2]);
+    if answer_first {
+        commits.received(answer.clone()).unwrap();
+        assert!(commits.acknowledge(&mut trees, 8));
+        trees.settle();
+    } else {
+        assert!(!commits.acknowledge(&mut trees, 8));
+    }
+    trees.set_remote("n".into(), remote_at(dir("x", "A (pending)"), 9));
+    if !answer_first {
+        commits.received(answer).unwrap();
+    }
+    commits.acknowledge(&mut trees, 9);
+    trees.settle();
+    for _ in 0..4 {
+        if let Some(commit) = build(&mut commits, &mut trees, &mut ids) {
+            let moved = ops(&commit)
+                .into_iter()
+                .any(|op| matches!(&op, op::Op::Move(m) if m.node_id == "n"));
+            assert!(!moved, "{:?}", ops(&commit));
+        }
+        effects_for(&mut trees, &mut ids, "n");
+    }
+    assert_eq!(
+        trees
+            .local()
+            .get("n")
+            .map(|n| (n.shape.parent.as_str(), n.shape.name.as_str())),
+        Some(("x", "A (pending)"))
+    );
+}

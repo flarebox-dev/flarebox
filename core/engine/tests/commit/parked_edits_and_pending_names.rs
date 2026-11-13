@@ -747,3 +747,158 @@ fn an_owed_rename_sent_through_a_name_cycle_still_brings_the_disk_to_its_name() 
         Some("a")
     );
 }
+
+#[test]
+fn a_folder_another_device_moves_at_its_pending_name_keeps_that_name() {
+    reparent_a_folder_at_its_pending_name(true);
+}
+
+#[test]
+fn a_folder_another_device_moves_at_its_pending_name_before_the_answer_keeps_that_name() {
+    reparent_a_folder_at_its_pending_name(false);
+}
+
+#[test]
+fn a_folder_another_device_moves_while_its_owed_name_is_still_taken_keeps_that_place() {
+    let mut trees = trees(&[
+        (
+            "h",
+            Some(file("n", "a", 1)),
+            Some(file(ROOT, "a", 1)),
+            Some(remote(file(ROOT, "a", 1))),
+        ),
+        ("n", Some(dir(ROOT, "A")), None, None),
+        (
+            "x",
+            Some(dir(ROOT, "x")),
+            Some(dir(ROOT, "x")),
+            Some(remote(dir(ROOT, "x"))),
+        ),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let first = build(&mut commits, &mut trees, &mut ids).unwrap();
+    let results = ops(&first)
+        .iter()
+        .map(|op| match op {
+            op::Op::Move(m) if m.node_id == "h" => outcome(op_result::Code::Superseded),
+            _ => outcome(op_result::Code::Applied),
+        })
+        .collect();
+    trees.set_remote("n".into(), remote_at(dir(ROOT, "A (pending)"), 8));
+    commits.received(result(8, results)).unwrap();
+    assert!(commits.acknowledge(&mut trees, 8));
+    trees.settle();
+    trees.set_remote("n".into(), remote_at(dir("x", "A (pending)"), 9));
+    commits.acknowledge(&mut trees, 9);
+    trees.settle();
+    let n_moves = |commit: &proto::Commit| {
+        ops(commit)
+            .into_iter()
+            .filter(|op| matches!(op, op::Op::Move(m) if m.node_id == "n"))
+            .collect::<Vec<_>>()
+    };
+    if let Some(commit) = build(&mut commits, &mut trees, &mut ids) {
+        assert_eq!(n_moves(&commit), [], "{:?}", ops(&commit));
+    }
+    assert!(commits.in_flight().is_none());
+    trees.set_remote("h".into(), remote_at(file("n", "a", 1), 10));
+    commits.acknowledge(&mut trees, 10);
+    trees.settle();
+    let _ = build(&mut commits, &mut trees, &mut ids);
+    effects_for(&mut trees, &mut ids, "n");
+    if let Some(commit) = build(&mut commits, &mut trees, &mut ids) {
+        assert_eq!(n_moves(&commit), [], "{:?}", ops(&commit));
+    }
+    let n = &trees.local().get("n").unwrap().shape;
+    assert_eq!((n.parent.as_str(), n.name.as_str()), ("x", "A (pending)"));
+}
+
+#[test]
+fn a_folder_the_user_moves_elsewhere_under_its_owed_name_is_still_moved() {
+    let (mut commits, mut trees, mut ids) = owing_its_name(&[
+        synced("u", dir(ROOT, "u")),
+        synced("x", dir(ROOT, "x")),
+        (
+            "a",
+            Some(dir("u", "a")),
+            Some(dir(ROOT, "a (pending)")),
+            Some(remote(dir("x", "a (pending)"))),
+        ),
+    ]);
+    let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&sent), [mv("a", "u", "a")]);
+}
+
+#[test]
+fn a_file_another_device_deletes_while_this_device_edits_it_takes_its_owed_name_once_the_edit_brings_it_back()
+ {
+    let (mut commits, mut trees, mut ids) = owing_its_name(&[(
+        "a",
+        Some(file(ROOT, "a", 2)),
+        Some(file(ROOT, "a (pending)", 1)),
+        Some(trashed(file(ROOT, "a (pending)", 1))),
+    )]);
+    assert!(!commits.acknowledge(&mut trees, 1));
+    trees.settle();
+    let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(!ops(&sent).contains(&mv("a", ROOT, "a")));
+    trees.set_remote("a".into(), remote_at(file(ROOT, "a (pending)", 2), 2));
+    acknowledge(
+        &mut commits,
+        &mut trees,
+        vec![outcome(op_result::Code::Applied)],
+    );
+    trees.settle();
+    let next = build(&mut commits, &mut trees, &mut ids);
+    assert_eq!(next.as_ref().map(ops), Some(vec![mv("a", ROOT, "a")]));
+}
+
+#[test]
+fn a_folder_another_device_deletes_takes_its_owed_name_once_an_unsent_edit_below_it_brings_it_back()
+{
+    let (mut commits, mut trees, mut ids) = owing_its_name(&[
+        (
+            "a",
+            Some(dir(ROOT, "a")),
+            Some(dir(ROOT, "a (pending)")),
+            Some(trashed(dir(ROOT, "a (pending)"))),
+        ),
+        (
+            "f",
+            Some(file("a", "c.txt", 1)),
+            Some(file("a", "c.txt", 1)),
+            Some(trashed(file("a", "c.txt", 1))),
+        ),
+    ]);
+    let mut state = trees.state();
+    state.unsent_edits.insert("f".into());
+    state.dirty.insert("f".into());
+    trees.restore(state).unwrap();
+    trees.rules_scanned();
+    trees.settle();
+    assert!(!commits.acknowledge(&mut trees, 1));
+    trees.settle();
+    let sent = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(
+        ops(&sent)
+            .iter()
+            .any(|op| matches!(op, op::Op::UpdateContent(update) if update.node_id == "f"))
+    );
+    assert!(
+        !ops(&sent)
+            .iter()
+            .any(|op| matches!(op, op::Op::Move(moved) if moved.node_id == "a"))
+    );
+    trees.set_remote("a".into(), remote_at(dir(ROOT, "a (pending)"), 8));
+    trees.set_remote("f".into(), remote_at(file("a", "c.txt", 1), 8));
+    commits
+        .received(result(
+            8,
+            vec![outcome(op_result::Code::Applied); sent.ops.len()],
+        ))
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 8));
+    trees.settle();
+    let rename = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&rename), [mv("a", ROOT, "a")]);
+}

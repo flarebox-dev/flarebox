@@ -1063,13 +1063,13 @@ impl Commits {
         acknowledged
     }
 
-    fn retire_pending(&mut self, trees: &Trees) {
-        let held = |id: &str, pending: &Pending| {
+    fn retire_pending(&mut self, trees: &mut Trees) {
+        let at_sent = |trees: &Trees, id: &str, pending: &Pending| {
             (trees.remote().get(id))
-                .is_some_and(|remote| nfc(&remote.shape.name) == nfc(&pending.sent))
+                .is_some_and(|remote| at_pending_name(trees, id, &remote.shape, pending))
         };
         let landed: Vec<NodeId> = (self.pending.iter())
-            .filter(|(id, pending)| !pending.landed && held(id, pending))
+            .filter(|(id, pending)| !pending.landed && at_sent(trees, id, pending))
             .map(|(id, _)| id.clone())
             .collect();
         for id in landed {
@@ -1085,7 +1085,20 @@ impl Commits {
                         if moved.node_id == *id && nfc(&moved.new_name) == nfc(&pending.name))
                 })
             });
-            held(id, pending) || (flight.is_some() && !pending.landed) || owed_in_flight
+            let at_sent = at_sent(trees, id, pending);
+            let left = left_pending_name(trees, id, pending);
+            if left
+                && !owed_in_flight
+                && !revived_here(trees, id)
+                && take_owed_name(trees, id, pending)
+            {
+                return false;
+            }
+            let owed_locally = holds_owed_name(trees, id, pending);
+            at_sent
+                || (flight.is_some() && !pending.landed)
+                || (left && owed_locally)
+                || owed_in_flight
         });
     }
 
@@ -2033,6 +2046,83 @@ fn agree(trees: &Trees, id: &str, seq: u64) -> Option<(NodeId, Agreed)> {
     (trees.position_after(id, seq)).map(|at| (id.to_owned(), at.clone()))
 }
 
+fn at_pending_name(trees: &Trees, id: &str, remote: &Shape, pending: &Pending) -> bool {
+    let parent = (trees.local().get(id).map(|local| &local.shape))
+        .or(trees.synced().live(id))
+        .map(|shape| &shape.parent);
+    nfc(&remote.name) == nfc(&pending.sent) && parent.is_none_or(|parent| *parent == remote.parent)
+}
+
+fn left_pending_name(trees: &Trees, id: &str, pending: &Pending) -> bool {
+    (trees.remote().get(id))
+        .is_some_and(|remote| remote.trashed || !at_pending_name(trees, id, &remote.shape, pending))
+}
+
+fn holds_owed_name(trees: &Trees, id: &str, pending: &Pending) -> bool {
+    let Some(local) = trees.local().get(id).filter(|local| !local.parked) else {
+        return false;
+    };
+    nfc(&local.shape.name) == nfc(&pending.name)
+        && trees.synced().live(id).is_none_or(|synced| {
+            synced.parent == local.shape.parent && nfc(&synced.name) == nfc(&pending.sent)
+        })
+}
+
+fn revived_here(trees: &Trees, id: &str) -> bool {
+    trees.remote().get(id).is_some_and(|remote| remote.trashed)
+        && (edited_here(trees, id) || changed_below(trees, id))
+}
+
+fn edited_here(trees: &Trees, id: &str) -> bool {
+    let local = trees
+        .local()
+        .live(id)
+        .and_then(|shape| shape.content.as_ref());
+    let synced = trees
+        .synced()
+        .live(id)
+        .and_then(|shape| shape.content.as_ref());
+    trees.unsent_edits().contains(id)
+        || local
+            .zip(synced)
+            .is_some_and(|(local, synced)| !same_content(local, synced))
+}
+
+fn changed_below(trees: &Trees, id: &str) -> bool {
+    trees.local_children(id).any(|child| {
+        let Some(local) = trees.local().live(child) else {
+            return false;
+        };
+        !trees.excluded(child)
+            && (trees
+                .synced()
+                .live(child)
+                .is_none_or(|synced| !synced.same(local))
+                || edited_here(trees, child)
+                || changed_below(trees, child))
+    })
+}
+
+fn take_owed_name(trees: &mut Trees, id: &str, pending: &Pending) -> bool {
+    let (Some(local), Some(synced)) = (trees.local().get(id), trees.synced().live(id)) else {
+        return false;
+    };
+    if local.parked
+        || trees.reverted().contains(id)
+        || trees.waiting().contains_key(id)
+        || local.shape.parent != synced.parent
+        || nfc(&local.shape.name) != nfc(&pending.name)
+        || nfc(&synced.name) != nfc(&pending.sent)
+    {
+        return false;
+    }
+    let shape = Shape {
+        name: local.shape.name.clone(),
+        ..synced.clone()
+    };
+    trees.set_synced_if_valid(id.to_owned(), Some(shape))
+}
+
 fn renames_owed<'a>(
     trees: &'a Trees,
     pending: &'a BTreeMap<NodeId, Pending>,
@@ -2277,9 +2367,13 @@ fn plan(
         if in_alias && (placed(synced) || placed(remote)) && !trees.reverted().contains(id) {
             reverts.push(id.clone());
         }
+        let yields = owed.get(id).is_some_and(|pending| {
+            holds_owed_name(trees, id, pending) && left_pending_name(trees, id, pending)
+        });
         if synced.is_none_or(|s| !s.same_position(local))
             && remote.is_none_or(|r| !r.same_position(local))
             && !trees.reverted().contains(id)
+            && !yields
         {
             wants.push(Want::Move {
                 id: id.clone(),
