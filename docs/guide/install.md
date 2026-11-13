@@ -26,6 +26,8 @@ The cask links the app's `koi` into Homebrew's `bin`, so the app and command sha
 
 The cask and CLI-only formula are alternatives. Before switching from the formula, run `brew uninstall --formula koidrive/tap/koidrive`. To switch to the formula, uninstall the cask first.
 
+After switching, run `koi service start` with the newly installed `koi`. This updates the background service to the new executable.
+
 For full removal of the app and its settings:
 
 ```sh

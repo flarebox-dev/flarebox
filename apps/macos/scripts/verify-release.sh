@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Checks a release disk image and the app inside it.
-# Usage: verify-release.sh <dmg> <signed|unsigned>
+# Usage: verify-release.sh <dmg> <signed|signed-static|unsigned>
 #   signed    Developer ID signature with the hardened runtime, notarization tickets stapled
 #             to the app and the disk image, and Gatekeeper acceptance of both
 #   unsigned  an ad hoc signature with the hardened runtime; Gatekeeper is expected to reject it
@@ -11,8 +11,8 @@
 #             CFBundleShortVersionString
 set -euo pipefail
 
-if [ $# -ne 2 ] || { [ "$2" != signed ] && [ "$2" != unsigned ]; }; then
-  echo "usage: $0 <dmg> <signed|unsigned>" >&2
+if [ $# -ne 2 ] || { [ "$2" != signed ] && [ "$2" != signed-static ] && [ "$2" != unsigned ]; }; then
+  echo "usage: $0 <dmg> <signed|signed-static|unsigned>" >&2
   exit 2
 fi
 dmg="$1"
@@ -58,6 +58,10 @@ helper="$app/Contents/Helpers/koi"
 [ -x "$helper" ] || fail "The app has no Contents/Helpers/koi."
 expected="$(plutil -extract KoidriveVersion raw -o - "$app/Contents/Info.plist" 2>/dev/null || echo "${VERSION:-}")"
 check_helper_version() {
+  if [ "$mode" = signed-static ]; then
+    echo "Skipped bundled helper execution during static verification."
+    return
+  fi
   local reported
   reported="$("$helper" --version)" || fail "Contents/Helpers/koi does not run."
   echo "$reported"
@@ -67,7 +71,7 @@ codesign --verify --strict --verbose=2 "$helper" || fail "codesign could not ver
 helper_details="$(codesign --display --verbose=4 "$helper" 2>&1)"
 echo "$helper_details" | grep -E '^(Identifier|Signature|Authority|Timestamp|TeamIdentifier)'
 grep -qE '^CodeDirectory .*flags=0x[0-9a-f]*\(.*runtime' <<<"$helper_details" || fail "Contents/Helpers/koi is not signed with the hardened runtime."
-if [ "$mode" = signed ]; then
+if [ "$mode" != unsigned ]; then
   grep -q '^Authority=Developer ID Application: ' <<<"$helper_details" || fail "Contents/Helpers/koi is not signed with a Developer ID Application certificate."
   grep -q '^Timestamp=' <<<"$helper_details" || fail "The signature of Contents/Helpers/koi has no secure timestamp."
 fi

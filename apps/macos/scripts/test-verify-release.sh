@@ -92,21 +92,30 @@ chmod +x "$tmp/bin/"*
 passed=0
 for entry in \
     'valid|signed|' \
+    'valid-static|signed-static|' \
     'unsigned|unsigned|' \
     'app-unstapled|signed|The app has no valid stapled notarization ticket.' \
     'dmg-unstapled|signed|The disk image has no valid stapled notarization ticket.' \
+    'dmg-unstapled-static|signed-static|The disk image has no valid stapled notarization ticket.' \
     'app-rejected|signed|Gatekeeper rejects the app.' \
     'dmg-rejected|signed|Gatekeeper rejects the disk image.' \
     'app-unnotarized|signed|Gatekeeper accepts the app, but not as notarized Developer ID software.' \
     'dmg-unnotarized|signed|Gatekeeper accepts the disk image, but not as notarized Developer ID software.' \
+    'dmg-unnotarized-static|signed-static|Gatekeeper accepts the disk image, but not as notarized Developer ID software.' \
     'unsigned-quarantined|unsigned|Unsigned verification requires a locally built, unquarantined disk image and app.'; do
     IFS='|' read -r name mode error <<< "$entry"
     rm -f "$tmp/helper-called"
     status=0
-    PATH="$tmp/bin:$PATH" VERSION=0.1.0-alpha.2 VERIFY_FIXTURE_CASE=$name VERIFY_FIXTURE_MODE=$mode \
+    PATH="$tmp/bin:$PATH" VERSION=0.1.0-alpha.2 VERIFY_FIXTURE_CASE=${name%-static} VERIFY_FIXTURE_MODE=$mode \
         VERIFY_FIXTURE_HELPER_CALLED=$tmp/helper-called \
         bash "$scripts/verify-release.sh" "$tmp/Koidrive.dmg" "$mode" > "$tmp/output" 2>&1 || status=$?
-    if [ -z "$error" ]; then
+    if [ "$name" = valid-static ]; then
+        if [ "$status" -ne 0 ] || [ -e "$tmp/helper-called" ]; then
+            cat "$tmp/output" >&2
+            echo 'FAIL static verification did not pass without running the helper' >&2
+            exit 1
+        fi
+    elif [ -z "$error" ]; then
         if [ "$status" -ne 0 ] || [ ! -e "$tmp/helper-called" ]; then
             cat "$tmp/output" >&2
             echo "FAIL $name did not verify and run the helper" >&2
