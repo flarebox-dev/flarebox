@@ -1,0 +1,1 @@
+cc cb2141f762b7ad2e80b01c20c8ab4ea7af51deabc085e16137140c8251998889 # shrinks to devices = 2, a device sends a lost move and edit again over a delete made after a restore (GUN-624)

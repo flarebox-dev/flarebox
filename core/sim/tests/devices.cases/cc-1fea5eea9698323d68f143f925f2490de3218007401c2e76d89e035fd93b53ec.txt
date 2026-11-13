@@ -1,0 +1,1 @@
+cc 1fea5eea9698323d68f143f925f2490de3218007401c2e76d89e035fd93b53ec # shrinks to devices = 2, a file another device edits and then deletes across a restore (GUN-591)

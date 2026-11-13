@@ -20,6 +20,12 @@ Forks and experiments are welcome under the licenses below. You can link a fork 
 
 Each change to the local store's schema is one SQL file in `core/store/migrations/`, named after what it adds, such as `kept_originals.sql`. A store applies the files it lacks in name order and records each name it applied, so migrations from different pull requests merge in any order. When a migration reads or changes a table or column that another named migration creates, its first line names that migration: `-- requires: other_name`. A merged migration file never changes. A later migration corrects it. `cargo test -p koidrive-store` checks that the named migrations give the same store in every order they can run in.
 
+## Property-test regressions
+
+The sim and driver properties save each failure as a separate `cc-<seed>.txt` file in a `.cases` directory beside the legacy regression file. Commit the generated case file with the fix. Independent cases do not edit a shared list.
+
+The properties also read the legacy files, so cases appended by an older branch still replay. To move those lines, run `python3 scripts/split-proptest-regressions.py <legacy-file>`. The command preserves each `cc` line and leaves the legacy file readable. CI replays the saved cases with `PROPTEST_CASES=0` and prints their seeds and property names.
+
 ## AI assistance
 
 You may use AI tools for reports and for invited changes. If you submit one, you are responsible for it:

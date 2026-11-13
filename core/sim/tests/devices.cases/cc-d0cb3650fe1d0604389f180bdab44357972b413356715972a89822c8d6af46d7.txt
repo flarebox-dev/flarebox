@@ -1,0 +1,1 @@
+cc d0cb3650fe1d0604389f180bdab44357972b413356715972a89822c8d6af46d7 # shrinks to devices = 2, an idle device moves a node back after a loss (GUN-531)

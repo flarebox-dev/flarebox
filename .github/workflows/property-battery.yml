@@ -233,7 +233,7 @@ jobs:
             failing='[{"target": "all targets", "reason": "no test ran", "repro": ""}]'
             echo "::error::Shard $SHARD ran no tests, so it checked nothing."
           fi
-          git status --porcelain --untracked-files=all -- '*.proptest-regressions' | cut -c4- | while read -r file; do
+          git status --porcelain --untracked-files=all -- '*.proptest-regressions' '*/proptest-regressions/*.txt' '*.cases/*.txt' | cut -c4- | while read -r file; do
             cp --parents "$file" "$out/regressions/"
           done
           jq -n --argjson shard "$SHARD" --argjson seed "$seed" --argjson cases "$CASES" --argjson passed "$passed" --argjson failed "$failed" --argjson failing "$failing" \
