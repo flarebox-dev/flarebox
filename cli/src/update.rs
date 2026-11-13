@@ -33,7 +33,7 @@ const BREW_BUSY: [&str; 2] = ["process is already running", "process has already
 pub struct Installs {
     homebrew: Vec<PathBuf>,
     script: Option<PathBuf>,
-    app: PathBuf,
+    apps: Vec<PathBuf>,
 }
 
 impl Installs {
@@ -54,7 +54,7 @@ impl Installs {
                     .into_iter()
                     .map(|prefix| prefix.join("opt/koidrive/bin/koi"))
                     .collect();
-                installs.app = root.join("Applications/Koidrive.app/Contents/Helpers/koi");
+                installs.apps = vec![root.join("Applications/Koidrive.app/Contents/Helpers/koi")];
             }
             installs
         };
@@ -78,14 +78,18 @@ impl Installs {
         Installs {
             homebrew,
             script: home.map(|home| home.join(".local/bin/koi")),
-            app: PathBuf::from("/Applications/Koidrive.app/Contents/Helpers/koi"),
+            apps: std::iter::once(PathBuf::from(
+                "/Applications/Koidrive.app/Contents/Helpers/koi",
+            ))
+            .chain(home.map(|home| home.join("Applications/Koidrive.app/Contents/Helpers/koi")))
+            .collect(),
         }
     }
 
     fn all(&self) -> Vec<PathBuf> {
         let mut all = self.homebrew.clone();
         all.extend(self.script.clone());
-        all.push(self.app.clone());
+        all.extend(self.apps.iter().cloned());
         all
     }
 
@@ -107,11 +111,23 @@ impl Installs {
                 dir: dir.to_path_buf(),
             });
         }
-        exists(&self.app).then_some(Install::App)
+        self.apps
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(
+                running
+                    .iter()
+                    .copied()
+                    .filter(|koi| crate::app::bundled(koi)),
+            )
+            .find(|koi| exists(koi))
+            .map(|koi| Install::App {
+                binary: koi.to_path_buf(),
+            })
     }
 
     fn owned(&self, koi: &Path) -> bool {
-        *koi == self.app
+        self.apps.iter().any(|app| app == koi)
             || self.homebrew.iter().any(|homebrew| homebrew == koi)
             || homebrew_link(koi).is_some()
             || (koi.components()).any(|part| part.as_os_str().to_string_lossy().ends_with(".app"))
@@ -138,15 +154,15 @@ pub fn homebrew_link(binary: &Path) -> Option<PathBuf> {
 enum Install {
     Homebrew { prefix: PathBuf },
     Script { dir: PathBuf },
-    App,
+    App { binary: PathBuf },
 }
 
 impl Install {
-    fn koi(&self, installs: &Installs) -> PathBuf {
+    fn koi(&self) -> PathBuf {
         match self {
             Install::Homebrew { prefix } => prefix.join("opt/koidrive/bin/koi"),
             Install::Script { dir } => dir.join("koi"),
-            Install::App => installs.app.clone(),
+            Install::App { binary } => binary.clone(),
         }
     }
 
@@ -154,7 +170,7 @@ impl Install {
         match self {
             Install::Homebrew { .. } => Via::Homebrew,
             Install::Script { .. } => Via::Installer,
-            Install::App => Via::App,
+            Install::App { .. } => Via::App,
         }
     }
 }
@@ -392,6 +408,89 @@ fn log_path(paths: &Paths) -> PathBuf {
     }
 }
 
+enum UpdateBinary {
+    Other(PathBuf),
+    #[cfg(target_os = "macos")]
+    App(Box<crate::app_install::VerifiedHelper>),
+}
+
+#[derive(Debug)]
+enum ReconcileError {
+    Failed(CliError),
+    #[cfg(target_os = "macos")]
+    Unverified(crate::app_install::AppInstallError),
+}
+
+impl From<CliError> for ReconcileError {
+    fn from(error: CliError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl UpdateBinary {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Other(path) => path,
+            #[cfg(target_os = "macos")]
+            Self::App(helper) => helper.path(),
+        }
+    }
+
+    async fn check(&self, deadline: tokio::time::Instant) -> Result<(), ReconcileError> {
+        #[cfg(not(target_os = "macos"))]
+        let _ = deadline;
+        match self {
+            Self::Other(_) => Ok(()),
+            #[cfg(target_os = "macos")]
+            Self::App(helper) => helper
+                .check(deadline)
+                .await
+                .map_err(ReconcileError::Unverified),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn discover_app_version(
+    helper: &crate::app_install::VerifiedHelper,
+    deadline: tokio::time::Instant,
+) -> Result<Version, ReconcileError> {
+    helper
+        .check(deadline)
+        .await
+        .map_err(ReconcileError::Unverified)?;
+    let actual = service::version_of(helper.path());
+    helper
+        .check(deadline)
+        .await
+        .map_err(ReconcileError::Unverified)?;
+    actual.ok_or_else(|| {
+        failed(format!(
+            "{} did not report a Koidrive version during app discovery",
+            helper.path().display()
+        ))
+        .into()
+    })
+}
+
+#[cfg(target_os = "macos")]
+async fn select_app_helper(
+    prepared: &crate::app::Prepared,
+    existing: crate::app_install::VerifiedHelper,
+    from: &Version,
+    target: &Version,
+    deadline: tokio::time::Instant,
+) -> Result<Option<crate::app_install::VerifiedHelper>, crate::app_install::AppInstallError> {
+    if let Some(helper) = prepared.verified_helper(deadline).await? {
+        return Ok(Some(helper));
+    }
+    if prepared.skipped_in_ci() && from.cmp_precedence(target).is_ge() {
+        existing.check(deadline).await?;
+        return Ok(Some(existing));
+    }
+    Ok(None)
+}
+
 pub async fn run(paths: &Paths, json: bool) -> Result<Done, CliError> {
     refuse_root(rustix::process::geteuid().is_root())?;
     if update::is_development_version(env!("CARGO_PKG_VERSION")) {
@@ -400,6 +499,7 @@ pub async fn run(paths: &Paths, json: bool) -> Result<Done, CliError> {
                 from: env!("CARGO_PKG_VERSION").to_owned(),
                 to: env!("CARGO_PKG_VERSION").to_owned(),
                 via: None,
+                app: None,
                 result: UpdateResult::Unchanged,
                 service: None,
             },
@@ -430,18 +530,101 @@ pub async fn run(paths: &Paths, json: bool) -> Result<Done, CliError> {
         .collect();
     let installs = Installs::of_this_machine();
     let install = installs.pick(Path::is_file, &running);
-    let from = (install.as_ref())
-        .and_then(|install| service::version_of(&install.koi(&installs)))
-        .unwrap_or_else(service::this_version);
+    let app_deadline = tokio::time::Instant::now() + RECONCILE;
+    #[cfg(target_os = "macos")]
+    let existing_app = if let Some(Install::App { binary }) = &install {
+        let discovered = async {
+            let helper = crate::app_install::verify_existing(binary, app_deadline)
+                .await
+                .map_err(ReconcileError::Unverified)?;
+            let version = discover_app_version(&helper, app_deadline).await?;
+            Ok::<_, ReconcileError>((helper, version))
+        }
+        .await;
+        Some(discovered.map_err(|error| {
+            let mut error = match error {
+                ReconcileError::Failed(error) => error,
+                ReconcileError::Unverified(error) => failed(error.to_string()),
+            };
+            error
+                .message
+                .push_str(&format!("\nDownload Koidrive {to} from {url}"));
+            error
+        })?)
+    } else {
+        None
+    };
+    let from = match &install {
+        #[cfg(target_os = "macos")]
+        Some(Install::App { .. }) => existing_app.as_ref().unwrap().1.clone(),
+        #[cfg(not(target_os = "macos"))]
+        Some(Install::App { .. }) => service::this_version(),
+        Some(install) => service::version_of(&install.koi()).unwrap_or_else(service::this_version),
+        None => service::this_version(),
+    };
     let upgrading = to.cmp_precedence(&from).is_gt();
     let download = || failed(format!("Download Koidrive {to} from {url}"));
     let mut echo = Echo::open(&log_path(paths), json);
-    if upgrading {
-        match &install {
-            Some(Install::Homebrew { prefix }) => homebrew(prefix, &mut echo).await?,
-            Some(Install::Script { dir }) => installer(script_url()?, dir, &to, &mut echo).await?,
-            Some(Install::App) | None => return Err(download()),
+    let koi = install.as_ref().and_then(|install| match install {
+        Install::App { .. } => None,
+        _ => Some(UpdateBinary::Other(install.koi())),
+    });
+    #[cfg(target_os = "macos")]
+    let mut koi = koi;
+    let prepared_app: Option<crate::app::Prepared> = None;
+    #[cfg(target_os = "macos")]
+    let mut prepared_app = prepared_app;
+    match &install {
+        Some(Install::App { .. }) => {
+            let prepared =
+                crate::app::prepare(&to, crate::app_install::AppLaunch::Preserve, app_deadline)
+                    .await;
+            #[cfg(target_os = "macos")]
+            {
+                match select_app_helper(
+                    &prepared,
+                    existing_app.unwrap().0,
+                    &from,
+                    &to,
+                    app_deadline,
+                )
+                .await
+                {
+                    Ok(Some(helper)) => koi = Some(UpdateBinary::App(Box::new(helper))),
+                    Ok(None) => {
+                        return Err(app_not_updated(
+                            paths,
+                            &from,
+                            &to,
+                            &url,
+                            prepared,
+                            app_deadline,
+                        )
+                        .await);
+                    }
+                    Err(error) => {
+                        return Err(app_not_updated(
+                            paths,
+                            &from,
+                            &to,
+                            &url,
+                            prepared.invalidate(error),
+                            app_deadline,
+                        )
+                        .await);
+                    }
+                }
+                prepared_app = Some(prepared);
+            }
+            #[cfg(not(target_os = "macos"))]
+            return Err(app_not_updated(paths, &from, &to, &url, prepared, app_deadline).await);
         }
+        Some(Install::Homebrew { prefix }) if upgrading => homebrew(prefix, &mut echo).await?,
+        Some(Install::Script { dir }) if upgrading => {
+            installer(script_url()?, dir, &to, &mut echo).await?
+        }
+        None if upgrading => return Err(download()),
+        _ => (),
     }
     let Some(install) = install else {
         let text = format!("Koidrive {from} is the newest release.\n");
@@ -452,70 +635,246 @@ pub async fn run(paths: &Paths, json: bool) -> Result<Done, CliError> {
                 via: None,
                 result: UpdateResult::Unchanged,
                 service: None,
+                app: None,
             },
             text,
         )
         .unchanged());
     };
-    let koi = install.koi(&installs);
-    let actual = service::version_of(&koi).ok_or_else(|| {
-        failed(format!(
-            "{} is missing or did not report a Koidrive version after the update",
-            koi.display()
-        ))
-    })?;
-    if actual.cmp_precedence(&to).is_lt() {
-        return Err(failed(format!(
-            "{} is still Koidrive {actual}; the requested release is {to}. Try koi update again when the install source has that release.",
-            koi.display()
-        )));
-    }
-    let service = service.map_err(failed)?;
-    let args = ["_reconcile", "--json"];
-    let mut command = Command::new(&koi);
-    command.args(args);
-    let output = (echo.run(command, RECONCILE, Child::Reconcile).await)
-        .map(|output| output.map(|(status, printed, _)| (status, printed)));
-    let report =
-        service::delegated_report(manager.as_ref(), &service, &koi, &args, RECONCILE, output);
-    let summary = match upgrading {
+    let koi = koi.expect("an installation has a koi path");
+    let changed = prepared_app
+        .as_ref()
+        .map_or(upgrading, |app| !app.committed().is_empty());
+    let reconcile_deadline = if prepared_app.is_some() {
+        app_deadline
+    } else {
+        tokio::time::Instant::now() + RECONCILE
+    };
+    let reconciled = reconcile_updated(
+        &koi,
+        &to,
+        manager.as_ref(),
+        service,
+        &mut echo,
+        reconcile_deadline,
+    )
+    .await;
+    let (actual, report, app) =
+        finish_reconciliation(paths, prepared_app, &from, reconciled, app_deadline).await?;
+    updated(&from, actual, install.via(), report, app, changed)
+}
+
+fn updated(
+    from: &Version,
+    actual: Version,
+    via: Via,
+    report: service::Report,
+    app: Option<crate::app::Report>,
+    changed: bool,
+) -> Result<Done, CliError> {
+    let changed = actual.cmp_precedence(from).is_gt()
+        || changed
+        || app.as_ref().is_some_and(|app| !app.committed().is_empty());
+    let summary = match changed {
         true => format!("Updated Koidrive from {from} to {actual}."),
         false => format!("Koidrive {actual} is the newest release."),
     };
-    let text = format!(
+    let mut text = format!(
         "{summary}\n{}",
         match report.text() {
             text if text.is_empty() => report.status_line(),
             text => text,
         }
     );
-    let failed_service = report.problem.is_some()
-        || matches!(
-            report.state,
-            service::State::Stopped | service::State::Unavailable
-        );
+    if let Some(app) = &app {
+        text.push_str(&app.text());
+    }
+    let problem = update_problem(&report, app.as_ref());
     let done = Done::ok(
         UpdatedData {
             from: from.to_string(),
             to: actual.to_string(),
-            via: Some(install.via()),
-            result: if upgrading {
+            via: Some(via),
+            result: if changed {
                 UpdateResult::Updated
             } else {
                 UpdateResult::Unchanged
             },
             service: Some(report),
+            app,
         },
         text,
     );
-    if failed_service {
-        let reason = done.text.lines().last().unwrap_or_default().to_owned();
+    let done = if changed { done } else { done.unchanged() };
+    if let Some(reason) = problem {
         return Err(CliError {
             partial: Some(Box::new(done)),
             ..CliError::new(Code::Failed, reason)
         });
     }
-    Ok(if upgrading { done } else { done.unchanged() })
+    Ok(done)
+}
+
+fn update_problem(report: &service::Report, app: Option<&crate::app::Report>) -> Option<String> {
+    if report.problem.is_some()
+        || matches!(
+            report.state,
+            service::State::Stopped | service::State::Unavailable
+        )
+    {
+        return Some(report.failure_message());
+    }
+    app.and_then(crate::app::Report::problem).map(str::to_owned)
+}
+
+async fn finish_reconciliation(
+    paths: &Paths,
+    prepared: Option<crate::app::Prepared>,
+    from: &Version,
+    reconciled: Result<(Version, service::Report, Option<crate::app::Report>), ReconcileError>,
+    deadline: tokio::time::Instant,
+) -> Result<(Version, service::Report, Option<crate::app::Report>), CliError> {
+    let (actual, report, forwarded) = match reconciled {
+        Ok(reconciled) => reconciled,
+        Err(error) => {
+            let (mut error, prepared) = match error {
+                ReconcileError::Failed(error) => (error, prepared),
+                #[cfg(target_os = "macos")]
+                ReconcileError::Unverified(error) => {
+                    let failure = failed(error.to_string());
+                    (failure, prepared.map(|prepared| prepared.invalidate(error)))
+                }
+            };
+            let Some(prepared) = prepared else {
+                return Err(error);
+            };
+            let app = prepared
+                .finish(paths, Err(error.message.clone()), deadline)
+                .await;
+            let text = format!(
+                "Koidrive update is incomplete: {}\n{}",
+                error.message,
+                app.text()
+            );
+            error.partial = Some(Box::new(app_partial(from, app, text)));
+            return Err(error);
+        }
+    };
+    let app = match prepared {
+        Some(prepared) => Some(prepared.finish(paths, Ok(&report), deadline).await),
+        None => forwarded,
+    };
+    Ok((actual, report, app))
+}
+
+fn app_partial(from: &Version, app: crate::app::Report, text: String) -> Done {
+    let committed = app.committed().last();
+    let to = match &app {
+        crate::app::Report::Present { version, .. } => Version::parse(version).ok(),
+        _ => None,
+    }
+    .or_else(|| committed.map(|commit| commit.version.clone()))
+    .unwrap_or_else(|| from.clone());
+    let changed = committed.is_some() || to.cmp_precedence(from).is_gt();
+    let done = Done::ok(
+        UpdatedData {
+            from: from.to_string(),
+            to: to.to_string(),
+            via: Some(Via::App),
+            result: if changed {
+                UpdateResult::Updated
+            } else {
+                UpdateResult::Unchanged
+            },
+            service: None,
+            app: Some(app),
+        },
+        text,
+    );
+    if changed { done } else { done.unchanged() }
+}
+
+async fn app_not_updated(
+    paths: &Paths,
+    from: &Version,
+    target: &Version,
+    url: &str,
+    prepared: crate::app::Prepared,
+    deadline: tokio::time::Instant,
+) -> CliError {
+    let changed = !prepared.committed().is_empty();
+    let app = prepared
+        .finish(
+            paths,
+            Err("App installation did not complete".into()),
+            deadline,
+        )
+        .await;
+    let guidance = format!("Download Koidrive {target} from {url}");
+    let message = match &app {
+        crate::app::Report::Failed { problem, .. } => format!("{problem}\n{guidance}"),
+        crate::app::Report::Skipped { reason } => {
+            format!("App installation was skipped ({reason}).\n{guidance}")
+        }
+        crate::app::Report::Present { .. } => unreachable!("a present app selected its helper"),
+    };
+    let text = if changed {
+        format!("Koidrive update is incomplete.\n{}{guidance}\n", app.text())
+    } else {
+        format!("Koidrive was not updated.\n{message}\n")
+    };
+    CliError {
+        partial: Some(Box::new(app_partial(from, app, text))),
+        ..failed(message)
+    }
+}
+
+async fn reconcile_updated(
+    binary: &UpdateBinary,
+    target: &Version,
+    manager: &dyn service::Manager,
+    service: Result<service::Service, String>,
+    echo: &mut Echo,
+    deadline: tokio::time::Instant,
+) -> Result<(Version, service::Report, Option<crate::app::Report>), ReconcileError> {
+    binary.check(deadline).await?;
+    let koi = binary.path();
+    let actual = service::version_of(koi);
+    binary.check(deadline).await?;
+    let actual = actual.ok_or_else(|| {
+        failed(format!(
+            "{} is missing or did not report a Koidrive version after the update",
+            koi.display()
+        ))
+    })?;
+    if actual.cmp_precedence(target).is_lt() {
+        return Err(failed(format!(
+            "{} is still Koidrive {actual}; the requested release is {target}. Try koi update again when the install source has that release.",
+            koi.display()
+        )).into());
+    }
+    let service = service.map_err(failed)?;
+    binary.check(deadline).await?;
+    let within = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let args = ["_reconcile", "--json"];
+    let mut command = Command::new(koi);
+    command.args(args);
+    let output = if within.is_zero() {
+        Ok(None)
+    } else {
+        (echo.run(command, within, Child::Reconcile).await)
+            .map(|output| output.map(|(status, printed, _)| (status, printed)))
+    };
+    let app = output
+        .as_ref()
+        .ok()
+        .and_then(Option::as_ref)
+        .and_then(|(_, printed)| {
+            let envelope: serde_json::Value = serde_json::from_slice(printed).ok()?;
+            serde_json::from_value::<crate::app::Report>(envelope["data"]["app"].clone()).ok()
+        });
+    let report = service::delegated_report(manager, &service, koi, &args, within, output);
+    Ok((actual, report, app))
 }
 
 fn scan(
@@ -669,8 +1028,21 @@ mod tests {
             "/opt/homebrew/opt/koidrive/bin/koi",
             "/Users/ada/Applications/Koidrive.app/Contents/Helpers/koi",
         ] {
-            assert_eq!(pick(&[app], &[owned]), Some(Install::App), "{owned}");
+            assert_eq!(
+                pick(&[app], &[owned]),
+                Some(Install::App { binary: app.into() }),
+                "{owned}"
+            );
         }
+        let user_app = "/Users/ada/Applications/Koidrive.app/Contents/Helpers/koi";
+        let selected = pick(&[user_app], &[user_app]).unwrap();
+        assert_eq!(
+            selected,
+            Install::App {
+                binary: user_app.into()
+            }
+        );
+        assert_eq!(selected.koi(), PathBuf::from(user_app));
         assert_eq!(pick(&[], &[]), None);
 
         let custom = Installs::under(Some(Path::new("/srv/brew")), None);
@@ -741,6 +1113,922 @@ echo "==> brew $1"
 
     fn echo(dir: &Path) -> Echo {
         Echo::open(&dir.join("logs/update.log"), true)
+    }
+
+    #[test]
+    fn user_applications_are_discovered_without_treating_their_helper_as_install_sh() {
+        let home = Path::new("/fixture/home");
+        let user = home.join("Applications/Koidrive.app/Contents/Helpers/koi");
+        let installs = Installs::under(None, Some(home));
+        assert!(installs.all().contains(&user));
+        assert!(matches!(
+            installs.pick(|path| path == user, &[&user]),
+            Some(Install::App { binary }) if binary == user
+        ));
+        assert!(matches!(
+            installs.pick(|path| path == user, &[]),
+            Some(Install::App { binary }) if binary == user
+        ));
+        assert_eq!(
+            installs.all().iter().filter(|path| **path == user).count(),
+            1
+        );
+        let no_home = Installs::under(None, None);
+        assert_eq!(no_home.apps.len(), 1);
+        assert!(no_home.apps[0].is_absolute());
+    }
+
+    #[test]
+    fn update_errors_name_the_failed_report_rather_than_success_or_retry_text() {
+        for (state, service_problem, app_problem) in [
+            ("stopped", None, None),
+            ("unavailable", None, None),
+            ("running", Some("Service reconciliation failed"), None),
+            ("running", None, Some("App signature is invalid")),
+            (
+                "running",
+                Some("Service reconciliation failed"),
+                Some("App signature is invalid"),
+            ),
+            ("running", None, None),
+            ("switched_off", None, None),
+        ] {
+            let report: service::Report = serde_json::from_value(serde_json::json!({
+                "manager": "launchd", "name": "fixture", "state": state,
+                "problem": service_problem
+            }))
+            .unwrap();
+            let expected =
+                if state == "stopped" || state == "unavailable" || service_problem.is_some() {
+                    Some(report.failure_message())
+                } else {
+                    app_problem.map(str::to_owned)
+                };
+            for present in [true, false] {
+                let app: crate::app::Report = if present {
+                    serde_json::from_value(serde_json::json!({
+                        "state": "present", "path": "/fixture/Koidrive.app", "version": "99.0.0",
+                        "change": "installed", "launch": "requested", "problem": app_problem
+                    }))
+                    .unwrap()
+                } else if let Some(problem) = app_problem {
+                    crate::app::Report::Failed {
+                        committed: Vec::new(),
+                        retired: Vec::new(),
+                        preserved: Vec::new(),
+                        problem: problem.into(),
+                        residue: Vec::new(),
+                    }
+                } else {
+                    crate::app::Report::skipped("ci")
+                };
+                assert_eq!(
+                    update_problem(&report, Some(&app)),
+                    expected,
+                    "{state}, {app:?}"
+                );
+            }
+        }
+    }
+
+    fn app_fixture(
+        dir: &Path,
+        actual: &str,
+        change: crate::app::Change,
+        problem: Option<String>,
+    ) -> crate::app::Prepared {
+        let path = dir.join("user Applications/Koidrive.app");
+        let binary = path.join("Contents/Helpers/koi");
+        executable(
+            &binary,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\ncase \"$1\" in\n--version) echo 'koi {actual}' ;;\n_reconcile) echo '{{\"data\":{{\"service\":{{\"manager\":\"launchd\",\"name\":\"fixture\",\"state\":\"running\"}},\"app\":{{\"state\":\"skipped\",\"reason\":\"bundled_helper\"}}}}}}' ;;\nesac\n"
+            ),
+        );
+        crate::app::Prepared::fixture(crate::app::Report::Present {
+            committed: Vec::new(),
+            path,
+            version: "99.0.0".into(),
+            change,
+            launch: if problem.is_some() {
+                crate::app::Launch::Failed
+            } else {
+                crate::app::Launch::NotRequested
+            },
+            problem,
+            retired: Vec::new(),
+            residue: Vec::new(),
+            preserved: Vec::new(),
+        })
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn selected_development_app_discovery_uses_its_helper_instead_of_the_invoking_app() {
+        let (_system_fixture, system) =
+            crate::app_install::verified_helper_fixture_with_metadata("98.2.0", None).await;
+        let (_user_fixture, invoking) = crate::app_install::verified_helper_fixture("99.0.0").await;
+        let installs = Installs {
+            homebrew: Vec::new(),
+            script: None,
+            apps: vec![system.path().to_path_buf(), invoking.path().to_path_buf()],
+        };
+        let selected = installs.pick(Path::is_file, &[invoking.path()]).unwrap();
+        assert_eq!(selected.koi(), system.path());
+        assert!(system.version().is_none());
+        let deadline = tokio::time::Instant::now() + RECONCILE;
+        system.check(deadline).await.unwrap();
+        let actual = service::version_of(system.path()).unwrap();
+        system.check(deadline).await.unwrap();
+        assert_eq!(actual.to_string(), "98.2.0");
+        let discovered = discover_app_version(&system, deadline).await.unwrap();
+        assert_eq!(
+            discovered, actual,
+            "The selected system app differs from the invoking user app"
+        );
+        assert!(!invoking.path().with_extension("calls").exists());
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn current_ci_skip_reconciles_the_verified_existing_helper() {
+        for (actual_version, state, problem, fails) in [
+            ("99.0.0", "running", None, false),
+            ("100.0.0", "switched_off", None, false),
+            ("99.0.0", "off", None, false),
+            ("99.0.0", "stopped", None, true),
+            ("99.0.0", "unavailable", None, true),
+            ("99.0.0", "switched_off", Some("registration failed"), true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let version = Version::parse(actual_version).unwrap();
+            let target = Version::parse("99.0.0").unwrap();
+            let prepared = crate::app::Prepared::fixture(crate::app::Report::skipped("ci"));
+            assert!(prepared.helper().is_none());
+            let (_fixture, helper) =
+                crate::app_install::verified_helper_fixture(actual_version).await;
+            let original = fs::read_to_string(helper.path()).unwrap();
+            let fields = format!(
+                "\"state\":{},\"problem\":{}",
+                serde_json::to_string(state).unwrap(),
+                serde_json::to_string(&problem).unwrap()
+            );
+            fs::write(
+                helper.path(),
+                original.replace("\"state\":\"running\"", &fields),
+            )
+            .unwrap();
+            let deadline = tokio::time::Instant::now() + RECONCILE;
+            let from = discover_app_version(&helper, deadline).await.unwrap();
+            assert_eq!(from, version);
+            let helper = select_app_helper(&prepared, helper, &from, &target, deadline)
+                .await
+                .unwrap()
+                .unwrap();
+            let binary = UpdateBinary::App(Box::new(helper));
+            let paths = Paths::under(dir.path());
+            let manager = service::system();
+            let reconciled = reconcile_updated(
+                &binary,
+                &target,
+                manager.as_ref(),
+                service::Service::new(&paths, dir.path(), binary.path()),
+                &mut echo(dir.path()),
+                deadline,
+            )
+            .await;
+            let (actual, service, app) =
+                finish_reconciliation(&paths, Some(prepared), &version, reconciled, deadline)
+                    .await
+                    .unwrap();
+            assert_eq!(actual, version);
+            assert_eq!(update_problem(&service, app.as_ref()).is_some(), fails);
+            assert_eq!(serde_json::to_value(&service).unwrap()["state"], state);
+            assert!(matches!(app, Some(crate::app::Report::Skipped { reason }) if reason == "ci"));
+            assert_eq!(
+                fs::read_to_string(binary.path().with_extension("calls")).unwrap(),
+                "--version\n--version\n_reconcile --json\n"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_app_failures_are_updated_partials_even_at_the_same_version() {
+        let dir = tempfile::tempdir().unwrap();
+        for from in ["1.0.0", "99.0.0"] {
+            let app: crate::app::Report = serde_json::from_value(serde_json::json!({
+                "state":"failed", "problem":"source changed",
+                "committed":[{"path":dir.path().join("Koidrive.app"), "version":"99.0.0", "change":"replaced"}],
+                "retired":[dir.path().join("retired.app")], "residue":[dir.path().join("receipt.json")]
+            })).unwrap();
+            let error = app_not_updated(
+                &Paths::under(dir.path()),
+                &Version::parse(from).unwrap(),
+                &Version::parse("99.0.0").unwrap(),
+                "https://example.test/release",
+                crate::app::Prepared::fixture(app),
+                tokio::time::Instant::now(),
+            )
+            .await;
+            assert_eq!(error.code, Code::Failed);
+            assert!(
+                error
+                    .message
+                    .starts_with("source changed\nDownload Koidrive")
+            );
+            let partial = error.partial.unwrap();
+            assert_eq!(partial.data["from"], from);
+            assert_eq!(partial.data["to"], "99.0.0");
+            assert_eq!(partial.data["result"], "updated");
+            assert_ne!(serde_json::to_value(partial.outcome).unwrap(), "unchanged");
+            assert_eq!(partial.data["app"]["state"], "failed");
+            assert!(partial.data["app"].get("version").is_none());
+            assert!(!partial.text.contains("was not updated"));
+            assert!(!partial.text.contains("is installed"));
+            assert_eq!(partial.text.matches("source changed").count(), 1);
+            assert_eq!(partial.text.matches("Download Koidrive").count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn ci_skip_fallback_requires_a_current_verified_app_and_never_accepts_errors() {
+        let target = Version::parse("99.0.0").unwrap();
+        for (reason, version, selected) in [
+            ("ci", "98.0.0", false),
+            ("ci", "100.0.0", true),
+            ("platform", "99.0.0", false),
+            ("architecture", "99.0.0", false),
+        ] {
+            let (_fixture, helper) = crate::app_install::verified_helper_fixture(version).await;
+            let binary = helper.path().to_path_buf();
+            let prepared = crate::app::Prepared::fixture(crate::app::Report::skipped(reason));
+            let result = select_app_helper(
+                &prepared,
+                helper,
+                &Version::parse(version).unwrap(),
+                &target,
+                tokio::time::Instant::now() + RECONCILE,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_some(), selected);
+            assert!(!binary.with_extension("calls").exists());
+        }
+        let (_fixture, helper) = crate::app_install::verified_helper_fixture("99.0.0").await;
+        let prepared = crate::app::Prepared::fixture(
+            serde_json::from_value(serde_json::json!({"state":"failed", "problem":"offline"}))
+                .unwrap(),
+        );
+        assert!(
+            select_app_helper(
+                &prepared,
+                helper,
+                &target,
+                &target,
+                tokio::time::Instant::now() + RECONCILE
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn initial_app_discovery_rejects_changes_during_the_version_probe() {
+        for invalid in [
+            "signer",
+            "helper",
+            "during_version",
+            "during_helper",
+            "invalid_version",
+        ] {
+            let (_fixture, helper) =
+                crate::app_install::verified_helper_fixture_with_metadata("99.0.0", None).await;
+            let binary = helper.path().to_path_buf();
+            let bundle = binary.ancestors().nth(3).unwrap();
+            match invalid {
+                "signer" => fs::write(bundle.join("Signer"), "OTHERTEAM").unwrap(),
+                "helper" => {
+                    fs::rename(&binary, binary.with_extension("old")).unwrap();
+                    executable(&binary, "#!/bin/sh\necho unsafe > \"$0.calls\"\n");
+                }
+                "during_version" => fs::write(&binary, format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\nprintf OTHERTEAM > '{}/Signer'\necho 'koi 98.0.0'\n", bundle.display()
+                )).unwrap(),
+                "during_helper" => fs::write(&binary,
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\n/bin/mv \"$0\" \"$0.old\"\n/bin/cp \"$0.old\" \"$0\"\necho 'koi 98.0.0'\n"
+                ).unwrap(),
+                _ => fs::write(&binary, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\necho 'not-a-version'\n").unwrap(),
+            }
+            let error = discover_app_version(&helper, tokio::time::Instant::now() + RECONCILE)
+                .await
+                .unwrap_err();
+            if invalid == "invalid_version" {
+                assert!(
+                    matches!(error, ReconcileError::Failed(error) if error.message.contains("during app discovery"))
+                );
+            } else {
+                assert!(matches!(error, ReconcileError::Unverified(_)));
+            }
+            if matches!(
+                invalid,
+                "during_version" | "during_helper" | "invalid_version"
+            ) {
+                assert_eq!(
+                    fs::read_to_string(binary.with_extension("calls")).unwrap(),
+                    "--version\n"
+                );
+            } else {
+                assert!(!binary.with_extension("calls").exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn ci_skip_uses_the_discovered_version_instead_of_missing_or_different_metadata() {
+        for (metadata, actual, selected) in [
+            (None, "99.0.0", true),
+            (None, "98.0.0", false),
+            (Some("100.0.0"), "98.0.0", false),
+        ] {
+            let (_fixture, helper) =
+                crate::app_install::verified_helper_fixture_with_metadata(actual, metadata).await;
+            let binary = helper.path().to_path_buf();
+            let deadline = tokio::time::Instant::now() + RECONCILE;
+            let from = discover_app_version(&helper, deadline).await.unwrap();
+            assert_eq!(from.to_string(), actual);
+            let prepared = crate::app::Prepared::fixture(crate::app::Report::skipped("ci"));
+            let helper = select_app_helper(
+                &prepared,
+                helper,
+                &from,
+                &Version::parse("99.0.0").unwrap(),
+                deadline,
+            )
+            .await
+            .unwrap();
+            assert_eq!(helper.is_some(), selected);
+            assert_eq!(
+                fs::read_to_string(binary.with_extension("calls")).unwrap(),
+                "--version\n"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn partial_update_versions_require_commits_or_a_verified_target_helper() {
+        for (actual, committed) in [
+            ("invalid", false),
+            ("98.0.0", false),
+            ("99.0.0", false),
+            ("100.0.0", false),
+            ("invalid", true),
+            ("98.0.0", true),
+            ("99.0.0", true),
+            ("100.0.0", true),
+        ] {
+            let (_fixture, helper) = crate::app_install::verified_helper_fixture("99.0.0").await;
+            let binary = helper.path().to_path_buf();
+            let bundle = binary.ancestors().nth(3).unwrap().to_path_buf();
+            fs::write(&binary, format!("#!/bin/sh\necho 'koi {actual}'\n")).unwrap();
+            let committed = if committed {
+                serde_json::json!([{"path":bundle, "version":"99.0.0", "change":"replaced"}])
+            } else {
+                serde_json::json!([])
+            };
+            let prepared = crate::app::Prepared::fixture(serde_json::from_value(serde_json::json!({
+                "state":"present", "path":bundle, "version":"99.0.0", "change":"unchanged", "launch":"not_requested", "committed":committed
+            })).unwrap());
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::under(dir.path());
+            let manager = service::system();
+            let deadline = tokio::time::Instant::now() + RECONCILE;
+            let reconciled = reconcile_updated(
+                &UpdateBinary::App(Box::new(helper)),
+                &Version::parse("99.0.0").unwrap(),
+                manager.as_ref(),
+                Err("The profile cannot construct its service".into()),
+                &mut echo(dir.path()),
+                deadline,
+            )
+            .await;
+            let error = finish_reconciliation(
+                &paths,
+                Some(prepared),
+                &Version::parse("1.0.0").unwrap(),
+                reconciled,
+                deadline,
+            )
+            .await
+            .unwrap_err();
+            let partial = error.partial.unwrap();
+            assert_eq!(partial.data["to"], "99.0.0", "{actual}, {committed}");
+            assert_eq!(partial.data["result"], "updated");
+            assert_eq!(serde_json::to_value(partial.outcome).unwrap(), "ok");
+            assert_eq!(
+                partial.data["app"]["committed"]
+                    .as_array()
+                    .map(Vec::len)
+                    .unwrap_or(0),
+                committed.as_array().unwrap().len()
+            );
+            assert!(partial.data.get("service").is_none());
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn failed_version_probes_cannot_preserve_a_substituted_app_as_present() {
+        for actual in ["invalid", "98.0.0", "99.0.0"] {
+            let (_fixture, helper) = crate::app_install::verified_helper_fixture("99.0.0").await;
+            let binary = helper.path().to_path_buf();
+            let bundle = binary.ancestors().nth(3).unwrap().to_path_buf();
+            let prepared = crate::app::Prepared::fixture(serde_json::from_value(serde_json::json!({
+                "state":"present", "path":bundle, "version":"99.0.0", "change":"unchanged", "launch":"not_requested"
+            })).unwrap());
+            fs::write(&binary, format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\nprintf OTHERTEAM > '{}/Signer'\necho 'koi {actual}'\n", bundle.display()
+            )).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::under(dir.path());
+            let manager = service::system();
+            let deadline = tokio::time::Instant::now() + RECONCILE;
+            let reconciled = reconcile_updated(
+                &UpdateBinary::App(Box::new(helper)),
+                &Version::parse("99.0.0").unwrap(),
+                manager.as_ref(),
+                service::Service::new(&paths, dir.path(), &binary),
+                &mut echo(dir.path()),
+                deadline,
+            )
+            .await;
+            assert!(
+                matches!(&reconciled, Err(ReconcileError::Unverified(_))),
+                "{actual}: {reconciled:?}"
+            );
+            let error = finish_reconciliation(
+                &paths,
+                Some(prepared),
+                &Version::parse("1.0.0").unwrap(),
+                reconciled,
+                deadline,
+            )
+            .await
+            .unwrap_err();
+            let partial = error.partial.unwrap();
+            assert_eq!(partial.data["app"]["state"], "failed");
+            assert_eq!(partial.data["result"], "unchanged");
+            assert_eq!(partial.data["to"], "1.0.0");
+            assert!(!partial.text.contains("is installed"));
+            assert_eq!(
+                fs::read_to_string(binary.with_extension("calls")).unwrap(),
+                "--version\n"
+            );
+        }
+    }
+
+    #[test]
+    fn reused_apps_report_verified_version_advancement_without_a_namespace_commit() {
+        for from in ["1.0.0", "99.0.0"] {
+            for state in ["running", "switched_off", "stopped"] {
+                let service: service::Report = serde_json::from_value(serde_json::json!({
+                    "manager":"launchd", "name":"fixture", "state":state
+                }))
+                .unwrap();
+                let app = serde_json::from_value(serde_json::json!({
+                    "state":"present", "path":"/fixture/Koidrive.app", "version":"99.0.0", "change":"unchanged", "launch":"not_requested"
+                })).unwrap();
+                let result = updated(
+                    &Version::parse(from).unwrap(),
+                    Version::parse("99.0.0").unwrap(),
+                    Via::App,
+                    service,
+                    Some(app),
+                    false,
+                );
+                let done = if state == "stopped" {
+                    result.unwrap_err().partial.map(|done| *done).unwrap()
+                } else {
+                    result.unwrap()
+                };
+                assert_eq!(done.data["from"], from);
+                assert_eq!(done.data["to"], "99.0.0");
+                assert_eq!(done.data["app"]["change"], "unchanged");
+                assert_eq!(done.data["service"]["state"], state);
+                if from == "1.0.0" {
+                    assert_eq!(done.data["result"], "updated");
+                    assert_ne!(serde_json::to_value(done.outcome).unwrap(), "unchanged");
+                    assert!(
+                        done.text
+                            .starts_with("Updated Koidrive from 1.0.0 to 99.0.0.")
+                    );
+                } else {
+                    assert_eq!(done.data["result"], "unchanged");
+                    assert_eq!(serde_json::to_value(done.outcome).unwrap(), "unchanged");
+                    assert!(
+                        done.text
+                            .starts_with("Koidrive 99.0.0 is the newest release.")
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn substituted_app_helpers_are_rejected_at_each_execution_boundary() {
+        for substitution in ["signer", "helper", "bundle", "during_version"] {
+            let (_fixture, helper) = crate::app_install::verified_helper_fixture("99.0.0").await;
+            let binary = helper.path().to_path_buf();
+            let bundle = binary.ancestors().nth(3).unwrap().to_path_buf();
+            let committed =
+                serde_json::json!([{"path":bundle, "version":"99.0.0", "change":"replaced"}]);
+            let prepared = crate::app::Prepared::fixture(serde_json::from_value(serde_json::json!({
+                "state":"present", "path":bundle, "version":"99.0.0", "change":"replaced", "launch":"not_requested", "committed":committed,
+            })).unwrap());
+            match substitution {
+                "signer" => fs::write(bundle.join("Signer"), "OTHERTEAM").unwrap(),
+                "helper" => {
+                    fs::rename(&binary, binary.with_extension("old")).unwrap();
+                    executable(&binary, "#!/bin/sh\necho unsafe > \"$0.calls\"\n");
+                }
+                "during_version" => fs::write(&binary, format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\ncase \"$1\" in\n--version) printf OTHERTEAM > '{}/Signer'; echo 'koi 99.0.0' ;;\n_reconcile) echo unsafe >> \"$0.calls\" ;;\nesac\n", bundle.display()
+                )).unwrap(),
+                _ => {
+                    fs::rename(&bundle, bundle.with_extension("displaced")).unwrap();
+                    fs::create_dir_all(binary.parent().unwrap()).unwrap();
+                    executable(&binary, "#!/bin/sh\necho unsafe > \"$0.calls\"\n");
+                }
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::under(dir.path());
+            let manager = service::system();
+            let version = Version::parse("99.0.0").unwrap();
+            let deadline = tokio::time::Instant::now() + RECONCILE;
+            let reconciled = reconcile_updated(
+                &UpdateBinary::App(Box::new(helper)),
+                &version,
+                manager.as_ref(),
+                service::Service::new(&paths, dir.path(), &binary),
+                &mut echo(dir.path()),
+                deadline,
+            )
+            .await;
+            assert!(matches!(&reconciled, Err(ReconcileError::Unverified(_))));
+            let error = finish_reconciliation(
+                &paths,
+                Some(prepared),
+                &Version::parse("1.0.0").unwrap(),
+                reconciled,
+                deadline,
+            )
+            .await
+            .unwrap_err();
+            let partial = error.partial.unwrap();
+            assert_eq!(partial.data["result"], "updated");
+            assert_eq!(partial.data["to"], "99.0.0");
+            assert_eq!(partial.data["app"]["state"], "failed");
+            assert_eq!(partial.data["app"]["committed"], committed);
+            assert!(!partial.text.contains("is installed"));
+            if substitution == "during_version" {
+                assert_eq!(
+                    fs::read_to_string(binary.with_extension("calls")).unwrap(),
+                    "--version\n"
+                );
+            } else {
+                assert!(!binary.with_extension("calls").exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unsuccessful_app_preparation_preserves_its_report_in_an_unchanged_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        for app in [
+            crate::app::Report::Failed {
+                committed: Vec::new(),
+                retired: Vec::new(),
+                preserved: Vec::new(),
+                problem: "Checksum mismatch".into(),
+                residue: vec![dir.path().join("retained-mount")],
+            },
+            crate::app::Report::skipped("ci"),
+            crate::app::Report::skipped("platform"),
+            crate::app::Report::skipped("architecture"),
+        ] {
+            let expected = serde_json::to_value(&app).unwrap();
+            let prepared = crate::app::Prepared::fixture(app);
+            assert_eq!(prepared.helper(), None);
+            let error = app_not_updated(
+                &paths,
+                &Version::parse("1.0.0").unwrap(),
+                &Version::parse("99.0.0").unwrap(),
+                "https://example.test/releases/v99.0.0",
+                prepared,
+                tokio::time::Instant::now(),
+            )
+            .await;
+            assert_eq!(error.code, Code::Failed);
+            assert!(
+                error.message.contains(
+                    "Download Koidrive 99.0.0 from https://example.test/releases/v99.0.0"
+                )
+            );
+            let partial = error.partial.unwrap();
+            assert_eq!(serde_json::to_value(partial.outcome).unwrap(), "unchanged");
+            assert_eq!(partial.data["from"], "1.0.0");
+            assert_eq!(partial.data["to"], "1.0.0");
+            assert_eq!(partial.data["result"], "unchanged");
+            assert_eq!(partial.data["via"], "app");
+            assert_eq!(partial.data["app"], expected);
+            assert!(partial.data.get("service").is_none());
+            assert!(!partial.text.contains("Updated Koidrive"));
+        }
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_app_reconciliation_error_retains_the_installed_app_in_its_partial_result() {
+        for (actual, valid_service) in [("invalid", true), ("98.0.0", true), ("99.0.0", false)] {
+            for result in [UpdateResult::Updated, UpdateResult::Unchanged] {
+                let dir = tempfile::tempdir().unwrap();
+                let paths = Paths::under(dir.path());
+                let path = dir.path().join("Koidrive.app");
+                let koi = path.join("Contents/Helpers/koi");
+                let marker = dir.path().join("must-not-reconcile");
+                executable(
+                    &koi,
+                    &format!(
+                        "#!/bin/sh\ncase \"$1\" in\n--version) echo 'koi {actual}' ;;\n_reconcile) echo ran > '{}' ;;\nesac\n",
+                        marker.display()
+                    ),
+                );
+                let old = dir.path().join("retired-helper");
+                let residue = dir.path().join("retained-residue");
+                fs::write(&old, "old helper remains usable").unwrap();
+                fs::write(&residue, "preserved residue").unwrap();
+                let prepared = crate::app::Prepared::fixture(crate::app::Report::Present {
+                    committed: Vec::new(),
+                    path,
+                    version: "99.0.0".into(),
+                    change: crate::app::Change::Replaced,
+                    launch: crate::app::Launch::NotRequested,
+                    problem: None,
+                    retired: vec![old.clone()],
+                    residue: vec![residue.clone()],
+                    preserved: Vec::new(),
+                });
+                let manager = service::system();
+                let service = if valid_service {
+                    service::Service::new(&paths, dir.path(), &koi)
+                } else {
+                    Err("The profile cannot construct its service".into())
+                };
+                let target = Version::parse("99.0.0").unwrap();
+                let deadline = tokio::time::Instant::now() + RECONCILE;
+                let reconciled = reconcile_updated(
+                    &UpdateBinary::Other(koi.clone()),
+                    &target,
+                    manager.as_ref(),
+                    service,
+                    &mut echo(dir.path()),
+                    deadline,
+                )
+                .await;
+                assert!(reconciled.is_err());
+                let from = Version::parse(if result == UpdateResult::Updated {
+                    "1.0.0"
+                } else {
+                    "99.0.0"
+                })
+                .unwrap();
+                let error =
+                    finish_reconciliation(&paths, Some(prepared), &from, reconciled, deadline)
+                        .await
+                        .unwrap_err();
+                let partial = error
+                    .partial
+                    .expect("the installed app must remain in the error result");
+                assert_eq!(partial.data["app"]["state"], "present");
+                assert_eq!(partial.data["app"]["version"], "99.0.0");
+                assert_eq!(partial.data["app"]["problem"], error.message);
+                assert_eq!(partial.data["app"]["retired"], serde_json::json!([old]));
+                assert_eq!(partial.data["app"]["residue"], serde_json::json!([residue]));
+                assert_eq!(partial.data["via"], "app");
+                assert_eq!(partial.data["to"], "99.0.0");
+                assert_eq!(
+                    partial.data["result"],
+                    serde_json::to_value(result).unwrap()
+                );
+                assert!(partial.data.get("service").is_none());
+                if result == UpdateResult::Unchanged {
+                    assert_eq!(serde_json::to_value(partial.outcome).unwrap(), "unchanged");
+                }
+                assert!(!marker.exists());
+                assert_eq!(fs::read(old).unwrap(), b"old helper remains usable");
+                assert_eq!(fs::read(residue).unwrap(), b"preserved residue");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_app_update_wait_uses_only_its_remaining_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let koi = dir.path().join("koi");
+        let pid_file = dir.path().join("pid");
+        executable(
+            &koi,
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n--version) echo 'koi 99.0.0' ;;\n_reconcile) echo $$ > '{}'; exec /bin/sleep 30 ;;\nesac\n",
+                pid_file.display()
+            ),
+        );
+        let paths = Paths::under(dir.path());
+        let manager = service::system();
+        let service = service::Service::new(&paths, dir.path(), &koi);
+        let mut echo = echo(dir.path());
+        let target = Version::parse("99.0.0").unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let binary = UpdateBinary::Other(koi.clone());
+        let tail = reconcile_updated(
+            &binary,
+            &target,
+            manager.as_ref(),
+            service,
+            &mut echo,
+            deadline,
+        );
+        tokio::pin!(tail);
+        let ready = async {
+            loop {
+                if let Some(pid) = fs::read_to_string(&pid_file)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<i32>().ok())
+                    .and_then(rustix::process::Pid::from_raw)
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        let pid = tokio::select! {
+            result = &mut tail => panic!("The reconciliation ended before the hanging helper started: {result:?}"),
+            pid = ready => pid,
+        };
+        assert!(rustix::process::test_kill_process(pid).is_ok());
+        let (_, report, app) = tokio::time::timeout(Duration::from_secs(5), tail)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(report.failed());
+        assert!(app.is_none());
+        assert!(tokio::time::Instant::now() >= deadline);
+        assert!(rustix::process::test_kill_process(pid).is_ok());
+        rustix::process::kill_process(pid, rustix::process::Signal::KILL).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rustix::process::test_kill_process(pid).is_ok() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let old = dir.path().join("retired-helper");
+        fs::write(&old, "old helper remains usable").unwrap();
+        let prepared = crate::app::Prepared::fixture(crate::app::Report::Present {
+            committed: Vec::new(),
+            path: dir.path().join("Koidrive.app"),
+            version: "99.0.0".into(),
+            change: crate::app::Change::Replaced,
+            launch: crate::app::Launch::NotRequested,
+            problem: None,
+            retired: vec![old.clone()],
+            residue: Vec::new(),
+            preserved: Vec::new(),
+        });
+        let app = prepared.finish(&paths, Ok(&report), deadline).await;
+        assert!(
+            matches!(app, crate::app::Report::Present { problem: Some(_), retired, .. } if retired == vec![old.clone()])
+        );
+        assert_eq!(fs::read(old).unwrap(), b"old helper remains usable");
+    }
+
+    #[tokio::test]
+    async fn app_updates_verify_the_prepared_helper_before_one_shared_reconcile() {
+        for (change, actual) in [
+            (crate::app::Change::Unchanged, "99.0.0"),
+            (crate::app::Change::Replaced, "100.0.0"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let prepared = app_fixture(
+                dir.path(),
+                actual,
+                change,
+                Some("The menu bar app could not open".into()),
+            );
+            let koi = prepared.helper().unwrap();
+            assert!(koi.starts_with(dir.path()));
+            let paths = Paths::under(dir.path());
+            let service = service::Service::new(&paths, dir.path(), &koi);
+            let manager = service::system();
+            let (version, report, forwarded) = reconcile_updated(
+                &UpdateBinary::Other(koi.clone()),
+                &Version::parse("99.0.0").unwrap(),
+                manager.as_ref(),
+                service,
+                &mut echo(dir.path()),
+                tokio::time::Instant::now() + RECONCILE,
+            )
+            .await
+            .unwrap();
+            assert_eq!(version.to_string(), actual);
+            assert!(
+                matches!(forwarded, Some(crate::app::Report::Skipped { reason }) if reason == "bundled_helper")
+            );
+            let before = serde_json::to_value(&report).unwrap();
+            let app = prepared
+                .finish(
+                    &paths,
+                    Ok(&report),
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                )
+                .await;
+            assert!(app.failed());
+            assert_eq!(serde_json::to_value(&report).unwrap(), before);
+            assert!(!report.failed());
+            assert_eq!(
+                fs::read_to_string(koi.with_extension("calls")).unwrap(),
+                "--version\n_reconcile --json\n"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prepared_app_does_not_bypass_actual_helper_version_verification() {
+        for version in ["0.1.0", "not-semver"] {
+            let dir = tempfile::tempdir().unwrap();
+            let prepared = app_fixture(dir.path(), version, crate::app::Change::Replaced, None);
+            let koi = prepared.helper().unwrap();
+            let paths = Paths::under(dir.path());
+            let service = service::Service::new(&paths, dir.path(), &koi);
+            let manager = service::system();
+            let error = reconcile_updated(
+                &UpdateBinary::Other(koi.clone()),
+                &Version::parse("99.0.0").unwrap(),
+                manager.as_ref(),
+                service,
+                &mut echo(dir.path()),
+                tokio::time::Instant::now() + RECONCILE,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(error, ReconcileError::Failed(error) if error.code == Code::Failed));
+            assert_eq!(
+                fs::read_to_string(koi.with_extension("calls")).unwrap(),
+                "--version\n"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_shared_update_tail_forwards_app_failure_without_changing_service() {
+        for changed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let koi = dir.path().join("koi");
+            let mut app = serde_json::json!({"state":"failed", "problem":"offline", "residue":["fixture-residue"]});
+            if changed {
+                app["committed"] = serde_json::json!([{"path":"/Applications/Koidrive.app", "version":"99.0.0", "change":"replaced"}]);
+            }
+            let report = serde_json::json!({"manager":"launchd", "name":"fixture", "state":"off"});
+            let envelope = serde_json::json!({"data":{"service":report, "app":app}});
+            executable(
+                &koi,
+                &format!(
+                    "#!/bin/sh\ncase \"$1\" in\n--version) echo 'koi 99.0.0' ;;\n_reconcile) printf '%s\\n' '{envelope}' ;;\nesac\n"
+                ),
+            );
+            let paths = Paths::under(dir.path());
+            let manager = service::system();
+            let (_, service, forwarded) = reconcile_updated(
+                &UpdateBinary::Other(koi.clone()),
+                &Version::parse("99.0.0").unwrap(),
+                manager.as_ref(),
+                service::Service::new(&paths, dir.path(), &koi),
+                &mut echo(dir.path()),
+                tokio::time::Instant::now() + RECONCILE,
+            )
+            .await
+            .unwrap();
+            assert_eq!(serde_json::to_value(service).unwrap(), report);
+            let forwarded = forwarded.unwrap();
+            assert_eq!(!forwarded.committed().is_empty(), changed);
+            assert_eq!(serde_json::to_value(forwarded).unwrap(), app);
+        }
     }
 
     #[test]

@@ -10,7 +10,7 @@ use crate::report::{
     Envelope, FolderData, HelpData, InvitationData, LeftData, RequestsData, RestoreAskedData,
     RevokedData, SCHEMA_VERSION, SetupData, ShareLinkData, ShareLinksData, SharedData, SpaceData,
     SpacesData, StatusData, TrashData, UnlinkedData, UpdatedData, UsagesData, VersionInfoData,
-    VersionsData, WithService,
+    VersionsData, WithApp, WithService,
 };
 use crate::telemetry::{ChoiceData, TelemetryStatusData};
 
@@ -29,14 +29,13 @@ fn data(command: &str) -> Option<&'static [Data]> {
         "space" | "folder" | "service" | "device" | "history" | "share" | "telemetry"
         | "_daemon" => &[],
         "setup" => &[
-            of::<WithService<ChoicesData>>,
-            of::<WithService<SetupData>>,
-            of::<WithService<Empty>>,
+            of::<WithApp<WithService<ChoicesData>>>,
+            of::<WithApp<WithService<SetupData>>>,
+            of::<WithApp<WithService<Empty>>>,
         ],
         "join" | "server claim" => &[of::<WithService<AccountData>>],
-        "server deploy" | "server add-device" | "service start" | "_reconcile" => {
-            &[of::<WithService<Empty>>]
-        }
+        "server deploy" | "server add-device" | "service start" => &[of::<WithService<Empty>>],
+        "_reconcile" => &[of::<WithApp<WithService<Empty>>>],
         "pause" => &[of::<Empty>],
         "resume" => &[of::<WithService<Empty>>],
         "space create" => &[of::<SpaceData>],
@@ -141,6 +140,29 @@ mod tests {
             .collect();
         assert!(missing.is_empty(), "no schema for {missing:?}");
         assert!(commands.contains(&"folder link".to_owned()), "{commands:?}");
+    }
+
+    #[test]
+    fn app_reports_are_optional_but_validated_when_present() {
+        for command in ["setup", "_reconcile"] {
+            let validator = jsonschema::validator_for(&envelope(command).unwrap()).unwrap();
+            let mut printed = json!({
+                "schema_version": 1,
+                "command": command,
+                "outcome": "error",
+                "data": {"service": {"manager":"launchd", "name":"fixture", "state":"unavailable"}},
+                "error": {"code":"failed", "message":"registration failed", "retryable":false},
+                "decisions": [],
+                "next_commands": [],
+            });
+            assert!(validator.is_valid(&printed), "{printed:#}");
+            printed["data"]["app"] = json!({"state":"skipped", "reason":"ci"});
+            assert!(validator.is_valid(&printed), "{printed:#}");
+            for invalid in [json!({}), json!({"state":"unknown"}), json!(false)] {
+                printed["data"]["app"] = invalid;
+                assert!(!validator.is_valid(&printed), "{printed:#}");
+            }
+        }
     }
 
     #[test]

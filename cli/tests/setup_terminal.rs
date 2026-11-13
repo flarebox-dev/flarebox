@@ -534,6 +534,9 @@ fn terminal_run(
         .stdout(slave.try_clone().unwrap())
         .stderr(slave)
         .env("TERM", "xterm-256color");
+    if args.first() == Some(&"setup") {
+        command.arg("--no-app");
+    }
     if !rich {
         command.arg("--plain");
     }

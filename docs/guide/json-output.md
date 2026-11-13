@@ -28,6 +28,8 @@ Without `--json`, a command whose result is one value prints only that value on 
 
 A failed command can still carry `data`. For example, `koi space usage` returns the spaces that answered when the server refuses another one.
 
+An app update can replace files before a later step fails. `data.app.committed` records each replacement's path, full version and `installed` or `replaced` change. With `data.app.state` set to `failed`, these are historical records, not a verified current app. In an app-only partial error, `data.result` stays `updated` and `data.to` names the last committed app version. The service result is independent.
+
 Each command's envelope has a JSON Schema (draft 2020-12) in [docs/json-schema/v1](../json-schema/v1), named after the command: `koi-folder-link.json` for `koi folder link`, and `koi.json` for `koi` alone. `koi-help.json` covers `koi help` with any command after it. Schema 1 can gain optional fields, so a validator should allow fields it doesn't know.
 
 ## koi help --json lists every command

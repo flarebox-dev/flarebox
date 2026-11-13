@@ -46,6 +46,9 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2.5.8"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = { version = "1.10.3", default-features = false }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "6.2.1", default-features = false, features = ["tokio"] }
 

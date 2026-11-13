@@ -6,6 +6,8 @@
 //! versions commands talk to the server directly with the credential. With `--json` every command prints one
 //! envelope (see [`report`]) and exits with the status of its [`koidrive_ipc::Code`].
 
+mod app;
+mod app_install;
 mod diagnose;
 mod error;
 mod history;
@@ -113,6 +115,9 @@ enum Command {
         login: setup::LoginArgs,
         #[command(flatten)]
         script: setup::ScriptArgs,
+        /// Skip installing and opening the macOS app.
+        #[arg(long)]
+        no_app: bool,
     },
     /// Add this device with a pairing code from a device that is already paired.
     #[command(group(clap::ArgGroup::new("code_source").required(true).args(["code", "code_stdin"])))]
@@ -194,7 +199,10 @@ enum Command {
     /// Bring the background service in line with the linked folders, as linking a folder does. It leaves koi switched
     /// off in Login Items off and never resumes a pause.
     #[command(name = "_reconcile", hide = true)]
-    Reconcile,
+    Reconcile {
+        #[arg(long, hide = true)]
+        no_app: bool,
+    },
 }
 
 impl Command {
@@ -469,6 +477,7 @@ fn main() -> ExitCode {
             } => done,
             Ok(status) = interrupt => {
                 terminal.cancel().await;
+                app::cancel_active().await;
                 let error = CliError::new(
                     Code::Interrupted,
                     if status == 143 { "stopped by SIGTERM; what the command already did stays done" } else { "interrupted by Ctrl-C; what the command already did stays done" },
@@ -516,7 +525,7 @@ fn telemetry_of(
         Command::Folder { .. } => (Name::Folder, None, None),
         Command::Device { .. } => (Name::Device, None, None),
         Command::History { .. } => (Name::History, None, None),
-        Command::Service { .. } | Command::Reconcile => (Name::Service, None, None),
+        Command::Service { .. } | Command::Reconcile { .. } => (Name::Service, None, None),
         Command::Pause => (Name::Pause, None, None),
         Command::Resume => (Name::Resume, None, None),
         Command::Share { .. } => (Name::Share, None, None),
@@ -535,8 +544,28 @@ async fn run(
     json: bool,
     terminal: Arc<terminal::Terminal>,
 ) -> Result<Done, CliError> {
+    let lifecycle_deadline = matches!(command, Command::Reconcile { .. })
+        .then(|| tokio::time::Instant::now() + std::time::Duration::from_secs(380));
+    let app_policy = match &command {
+        Command::Setup { no_app, .. } => Some(if *no_app {
+            Err("opt_out")
+        } else if !terminal.guided() {
+            Err("unattended_setup")
+        } else {
+            Ok(app_install::AppLaunch::Open)
+        }),
+        Command::Reconcile { no_app } => Some(if *no_app {
+            Err("service_handoff")
+        } else if std::env::current_exe().is_ok_and(|binary| app::bundled(&binary)) {
+            Err("bundled_helper")
+        } else {
+            Ok(app_install::AppLaunch::Preserve)
+        }),
+        _ => None,
+    };
+    let setup_app = matches!(command, Command::Setup { .. });
     let asked = matches!(command, Command::Service { .. });
-    let shows_state = asked || matches!(command, Command::Reconcile);
+    let shows_state = asked || matches!(command, Command::Reconcile { .. });
     let reconciles = shows_state
         || matches!(
             command,
@@ -553,33 +582,89 @@ async fn run(
                         | setup::ServerAction::AddDevice { .. }
                 }
         );
-    let mut done = execute(paths.clone(), command, json, terminal).await?;
-    if reconciles {
+    let done = execute(paths.clone(), command, json, terminal).await?;
+    let service = if reconciles {
         let report = service::reconcile(&paths, asked).await;
-        let text = match report.text() {
-            text if text.is_empty() && shows_state => report.status_line(),
-            text => text,
-        };
         let failed = shows_state
             && report.failed()
             && (asked || report.state != service::State::SwitchedOff || report.problem.is_some());
         let failure = failed.then(|| report.failure_message());
-        let data = match done.data.take() {
-            Value::Null => Value::Object(serde_json::Map::new()),
-            data => data,
-        };
-        done.data = serde_json::to_value(WithService {
-            data,
-            service: report,
-        })
-        .expect("the CLI's own types serialize");
         if let Some(message) = failure {
             return Err(CliError {
-                partial: Some(Box::new(done)),
+                partial: Some(Box::new(with_service(done, report))),
                 ..CliError::new(Code::Failed, message)
             });
         }
+        Some(report)
+    } else {
+        None
+    };
+    let app = match app_policy {
+        Some(policy) => Some(match policy {
+            Ok(launch) => {
+                let deadline = lifecycle_deadline.unwrap_or_else(|| {
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(400)
+                });
+                app::install(&paths, &service::this_version(), launch, deadline).await
+            }
+            Err(reason) => (app::Report::skipped(reason), None),
+        }),
+        None => None,
+    };
+    finish_lifecycle(done, service, app, setup_app, shows_state)
+}
+
+fn with_service(mut done: Done, report: service::Report) -> Done {
+    let data = match done.data.take() {
+        Value::Null => Value::Object(serde_json::Map::new()),
+        data => data,
+    };
+    done.data = serde_json::to_value(WithService {
+        data,
+        service: report,
+    })
+    .expect("the CLI's own types serialize");
+    done
+}
+
+fn finish_lifecycle(
+    mut done: Done,
+    service: Option<service::Report>,
+    app: Option<(app::Report, Option<service::Report>)>,
+    setup_app: bool,
+    shows_state: bool,
+) -> Result<Done, CliError> {
+    let (app, handoff) = app.map_or((None, None), |(app, service)| (Some(app), service));
+    let service = if setup_app {
+        handoff.or(service)
+    } else {
+        service
+    };
+    if let Some(report) = service {
+        let text = match report.text() {
+            text if text.is_empty() && shows_state => report.status_line(),
+            text => text,
+        };
+        done = with_service(done, report);
         done.text.push_str(&text);
+    }
+    if let Some(report) = app {
+        let failed = setup_app && report.failed();
+        done.text.push_str(&report.text());
+        done.data = serde_json::to_value(report::WithApp {
+            data: done.data,
+            app: Some(report),
+        })
+        .expect("the CLI's own types serialize");
+        if failed {
+            return Err(CliError {
+                partial: Some(Box::new(done)),
+                ..CliError::new(
+                    Code::Failed,
+                    "The device is connected, but app setup is incomplete; run koi setup to retry, or use --no-app",
+                )
+            });
+        }
     }
     Ok(done)
 }
@@ -600,6 +685,7 @@ async fn execute(
             device,
             login,
             script,
+            ..
         } => setup::setup(&paths, &device.name(), &login, &script, json, terminal).await,
         Command::Join {
             code,
@@ -646,7 +732,7 @@ async fn execute(
         Command::Service {
             action: ServiceAction::Start,
         }
-        | Command::Reconcile => Ok(Done::ok(Empty {}, "")),
+        | Command::Reconcile { .. } => Ok(Done::ok(Empty {}, "")),
         Command::Pause => pause(&paths).await,
         Command::Resume => resume(&paths).await,
         Command::Device { action } => device(paths, action).await,
@@ -2720,6 +2806,63 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(opened, Err(DriverError::Busy(_))));
+    }
+
+    #[test]
+    fn setup_uses_the_final_service_handoff_without_changing_reconcile_results() {
+        for (initial_state, later_state, app_failed) in [
+            ("unavailable", "running", false),
+            ("running", "unavailable", true),
+        ] {
+            for setup_app in [false, true] {
+                for has_handoff in [false, true] {
+                    let report = |state| -> service::Report {
+                        serde_json::from_value(serde_json::json!({
+                            "manager":"launchd", "name":"fixture", "state":state,
+                            "problem": if state == "unavailable" { Some("fixture service failure") } else { None }
+                        })).unwrap()
+                    };
+                    let initial = report(initial_state);
+                    let later = report(later_state);
+                    let selected = if setup_app && has_handoff {
+                        &later
+                    } else {
+                        &initial
+                    };
+                    let expected_service = serde_json::to_value(selected).unwrap();
+                    let expected_text = match selected.text() {
+                        text if text.is_empty() && !setup_app => selected.status_line(),
+                        text => text,
+                    };
+                    let app: app::Report = serde_json::from_value(serde_json::json!({
+                        "state":"present", "path":"/fixture/Koidrive.app", "version":"99.0.0",
+                        "change":"installed", "launch":"not_requested",
+                        "problem": app_failed.then_some("fixture app failure")
+                    }))
+                    .unwrap();
+                    let expected_app = serde_json::to_value(&app).unwrap();
+                    let app_text = app.text();
+                    let result = finish_lifecycle(
+                        Done::ok(serde_json::json!({"device":"fixture"}), "Connected\n"),
+                        Some(initial),
+                        Some((app, has_handoff.then_some(later))),
+                        setup_app,
+                        !setup_app,
+                    );
+                    let done = if setup_app && app_failed {
+                        let error = result.unwrap_err();
+                        assert_eq!(error.code, Code::Failed);
+                        *error.partial.unwrap()
+                    } else {
+                        result.unwrap()
+                    };
+                    assert_eq!(done.data["service"], expected_service);
+                    assert_eq!(done.data["app"], expected_app);
+                    assert_eq!(done.data["device"], "fixture");
+                    assert_eq!(done.text, format!("Connected\n{expected_text}{app_text}"));
+                }
+            }
+        }
     }
 
     #[test]

@@ -99,6 +99,14 @@
       ],
       "type": "object"
     },
+    "Change": {
+      "enum": [
+        "unchanged",
+        "installed",
+        "replaced"
+      ],
+      "type": "string"
+    },
     "Code": {
       "description": "What kind of failure an error is. Each code has one exit status.",
       "oneOf": [
@@ -216,6 +224,32 @@
         "auth",
         "output",
         "schema"
+      ],
+      "type": "object"
+    },
+    "CommitChange": {
+      "enum": [
+        "installed",
+        "replaced"
+      ],
+      "type": "string"
+    },
+    "CommitFact": {
+      "properties": {
+        "change": {
+          "$ref": "#/$defs/CommitChange"
+        },
+        "path": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "version",
+        "change"
       ],
       "type": "object"
     },
@@ -483,6 +517,14 @@
       ],
       "type": "object"
     },
+    "Launch": {
+      "enum": [
+        "not_requested",
+        "requested",
+        "failed"
+      ],
+      "type": "string"
+    },
     "LimitKind": {
       "enum": [
         "deletions",
@@ -694,6 +736,124 @@
       ],
       "type": "object"
     },
+    "Report2": {
+      "oneOf": [
+        {
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "state": {
+              "const": "skipped",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "reason"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "change": {
+              "$ref": "#/$defs/Change"
+            },
+            "committed": {
+              "items": {
+                "$ref": "#/$defs/CommitFact"
+              },
+              "type": "array"
+            },
+            "launch": {
+              "$ref": "#/$defs/Launch"
+            },
+            "path": {
+              "type": "string"
+            },
+            "preserved": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "problem": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "residue": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "retired": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "state": {
+              "const": "present",
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "path",
+            "version",
+            "change",
+            "launch"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "committed": {
+              "items": {
+                "$ref": "#/$defs/CommitFact"
+              },
+              "type": "array"
+            },
+            "preserved": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "problem": {
+              "type": "string"
+            },
+            "residue": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "retired": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "state": {
+              "const": "failed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "problem"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "RevisionsData": {
       "properties": {
         "content_rev": {
@@ -762,6 +922,16 @@
     "UpdatedData": {
       "description": "What `koi update` did: `updated` from `from` to `to` through `via`, or `unchanged` when this device runs the newest\nrelease. `service` is the background service once the new koi took it.",
       "properties": {
+        "app": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Report2"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "from": {
           "type": "string"
         },
