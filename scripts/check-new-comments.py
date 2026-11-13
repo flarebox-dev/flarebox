@@ -212,11 +212,10 @@ def rust_fns(src):
     if run.returncode:
         return None
     lines = src.split("\n")
-    fns, seen = {}, {}
+    fns = {}
     for record in run.stdout.decode().splitlines():
         scope, name, public, number, top, docs = record.split("\t")
-        seen[scope, name] = seen.get((scope, name), 0) + 1
-        fns[(scope, name, seen[scope, name])] = (public == "true", docs, int(number), lines[int(number) - 1], int(top))
+        fns.setdefault((scope, name), []).append((public == "true", docs, int(number), lines[int(number) - 1], int(top)))
     return fns
 
 
@@ -226,17 +225,21 @@ def moved_docs(path, old_src, new_src):
     if old is None or new is None:
         return []
 
-    def has(fns, key, docs):
-        return key in fns and fns[key][1].startswith(docs)
+    def count(fns, key, docs):
+        return sum(fn[1].startswith(docs) for fn in fns.get(key, []))
 
-    lost = {docs for key, (public, docs, *_) in old.items() if public and docs and not has(new, key, docs)}
-    gained = {docs for docs in lost if any(has(new, key, docs) and not has(old, key, docs) for key in new)}
+    lost = {
+        key: {docs for public, docs, *_ in group if public and docs and count(new, key, docs) < count(old, key, docs)}
+        for key, group in old.items()
+    }
+    gained = {docs for docs in set().union(*lost.values()) if any(count(new, key, docs) > count(old, key, docs) for key in new)}
     problems = []
-    for key, (public, docs, number, text, top) in new.items():
-        if not public and any(docs.startswith(moved) and not has(old, key, moved) for moved in gained):
-            problems.append((path, number, "private-doc", text, top))
-        if public and key in old and old[key][0] and old[key][1] in gained and not has(new, key, old[key][1]):
-            problems.append((path, number, "lost-doc", text, number))
+    for key, group in new.items():
+        for public, docs, number, text, top in group:
+            if not public and any(docs.startswith(moved) and count(new, key, moved) > count(old, key, moved) for moved in gained):
+                problems.append((path, number, "private-doc", text, top))
+            if public and any(not docs.startswith(moved) for moved in lost.get(key, set()) & gained):
+                problems.append((path, number, "lost-doc", text, number))
     return problems
 
 

@@ -372,6 +372,11 @@ class NewComments(unittest.TestCase):
         other = '#[cfg(not(target_os = "macos"))]\nimpl A {\n    /// Runs elsewhere.\n    pub fn run() {}\n}\n'
         self.assertFlags({"core/a/src/lib.rs": mac + other}, {"core/a/src/lib.rs": other + mac})
 
+    def test_reordering_cfg_attr_alternatives_of_a_documented_fn_passes(self):
+        mac = '#[cfg_attr(all(), cfg(target_os = "macos"))]\n/// Runs on macOS.\npub fn run() {}\n'
+        other = '#[cfg_attr(all(), cfg(not(target_os = "macos")))]\n/// Runs elsewhere.\npub fn run() {}\n'
+        self.assertFlags({"core/a/src/lib.rs": mac + other}, {"core/a/src/lib.rs": other + mac})
+
     def test_deleting_a_pub_fn_doc_comment_passes(self):
         self.assertFlags(
             {"core/a/src/lib.rs": "/// Acknowledges.\npub fn ack() {}\n"},
