@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
+import importlib.util
 import os
 import subprocess
 import sys
@@ -8,6 +9,13 @@ import textwrap
 import unittest
 
 CHECK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check-new-comments.py")
+
+
+def setUpModule():
+    spec = importlib.util.spec_from_file_location("check", CHECK)
+    check = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(check)
+    os.environ["FN_DOCS"] = check.fn_docs()
 
 
 class NewComments(unittest.TestCase):
@@ -250,6 +258,175 @@ class NewComments(unittest.TestCase):
             {"core/a/src/lib.rs": "fn f() { a && b; }\n"},
         )
         self.assertEqual(code, 1, out)
+
+    def test_a_helper_between_a_pub_fn_and_its_doc_comment_fails(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "/// Acknowledges.\npub fn ack() {}\n"},
+            {"core/a/src/lib.rs": "/// Acknowledges.\nfn helper() {}\n\npub fn ack() {\n    helper();\n}\n"},
+            ("core/a/src/lib.rs", 2),
+            ("core/a/src/lib.rs", 4),
+        )
+
+    def test_a_documented_helper_between_a_pub_fn_and_its_doc_comment_fails(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "/// Acknowledges.\npub fn ack() {}\n"},
+            {"core/a/src/lib.rs": "/// Acknowledges.\n/// Helps.\nfn helper() {}\n\npub fn ack() {\n    helper();\n}\n"},
+            ("core/a/src/lib.rs", 3),
+            ("core/a/src/lib.rs", 5),
+        )
+
+    def test_a_helper_between_a_doc_comment_and_its_multiline_attribute_fails(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "/// Acknowledges.\n#[allow(\n    dead_code,\n)]\npub fn ack() {}\n"},
+            {"core/a/src/lib.rs": "/// Acknowledges.\n#[allow(\n    dead_code,\n)]\nfn helper() {}\n\npub fn ack() {}\n"},
+            ("core/a/src/lib.rs", 5),
+            ("core/a/src/lib.rs", 7),
+        )
+
+    def test_a_helper_after_a_blank_line_below_a_doc_comment_fails(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "/// Acknowledges.\n\npub fn ack() {}\n"},
+            {"core/a/src/lib.rs": "/// Acknowledges.\n\nfn helper() {}\n\npub fn ack() {}\n"},
+            ("core/a/src/lib.rs", 3),
+            ("core/a/src/lib.rs", 5),
+        )
+
+    def test_deleting_one_of_two_equal_doc_comments_passes(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "/// Runs.\npub fn a() {}\n/// Runs.\npub fn b() {}\n"},
+            {"core/a/src/lib.rs": "pub fn a() { let _x = 1; }\n/// Runs.\npub fn b() {}\n"},
+        )
+
+    def test_renaming_a_private_fn_whose_doc_a_pub_fn_shares_passes(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "/// Runs.\npub fn a() {}\n/// Runs.\nfn b() {}\n"},
+            {"core/a/src/lib.rs": "/// Runs.\npub fn a() {}\n/// Runs.\nfn c() {}\n"},
+        )
+
+    def test_deleting_a_pub_fn_and_leaving_its_doc_on_a_helper_fails(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "/// Acknowledges.\npub fn ack() {}\nfn helper() {}\n"},
+            {"core/a/src/lib.rs": "/// Acknowledges.\nfn helper() {}\n"},
+            ("core/a/src/lib.rs", 2),
+        )
+
+    def test_a_helper_under_a_pub_fn_doc_in_a_file_with_clap_help_fails(self):
+        prefix = "#[derive(Parser)]\nstruct Args;\n"
+        self.assertFlags(
+            {"core/a/src/lib.rs": prefix + "/// Acknowledges.\npub fn ack() {}\n"},
+            {"core/a/src/lib.rs": prefix + "/// Acknowledges.\nfn helper() {}\n\npub fn ack() {}\n"},
+            ("core/a/src/lib.rs", 4),
+            ("core/a/src/lib.rs", 6),
+        )
+
+    def test_brackets_in_attribute_strings_and_comments_keep_the_doc_attached(self):
+        for attribute in ['#[allow(dead_code, reason = "[")]', '#[allow(dead_code, reason = "]")]', "#[allow(dead_code)] // [", "#[allow(/* ] */ dead_code)]"]:
+            with self.subTest(attribute=attribute):
+                self.assertFlags(
+                    {"core/a/src/lib.rs": f"/// Runs.\n{attribute}\npub fn a() {{}}\n"},
+                    {"core/a/src/lib.rs": f"/// Runs.\n{attribute}\nfn helper() {{}}\npub fn a() {{}}\n"},
+                    ("core/a/src/lib.rs", 3),
+                    ("core/a/src/lib.rs", 4),
+                )
+
+    def test_moving_different_block_docs_between_pub_fns_passes(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "/**\n * Acknowledges.\n */\npub fn a() {}\npub fn b() {}\n"},
+            {"core/a/src/lib.rs": "pub fn a() {}\n/**\n * Lists.\n */\npub fn b() {}\n"},
+        )
+
+    def test_a_block_doc_moved_onto_a_helper_fails(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "/**\n * Acknowledges.\n */\npub fn ack() {}\n"},
+            {"core/a/src/lib.rs": "/**\n * Acknowledges.\n */\nfn helper() {}\npub fn ack() {}\n"},
+            ("core/a/src/lib.rs", 4),
+            ("core/a/src/lib.rs", 5),
+        )
+
+    def test_a_code_edit_below_a_shebang_passes(self):
+        self.assertFlags(
+            {"core/a/src/main.rs": "#!/usr/bin/env rust-script\npub fn a() {}\n"},
+            {"core/a/src/main.rs": "#!/usr/bin/env rust-script\npub fn a() { let _x = 1; }\n"},
+        )
+
+    def test_reordering_modules_with_same_named_documented_fns_passes(self):
+        a = "mod a {\n    /// Runs a.\n    pub fn run() {}\n}\n"
+        b = "mod b {\n    /// Runs b.\n    pub fn run() {}\n}\n"
+        self.assertFlags({"core/a/src/lib.rs": a + b}, {"core/a/src/lib.rs": b + a})
+
+    def test_a_pub_trait_method_doc_moved_onto_a_helper_fails(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "pub trait Api {\n    /// Calls.\n    fn call(&self);\n}\nfn helper() {}\n"},
+            {"core/a/src/lib.rs": "pub trait Api {\n    fn call(&self);\n}\n/// Calls.\nfn helper() {}\n"},
+            ("core/a/src/lib.rs", 2),
+            ("core/a/src/lib.rs", 5),
+        )
+
+    def test_reordering_cfg_alternatives_of_a_documented_fn_passes(self):
+        mac = '#[cfg(target_os = "macos")]\n/// Runs on macOS.\npub fn run() {}\n'
+        other = '/// Runs elsewhere.\n#[cfg(not(target_os = "macos"))]\npub fn run() {}\n'
+        self.assertFlags({"core/a/src/lib.rs": mac + other}, {"core/a/src/lib.rs": other + mac})
+
+    def test_reordering_cfg_alternatives_of_an_impl_passes(self):
+        mac = '#[cfg(target_os = "macos")]\nimpl A {\n    /// Runs on macOS.\n    pub fn run() {}\n}\n'
+        other = '#[cfg(not(target_os = "macos"))]\nimpl A {\n    /// Runs elsewhere.\n    pub fn run() {}\n}\n'
+        self.assertFlags({"core/a/src/lib.rs": mac + other}, {"core/a/src/lib.rs": other + mac})
+
+    def test_reordering_cfg_attr_alternatives_of_a_documented_fn_passes(self):
+        mac = '#[cfg_attr(all(), cfg(target_os = "macos"))]\n/// Runs on macOS.\npub fn run() {}\n'
+        other = '#[cfg_attr(all(), cfg(not(target_os = "macos")))]\n/// Runs elsewhere.\npub fn run() {}\n'
+        self.assertFlags({"core/a/src/lib.rs": mac + other}, {"core/a/src/lib.rs": other + mac})
+
+    def test_renaming_one_cfg_alternative_with_its_doc_passes(self):
+        mac = '#[cfg(target_os = "macos")]\n/// Runs on macOS.\npub fn {}() {{}}\n'
+        other = '#[cfg(not(target_os = "macos"))]\n/// Runs elsewhere.\npub fn run() {}\n'
+        self.assertFlags({"core/a/src/lib.rs": mac.format("run") + other}, {"core/a/src/lib.rs": mac.format("moved") + other})
+
+    def test_a_doc_moved_from_a_pub_fn_to_a_private_namesake_fails(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": '#[cfg(target_os = "macos")]\n/// Runs.\npub fn run() {}\n#[cfg(not(target_os = "macos"))]\nfn run() {}\n'},
+            {"core/a/src/lib.rs": '#[cfg(target_os = "macos")]\npub fn run() {}\n#[cfg(not(target_os = "macos"))]\n/// Runs.\nfn run() {}\n'},
+            ("core/a/src/lib.rs", 2),
+            ("core/a/src/lib.rs", 5),
+        )
+
+    def test_a_moved_doc_that_prefixes_an_extended_namesake_doc_fails(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": '#[cfg(unix)]\n/// Runs.\npub fn run() {}\n#[cfg(not(unix))]\n/// Runs.\n/// Fast.\npub fn run() {}\nfn helper() {}\n'},
+            {"core/a/src/lib.rs": '#[cfg(unix)]\npub fn run() {}\n#[cfg(not(unix))]\n/// Runs.\n/// Fast.\n/// More.\npub fn run() {}\n/// Runs.\nfn helper() {}\n'},
+            ("core/a/src/lib.rs", 2),
+            ("core/a/src/lib.rs", 9),
+        )
+
+    def test_deleting_a_pub_fn_doc_comment_passes(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "/// Acknowledges.\npub fn ack() {}\n"},
+            {"core/a/src/lib.rs": "pub fn ack() {}\n"},
+        )
+
+    def test_a_new_doc_comment_on_a_private_fn_outside_internal_code_passes(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "pub(crate) fn a() {}\n"},
+            {"core/a/src/lib.rs": "/// Explains a.\npub(crate) fn a() {}\n"},
+        )
+
+    def test_renaming_a_documented_private_fn_passes(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "/// Explains a.\n#[inline]\nfn a() {}\n"},
+            {"core/a/src/lib.rs": "/// Explains a.\n#[inline]\nfn b() {}\n"},
+        )
+
+    def test_a_helper_below_a_documented_pub_fn_passes(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "/// Acknowledges.\npub fn ack() {}\n"},
+            {"core/a/src/lib.rs": "/// Acknowledges.\npub fn ack() {\n    helper();\n}\n\nfn helper() {}\n"},
+        )
+
+    def test_clap_help_on_a_private_fn_passes(self):
+        self.assertFlags(
+            {"cli/src/a.rs": "#[derive(Parser)]\nstruct A;\nfn run() {}\n"},
+            {"cli/src/a.rs": "#[derive(Parser)]\nstruct A;\n/// Runs.\nfn run() {}\n"},
+        )
 
 
 class WorkflowBase(unittest.TestCase):

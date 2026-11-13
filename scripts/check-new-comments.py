@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 import argparse
 import bisect
+import functools
+import json
+import os
 import re
 import subprocess
 import sys
@@ -28,11 +31,14 @@ IDENT = re.compile(r"[A-Za-z0-9_$]+")
 RUST_RAW = re.compile(r'[bc]?r(#*)"')
 RUST_CHAR = re.compile(r"'(\\.[^'\n]*|[^\\'\n])'")
 SWIFT_RAW = re.compile(r'(#+)("""|")')
+FN_DOCS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fn-docs", "Cargo.toml")
 REGEX_BEFORE = set("(,=:[!&|?{};+-*%<>~^") | {"", "return", "typeof", "case", "in", "of", "delete", "void", "throw", "yield", "await"}
 
 MESSAGES = {
     "marker": "TODO, FIXME, XXX, HACK and 'for now' belong in an issue, not in the code.",
     "doc": "New doc comment on internal code (tests, server/, the macOS app, cli/tests). Doc comments go only on API that other packages call, so let the name or the type say it.",
+    "private-doc": "A doc comment now sits on a private fn. Doc comments go only on public API. If a helper went in between a pub fn's doc comment and that fn, move the helper below the documented fn.",
+    "lost-doc": "This pub fn lost its doc comment. If a helper went in between the doc comment and this fn, move the helper below this fn.",
     "comment": "New comment. Say it in code: a name, a type, a test or an assertion message. A comment may stay only as a license header, a SAFETY: note, a tool pragma, or a line that links the source of an external constraint.",
 }
 
@@ -183,6 +189,66 @@ def comment_lines(src, lang):
     return lines
 
 
+@functools.cache
+def fn_docs():
+    if os.environ.get("FN_DOCS"):
+        return os.environ["FN_DOCS"]
+    build = subprocess.run(
+        ["cargo", "build", "--quiet", "--release", "--message-format=json", "--manifest-path", FN_DOCS],
+        cwd=os.path.dirname(FN_DOCS),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return next(
+        message["executable"]
+        for message in map(json.loads, build.stdout.splitlines())
+        if message.get("reason") == "compiler-artifact" and message.get("executable")
+    )
+
+
+def rust_fns(src):
+    run = subprocess.run([fn_docs()], input=src.encode(), capture_output=True)
+    if run.returncode:
+        return None
+    lines = src.split("\n")
+    fns = {}
+    for record in run.stdout.decode().splitlines():
+        scope, name, public, number, top, docs = record.split("\t")
+        fns.setdefault((scope, name, public == "true"), []).append((docs, int(number), lines[int(number) - 1], int(top)))
+    return fns
+
+
+def changed_docs(old, new):
+    added, removed = list(new), list(old)
+    for same in (str.__eq__, lambda after, before: bool(before) and after.startswith(before)):
+        for docs in sorted(removed, key=len, reverse=True):
+            match = next((fn for fn in added if same(fn[0], docs)), None)
+            if match:
+                added.remove(match)
+                removed.remove(docs)
+    return removed, added
+
+
+def moved_docs(path, old_src, new_src):
+    old = rust_fns(old_src) if old_src is not None else {}
+    new = rust_fns(new_src)
+    if old is None or new is None:
+        return []
+    changes = {key: changed_docs([fn[0] for fn in old.get(key, [])], new.get(key, [])) for key in old.keys() | new.keys()}
+    lost = {key: {docs for docs in removed if docs} for key, (removed, _) in changes.items() if key[2]}
+    gained = [fn for _, added in changes.values() for fn in added]
+    moved = {docs for docs in set().union(*lost.values()) if any(fn[0].startswith(docs) for fn in gained)}
+    problems = []
+    for key, (_, added) in changes.items():
+        for docs, number, text, top in added:
+            if not key[2] and any(docs.startswith(m) for m in moved):
+                problems.append((path, number, "private-doc", text, top))
+            if key[2] and any(not docs.startswith(m) for m in lost[key] & moved):
+                problems.append((path, number, "lost-doc", text, number))
+    return problems
+
+
 def git(*args):
     return subprocess.run(["git", *args], check=True, capture_output=True).stdout.decode("utf-8", "replace")
 
@@ -269,13 +335,17 @@ def check(base, head):
                 runs[-1].extend(w.lower() for w in WORD.findall(piece))
                 previous = number
 
-    problems = []
+    problems, moved = [], []
     for f in files:
         path = f.get("new")
-        if not path or not f["added"] or "/gen/" in path:
+        if not path or "/gen/" in path:
             continue
         lang = LANGUAGES["." + path.rsplit(".", 1)[-1]]
         new_src = git("show", f"{head}:{path}")
+        if lang == "rust":
+            moved.extend(moved_docs(path, git("show", f"{base}:{f['old']}") if f["old"] else None, new_src))
+        if not f["added"]:
+            continue
         new_lines = comment_lines(new_src, lang)
         help_text = macro_docs(new_src, lang)
         for number in f["added"]:
@@ -295,6 +365,10 @@ def check(base, head):
                     problems.append((path, number, "comment", piece))
                 elif INTERNAL.search(path):
                     problems.append((path, number, "doc", piece))
+    flagged = {(path, number) for path, number, _, _ in problems}
+    for path, number, kind, text, top in sorted(moved):
+        if not any((path, line) in flagged for line in range(top, number)):
+            problems.append((path, number, kind, text))
     return problems
 
 
@@ -320,7 +394,7 @@ def main():
         print(f"::error file={path},line={number}::{MESSAGES[kind]}")
         print(f"    {piece.strip()}")
     if problems:
-        print(f"{len(problems)} comment lines added between {args.base} and {args.head}. Remove them, or reshape the code so it reads without them.")
+        print(f"{len(problems)} comment problems between {args.base} and {args.head}. Remove the comments, or reshape the code so it reads without them.")
         return 1
     print(f"No new comments between {args.base} and {args.head}.")
     return 0
