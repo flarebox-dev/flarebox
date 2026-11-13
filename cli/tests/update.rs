@@ -747,10 +747,19 @@ fn koi_update_keeps_a_direct_app_helper_on_the_manual_download_path() {
     let response = envelope(&output);
     assert!(!output.status.success(), "{response:#}");
     assert_eq!(response["outcome"], "error");
-    assert_eq!(
-        response["error"]["message"],
-        "Download Koidrive 99.0.0 from https://github.com/koidrive/koidrive/releases/tag/v99.0.0"
+    let message = response["error"]["message"].as_str().unwrap();
+    assert!(
+        message.ends_with(
+            "Download Koidrive 99.0.0 from https://github.com/koidrive/koidrive/releases/tag/v99.0.0"
+        ),
+        "{message}"
     );
+    if cfg!(target_os = "macos") {
+        assert!(
+            message.starts_with("App signature verification failed"),
+            "{message}"
+        );
+    }
     assert_eq!(response["next_commands"], serde_json::json!([]));
     assert_eq!(github.requests.lock().unwrap().len(), 1);
     assert!(installer.requests.lock().unwrap().is_empty());
@@ -779,15 +788,16 @@ fn koi_update_keeps_a_direct_app_helper_on_the_manual_download_path() {
         .unwrap();
     let update = envelope(&output)["data"]["update"].clone();
     assert_eq!(update["state"], "available");
-    assert!(update.get("command").is_none(), "{update:#}");
+    let command = format!(
+        "{} update",
+        std::fs::canonicalize(&binary).unwrap().display()
+    );
+    assert_eq!(update["command"], command, "{update:#}");
     let output = koi_at(&binary, home.path(), &github, &["status"])
         .output()
         .unwrap();
     let text = String::from_utf8(output.stdout).unwrap();
-    assert!(
-        text.contains("https://github.com/koidrive/koidrive/releases/tag/v99.0.0"),
-        "{text}"
-    );
+    assert!(text.contains(&format!("Run: {command}")), "{text}");
     assert!(!text.contains("Run: koi update"), "{text}");
     assert_eq!(github.requests.lock().unwrap().len(), 1);
 }
@@ -1331,28 +1341,33 @@ fn a_formula_receipt_with_no_discoverable_prefix_never_self_replaces() {
 
 #[test]
 fn an_unverified_invocation_never_enters_installer_replacement() {
-    let home = tempfile::tempdir().unwrap();
-    let github = github("v99.0.0");
-    let binary = copy_koi(&home.path().join("standalone/koi"));
-    let before = std::fs::read(&binary).unwrap();
-    let output = koi_at(&binary, home.path(), &github, &["update", "--json"])
-        .arg0("missing-invocation")
-        .env("PATH", home.path().join("no-tools"))
-        .env("KOIDRIVE_UPDATE_CHECK_URL", "not-a-URL")
-        .output()
-        .unwrap();
-    if !development_update(&output, home.path(), &github) {
-        let response = envelope(&output);
-        assert!(!output.status.success(), "{response:#}");
-        assert!(
-            response["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("run its full path"),
-            "{response:#}"
-        );
+    for relative in [
+        "standalone/koi",
+        "Applications/Koidrive.app/Contents/Helpers/koi",
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let github = github("v99.0.0");
+        let binary = copy_koi(&home.path().join(relative));
+        let before = std::fs::read(&binary).unwrap();
+        let output = koi_at(&binary, home.path(), &github, &["update", "--json"])
+            .arg0("missing-invocation")
+            .env("PATH", home.path().join("no-tools"))
+            .env("KOIDRIVE_UPDATE_CHECK_URL", "not-a-URL")
+            .output()
+            .unwrap();
+        if !development_update(&output, home.path(), &github) {
+            let response = envelope(&output);
+            assert!(!output.status.success(), "{response:#}");
+            assert!(
+                response["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("run its full path"),
+                "{response:#}"
+            );
+        }
+        assert_eq!(std::fs::read(&binary).unwrap(), before);
+        assert!(!update_log(home.path()).exists());
+        assert!(github.requests.lock().unwrap().is_empty());
     }
-    assert_eq!(std::fs::read(&binary).unwrap(), before);
-    assert!(!update_log(home.path()).exists());
-    assert!(github.requests.lock().unwrap().is_empty());
 }

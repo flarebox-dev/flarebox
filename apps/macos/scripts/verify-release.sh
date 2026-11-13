@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Checks a release disk image and the app inside it.
-# Usage: verify-release.sh <dmg> <signed|signed-static|unsigned>
 #   signed    Developer ID signature with the hardened runtime, notarization tickets stapled
 #             to the app and the disk image, and Gatekeeper acceptance of both
 #   unsigned  an ad hoc signature with the hardened runtime; Gatekeeper is expected to reject it
