@@ -1,6 +1,6 @@
 # Self-hosted Mac runners
 
-The project's Mac hosts four runners (label `flarebox-mini`), which run as the user `ghrunner` in `/Users/ghrunner/runner-1` to `runner-4`. The merge queue and pushes to `main` run their macOS jobs there. For a pull request from a branch of `koidrive/koidrive`, the `pick-macos` job of CI sends each macOS job to an idle runner there or to a GitHub-hosted runner. Pull requests from forks always run their macOS jobs on GitHub-hosted runners.
+The project's Mac hosts four runners (label `flarebox-mini`), which run as the user `ghrunner` in `/Users/ghrunner/runner-1` to `runner-4`. When `MACOS_RUNS_ON` is unset, the merge queue and pushes to `main` run their macOS jobs there. For a pull request from a branch of `koidrive/koidrive`, the `pick-macos` job of CI sends each macOS job to an idle runner there or to a GitHub-hosted runner. Pull requests from forks always run their macOS jobs on GitHub-hosted runners.
 
 ## Trust rule
 
@@ -36,4 +36,16 @@ If the installer fails or is interrupted, it restores the runner it was updating
 
 ## Move the macOS jobs off these runners
 
-Set the repository variable `MACOS_RUNS_ON` to `["xcode-27"]` in Settings → Secrets and variables → Actions → Variables. Every macOS job then runs on GitHub-hosted runners. Delete the variable to go back to these runners.
+Set the repository variable `MACOS_RUNS_ON` to `["macos-15"]` in Settings → Secrets and variables → Actions → Variables. An array without `self-hosted` selects hosted mode. The existing value `["xcode-27"]` selects the same mode. CI chooses the hosted label for each job, not from this array.
+
+| CI job | Hosted label | Toolchain |
+| --- | --- | --- |
+| `rust (macos)` | `macos-15` | The Rust toolchain in `rust-toolchain.toml` and the runner's default Apple command-line tools. |
+| `server (macos)` | `macos-15` | Node 24 and pnpm for TypeScript and Worker tests. |
+| `spec (macos)` | `macos-15` | Buf for lint, code generation, and compatibility checks. |
+| `runner hook` | `macos-15` | Shell scripts that test the hook and its installer without root. |
+| `macos app` | `xcode-27` | Xcode 27.2, matching the toolchain used by `release-macos.yml`. |
+
+The ordinary hosted jobs use the image's default developer tools. Only the hosted app job sets `DEVELOPER_DIR` to `/Applications/Xcode_27.2.app/Contents/Developer`.
+
+Delete the variable to use `["self-hosted","flarebox-mini"]`, or set it to another JSON array containing `self-hosted` and the labels of those runners. Self-hosted jobs keep their per-runner Rust target directories and use `/Applications/Xcode.app/Contents/Developer`. Pull requests that overflow the idle self-hosted runners use the hosted labels above while fewer than five hosted macOS jobs are queued or running. That count includes both hosted labels. Jobs beyond that limit queue on the self-hosted runners.
