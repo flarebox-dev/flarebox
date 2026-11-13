@@ -245,9 +245,22 @@ impl Home {
                     }
                     "status" => {
                         let folders = linked.lock().unwrap().clone();
-                        serde_json::json!({"response":"status", "status":{"account":null,"running":true,"folders":folders}})
+                        let version = (!paths.state_dir.join("legacy-daemon").exists()
+                            || paths.state_dir.join("upgraded").exists())
+                        .then_some(env!("CARGO_PKG_VERSION"));
+                        serde_json::json!({"response":"status", "status":{
+                            "account":null,"running":true,"folders":folders,"version":version,
+                            "paused":paths.paused().exists()
+                        }})
                     }
                     "questions" => serde_json::json!({"response":"questions", "questions":[]}),
+                    "access" => serde_json::json!({"response":"access", "blocked":[]}),
+                    "link_approved"
+                        if paths.state_dir.join("legacy-daemon").exists()
+                            && !paths.state_dir.join("upgraded").exists() =>
+                    {
+                        serde_json::json!({"response":"error", "code":"usage", "message":"unknown variant link_approved"})
+                    }
                     "link" | "link_approved" => {
                         let folder = request["folder"].as_str().unwrap();
                         let wanted = request["space"].as_str().unwrap();
@@ -1847,4 +1860,62 @@ fn setup_without_script_flags_still_refuses_a_connected_device() {
         "{envelope:#}"
     );
     assert!(home.requests().is_empty());
+}
+
+#[test]
+fn approved_setup_reconciles_a_legacy_daemon_before_linking() {
+    let home = Home::new(&["Existing", "Work"]);
+    home.connect();
+    let old = home.path().join("Existing");
+    fs::create_dir(&old).unwrap();
+    home.link(&old, &home.space_id("Existing"));
+    fs::write(home.paths().config_file, "[service]\nbackground = true\n").unwrap();
+    fs::write(home.paths().state_dir.join("legacy-daemon"), "").unwrap();
+    fs::write(home.paths().paused(), "").unwrap();
+    let tools = home.path().join("tools");
+    fs::create_dir(&tools).unwrap();
+    for (name, body) in [
+        (
+            "launchctl",
+            r#"case "$1" in
+print) echo 'state = running' ;;
+print-disabled) echo '{}' ;;
+bootout) ;;
+bootstrap) /usr/bin/touch "$HOME/state/koidrive/upgraded" ;;
+kickstart) [ "$2" != '-k' ] || /usr/bin/touch "$HOME/state/koidrive/upgraded" ;;
+*) exit 91 ;;
+esac"#,
+        ),
+        (
+            "systemctl",
+            r#"[ "$1" = '--user' ]
+case "$2" in
+show-environment|is-active|enable|daemon-reload|start) ;;
+restart) /usr/bin/touch "$HOME/state/koidrive/upgraded" ;;
+*) exit 91 ;;
+esac"#,
+        ),
+        ("loginctl", "echo yes"),
+    ] {
+        let tool = tools.join(name);
+        fs::write(&tool, format!("#!/bin/sh\nset -eu\n{body}\n")).unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let daemon = home.daemon(false);
+    let folder = home.path().join("Work");
+    let output = koi(home.path())
+        .args(["setup", "--json", "--telemetry", "off", "--folder"])
+        .arg(&folder)
+        .args(["--space", "Work"])
+        .env("PATH", &tools)
+        .output()
+        .unwrap();
+    daemon.finish();
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(output.status.success(), "{envelope:#}");
+    schema::check(&envelope);
+    assert_eq!(envelope["data"]["folder"]["space_name"], "Work");
+    assert!(home.paths().state_dir.join("upgraded").exists());
+    assert!(home.paths().paused().exists());
+    assert_eq!(home.links().len(), 1);
 }

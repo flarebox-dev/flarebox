@@ -1175,11 +1175,14 @@ async fn link(
     approval: Option<koidrive_driver::LinkApproval>,
 ) -> Result<(FolderStatus, report::Outcome), CliError> {
     let request = match approval {
-        Some(approval) => Request::LinkApproved {
-            folder,
-            space,
-            approval,
-        },
+        Some(approval) => {
+            service::reconcile(paths, false).await;
+            Request::LinkApproved {
+                folder,
+                space,
+                approval,
+            }
+        }
         None => Request::Link { folder, space },
     };
     match ipc::run(paths, request).await? {
