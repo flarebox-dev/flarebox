@@ -626,7 +626,7 @@ async fn run(
         done.text.push_str(&report.text());
         done.data = serde_json::to_value(report::WithApp {
             data: done.data,
-            app: report,
+            app: Some(report),
         })
         .expect("the CLI's own types serialize");
         if failed {

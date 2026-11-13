@@ -1068,13 +1068,13 @@ mod tests {
         let service = serde_json::json!({"manager":"launchd", "name":"example", "state":"off"});
         let value = serde_json::to_value(crate::report::WithApp {
             data: serde_json::json!({"service":service}),
-            app: Report::Failed {
+            app: Some(Report::Failed {
                 committed: Vec::new(),
                 retired: Vec::new(),
                 preserved: Vec::new(),
                 problem: "offline".into(),
                 residue: Vec::new(),
-            },
+            }),
         })
         .unwrap();
         assert_eq!(value["service"], service);

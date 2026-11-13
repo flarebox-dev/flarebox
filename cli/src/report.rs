@@ -1235,7 +1235,8 @@ pub struct WithService<T> {
 pub(crate) struct WithApp<T> {
     #[serde(flatten)]
     pub data: T,
-    pub app: crate::app::Report,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<crate::app::Report>,
 }
 
 #[derive(Debug, PartialEq, Serialize, JsonSchema)]

@@ -143,6 +143,29 @@ mod tests {
     }
 
     #[test]
+    fn app_reports_are_optional_but_validated_when_present() {
+        for command in ["setup", "_reconcile"] {
+            let validator = jsonschema::validator_for(&envelope(command).unwrap()).unwrap();
+            let mut printed = json!({
+                "schema_version": 1,
+                "command": command,
+                "outcome": "error",
+                "data": {"service": {"manager":"launchd", "name":"fixture", "state":"unavailable"}},
+                "error": {"code":"failed", "message":"registration failed", "retryable":false},
+                "decisions": [],
+                "next_commands": [],
+            });
+            assert!(validator.is_valid(&printed), "{printed:#}");
+            printed["data"]["app"] = json!({"state":"skipped", "reason":"ci"});
+            assert!(validator.is_valid(&printed), "{printed:#}");
+            for invalid in [json!({}), json!({"state":"unknown"}), json!(false)] {
+                printed["data"]["app"] = invalid;
+                assert!(!validator.is_valid(&printed), "{printed:#}");
+            }
+        }
+    }
+
+    #[test]
     fn the_published_schemas_match_the_cli_types() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/json-schema/v1");
         let write = std::env::var_os("KOI_WRITE_SCHEMAS").is_some();

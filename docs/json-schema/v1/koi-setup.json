@@ -1087,7 +1087,14 @@
       "description": "The data of a command that brings the background service in line with the profile, with the service's report.",
       "properties": {
         "app": {
-          "$ref": "#/$defs/Report2"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Report2"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "choices": {
           "items": {
@@ -1101,8 +1108,7 @@
       },
       "required": [
         "choices",
-        "service",
-        "app"
+        "service"
       ],
       "type": "object"
     },
@@ -1114,7 +1120,14 @@
           "description": "The device this computer is connected as."
         },
         "app": {
-          "$ref": "#/$defs/Report2"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Report2"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "folder": {
           "$ref": "#/$defs/FolderData",
@@ -1127,8 +1140,7 @@
       "required": [
         "account",
         "folder",
-        "service",
-        "app"
+        "service"
       ],
       "type": "object"
     },
@@ -1136,15 +1148,21 @@
       "description": "The data of a command that brings the background service in line with the profile, with the service's report.",
       "properties": {
         "app": {
-          "$ref": "#/$defs/Report2"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Report2"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "service": {
           "$ref": "#/$defs/Report"
         }
       },
       "required": [
-        "service",
-        "app"
+        "service"
       ],
       "type": "object"
     }
