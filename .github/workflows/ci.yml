@@ -118,6 +118,40 @@ jobs:
           for job in server_macos spec_macos; do
             decide "$job" "ci.yml did not change" "$(grep -Fx '.github/workflows/ci.yml' <<<"$changed" || true)"
           done
+      - name: Keep merged store migrations unchanged
+        if: github.event_name != 'push'
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.merge_group.base_sha }}
+        run: |
+          if [ "$EVENT" = merge_group ]; then
+            git fetch --no-tags --depth=1 origin "$BASE"
+          else
+            BASE=$(git rev-parse HEAD^1)
+          fi
+          if ! changed="$(git diff --name-only --no-renames --diff-filter=DMT "$BASE" HEAD -- core/store/migrations)"; then
+            echo "::error::git diff between $BASE and HEAD failed, so changes to merged store migrations are unknown."
+            exit 1
+          fi
+          if [ -n "$changed" ]; then
+            while read -r file; do
+              echo "::error file=$file::$file is a merged store migration. Stores may have applied it already, so add a new migration instead of changing or removing this one."
+            done <<<"$changed"
+            exit 1
+          fi
+          if git cat-file -e "$BASE:core/store/migrations/legacy" 2>/dev/null; then
+            if ! added="$(git diff --name-only --no-renames --diff-filter=A "$BASE" HEAD -- core/store/migrations/legacy)"; then
+              echo "::error::git diff between $BASE and HEAD failed, so additions to the legacy store migrations are unknown."
+              exit 1
+            fi
+            if [ -n "$added" ]; then
+              while read -r file; do
+                echo "::error file=$file::$file adds a legacy store migration. Legacy steps map positional schema versions, so add the migration as core/store/migrations/<name>.sql instead."
+              done <<<"$added"
+              exit 1
+            fi
+          fi
+          echo "No merged store migration changed."
 
   pick-macos:
     name: pick-macos
