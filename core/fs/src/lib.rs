@@ -1362,23 +1362,7 @@ fn hold_back(
         .filter(|path| !removed.contains(*path) && !carried(path))
         .collect();
     let key = |path: &Path| (old[path].id, old[path].kind);
-    let asked: HashSet<Key> = removed
-        .iter()
-        .chain(&replaced)
-        .map(|path| key(path))
-        .collect();
-    let arrived: HashSet<Key> = (new.iter())
-        .filter(|(path, after)| {
-            !old.get(*path)
-                .is_some_and(|before| before.id == after.id && before.kind == after.kind)
-        })
-        .map(|(_, entry)| (entry.id, entry.kind))
-        .filter(|key| asked.contains(key))
-        .collect();
-    let gone: Vec<&PathBuf> = (removed.iter())
-        .filter(|path| !arrived.contains(&key(path)))
-        .chain(held.iter().copied())
-        .collect();
+    let gone: Vec<&PathBuf> = (removed.iter()).chain(held.iter().copied()).collect();
     let mut wanted: Wanted = gone.iter().map(|path| (key(path), None)).collect();
     let fresh: HashSet<Key> = (gone.iter().copied())
         .filter(|path| !path.as_os_str().as_bytes().contains(&0))
@@ -1386,7 +1370,7 @@ fn hold_back(
         .map(|path| key(path))
         .collect();
     let seeded: Vec<&PathBuf> = (replaced.iter())
-        .filter(|path| earlier.unscanned(path) && !arrived.contains(&key(path)))
+        .filter(|path| earlier.unscanned(path))
         .collect();
     wanted.extend(seeded.iter().map(|path| (key(path), None)));
     let undecided = rules.search(root, &mut wanted, &fresh, true, cut);
