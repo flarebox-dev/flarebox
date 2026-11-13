@@ -3317,14 +3317,8 @@ fn a_scan_that_unblocks_a_node_without_planning_an_effect_stores_it_unblocked() 
     assert_eq!(b.state(), FolderState::UpToDate);
 }
 
-/// Device `a` turns the file `a` into a folder `a` that holds the file as `a/ß` and a new file `a/a`. Device `b` parks
-/// the file to make room for the folder. Before `b` moves the file into the folder, the user there makes a folder `ß`
-/// in it and then excludes `ss/`, which `ß` matches after case folding. Nothing can put the file at `a/ß` or back
-/// at `a`, so the folder `a` and the files in it wait for the name the file keeps (design §5.10). The folder is up to
-/// date, its problem names the file, where it is kept and the entry that holds its name, and what waits behind it. An
-/// edit of `a/a` on `b` still reaches the server. The excluded folder and the file's bytes stay as they are.
 #[test]
-fn a_file_whose_place_an_excluded_folder_holds_is_named_with_what_waits_for_its_name() {
+fn a_file_whose_place_an_excluded_folder_holds_is_reported_while_its_folder_syncs() {
     let mut remote = Remote::new();
     let (site_a, mut a) = linked(&mut remote, "a");
     a.create(&mut remote, &site_a.root.join("a"), b"moved on a");
@@ -3373,22 +3367,32 @@ fn a_file_whose_place_an_excluded_folder_holds_is_named_with_what_waits_for_its_
     assert_eq!(fs::read(site_a.root.join("a/a")).unwrap(), b"edited on b");
 
     let view = b.folder.view();
-    let waits =
-        "waits for \"a/ß\", whose name here is taken by an entry this device's rules exclude";
     assert_eq!(
         (view.state, view.problem),
         (
             FolderState::UpToDate,
             Some(format!(
-                "3 items could not be synced: \"a\" ({waits}), \"a/a\" ({waits}), \"a/ß\" (its name here is taken by \
-                 \"a/ß\", which this device's rules exclude; it is kept in \".koidrive/parked/{file}\"); run koi \
-                 folder restart once they are fixed"
+                "1 item could not be synced: \"a/ß\" (its name here is taken by \"a/ß\", which this device's \
+                 rules exclude; it is kept in \".koidrive/parked/{file}\"); run koi folder restart once it is fixed"
             ))
         )
     );
     assert_eq!(fs::read_dir(site.root.join("a/ß")).unwrap().count(), 0);
     assert_eq!(fs::read(&parked).unwrap(), b"moved on a");
     assert_eq!(remote.names(), ["a", "a", "ß"]);
+
+    fs::remove_file(site.root.join("a/a")).unwrap();
+    b.settle();
+    assert_eq!(b.run(&mut remote), ["send"]);
+    b.settle();
+    assert!(b.run(&mut remote).is_empty());
+    assert_eq!(remote.names(), ["a", "ß"]);
+    a.pull_at_once(&remote);
+    a.settle();
+    a.run(&mut remote);
+    assert!(!site_a.root.join("a/a").exists());
+    assert_eq!(fs::read(site_a.root.join("a/ß")).unwrap(), b"moved on a");
+    assert!(!site.root.join("a/a").exists());
 }
 
 /// Device `b` excludes the folder `q/x`. Device `a` renames that folder to `q/y`, then moves the file `p/f` to `q/x` and
