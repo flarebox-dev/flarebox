@@ -11,7 +11,8 @@ describe("the Durable Object PITR backend", () => {
   it("answers no bookmark for a time before the object's PITR history begins, and passes any other error on", async () => {
     const before = pitrBackend.open(storageRejecting(new Error("Requested time is before this database existed.")));
     expect(await before.bookmarkForTime(1)).toBeUndefined();
-    const other = new Error("internal error");
-    await expect(pitrBackend.open(storageRejecting(other)).bookmarkForTime(1)).rejects.toBe(other);
+    for (const other of [new Error("internal error"), new Error("Requested time is before this database existed: transient service failure")]) {
+      await expect(pitrBackend.open(storageRejecting(other)).bookmarkForTime(1)).rejects.toBe(other);
+    }
   });
 });
