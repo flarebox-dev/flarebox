@@ -154,7 +154,6 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "after a server loss, a device can move a node back to a position it never set (GUN-531)"]
     fn devices_converge_across_server_restores(devices in 2..=3usize, phases in phases(Losses::Restores)) {
         converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
@@ -1375,6 +1374,150 @@ fn a_write_two_downloads_place_after_a_restore_took_it_is_kept_once_beside_the_e
         writes.sort();
         assert_eq!(writes, [Some(1), Some(2)]);
     }
+}
+
+#[test]
+fn a_folder_renamed_after_a_restore_is_not_moved_back_by_a_device_that_never_moved_it() {
+    let world = converge(
+        3,
+        &[
+            vec![(2, file("ss")), (2, folder("A"))],
+            vec![(0, BACKUP), (2, rename(0, 0, "b"))],
+            vec![
+                (0, folder("c.txt")),
+                (0, SCAN),
+                (1, rename(0, 0, "a")),
+                (0, COMMIT),
+                (0, RESTORE),
+            ],
+        ],
+    )
+    .unwrap();
+    for device in &world.devices {
+        let disk = &device.disk;
+        let paths: BTreeSet<Vec<String>> = (disk.entries().keys())
+            .filter_map(|ino| disk.path(*ino))
+            .collect();
+        let expected = [["a"], ["b"], ["c.txt"]].map(|path| path.map(String::from).to_vec());
+        assert_eq!(paths, BTreeSet::from(expected));
+    }
+}
+
+#[test]
+fn a_rename_after_a_restore_is_not_undone_by_the_lost_rename_it_replaced() {
+    let mut after = vec![(0, RESTORE), (1, Step::Connect)];
+    for _ in 0..12 {
+        after.extend([(1, Step::Work(0)), (1, DELIVER), (1, EFFECT)]);
+    }
+    after.extend([
+        (1, SCAN),
+        (1, rename(0, 0, "ss")),
+        (1, SCAN),
+        (1, COMMIT),
+        (1, COMMIT),
+        (1, DELIVER),
+        (1, Step::Work(0)),
+        (1, DELIVER),
+    ]);
+    let world = converge(
+        2,
+        &[
+            vec![(0, file("a"))],
+            vec![(0, BACKUP), (0, rename(0, 0, "b"))],
+            after,
+        ],
+    )
+    .unwrap();
+    for device in &world.devices {
+        let names: Vec<&str> = (device.disk.entries().values())
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["ss"]);
+    }
+}
+
+#[test]
+fn the_last_of_two_lost_renames_is_kept_through_the_restore() {
+    let world = converge(
+        3,
+        &[
+            vec![(0, file("a"))],
+            vec![(1, rename(0, 0, "A"))],
+            vec![(0, BACKUP), (2, rename(0, 0, "b"))],
+            vec![(0, rename(0, 0, "ss"))],
+            vec![(0, RESTORE)],
+        ],
+    )
+    .unwrap();
+    for device in &world.devices {
+        let names: Vec<&str> = (device.disk.entries().values())
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["ss"]);
+    }
+}
+
+#[test]
+fn a_lost_rename_sent_again_before_a_later_lost_rename_keeps_the_later_one() {
+    let mut lost = vec![
+        (0, rename(0, 0, "ss")),
+        (0, SCAN),
+        (0, COMMIT),
+        (0, COMMIT),
+        (0, DELIVER),
+        (0, DELIVER),
+        (0, RESTORE),
+        (1, Step::Connect),
+    ];
+    for _ in 0..12 {
+        lost.extend([(1, Step::Work(0)), (1, DELIVER), (1, EFFECT)]);
+    }
+    lost.push((0, Step::Connect));
+    let world = converge(
+        2,
+        &[
+            vec![(0, file("a"))],
+            vec![(0, BACKUP), (1, rename(0, 0, "b"))],
+            lost,
+        ],
+    )
+    .unwrap();
+    for device in &world.devices {
+        let names: Vec<&str> = (device.disk.entries().values())
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["ss"]);
+    }
+}
+
+#[test]
+fn a_file_renamed_by_the_server_in_a_folder_it_merged_is_not_moved_back() {
+    converge(
+        2,
+        &[
+            vec![
+                (0, Step::Work(0)),
+                (0, folder("a")),
+                (0, rename(0, 0, "ss")),
+                (0, user(1, 0, 1, "b")),
+                (0, file("a")),
+                (0, BACKUP),
+            ],
+            vec![
+                (0, overwrite(1)),
+                (0, Step::Work(0)),
+                (0, COMMIT),
+                (0, user(1, 0, 1, "a")),
+                (0, folder("A")),
+                (0, RESTORE),
+                (0, user(0, 0, 2, "a")),
+                (0, Step::Work(0)),
+                (0, delete(4)),
+                (0, folder("ß")),
+            ],
+        ],
+    )
+    .unwrap();
 }
 
 fn created_again_by_both_and_deleted_by_one(made: Step, edit: bool) -> World {

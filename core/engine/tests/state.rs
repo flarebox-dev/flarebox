@@ -11,7 +11,9 @@ use koidrive_engine::guard::{Counted, GuardState, RemoteDeletion, Trash};
 use koidrive_engine::ids::uuid_v7;
 use koidrive_engine::question::{Answer, Held, Limit, Question, QuestionKind, Revisions};
 use koidrive_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
-use koidrive_engine::state::{Agreed, CommitsState, EffectsState, Pending, StateError, TreesState};
+use koidrive_engine::state::{
+    Agreed, CommitsState, EffectsState, MovedHere, Pending, StateError, TreesState,
+};
 use koidrive_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape, TreeError};
 use koidrive_proto::v1::{Commit, CommitResult, Delete, Move, Op, OpResult, op};
 
@@ -102,6 +104,23 @@ fn trees_state() -> TreesState {
         lost: ["a".into()].into(),
         displaced: Default::default(),
         edited_here: [("a".into(), 1)].into(),
+        moved_here: [(
+            "a".into(),
+            MovedHere {
+                seq: 1,
+                upgraded: false,
+            },
+        )]
+        .into(),
+        past_positions: [(
+            "a".into(),
+            vec![Agreed {
+                rev: 1,
+                parent: ROOT.into(),
+                name: "q".into(),
+            }],
+        )]
+        .into(),
         unsent_edits: Default::default(),
         resends: Default::default(),
         replaced_versions: [("a".into(), vec!["v1".into()])].into(),
@@ -475,6 +494,27 @@ fn trees_restore_a_valid_state_and_refuse_each_broken_one() {
                     .insert("gone".into(), vec!["v1".into()]);
             }),
             StateError::NotRemote("gone".into()),
+        ),
+        (
+            "earlier records of a node R does not hold",
+            trees(),
+            broken(trees_state(), |state| {
+                let past = state.past_positions["a"].clone();
+                state.past_positions.insert("gone".into(), past);
+            }),
+            StateError::NotPastPosition("gone".into()),
+        ),
+        (
+            "a node moved here that R holds at a revision before that commit",
+            trees(),
+            broken(trees_state(), |state| {
+                let moved = MovedHere {
+                    seq: 2,
+                    upgraded: false,
+                };
+                state.moved_here.insert("a".into(), moved);
+            }),
+            StateError::NotMovedHere("a".into()),
         ),
     ];
     for (name, mut trees, state, error) in cases {

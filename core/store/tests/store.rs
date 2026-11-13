@@ -3,17 +3,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use koidrive_engine::classify::{Origin, Waiting};
+use koidrive_engine::classify::{Origin, Trees, Waiting};
 use koidrive_engine::commit::{Commits, Halt, InFlight, Reconnect};
 use koidrive_engine::effects::{Base, Dir, Displaced, Effect, EffectRecord, Location};
 use koidrive_engine::guard::{Counted, GuardState, RemoteDeletion, Trash};
-use koidrive_engine::ids::uuid_v7;
+use koidrive_engine::ids::{IdGen, uuid_v7};
 use koidrive_engine::question::{
     Answer, Held, Limit, Question, QuestionKind, RecoveryGroup, Revisions,
 };
 use koidrive_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
-use koidrive_engine::state::{Agreed, CommitsState, EffectsState, Pending, TreesState};
-use koidrive_engine::tree::{FileIdentity, Kind, Shape as EngineShape};
+use koidrive_engine::state::{Agreed, CommitsState, EffectsState, MovedHere, Pending, TreesState};
+use koidrive_engine::tree::{
+    FileIdentity, Kind, LocalNode as EngineLocalNode, RemoteNode, Shape as EngineShape,
+};
 use koidrive_fs::FileId;
 use koidrive_proto::v1::{
     ChunkRef, Commit, CommitResult, Content, CreateFile, Delete, NodeKind, NodeState, NodeStatus,
@@ -103,12 +105,14 @@ fn migrations_apply_from_empty() {
             "link",
             "local_nodes",
             "migrations",
+            "moved_here",
             "node_maps",
             "node_sets",
             "open_question_items",
             "open_question_members",
             "open_question_shapes",
             "open_questions",
+            "past_positions",
             "pending_names",
             "published_nodes",
             "questions",
@@ -343,6 +347,11 @@ fn a_store_written_by_alpha_1_upgrades_and_keeps_every_row() {
     expected.trees.resends.clear();
     expected.trees.replaced_versions.clear();
     expected.trees.discarded.clear();
+    let upgraded = MovedHere {
+        seq: 9,
+        upgraded: true,
+    };
+    expected.trees.moved_here = BTreeMap::from([("moved".into(), upgraded)]);
     store
         .transaction(|tx| {
             assert_eq!(tx.engine_state()?, expected);
@@ -1197,6 +1206,37 @@ fn engine_state() -> EngineState {
                 },
             )]),
             edited_here: BTreeMap::from([("e".into(), 6)]),
+            moved_here: BTreeMap::from([
+                (
+                    "m".into(),
+                    MovedHere {
+                        seq: 7,
+                        upgraded: false,
+                    },
+                ),
+                (
+                    "n".into(),
+                    MovedHere {
+                        seq: 8,
+                        upgraded: true,
+                    },
+                ),
+            ]),
+            past_positions: BTreeMap::from([(
+                "moved".into(),
+                vec![
+                    Agreed {
+                        rev: 6,
+                        parent: "root".into(),
+                        name: "old.txt".into(),
+                    },
+                    Agreed {
+                        rev: 8,
+                        parent: String::new(),
+                        name: "before.txt".into(),
+                    },
+                ],
+            )]),
             unsent_edits: nodes(["u"]),
             resends: nodes(["u"]),
             replaced_versions: BTreeMap::from([(
@@ -1407,7 +1447,7 @@ fn engine_state_survives_a_reopen() {
 }
 
 /// The tables of the engine state besides the nodes of R, L and S.
-const ENGINE_TABLES: [&str; 29] = [
+const ENGINE_TABLES: [&str; 31] = [
     "node_sets",
     "node_maps",
     "waiting_updates",
@@ -1437,6 +1477,8 @@ const ENGINE_TABLES: [&str; 29] = [
     "guard_confirmed_limits",
     "watched_positions",
     "unsent_edits",
+    "moved_here",
+    "past_positions",
 ];
 
 /// Counts each row inserted, updated or deleted in the engine's tables from now on in the table
@@ -2305,6 +2347,191 @@ fn a_store_from_before_unsent_edits_were_recorded_opens_with_none_recorded() {
 }
 
 #[test]
+fn a_store_from_before_moves_were_recorded_records_the_positions_its_commits_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let mut before = engine_state();
+    let node = |id: &str, name: &str, meta_rev: u64, status: NodeStatus| NodeState {
+        node_id: id.into(),
+        parent_id: "root".into(),
+        name: name.into(),
+        kind: NodeKind::File as i32,
+        status: status as i32,
+        content_rev: 1,
+        meta_rev,
+        current: Some(VersionInfo {
+            content: Some(content(3)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let remote = [
+        node("own", "own.txt", 7, NodeStatus::Live),
+        node("other", "other.txt", 8, NodeStatus::Live),
+        node("moved", "moved.txt", 9, NodeStatus::Live),
+        node("gone", "gone.txt", 9, NodeStatus::Trashed),
+        node("nfd", "\u{d55c}.txt", 7, NodeStatus::Live),
+    ];
+    let synced = [
+        ("own", "own.txt"),
+        ("other", "other.txt"),
+        ("moved", "since.txt"),
+        ("nfd", "\u{1112}\u{1161}\u{11ab}.txt"),
+        ("gone", "gone.txt"),
+    ]
+    .map(|(id, name)| SyncedNode {
+        node_id: id.into(),
+        shape: file_shape("root", name),
+    });
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| {
+            tx.set_engine_state(&before)?;
+            for node in &remote {
+                tx.put_remote_node(node)?;
+            }
+            for node in &synced {
+                tx.put_synced_node(node)?;
+            }
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+    store_before(&path, "moved_here");
+
+    let mut store = Store::open(&path).unwrap();
+    let after = before.clone();
+    let upgraded = |seq| MovedHere {
+        seq,
+        upgraded: true,
+    };
+    before.trees.moved_here = BTreeMap::from([
+        ("own".into(), upgraded(7)),
+        ("moved".into(), upgraded(9)),
+        ("nfd".into(), upgraded(7)),
+    ]);
+    before.trees.past_positions.clear();
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
+    store
+        .transaction(|tx| tx.update_engine_state(&before, &after))
+        .unwrap();
+    drop(store);
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), after);
+}
+
+#[test]
+fn an_own_move_acknowledged_before_the_upgrade_is_sent_again_after_a_later_loss() {
+    let remote = |name: &str, meta_rev| RemoteNode {
+        shape: engine_shape("root", name),
+        trashed: false,
+        content_rev: 1,
+        meta_rev,
+        edit_rev: 0,
+        trash_group: String::new(),
+        version_id: String::new(),
+    };
+    let local = |name: &str| EngineLocalNode {
+        shape: engine_shape("root", name),
+        identity: FileIdentity {
+            dev: 1,
+            ino: 1,
+            birth_ns: Some(0),
+        },
+        parked: false,
+    };
+    let mut trees = Trees::new("root");
+    trees.set_remote("n".into(), remote("x", 1));
+    trees.set_local("n".into(), local("x"));
+    trees.set_synced("n".into(), Some(engine_shape("root", "x")));
+    trees.set_local("n".into(), local("y"));
+    trees.settle();
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let sent = commits.build(&mut trees, &mut ids, 1_794_268_740_000, "history", 1);
+    assert!(sent.is_some_and(|commit| matches!(
+        &commit.ops[..],
+        [Op {
+            op: Some(op::Op::Move(_)),
+            ..
+        }]
+    )));
+    trees.set_remote("n".into(), remote("y", 2));
+    let applied = OpResult {
+        code: op_result::Code::Applied as i32,
+        ..Default::default()
+    };
+    commits
+        .received(CommitResult {
+            seq: 2,
+            results: vec![applied],
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(commits.acknowledge(&mut trees, 2));
+    trees.settle();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let state = EngineState {
+        trees: trees.state(),
+        commits: commits.state(),
+        ..Default::default()
+    };
+    let n = NodeState {
+        node_id: "n".into(),
+        parent_id: "root".into(),
+        name: "y".into(),
+        kind: NodeKind::File as i32,
+        status: NodeStatus::Live as i32,
+        content_rev: 1,
+        meta_rev: 2,
+        current: Some(VersionInfo {
+            content: Some(content(3)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| {
+            tx.set_engine_state(&state)?;
+            tx.put_remote_node(&n)?;
+            tx.put_synced_node(&SyncedNode {
+                node_id: "n".into(),
+                shape: file_shape("root", "y"),
+            })
+        })
+        .unwrap();
+    store_before(&path, "moved_here");
+
+    let state = (Store::open(&path).unwrap())
+        .transaction(|tx| tx.engine_state())
+        .unwrap();
+    trees.restore(state.trees).unwrap();
+    trees.rules_scanned();
+    let mut commits = Commits::from_state(state.commits).unwrap();
+    let welcome = Welcome {
+        history_id: "history".into(),
+        device_seq: 0,
+        ..Default::default()
+    };
+    assert_eq!(commits.connected(&welcome), Reconnect::AheadOfServer);
+    let moved = trees.moved_here();
+    trees.set_remote("n".into(), remote("x", 1));
+    trees.forget_lost(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        moved,
+        commits.held_through(),
+        commits.accepted(),
+    );
+    trees.settle();
+    let resent = commits.build(&mut trees, &mut ids, 1_794_268_740_001, "history", 1);
+    let moved_to_y = |op: &Op| matches!(&op.op, Some(op::Op::Move(moved)) if moved.new_name == "y");
+    assert!(resent.is_some_and(|commit| commit.ops.iter().any(moved_to_y)));
+}
+
+#[test]
 fn a_store_from_before_inodes_took_128_bits_keeps_every_identity() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
@@ -2602,7 +2829,7 @@ fn a_discarded_file_that_s_no_longer_holds_is_asked_about_again(edited: bool) {
             .build(&mut trees, &mut ids, 1, "history", 1)
             .is_none()
     );
-    trees.forget_lost(Vec::new(), Vec::new(), Vec::new(), 0, 0);
+    trees.forget_lost(Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0, 0);
     trees.settle();
     assert!(trees.synced().get("secret").is_none());
     assert!(!trees.waiting().contains_key("secret"));

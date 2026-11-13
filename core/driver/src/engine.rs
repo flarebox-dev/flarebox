@@ -479,6 +479,7 @@ impl Engine {
         let edited = self.trees.edited_here();
         let commits = &self.commits;
         let synced = (self.trees).taken_from_others(|seq| commits.made_here(seq));
+        let moved = self.trees.moved_here();
         let root = self.trees.remote().root.clone();
         let mut tree = Tree::new(root.clone());
         for state in staging.nodes.values().filter(|state| state.node_id != root) {
@@ -508,6 +509,7 @@ impl Engine {
                 trashed,
                 edited,
                 synced,
+                moved,
                 self.commits.held_through(),
                 self.commits.accepted(),
             );

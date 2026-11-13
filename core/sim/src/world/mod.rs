@@ -1350,6 +1350,7 @@ impl World {
                 let trashed = trees.trashed_here();
                 let edited = trees.edited_here();
                 let synced = trees.taken_from_others(|seq| commits.made_here(seq));
+                let moved = trees.moved_here();
                 let root = trees.remote().root.clone();
                 let mut listed = BTreeMap::new();
                 for state in nodes.iter().filter(|state| state.node_id != root) {
@@ -1376,6 +1377,7 @@ impl World {
                         trashed,
                         edited,
                         synced,
+                        moved,
                         commits.held_through(),
                         commits.accepted(),
                     );

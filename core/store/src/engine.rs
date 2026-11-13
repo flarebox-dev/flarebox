@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use koidrive_engine::classify::{Origin, Waiting};
 use koidrive_engine::commit::{Halt, InFlight};
 use koidrive_engine::effects::{Base, Dir, Displaced, Effect, EffectRecord, Location};
-use koidrive_engine::state::{Agreed, CommitsState, EffectsState, Pending, TreesState};
+use koidrive_engine::state::{Agreed, CommitsState, EffectsState, MovedHere, Pending, TreesState};
 use koidrive_engine::tree::{FileIdentity, Kind, NodeId, Shape};
 use koidrive_proto::v1::{Commit, CommitResult, Content, NodeKind};
 use prost::{Message, Oneof};
@@ -190,6 +190,35 @@ impl Tx<'_> {
         while let Some(row) = rows.next()? {
             state.trees.edited_here.insert(row.get(0)?, row.get(1)?);
         }
+        let mut stmt = self
+            .0
+            .prepare_cached("SELECT node_id, seq, upgraded FROM moved_here")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let moved = MovedHere {
+                seq: row.get(1)?,
+                upgraded: row.get(2)?,
+            };
+            state.trees.moved_here.insert(row.get(0)?, moved);
+        }
+        let mut stmt = self.0.prepare_cached(
+            "SELECT node_id, rev, parent_id, name FROM past_positions ORDER BY node_id, position",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let past = Agreed {
+                rev: row.get(1)?,
+                parent: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                name: row.get(3)?,
+            };
+            let node: NodeId = row.get(0)?;
+            state
+                .trees
+                .past_positions
+                .entry(node)
+                .or_default()
+                .push(past);
+        }
         let mut stmt = self.0.prepare_cached("SELECT node_id FROM unsent_edits")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
@@ -299,6 +328,8 @@ impl Tx<'_> {
             "pending_names",
             "recorded_nodes",
             "edited_here",
+            "moved_here",
+            "past_positions",
             "unsent_edits",
             "replaced_versions",
             "resends",
@@ -496,6 +527,43 @@ impl Tx<'_> {
         }
         for (node, seq) in changed {
             put.execute(params![node, seq])?;
+        }
+        let mut remove = self
+            .0
+            .prepare_cached("DELETE FROM moved_here WHERE node_id = ?1")?;
+        let mut put = self.0.prepare_cached(
+            "INSERT OR REPLACE INTO moved_here (node_id, seq, upgraded) VALUES (?1, ?2, ?3)",
+        )?;
+        let (removed, changed) = differences(&before.trees.moved_here, &after.trees.moved_here);
+        for node in removed {
+            remove.execute([node])?;
+        }
+        for (node, moved) in changed {
+            put.execute(params![node, moved.seq, moved.upgraded])?;
+        }
+        let mut remove = self
+            .0
+            .prepare_cached("DELETE FROM past_positions WHERE node_id = ?1")?;
+        let mut put = self.0.prepare_cached(
+            "INSERT INTO past_positions (node_id, position, rev, parent_id, name)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        let (removed, changed) =
+            differences(&before.trees.past_positions, &after.trees.past_positions);
+        for node in removed {
+            remove.execute([node])?;
+        }
+        for (node, past) in changed {
+            remove.execute([node])?;
+            for (index, position) in past.iter().enumerate() {
+                put.execute(params![
+                    node,
+                    index,
+                    position.rev,
+                    non_empty(&position.parent),
+                    &position.name
+                ])?;
+            }
         }
         let mut remove = self
             .0

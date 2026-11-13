@@ -29,6 +29,14 @@ pub struct Agreed {
     pub name: String,
 }
 
+/// A position a create or a move of this device set: the seq of its commit, and whether the store
+/// upgrade recorded it, without the positions R held before it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MovedHere {
+    pub seq: u64,
+    pub upgraded: bool,
+}
+
 /// What [`Trees`](crate::classify::Trees) holds besides the nodes of R, L and S.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TreesState {
@@ -67,6 +75,12 @@ pub struct TreesState {
     /// The files whose content an edit of this device set, each with the seq of its commit, while
     /// R holds that content.
     pub edited_here: BTreeMap<NodeId, u64>,
+    /// The nodes whose position a create or a move of this device set, while R holds them at that
+    /// position, also after a delete and a restore of the node.
+    pub moved_here: BTreeMap<NodeId, MovedHere>,
+    /// The earlier live records R held of each node, oldest first, the newest
+    /// [`PAST_POSITIONS_KEPT`](crate::classify::PAST_POSITIONS_KEPT).
+    pub past_positions: BTreeMap<NodeId, Vec<Agreed>>,
     /// The files whose content in L is an edit of this device that the server does not hold,
     /// although S and R may hold the same bytes (section 4.4).
     pub unsent_edits: BTreeSet<NodeId>,
@@ -173,6 +187,11 @@ pub enum StateError {
     /// A file is recorded as edited by this device, but R does not hold the content of that
     /// commit.
     NotEditedHere(NodeId),
+    /// A node is recorded as moved by this device, but R does not hold it at a revision at or after
+    /// that commit.
+    NotMovedHere(NodeId),
+    /// Earlier records are kept for a node R does not hold.
+    NotPastPosition(NodeId),
     /// A file is recorded with an edit the server does not hold, but L does not hold it.
     NotUnsentEdit(NodeId),
     NotRemote(NodeId),

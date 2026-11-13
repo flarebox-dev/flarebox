@@ -1187,6 +1187,9 @@ impl Commits {
                 }
                 _ => continue,
             };
+            if applied && sent.is_some() {
+                trees.record_moved(node, result.seq);
+            }
             let created = matches!(&op.op, Some(op::Op::CreateDir(_) | op::Op::CreateFile(_)));
             if created
                 && taken
@@ -1223,9 +1226,10 @@ impl Commits {
                 let held = &local.shape.parent;
                 aliases.contains_key(held) || merged.contains_key(held)
             });
-            let left = sent.is_some_and(|(parent, name)| {
+            let left = sent.is_some_and(|(sent_parent, name)| {
                 (trees.local().get(node)).is_some_and(|local| {
-                    local.shape.parent != *parent || nfc(&local.shape.name) != nfc(name)
+                    local.shape.parent != *merged.get(sent_parent).unwrap_or(sent_parent)
+                        || nfc(&local.shape.name) != nfc(name)
                 })
             });
             let kept = agreed.contains_key(node);
@@ -1328,6 +1332,11 @@ impl Commits {
         self.slots.insert(flight.commit.device_seq, result.seq);
         while self.slots.len() > SLOTS_KEPT {
             self.slots.pop_first();
+        }
+        if self.slots.len() == SLOTS_KEPT
+            && let Some((_, &oldest)) = self.slots.first_key_value()
+        {
+            trees.forget_past_positions_below(oldest);
         }
         self.cap = self.cap.map(|cap| cap * 2).filter(|cap| *cap < MAX_OPS);
         true
