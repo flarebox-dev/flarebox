@@ -4083,3 +4083,23 @@ fn a_file_deleted_after_its_lost_edit_was_sent_again_stays_deleted_after_a_secon
     ];
     converge(2, &phases).unwrap();
 }
+
+#[test]
+fn an_observers_rename_survives_when_a_restore_takes_it_with_the_edit_it_downloaded() {
+    let mut lost = vec![(0, BACKUP), (0, overwrite(0))];
+    lost.extend(commit(0));
+    lost.push((1, Step::Connect));
+    lost.extend([(1, Step::Work(0)); 16]);
+    lost.push((1, rename(0, 0, "b")));
+    lost.extend(commit(1));
+    lost.extend([(1, DELIVER); 4]);
+    lost.push((0, RESTORE));
+    reconnect(&mut lost, 1, true);
+    reconnect(&mut lost, 0, true);
+    let world = keep(3, &[vec![(0, file("a"))], lost]).unwrap();
+    for device in 0..3 {
+        let files = files_on(&world, device);
+        let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["b"], "device {device}: {files:?}");
+    }
+}

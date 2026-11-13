@@ -437,7 +437,10 @@ impl Trees {
                 .acknowledged(&id)
                 .and_then(|shape| shape.content.as_ref()))
             .zip(node.shape.content.as_ref())
-            .is_some_and(|(synced, remote)| same_content(synced, remote));
+            .is_some_and(|(synced, remote)| same_content(synced, remote))
+            && !(self.l.live(&id).and_then(|local| local.content.as_ref()))
+                .zip(node.shape.content.as_ref())
+                .is_some_and(|(local, remote)| same_content(local, remote));
         let local_gone = !made_here && self.l.get(&id).is_none();
         let resent_over_delete = local_gone
             && (self.r.get(&id)).is_some_and(|old| {
