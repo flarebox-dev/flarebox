@@ -7975,3 +7975,33 @@ fn a_file_moved_over_another_with_an_older_link_in_an_ignored_folder_leaves_the_
     );
     assert_eq!(a.folder.engine.trees.check(), Ok(()));
 }
+
+#[test]
+fn a_file_moved_over_another_out_of_a_removed_folder_with_an_older_link_in_an_ignored_folder_leaves_the_server()
+ {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    let settled = |a: &mut Device, remote: &mut Remote| {
+        for _ in 0..3 {
+            a.settle();
+            a.run(remote);
+        }
+    };
+    a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
+    fs::create_dir(site.root.join("d")).unwrap();
+    a.create(&mut remote, &site.root.join("d/f"), b"kept");
+    a.create(&mut remote, &site.root.join("x"), b"other");
+    fs::create_dir(site.root.join("ignored")).unwrap();
+    fs::hard_link(site.root.join("d/f"), site.root.join("ignored/l")).unwrap();
+    settled(&mut a, &mut remote);
+
+    fs::rename(site.root.join("d/f"), site.root.join("x")).unwrap();
+    fs::remove_dir(site.root.join("d")).unwrap();
+    settled(&mut a, &mut remote);
+    let after = server_nodes(&remote);
+    assert!(
+        !(after.iter()).any(|(name, _, live)| (name == "d" || name == "f") && *live),
+        "{after:?}"
+    );
+    assert_eq!(a.folder.engine.trees.check(), Ok(()));
+}

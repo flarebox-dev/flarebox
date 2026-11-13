@@ -830,6 +830,28 @@ fn a_file_moved_over_another_with_an_older_link_in_an_ignored_folder_is_removed(
 }
 
 #[test]
+fn a_file_moved_over_another_out_of_a_removed_folder_with_an_older_link_in_an_ignored_folder_is_removed()
+ {
+    let (dir, mut snapshot, mut rules) = tree_with_an_ignored_folder();
+    let root = dir.path();
+    write(root, "x", "x");
+    fs::hard_link(root.join("d/g.txt"), root.join("ig/l")).unwrap();
+    snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    fs::rename(root.join("d/g.txt"), root.join("x")).unwrap();
+    fs::remove_dir(root.join("d")).unwrap();
+
+    let rescan = snapshot
+        .rescan_with_rules(root, whole(), &mut rules)
+        .unwrap();
+    assert_eq!(
+        rescan.changes,
+        [removed("d", Dir), Change::Modified { path: "x".into() }]
+    );
+}
+
+#[test]
 fn a_link_removed_while_another_link_stays_included_is_removed() {
     for budget in [usize::MAX, 100] {
         let dir = large_ignored_tree();
