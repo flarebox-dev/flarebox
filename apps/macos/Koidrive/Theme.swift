@@ -11,6 +11,8 @@ extension Color {
                                dark: NSColor(red: 1, green: 106 / 255, blue: 19 / 255, alpha: 0.18))
     static let statusGreen = Color(light: 0x1FA83A, dark: 0x32D74B)
     static let statusRed = Color(light: 0xE0352B, dark: 0xFF453A)
+    static let redLabel = Color(light: NSColor(hex: 0xD70015), dark: NSColor(hex: 0xFF6961),
+                                increasedContrast: (NSColor(hex: 0xB0000F), NSColor(hex: 0xFF8A82)))
     static let statusYellow = Color(light: 0xB07A00, dark: 0xFFD60A)
     static let redTint = Color(light: NSColor(red: 224 / 255, green: 53 / 255, blue: 43 / 255, alpha: 0.1),
                                dark: NSColor(red: 1, green: 69 / 255, blue: 58 / 255, alpha: 0.16))
@@ -28,9 +30,14 @@ extension Color {
         self.init(light: NSColor(hex: light), dark: NSColor(hex: dark))
     }
 
-    init(light: NSColor, dark: NSColor) {
+    init(light: NSColor, dark: NSColor, increasedContrast: (light: NSColor, dark: NSColor)? = nil) {
         self.init(nsColor: NSColor(name: nil) { appearance in
-            appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? dark : light
+            switch appearance.bestMatch(from: [.aqua, .darkAqua, .accessibilityHighContrastAqua, .accessibilityHighContrastDarkAqua]) {
+            case .darkAqua: dark
+            case .accessibilityHighContrastAqua: increasedContrast?.light ?? light
+            case .accessibilityHighContrastDarkAqua: increasedContrast?.dark ?? dark
+            default: light
+            }
         })
     }
 }
@@ -93,7 +100,7 @@ private struct KoiButton: View {
         case .primary: .onInk
         case .destructiveConfirm: .white
         case .secondary where !isEnabled: .label3
-        case .secondary where configuration.role == .destructive: .statusRed
+        case .secondary where configuration.role == .destructive: .redLabel
         case .secondary: .label
         }
     }

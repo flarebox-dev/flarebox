@@ -45,6 +45,8 @@ enum Snapshots {
             }
             await capture(ButtonGallery(), width: 432, titled: nil, dark: dark,
                           to: directory.appending(path: "buttons-\(suffix).png"))
+            await capture(ButtonGallery(), width: 432, titled: nil, dark: dark, increasedContrast: true,
+                          to: directory.appending(path: "buttons-increased-contrast-\(suffix).png"))
             for (name, view) in await settingsStates() {
                 await capture(view.frame(width: 600, height: 380), width: 600, height: 380, titled: nil, dark: dark,
                               to: directory.appending(path: "settings-\(name)-\(suffix).png"))
@@ -149,8 +151,14 @@ enum Snapshots {
     }
 
     private static func capture(_ view: some View, width: CGFloat, height: CGFloat? = nil, titled: String?,
-                                dark: Bool, to url: URL) async {
-        let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+                                dark: Bool, increasedContrast: Bool = false, to url: URL) async {
+        let name: NSAppearance.Name = switch (dark, increasedContrast) {
+        case (false, false): .aqua
+        case (true, false): .darkAqua
+        case (false, true): .accessibilityHighContrastAqua
+        case (true, true): .accessibilityHighContrastDarkAqua
+        }
+        let appearance = NSAppearance(named: name)
         let host = NSHostingView(rootView: view
             .buttonStyle(.secondary)
             .background(Color(nsColor: .windowBackgroundColor))
