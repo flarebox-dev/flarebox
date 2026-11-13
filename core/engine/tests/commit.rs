@@ -3405,6 +3405,44 @@ fn a_lost_move_is_not_sent_over_a_position_this_device_never_saw() {
     assert_eq!(trees.class("n"), Class::Remote);
 }
 
+fn past_revisions_of_n(trees: &Trees) -> Vec<u64> {
+    let past = trees.state().past_positions;
+    (past.get("n").into_iter().flatten())
+        .map(|position| position.rev)
+        .collect()
+}
+
+#[test]
+fn a_full_set_of_slots_forgets_only_the_positions_below_its_oldest_seq() {
+    let (mut trees, _, mut ids) = n_at_x();
+    take_remote_move("w", 5, &mut trees);
+    take_remote_move("v", 1500, &mut trees);
+    take_remote_move("z", 1600, &mut trees);
+    let mut commits = Commits::from_state(CommitsState {
+        accepted: 999,
+        slots: (1..=999).map(|slot| (slot, slot + 1000)).collect(),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(past_revisions_of_n(&trees), [1, 5, 1500]);
+    move_n_to_y_at(2000, &mut trees, &mut commits, &mut ids);
+    assert_eq!(past_revisions_of_n(&trees), [1500, 1600]);
+}
+
+#[test]
+fn a_position_the_node_held_in_the_trash_is_not_kept_as_an_earlier_one() {
+    let (mut trees, _, _) = n_at_x();
+    trees.set_remote(
+        "n".into(),
+        RemoteNode {
+            meta_rev: 5,
+            ..trashed(file(ROOT, "w", 1))
+        },
+    );
+    take_remote_move("z", 7, &mut trees);
+    assert_eq!(past_revisions_of_n(&trees), [1]);
+}
+
 #[test]
 fn an_edit_to_the_content_a_lost_commit_replaced_is_sent_after_the_loss() {
     let (mut trees, mut commits, mut ids) = an_edit_to_the_content_a_lost_commit_replaced();
