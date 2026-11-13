@@ -1932,7 +1932,7 @@ impl World {
             if self.devices[d].recovering.is_some() {
                 continue;
             }
-            if self.devices[d].engine.effects.in_flight().first().is_some() {
+            if !self.devices[d].engine.effects.in_flight().is_empty() {
                 self.effect(d, Outcome::Run)?;
             }
             self.devices[d].link = None;

@@ -373,14 +373,7 @@ fn rewound_write_whose_delete_this_device_has_not_applied() {
             ],
         )
         .unwrap();
-    assert!(
-        world.devices[0]
-            .engine
-            .effects
-            .in_flight()
-            .first()
-            .is_none()
-    );
+    assert!(world.devices[0].engine.effects.in_flight().is_empty());
     assert!(world.devices[0].disk.holds(1));
     world.run(1, &[(0, Step::Rewind)]).unwrap();
     world.phase(2, &[]).unwrap();

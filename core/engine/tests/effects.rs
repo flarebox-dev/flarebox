@@ -974,7 +974,7 @@ fn done_takes_only_the_effect_in_flight_and_a_created_entry_needs_its_identity()
         effects.done(&mut trees, None, &id, None),
         Err(EffectError::MissingIdentity)
     );
-    assert!(effects.in_flight().first().is_some());
+    assert!(!effects.in_flight().is_empty());
     assert_eq!(
         effects.done(&mut trees, None, &id, Some(identity(5))),
         Ok(None)
@@ -1728,8 +1728,7 @@ fn a_parked_node_that_can_go_nowhere_is_reported_beside_a_failed_effect() {
     assert!(
         effects
             .plan(&trees, None, &mut ids, NOW, BatchLimit::ONE)
-            .first()
-            .is_none()
+            .is_empty()
     );
     let reported = koidrive_engine::effects::stuck(&trees, &effects, None);
     assert!(reported.contains_key("f"), "{reported:?}");

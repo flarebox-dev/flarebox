@@ -418,8 +418,14 @@ fn a_recorded_file_another_device_purges_is_created_again() {
     let (mut effects, mut effect_ids) = (Effects::default(), IdGen::new(50));
     assert!(
         effects
-            .plan(&trees, commits.in_flight(), &mut effect_ids, NOW, BatchLimit::ONE).first()
-            .is_none()
+            .plan(
+                &trees,
+                commits.in_flight(),
+                &mut effect_ids,
+                NOW,
+                BatchLimit::ONE
+            )
+            .is_empty()
     );
     let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
     assert!(
@@ -472,12 +478,16 @@ fn a_recorded_file_whose_s_update_waits_gets_no_download() {
     };
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
     assert!(
-        effects
-            .plan(&restored(false), None, &mut ids, NOW, BatchLimit::ONE).first()
-            .is_some()
+        !effects
+            .plan(&restored(false), None, &mut ids, NOW, BatchLimit::ONE)
+            .is_empty()
     );
     let (mut effects, mut ids) = (Effects::default(), IdGen::new(1));
-    assert!(effects.plan(&restored(true), None, &mut ids, NOW, BatchLimit::ONE).first().is_none());
+    assert!(
+        effects
+            .plan(&restored(true), None, &mut ids, NOW, BatchLimit::ONE)
+            .is_empty()
+    );
 }
 
 /// GUN-418: the move and edit of n at slot 1 wait behind h. Another device moves n back at seq 2,
@@ -753,7 +763,8 @@ fn a_lost_update_is_not_the_effects_base_while_it_cannot_fit() {
     for _ in 0..3 {
         assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
         let Some(record) = effects
-            .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE).first()
+            .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+            .first()
             .cloned()
         else {
             break;

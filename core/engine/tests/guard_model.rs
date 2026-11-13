@@ -298,15 +298,14 @@ impl World {
                 events.push(Event::Restore(member));
             }
         }
-        if (Effects::default().plan(
+        if !(Effects::default().plan(
             &self.trees,
             self.commits.in_flight(),
             &mut self.ids.clone(),
             self.now,
             BatchLimit::ONE,
         ))
-        .first()
-        .is_some()
+        .is_empty()
         {
             events.extend([Event::Step, Event::StepAll]);
         }

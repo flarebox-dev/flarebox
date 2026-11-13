@@ -1126,7 +1126,8 @@ fn run_ignoring(
                 &mut device.ids,
                 NOW as u64,
                 BatchLimit::ONE,
-            ).first()
+            )
+            .first()
             .cloned()
         {
             let known = device.trees.remote().get(&record.node).is_some()

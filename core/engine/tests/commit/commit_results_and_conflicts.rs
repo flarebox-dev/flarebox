@@ -94,7 +94,8 @@ fn a_folder_merged_into_one_l_holds_elsewhere_is_removed_once_its_files_follow_i
     assert_eq!(reverted, ["a", "c", "g"]);
     let mut effects = Effects::default();
     while let Some(record) = effects
-        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE).first()
+        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+        .first()
         .cloned()
     {
         effects
@@ -163,7 +164,8 @@ fn a_conflict_copy_downloaded_before_its_result_is_kept_once() {
         birth_ns: Some(0),
     };
     let download = effects
-        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE).first()
+        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+        .first()
         .cloned()
         .unwrap();
     assert_eq!(download.node, "y");
@@ -183,7 +185,8 @@ fn a_conflict_copy_downloaded_before_its_result_is_kept_once() {
     acknowledge(&mut commits, &mut trees, vec![copy]);
     let mut ino = 10;
     while let Some(record) = effects
-        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE).first()
+        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+        .first()
         .cloned()
     {
         effects
@@ -232,7 +235,8 @@ fn a_conflict_copy_whose_result_arrives_during_its_download_keeps_the_local_file
         birth_ns: Some(0),
     };
     let download = effects
-        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE).first()
+        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+        .first()
         .cloned()
         .unwrap();
     assert_eq!(download.node, "y");
@@ -257,7 +261,8 @@ fn a_conflict_copy_whose_result_arrives_during_its_download_keeps_the_local_file
     trees.settle();
     let mut ino = 10;
     while let Some(record) = effects
-        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE).first()
+        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+        .first()
         .cloned()
     {
         effects
@@ -320,7 +325,8 @@ fn a_conflict_copy_whose_s_update_waits_behind_a_new_folder_is_moved_to_its_name
     let mut effects = Effects::default();
     let mut ino = 10;
     while let Some(record) = effects
-        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE).first()
+        .plan(&trees, commits.in_flight(), &mut ids, NOW, BatchLimit::ONE)
+        .first()
         .cloned()
     {
         let identity = FileIdentity {
