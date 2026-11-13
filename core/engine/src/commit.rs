@@ -344,6 +344,17 @@ impl Commits {
             || (self.in_flight.as_ref()).is_some_and(|flight| flight.commit.commit_id == commit_id)
     }
 
+    /// Whether the commit in flight is `commit_id` and edits the content of `id`, other than as a
+    /// resend: a record of it that arrives before the result is this device's edit.
+    pub fn edits_in_flight(&self, commit_id: &str, id: &str) -> bool {
+        (self.in_flight.as_ref()).is_some_and(|flight| {
+            flight.commit.commit_id == commit_id
+                && (flight.commit.ops.iter()).any(|op| {
+                    matches!(&op.op, Some(op::Op::UpdateContent(update)) if update.node_id == id && !update.resend)
+                })
+        })
+    }
+
     /// Whether one of this device's commits that the server lost has seq `seq`: one above
     /// [`Commits::held_through`], until R is listed again.
     pub fn lost_here(&self, seq: u64) -> bool {

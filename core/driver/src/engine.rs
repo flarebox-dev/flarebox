@@ -415,7 +415,9 @@ impl Engine {
                     tx.put_remote_node(state)?;
                     if state.node_id != self.trees.remote().root {
                         let (id, node) = remote_node(state)?;
-                        if made_here {
+                        if made_here && self.commits.edits_in_flight(&at.commit_id, &id) {
+                            self.trees.set_remote_edited_here(id, node);
+                        } else if made_here {
                             self.trees.set_remote_made_here(id, node);
                         } else {
                             self.trees.set_remote(id, node);

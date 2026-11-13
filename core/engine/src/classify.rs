@@ -415,14 +415,18 @@ impl Trees {
     }
 
     pub fn set_remote(&mut self, id: NodeId, node: RemoteNode) {
-        self.apply_remote(id, node, false);
+        self.apply_remote(id, node, false, false);
     }
 
     pub fn set_remote_made_here(&mut self, id: NodeId, node: RemoteNode) {
-        self.apply_remote(id, node, true);
+        self.apply_remote(id, node, true, false);
     }
 
-    fn apply_remote(&mut self, id: NodeId, node: RemoteNode, made_here: bool) {
+    pub fn set_remote_edited_here(&mut self, id: NodeId, node: RemoteNode) {
+        self.apply_remote(id, node, true, true);
+    }
+
+    fn apply_remote(&mut self, id: NodeId, node: RemoteNode, made_here: bool, edit: bool) {
         let hidden = (self.r.get(&id)).is_some_and(|old| old.content_rev != node.content_rev)
             && !node.trashed
             && self.edited(&id)
@@ -459,7 +463,7 @@ impl Trees {
                 versions.remove(0);
             }
         }
-        let edited_here = made_here
+        let edited_here = edit
             && !node.trashed
             && (self.r.get(&id)).is_some_and(|old| old.edit_rev != node.edit_rev);
         let shape = node.shape.clone();
