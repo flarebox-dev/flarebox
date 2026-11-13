@@ -1025,7 +1025,9 @@ impl Commits {
         let left = self.ask_again(trees, ids, now_ms);
         let released = self.ask_recovery(trees, cause, left, ids, now_ms);
         let reclaimed = trees.reclaim(|_| true);
-        let discardable = reclaimed.into_iter().filter(|id| !holds_remote(trees, id));
+        let discardable = reclaimed
+            .into_iter()
+            .filter(|id| !holds_server_entry(trees, id));
         if let Some(question) =
             first_link::ask(trees, discardable, None, cause.as_ref(), ids, now_ms)
         {
@@ -2494,10 +2496,12 @@ fn edited_on_both_sides(trees: &Trees, id: &str) -> bool {
     (changed(&l) || trees.unsent_edits().contains(id)) && changed(&r) && !same_content(&l, &r)
 }
 
-fn holds_remote(trees: &Trees, id: &str) -> bool {
+fn holds_server_entry(trees: &Trees, id: &str) -> bool {
     trees.local_children(id).any(|child| {
         !trees.excluded(child)
-            && (trees.remote().live(child).is_some() || holds_remote(trees, child))
+            && (trees.remote().live(child).is_some()
+                || trees.synced().live(child).is_some()
+                || holds_server_entry(trees, child))
     })
 }
 
