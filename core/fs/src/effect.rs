@@ -241,6 +241,15 @@ impl Space {
         Ok(rustix::fs::openat(staging.fd(), id, flags, Mode::from_raw_mode(0o644))?.into())
     }
 
+    /// Flushes `folder` after a change in it. A folder on another device than the root, such as a volume mounted
+    /// below it, is flushed in full, since the full flush that ends a section reaches only the root's device.
+    pub(crate) fn flush_folder(&self, folder: &Folder, how: Flush) -> io::Result<()> {
+        match folder.id().dev == self.id().dev {
+            true => flush(folder.fd(), how),
+            false => flush(folder.fd(), Flush::Full),
+        }
+    }
+
     /// Opens the staged file of effect `id` that [`Space::stage`] created, to write more of its content.
     pub fn open_staged(&self, id: &str) -> io::Result<File> {
         check_name(OsStr::new(id))?;
@@ -319,7 +328,7 @@ impl Space {
                 hook(Step::Checked);
                 resolve!(self.recheck(&parent));
                 match rustix::fs::mkdirat(parent.fd(), name, Mode::from_raw_mode(0o755)) {
-                    Ok(()) => flush(parent.fd(), Flush::Plain)?,
+                    Ok(()) => self.flush_folder(&parent, Flush::Plain)?,
                     Err(Errno::EXIST) => return Ok(failed(Reason::Taken)),
                     Err(err) => return Err(err.into()),
                 }
@@ -370,8 +379,8 @@ impl Space {
                     }
                     Err(err) => return Err(err),
                 }
-                flush(source.fd(), Flush::Plain)?;
-                flush(target.fd(), Flush::Plain)?;
+                self.flush_folder(&source, Flush::Plain)?;
+                self.flush_folder(&target, Flush::Plain)?;
                 hook(Step::Placed);
                 Outcome::Done { identity: None }
             }
@@ -426,8 +435,8 @@ impl Space {
             }
             Err(err) => return Err(err),
         }
-        flush(parent.fd(), Flush::Plain)?;
-        flush(quarantine.fd(), Flush::Barrier)?;
+        self.flush_folder(&parent, Flush::Plain)?;
+        self.flush_folder(&quarantine, Flush::Barrier)?;
         hook(Step::Quarantined);
 
         let differs = differs(quarantine.fd(), id, &displaced.entry, contents)?;
@@ -473,8 +482,8 @@ impl Space {
             }
             Err(err) => return Err(err),
         }
-        flush(staging.fd(), Flush::Plain)?;
-        flush(target.fd(), Flush::Plain)?;
+        self.flush_folder(staging, Flush::Plain)?;
+        self.flush_folder(target, Flush::Plain)?;
         hook(Step::Placed);
         Ok(Outcome::Done {
             identity: Some(identity),
@@ -508,8 +517,8 @@ impl Space {
         };
         match rename_no_replace(quarantine.fd(), id, parent.fd(), name) {
             Ok(()) => {
-                flush(quarantine.fd(), Flush::Plain)?;
-                flush(parent.fd(), Flush::Barrier)?;
+                self.flush_folder(quarantine, Flush::Plain)?;
+                self.flush_folder(&parent, Flush::Barrier)?;
                 Ok(None)
             }
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {

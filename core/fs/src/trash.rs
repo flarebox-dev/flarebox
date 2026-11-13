@@ -12,7 +12,7 @@ use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
 use crate::resolve::{Folder, Space, check_name};
-use crate::root::{Flush, flush, rename_no_replace, replace_file};
+use crate::root::{Flush, rename_no_replace, replace_file};
 use crate::{FileType, list, stat_at};
 
 /// The folder inside the private folder that holds the local trash.
@@ -101,8 +101,8 @@ impl Space {
         self.recheck(from)?;
         self.recheck(&trash)?;
         rename_no_replace(from.fd(), name, trash.fd(), OsStr::new(entry))?;
-        flush(from.fd(), Flush::Plain)?;
-        flush(trash.fd(), Flush::Barrier)
+        self.flush_folder(from, Flush::Plain)?;
+        self.flush_folder(&trash, Flush::Barrier)
     }
 
     /// Reclaims the local trash at `now`: entries older than
