@@ -1,11 +1,11 @@
 # Releasing the macOS app
 
-The [macOS release](../.github/workflows/release-macos.yml) workflow builds the app from `apps/macos` as a disk image (DMG). It never creates a GitHub release and never publishes anything: the DMG is only a workflow artifact on the run's page. Publishing a release is a separate, manual step.
+The [macOS release](../.github/workflows/release-macos.yml) workflow builds the app from `apps/macos` as a disk image (DMG), signs and notarizes it. For a version tag, the [CLI distribution](../.github/workflows/release-cli.yml) workflow runs it as one of its jobs and publishes the DMG on the tag's GitHub release, next to the CLI tarballs and in the same `SHA256SUMS`.
 
 | Trigger | What it builds |
 |---|---|
-| A tag like `v0.1.0` on a commit that is on `main` | The app at version 0.1.0, signed and notarized if the signing secrets are set |
-| **Run workflow** (manual) from `main` | The same, at the version you enter, or `MARKETING_VERSION` from `apps/macos/project.yml` when you leave it empty |
+| A tag like `v0.1.0`, `v0.1.0-alpha.2` or `v0.1.0-rc.1` on a commit that is on `main` | The CLI distribution workflow builds the app at that version, signed and notarized, and attaches `Koidrive-<version>-arm64.dmg` to the release, for example `Koidrive-0.1.0-alpha.2-arm64.dmg`. If the app does not build, sign, notarize or verify, or a signing secret is missing, the run fails and publishes nothing, not even the CLI tarballs. |
+| **Run workflow** (manual) on the macOS release workflow from `main` | The app at the version you enter (`0.1.0` or `0.1.0-alpha.2`), or at `MARKETING_VERSION` from `apps/macos/project.yml` when you leave it empty. It is signed and notarized if the signing secrets are set, and it is only a workflow artifact on the run's page. |
 | Pull requests, the merge queue and pushes to `main` | An unsigned DMG, to check that the build, packaging and verification still work. The `macos app` job of [CI](../.github/workflows/ci.yml) builds it after testing the app's Swift bindings. A pull request or merge queue run builds it only when the change touches `core/`, `apps/macos/`, `.cargo/`, the Cargo files (including `cli/Cargo.toml`, which Cargo loads as a workspace member), `rust-toolchain.toml` or the workflow. A push to `main` always builds it, and `ci-report` fails the push if it did not run and pass. For a pull request from a fork it runs on GitHub-hosted `xcode-27` runners with Xcode 27.2. For a pull request from a branch of this repository, the `pick-macos` job of CI puts it on a self-hosted Mac runner or on `xcode-27`. In the merge queue and on `main` it runs on the self-hosted Mac runners with the Xcode installed there, or on `xcode-27` when the `MACOS_RUNS_ON` variable is set (see the [runner README](../.github/runner/README.md), which also describes the hook that keeps fork pull requests off the self-hosted runners). These runs never see the signing secrets. |
 
 ## What a signed run does
@@ -21,9 +21,23 @@ The [macOS release](../.github/workflows/release-macos.yml) workflow builds the 
 9. Uploads `Koidrive-<version>-arm64.dmg` as an artifact and writes its SHA-256 to the run summary.
 10. Deletes the keychain and the key files, even when a step failed.
 
+For a tag, the CLI distribution workflow then writes one `SHA256SUMS` for the CLI tarballs and the DMG, and [`scripts/publish-release.sh`](../scripts/publish-release.sh) attaches all of them to the release in one step. It refuses to publish when the DMG for the tag's version is missing, when any other file is present (an unsigned DMG included), or when `SHA256SUMS` does not list exactly those files with matching hashes.
+
 If Apple reports a submission as Invalid or Rejected, the log shows Apple's notarization log for it. If Apple gives no final answer within 2.5 hours, the step fails and names the submission id.
 
-When none of the signing secrets are set, the run still builds the DMG but signs it ad hoc only, names it `Koidrive-<version>-arm64-unsigned.dmg`, and says "Signing skipped" in a warning and in the run summary. Gatekeeper blocks such a DMG on other Macs. When only some of the secrets are set, the run fails and names the missing ones.
+When none of the signing secrets are set, a manual run still builds the DMG but signs it ad hoc only, names it `Koidrive-<version>-arm64-unsigned.dmg`, and says "Signing skipped" in a warning and in the run summary. Gatekeeper blocks such a DMG on other Macs. When only some of the secrets are set, the run fails and names the missing ones. A tag run fails when any of them is missing.
+
+## Versions
+
+The app carries the version in three `Info.plist` keys. For the tag `v0.1.0-alpha.2`:
+
+| Key | Value | Set from |
+|---|---|---|
+| `CFBundleShortVersionString` | `0.1.0` | The `X.Y.Z` part of the version, because macOS expects three numbers here |
+| `CFBundleVersion` | The build number, for example `412` | The run number of the workflow run: the CLI distribution run for a tag, or the macOS release run (or the **build-number** input) for a manual run |
+| `KoidriveVersion` | `0.1.0-alpha.2` | The full version, including `-alpha.N` or `-rc.N` |
+
+`apps/macos/scripts/build-release.sh` takes the full version in `VERSION` and sets the first and third keys; `KoidriveVersion` comes from the `KOIDRIVE_VERSION` build setting in `apps/macos/project.yml`, which defaults to `MARKETING_VERSION`. Read `KoidriveVersion` to compare two builds, because it orders `0.1.0-alpha.2` before `0.1.0-rc.1` and `0.1.0`, which `CFBundleShortVersionString` cannot.
 
 ## Before you add any secret
 
@@ -53,7 +67,7 @@ Only repository admins can then create, move or delete `v*` tags; everyone else,
 4. Deselect **Allow administrators to bypass configured protection rules** and click **Save protection rules**.
 5. Under "Deployment branches and tags", choose **Selected branches and tags**. Click **Add deployment branch or tag rule**, choose **Branch** as the ref type, type `main` and click **Add rule**. Click it again, choose **Tag**, type `v*` and click **Add rule**.
 
-Each signed run then waits on its run page until you click **Review deployments**, select `macos-release` and **Approve and deploy**. Approve only runs for a commit and version you meant to release ([Managing environments for deployment](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)).
+Each signed run then waits on its run page until you click **Review deployments**, select `macos-release` and **Approve and deploy**. A tag run of the CLI distribution workflow asks twice: once when the app job starts, and again when the CLI tarballs are ready for signing. Approve only runs for a commit and version you meant to release ([Managing environments for deployment](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)).
 
 ### 3. Keep the secrets in the environment only
 
@@ -109,11 +123,11 @@ GitHub never shows a secret again after you save it. If the secret is lost, crea
 ## Run a release build
 
 - **Manually:** open **Actions**, **macOS release**, **Run workflow**, keep `main` under "Use workflow from", and enter a version such as `0.1.0` or leave it empty. A run from any other branch fails in the "commit on main" job.
-- **From a tag:** merge the release to `main`, then tag a commit on `main`, for example `git fetch origin main && git tag v0.1.0 origin/main && git push origin v0.1.0`, so the tag lands on the latest merged commit. The tag must be three numbers after the `v`, and a tag on a commit that is not on `main` fails in the "commit on main" job.
+- **From a tag:** merge the release to `main`, then tag a commit on `main`, for example `git fetch origin main && git tag v0.1.0-alpha.2 origin/main && git push origin v0.1.0-alpha.2`, so the tag lands on the latest merged commit. The tag is `v` and three numbers, optionally followed by `-alpha.N` or `-rc.N`. The tag starts the CLI distribution workflow, and a tag on a commit that is not on `main` fails in its "commit on main" jobs.
 
 Either way, approve the deployment to `macos-release` on the run page when it asks.
 
-Download the DMG from the **Artifacts** section of the run's page. To check it on your Mac:
+Download the DMG from the tag's release, or from the **Artifacts** section of a manual run's page. To check it on your Mac:
 
 ```sh
 hdiutil attach Koidrive-0.1.0-arm64.dmg -nobrowse -readonly
@@ -125,7 +139,7 @@ hdiutil detach /Volumes/Koidrive
 
 ### If the app's notarization was interrupted
 
-Each notarization step prints its submission id in the log and as a notice on the run's page. If the run failed while Apple was still processing the app, for example after a network error or at the deadline, you can wait for that submission instead of submitting the app again. `xcrun notarytool info <id>` with the team's API key shows its status. Start a new manual run with the same version, enter the failed run's build number as **build-number** (its "Decide the version" step prints `Version <version>, build <number>.`), and enter the id as **app-submission-id**. The new run rebuilds the same app, waits for that submission and staples its ticket. If the rebuilt app differs from the submitted one, stapling fails, and the step says so; run again with **app-submission-id** empty to submit the app again.
+Each notarization step prints its submission id in the log and as a notice on the run's page. If the run failed while Apple was still processing the app, for example after a network error or at the deadline, you can wait for that submission instead of submitting the app again. `xcrun notarytool info <id>` with the team's API key shows its status. This works for manual runs only; a tag run submits again when you rerun its failed jobs. Start a new manual run with the same version, enter the failed run's build number as **build-number** (its "Decide the version" step prints `Version <version>, build <number>.`), and enter the id as **app-submission-id**. The new run rebuilds the same app, waits for that submission and staples its ticket. If the rebuilt app differs from the submitted one, stapling fails, and the step says so; run again with **app-submission-id** empty to submit the app again.
 
 The disk image always goes through a new submission, because a rebuilt disk image is never identical to the one submitted before.
 
@@ -136,5 +150,5 @@ The disk image always goes through a new submission, because a rebuilt disk imag
 ## Limits
 
 - The DMG runs on Apple silicon only. `scripts/build-ffi.sh` builds the Rust library for the runner's architecture, and the release runners are arm64, so there is no Intel or universal build yet.
-- Nothing is published: no GitHub release, no update feed, no Homebrew cask.
+- There is no update feed and no Homebrew cask.
 - A run cannot wait for an earlier submission of the disk image. Every run builds a new disk image and submits it.

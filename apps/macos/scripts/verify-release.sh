@@ -7,7 +7,8 @@
 #             to the app and the disk image, and Gatekeeper acceptance of both
 #   unsigned  an ad hoc signature with the hardened runtime; Gatekeeper is expected to reject it
 # Optional environment:
-#   VERSION   the expected CFBundleShortVersionString
+#   VERSION   the expected KoidriveVersion, for example 0.1.0-alpha.2; its X.Y.Z part is the expected
+#             CFBundleShortVersionString
 set -euo pipefail
 
 if [ $# -ne 2 ] || { [ "$2" != signed ] && [ "$2" != unsigned ]; }; then
@@ -37,10 +38,13 @@ app="$mountpoint/Koidrive.app"
 [ -L "$mountpoint/Applications" ] || fail "$dmg has no link to /Applications."
 
 echo "== Info.plist"
-plutil -p "$app/Contents/Info.plist" | grep -E 'CFBundle(ShortVersionString|Version|Identifier)"'
+plutil -p "$app/Contents/Info.plist" | grep -E '"(CFBundleShortVersionString|CFBundleVersion|CFBundleIdentifier|KoidriveVersion)"'
 if [ -n "${VERSION:-}" ]; then
-  actual="$(plutil -extract CFBundleShortVersionString raw -o - "$app/Contents/Info.plist")"
-  [ "$actual" = "$VERSION" ] || fail "The app's CFBundleShortVersionString is $actual, expected $VERSION."
+  for pair in "KoidriveVersion=$VERSION" "CFBundleShortVersionString=${VERSION%%-*}"; do
+    key="${pair%%=*}"
+    actual="$(plutil -extract "$key" raw -o - "$app/Contents/Info.plist" 2>/dev/null || echo missing)"
+    [ "$actual" = "${pair#*=}" ] || fail "The app's $key is $actual, expected ${pair#*=}."
+  done
 fi
 
 echo "== codesign --verify --deep --strict (app)"

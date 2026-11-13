@@ -18,6 +18,10 @@ targets:
     platform: macOS
     sources:
       - Koidrive
+    info:
+      path: build/Info.plist
+      properties:
+        KoidriveVersion: $(KOIDRIVE_VERSION)
     dependencies:
       - package: KoidriveFFI
         product: KoidriveFFI
@@ -32,6 +36,7 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: Koidrive
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.productivity
         MARKETING_VERSION: 0.1.0
+        KOIDRIVE_VERSION: $(MARKETING_VERSION)
         CURRENT_PROJECT_VERSION: 1
         SWIFT_VERSION: 6.0
         ONLY_ACTIVE_ARCH: YES

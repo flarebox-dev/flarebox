@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Tests scripts/publish-release.sh against a stub gh that keeps releases in a directory and
-# follows GitHub's rules for Latest: --latest=true moves it, --latest=false leaves it, and a draft
-# or a prerelease is never Latest. The release list goes through the script's own jq filter.
+# Tests scripts/publish-release.sh against a stub gh that keeps releases and their uploaded file names
+# in a directory and follows GitHub's rules for Latest: --latest=true moves it, --latest=false leaves it,
+# and a draft or a prerelease is never Latest. The release list goes through the script's own jq filter.
 set -euo pipefail
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-mkdir -p "$tmp/bin" "$tmp/dist"
-touch "$tmp/dist/SHA256SUMS"
+mkdir -p "$tmp/bin"
 cat > "$tmp/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -38,7 +37,11 @@ case "$1 $2" in
         fi
         ;;
     "release create") echo "true false" > "$db/release-$3" ;;
-    "release upload") ;;
+    "release upload")
+        for arg in "${@:4}"; do
+            [ "$arg" = --clobber ] || basename "$arg"
+        done >> "$db/assets-$3"
+        ;;
     "release edit")
         tag=$3
         read -r draft prerelease < "$db/release-$tag"
@@ -62,10 +65,22 @@ chmod +x "$tmp/bin/gh"
 export PATH="$tmp/bin:$PATH" GH_REPO=koidrive/koidrive GH_STUB_DIR="$tmp/db" PRERELEASE_TAGS_PUBLISH_AS=latest
 passed=0
 
-publish() {
+stage() {
+    rm -rf "$tmp/dist"
+    mkdir "$tmp/dist"
+    echo cli > "$tmp/dist/koidrive-x86_64-unknown-linux-musl.tar.gz"
+    echo cli > "$tmp/dist/koidrive-aarch64-apple-darwin.tar.gz"
+    echo app > "$tmp/dist/Koidrive-${1#v}-arm64.dmg"
+    (cd "$tmp/dist" && sha256sum koidrive-*.tar.gz Koidrive-*.dmg > SHA256SUMS)
+}
+publish_staged() {
     local prerelease=false
     if [[ $1 == *-* ]]; then prerelease=true; fi
     PRERELEASE=$prerelease bash "$root/scripts/publish-release.sh" "$1" "$tmp/dist"
+}
+publish() {
+    stage "$1"
+    publish_staged "$1"
 }
 pass() {
     echo "PASS $1"
@@ -81,6 +96,50 @@ fresh() {
     rm -rf "$tmp/db"
     mkdir -p "$tmp/db"
 }
+expect_refused() {
+    local tag=$1 message=$2 description=$3 output
+    if output=$(publish_staged "$tag" 2>&1); then
+        echo "FAIL $description: the publish succeeded" >&2
+        exit 1
+    fi
+    grep '^::error::' <<< "$output" | grep -qF "$message" || { echo "FAIL $description: expected an error with '$message' in:" >&2; echo "$output" >&2; exit 1; }
+    [ ! -e "$tmp/db/release-$tag" ] || { echo "FAIL $description: the release $tag was created" >&2; exit 1; }
+    pass "$description"
+}
+
+fresh
+publish v0.1.0-alpha.2
+[ "$(sort "$tmp/db/assets-v0.1.0-alpha.2")" = "$(printf '%s\n' Koidrive-0.1.0-alpha.2-arm64.dmg SHA256SUMS koidrive-aarch64-apple-darwin.tar.gz koidrive-x86_64-unknown-linux-musl.tar.gz | sort)" ] \
+    || { echo 'FAIL the release does not have the tarballs, the dmg and SHA256SUMS' >&2; cat "$tmp/db/assets-v0.1.0-alpha.2" >&2; exit 1; }
+pass 'a prerelease tag attaches the tarballs, its dmg and SHA256SUMS'
+
+fresh
+stage v0.2.0
+rm "$tmp/dist/Koidrive-0.2.0-arm64.dmg"
+(cd "$tmp/dist" && sha256sum koidrive-*.tar.gz > SHA256SUMS)
+expect_refused v0.2.0 'has no Koidrive-0.2.0-arm64.dmg' 'a release without the dmg is refused'
+stage v0.2.0
+mv "$tmp/dist/Koidrive-0.2.0-arm64.dmg" "$tmp/dist/Koidrive-0.2.0-arm64-unsigned.dmg"
+(cd "$tmp/dist" && sha256sum koidrive-*.tar.gz Koidrive-*.dmg > SHA256SUMS)
+expect_refused v0.2.0 'has no Koidrive-0.2.0-arm64.dmg' 'an unsigned dmg alone is refused'
+stage v0.2.0
+echo app > "$tmp/dist/Koidrive-0.2.0-arm64-unsigned.dmg"
+(cd "$tmp/dist" && sha256sum koidrive-*.tar.gz Koidrive-*.dmg > SHA256SUMS)
+expect_refused v0.2.0 'has Koidrive-0.2.0-arm64-unsigned.dmg' 'an unsigned dmg next to the signed one is refused'
+stage v0.2.0-alpha.1
+expect_refused v0.2.0 'has no Koidrive-0.2.0-arm64.dmg' 'a dmg of another version is refused'
+stage v0.2.0
+grep -v dmg "$tmp/dist/SHA256SUMS" > "$tmp/sums" && mv "$tmp/sums" "$tmp/dist/SHA256SUMS"
+expect_refused v0.2.0 'SHA256SUMS lists Koidrive-0.2.0-arm64.dmg 0 times' 'a dmg missing from SHA256SUMS is refused'
+stage v0.2.0
+(cd "$tmp/dist" && sha256sum koidrive-x86_64-unknown-linux-musl.tar.gz | sed 's/musl/gnu/') >> "$tmp/dist/SHA256SUMS"
+expect_refused v0.2.0 'SHA256SUMS has 4 entries' 'SHA256SUMS entries for files that are not published are refused'
+stage v0.2.0
+echo changed > "$tmp/dist/Koidrive-0.2.0-arm64.dmg"
+expect_refused v0.2.0 'does not match its SHA256SUMS entry' 'a dmg that does not match SHA256SUMS is refused'
+stage v0.2.0
+rm "$tmp/dist/SHA256SUMS"
+expect_refused v0.2.0 'has no SHA256SUMS' 'a release without SHA256SUMS is refused'
 
 fresh
 publish v0.1.0-alpha.1
