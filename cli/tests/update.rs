@@ -3,6 +3,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
@@ -1234,4 +1235,124 @@ fn homebrew_guidance_targets_its_owner_when_path_selects_another_brew() {
         assert_eq!(std::fs::read_link(&binary).unwrap(), link_before);
         assert!(!update_log(&root).exists());
     }
+}
+
+#[test]
+fn a_relocated_formula_is_found_from_the_process_invocation() {
+    let home = tempfile::tempdir().unwrap();
+    let github = github("v99.0.0");
+    let link = homebrew_binary(home.path(), false);
+    let prefix = home.path().join("brew");
+    let version = prefix.join("Cellar/koidrive/0.1.0");
+    let external = home.path().join("external/koidrive/0.1.0");
+    std::fs::create_dir_all(external.parent().unwrap()).unwrap();
+    std::fs::rename(&version, &external).unwrap();
+    std::fs::write(external.join("INSTALL_RECEIPT.json"), "{}").unwrap();
+    let opt = prefix.join("opt/koidrive");
+    std::fs::remove_file(&opt).unwrap();
+    std::os::unix::fs::symlink(&external, &opt).unwrap();
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink("../opt/koidrive/bin/koi", &link).unwrap();
+    let alias = home.path().join("alias");
+    std::os::unix::fs::symlink(&link, &alias).unwrap();
+    let before = std::fs::read(&alias).unwrap();
+    for invoked in [alias.as_path(), Path::new("./alias"), Path::new("koi")] {
+        let path = if invoked == Path::new("koi") {
+            prefix.join("bin")
+        } else {
+            home.path().join("no-tools")
+        };
+        let output = koi_at(invoked, home.path(), &github, &["update", "--json"])
+            .current_dir(home.path())
+            .env_remove("HOMEBREW_PREFIX")
+            .env("PATH", &path)
+            .env("KOIDRIVE_UPDATE_CHECK_URL", "not-a-URL")
+            .output()
+            .unwrap();
+        if development_update(&output, home.path(), &github) {
+            continue;
+        }
+        let response = envelope(&output);
+        assert!(output.status.success(), "{response:#}");
+        let owner = std::fs::canonicalize(prefix.join("bin"))
+            .unwrap()
+            .join("brew");
+        let brew = if invoked == Path::new("koi") {
+            "brew"
+        } else {
+            owner.to_str().unwrap()
+        };
+        assert_eq!(
+            response["next_commands"],
+            serde_json::json!([{ "argv": [brew, "upgrade", "koidrive"] }])
+        );
+    }
+    assert_eq!(std::fs::read(&alias).unwrap(), before);
+    assert_eq!(std::fs::read_link(&alias).unwrap(), link);
+    assert!(!prefix.join("bin/brew.calls").exists());
+    assert!(!update_log(home.path()).exists());
+    assert!(github.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_formula_receipt_with_no_discoverable_prefix_never_self_replaces() {
+    let home = tempfile::tempdir().unwrap();
+    let github = github("v99.0.0");
+    let keg = home.path().join("external/package/0.1.0");
+    let binary = copy_koi(&keg.join("bin/koi"));
+    std::fs::write(keg.join("INSTALL_RECEIPT.json"), "{}").unwrap();
+    let alias = home.path().join("direct-store-alias");
+    std::os::unix::fs::symlink(&binary, &alias).unwrap();
+    let before = std::fs::read(&binary).unwrap();
+    for invoked in [&binary, &alias] {
+        let output = koi_at(invoked, home.path(), &github, &["update", "--json"])
+            .env_remove("HOMEBREW_PREFIX")
+            .env("PATH", home.path().join("no-tools"))
+            .env("KOIDRIVE_UPDATE_CHECK_URL", "not-a-URL")
+            .output()
+            .unwrap();
+        if development_update(&output, home.path(), &github) {
+            continue;
+        }
+        let response = envelope(&output);
+        assert!(!output.status.success(), "{response:#}");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Homebrew"),
+            "{response:#}"
+        );
+    }
+    assert_eq!(std::fs::read(&binary).unwrap(), before);
+    assert!(!update_log(home.path()).exists());
+    assert!(github.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn an_unverified_invocation_never_enters_installer_replacement() {
+    let home = tempfile::tempdir().unwrap();
+    let github = github("v99.0.0");
+    let binary = copy_koi(&home.path().join("standalone/koi"));
+    let before = std::fs::read(&binary).unwrap();
+    let output = koi_at(&binary, home.path(), &github, &["update", "--json"])
+        .arg0("missing-invocation")
+        .env("PATH", home.path().join("no-tools"))
+        .env("KOIDRIVE_UPDATE_CHECK_URL", "not-a-URL")
+        .output()
+        .unwrap();
+    if !development_update(&output, home.path(), &github) {
+        let response = envelope(&output);
+        assert!(!output.status.success(), "{response:#}");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("run its full path"),
+            "{response:#}"
+        );
+    }
+    assert_eq!(std::fs::read(&binary).unwrap(), before);
+    assert!(!update_log(home.path()).exists());
+    assert!(github.requests.lock().unwrap().is_empty());
 }

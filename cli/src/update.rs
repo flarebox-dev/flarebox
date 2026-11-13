@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -154,7 +155,33 @@ impl Install {
         }
         let binary = std::env::current_exe()
             .map_err(|error| failed(format!("Cannot locate this koi: {error}")))?;
-        Self::resolve(&binary, env!("CARGO_PKG_VERSION"), &prefixes)
+        let invoked = std::env::args_os()
+            .next()
+            .and_then(|arg| Self::invoked(&binary, &arg, std::env::var_os("PATH").as_deref()));
+        let install = Self::resolve(
+            invoked.as_deref().unwrap_or(&binary),
+            env!("CARGO_PKG_VERSION"),
+            &prefixes,
+        )?;
+        if invoked.is_none() && install.method == Method::Installer {
+            return Err(failed(
+                "Cannot identify the invoked koi; run its full path to update".to_owned(),
+            ));
+        }
+        Ok(install)
+    }
+
+    fn invoked(binary: &Path, arg: &OsStr, path: Option<&OsStr>) -> Option<PathBuf> {
+        if arg.is_empty() {
+            return None;
+        }
+        let invoked = Path::new(arg);
+        let invoked = if invoked.is_absolute() || invoked.components().count() > 1 {
+            invoked.to_path_buf()
+        } else {
+            on_path(arg, path)?
+        };
+        (fs::canonicalize(&invoked).ok()? == fs::canonicalize(binary).ok()?).then_some(invoked)
     }
 
     fn resolve(binary: &Path, version: &str, prefixes: &[PathBuf]) -> Result<Self, CliError> {
@@ -235,6 +262,13 @@ impl Install {
                 },
                 None => Method::App,
             }
+        } else if resolved.ends_with("bin/koi")
+            && resolved
+                .ancestors()
+                .nth(2)
+                .is_some_and(|keg| keg.join("INSTALL_RECEIPT.json").is_file())
+        {
+            return Err(failed("Cannot locate the Homebrew that owns this koi; set its HOMEBREW_PREFIX or put its bin directory on PATH".to_owned()));
         } else if resolved.file_name().is_some_and(|name| name == "koi")
             && !resolved
                 .components()
@@ -257,20 +291,9 @@ impl Install {
         match &self.method {
             Method::Cask { brew } | Method::Formula { brew } => {
                 let path = std::env::var_os("PATH");
-                let selected = path
-                    .as_ref()
-                    .and_then(|path| {
-                        std::env::split_paths(path)
-                            .map(|bin| bin.join("brew"))
-                            .find(|candidate| {
-                                fs::metadata(candidate).is_ok_and(|metadata| {
-                                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-                                })
-                            })
-                    })
-                    .and_then(|selected| {
-                        selected.parent().and_then(|bin| fs::canonicalize(bin).ok())
-                    });
+                let selected = on_path(OsStr::new("brew"), path.as_deref()).and_then(|selected| {
+                    selected.parent().and_then(|bin| fs::canonicalize(bin).ok())
+                });
                 let owned = brew.parent().and_then(|bin| fs::canonicalize(bin).ok());
                 let executable = if owned.is_some() && selected == owned {
                     "brew"
@@ -306,6 +329,16 @@ fn command_text(command: &[&str]) -> String {
         .map(|word| crate::pairing::shell_word(word))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn on_path(name: &OsStr, path: Option<&OsStr>) -> Option<PathBuf> {
+    std::env::split_paths(path?)
+        .map(|bin| bin.join(Path::new(name)))
+        .find(|candidate| {
+            fs::metadata(candidate).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
 }
 
 fn refuse_root(root: bool) -> Result<(), CliError> {
@@ -2561,6 +2594,62 @@ mod tests {
                 }
             );
             assert_eq!(install.binary, fs::canonicalize(&binary).unwrap());
+        }
+    }
+
+    #[test]
+    fn invocation_hints_must_resolve_to_the_running_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("actual/koi");
+        executable(&binary, "#!/bin/sh\nexit 0\n");
+        let kernel = fs::canonicalize(&binary).unwrap();
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let alias = bin.join("koi");
+        std::os::unix::fs::symlink(&binary, &alias).unwrap();
+        assert_eq!(
+            Install::invoked(&kernel, alias.as_os_str(), None),
+            Some(alias.clone())
+        );
+        assert_eq!(
+            Install::invoked(&kernel, OsStr::new("koi"), Some(bin.as_os_str())),
+            Some(alias)
+        );
+        let other = dir.path().join("other/koi");
+        executable(&other, "#!/bin/sh\nexit 0\n");
+        assert_eq!(Install::invoked(&kernel, other.as_os_str(), None), None);
+        let shadowed = std::env::join_paths([other.parent().unwrap(), &bin]).unwrap();
+        assert_eq!(
+            Install::invoked(&kernel, OsStr::new("koi"), Some(&shadowed)),
+            None
+        );
+        assert_eq!(
+            Install::invoked(&kernel, OsStr::new(""), Some(&shadowed)),
+            None
+        );
+        let cwd = std::env::current_dir().unwrap();
+        let relative_dir = tempfile::tempdir_in(&cwd).unwrap();
+        let binary = relative_dir.path().join("koi");
+        executable(&binary, "#!/bin/sh\nexit 0\n");
+        let relative = Path::new(".").join(binary.strip_prefix(&cwd).unwrap());
+        assert_eq!(
+            Install::invoked(&binary, relative.as_os_str(), None),
+            Some(relative)
+        );
+    }
+
+    #[test]
+    fn a_homebrew_receipt_blocks_installer_fallback_without_an_owning_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let keg = dir.path().join("external/package/0.1.0");
+        let binary = keg.join("bin/koi");
+        executable(&binary, "#!/bin/sh\nexit 0\n");
+        fs::write(keg.join("INSTALL_RECEIPT.json"), "{}").unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&binary, &alias).unwrap();
+        for invoked in [&binary, &alias] {
+            let error = Install::resolve(invoked, "0.1.0", &[]).err().unwrap();
+            assert!(error.message.contains("Homebrew"), "{}", error.message);
         }
     }
 }
