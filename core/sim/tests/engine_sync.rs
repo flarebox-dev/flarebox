@@ -628,8 +628,11 @@ impl Device {
                 if unseen(&id, Kind::File) {
                     return;
                 }
-                node.shape.content = Some(content(1, action.text));
-                self.touched.insert(id.clone());
+                let written = Some(content(1, action.text));
+                if node.shape.content != written {
+                    self.touched.insert(id.clone());
+                }
+                node.shape.content = written;
                 self.trees.set_local(id, node);
             }
             (3, Some((id, mut node))) if !taken(&id) && !self.holds(&id, &parent) => {
@@ -641,7 +644,9 @@ impl Device {
                         self.trees.ignore_local(&id)
                     }
                     _ => {
-                        self.touched.insert(id.clone());
+                        if node.shape.parent != parent || node.shape.name != name {
+                            self.touched.insert(id.clone());
+                        }
                         node.shape.parent = parent;
                         node.shape.name = name.into();
                         self.trees.set_local(id, node);

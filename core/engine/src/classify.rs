@@ -677,9 +677,10 @@ impl Trees {
 
     /// Whether `id` is an entry the person discarded on a first link (section 6.4), that R does not
     /// hold and the user changed since: L holds it at another place or with other content than
-    /// the person discarded, or holds an entry below it that was not discarded there or that is
-    /// reclaimed itself. The entry is the user's again, so it is not removed: the commit planner
-    /// drops it from S, with every reclaimed folder above it, and sends them again.
+    /// the person discarded, or holds an entry below it, held by no question, that was not
+    /// discarded there or that is reclaimed itself. The entry is the user's again, so it is not
+    /// removed: the commit planner drops it from S, with every reclaimed folder above it, and
+    /// sends them again.
     pub fn reclaimed(&self, id: &str) -> bool {
         let (Some(local), Some(discarded)) = (self.l.get(id), self.discarded.get(id)) else {
             return false;
@@ -689,6 +690,7 @@ impl Trees {
             && (!local.shape.same(discarded)
                 || (self.local_children(id)).any(|child| {
                     !self.excluded(child)
+                        && !self.held(child)
                         && ((self.discarded.get(child)).is_none_or(|shape| shape.parent != id)
                             || self.reclaimed(child))
                 }))

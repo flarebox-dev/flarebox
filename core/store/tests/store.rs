@@ -3033,3 +3033,134 @@ fn remote_tree_can_be_counted_and_cleared() {
         })
         .unwrap();
 }
+
+#[test]
+fn a_discarded_folder_is_not_sent_while_a_question_asks_again_about_what_it_holds() {
+    use koidrive_engine::classify::Trees;
+    use koidrive_engine::effects::Effects;
+    use koidrive_engine::ids::IdGen;
+    use koidrive_engine::tree::{LocalNode as Entry, RemoteNode};
+
+    for answer in [Answer::Discard, Answer::Publish] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let mut trees = Trees::new("root");
+        let folder = EngineShape {
+            parent: "root".into(),
+            name: "dir".into(),
+            kind: Kind::Dir,
+            content: None,
+        };
+        for (ino, (id, shape)) in [("dir", folder), ("c", engine_shape("dir", "c.txt"))]
+            .into_iter()
+            .enumerate()
+        {
+            let identity = FileIdentity {
+                dev: 1,
+                ino: ino as u128 + 1,
+                birth_ns: Some(0),
+            };
+            let entry = Entry {
+                shape,
+                identity,
+                parked: false,
+            };
+            trees.set_local(id.into(), entry);
+        }
+        trees.set_remote(
+            "other".into(),
+            RemoteNode {
+                shape: engine_shape("root", "other.txt"),
+                trashed: false,
+                meta_rev: 1,
+                content_rev: 1,
+                trash_group: String::new(),
+                version_id: String::new(),
+            },
+        );
+        trees.settle();
+        let mut commits = Commits::default();
+        let mut ids = IdGen::new(335);
+        commits.first_link(&mut trees, &mut ids, 1);
+        let question = commits.questions()[0].id.clone();
+        assert!(commits.decide(&question, Answer::Discard));
+        assert!(
+            commits
+                .build(&mut trees, &mut ids, 1, "history", 1)
+                .is_none()
+        );
+        trees.set_synced("c".into(), None);
+        trees.settle();
+        assert!(trees.synced().get("dir").is_some());
+        assert!(trees.synced().get("c").is_none());
+        let before = EngineState {
+            trees: trees.state(),
+            commits: commits.state(),
+            effects: EffectsState::default(),
+        };
+        Store::open(&path)
+            .unwrap()
+            .transaction(|tx| {
+                tx.put_synced_node(&SyncedNode {
+                    node_id: "dir".into(),
+                    shape: dir_shape("root", "dir"),
+                })?;
+                for (ino, (id, shape)) in [
+                    ("dir", dir_shape("root", "dir")),
+                    ("c", file_shape("dir", "c.txt")),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    tx.put_local_node(&LocalNode {
+                        node_id: id.into(),
+                        shape,
+                        identity: FileId {
+                            dev: 1,
+                            ino: ino as u128 + 1,
+                            birth_ns: Some(0),
+                        },
+                        parked: false,
+                    })?;
+                }
+                tx.set_engine_state(&before)
+            })
+            .unwrap();
+        store_before(&path, "discarded_shapes");
+
+        let after = (Store::open(&path).unwrap())
+            .transaction(|tx| tx.engine_state())
+            .unwrap();
+        trees.restore(after.trees).unwrap();
+        trees.rules_scanned();
+        let mut commits = Commits::from_state(after.commits).unwrap();
+        commits.hold(&mut trees);
+        assert!(trees.held("c") && !trees.held("dir"));
+        let built = commits
+            .build(&mut trees, &mut ids, 1, "history", 1)
+            .cloned();
+        assert!(built.is_none(), "sent before the answer: {built:?}");
+        let mut effects = Effects::default();
+        if let Some(record) = effects.plan(&trees, commits.in_flight(), &mut ids, 1) {
+            assert!(record.node != "dir" && record.node != "c", "{record:?}");
+        }
+
+        let asked = commits.questions().last().unwrap().id.clone();
+        assert!(commits.decide(&asked, answer));
+        let sent: Vec<String> = commits
+            .build(&mut trees, &mut ids, 1, "history", 1)
+            .into_iter()
+            .flat_map(|commit| &commit.ops)
+            .filter_map(|op| match &op.op {
+                Some(op::Op::CreateDir(create)) => Some(create.node_id.clone()),
+                Some(op::Op::CreateFile(create)) => Some(create.node_id.clone()),
+                _ => None,
+            })
+            .collect();
+        let expected: &[&str] = match answer {
+            Answer::Publish => &["dir", "c"],
+            _ => &[],
+        };
+        assert_eq!(sent, expected, "{answer:?}");
+    }
+}
