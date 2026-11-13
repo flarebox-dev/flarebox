@@ -1622,9 +1622,17 @@ impl World {
                     .filter(|node| node.status == NodeStatus::Trashed as i32)
                     .map(|node| node.node_id)
                     .collect();
-                let resends: BTreeSet<NodeId> = (self.space.nodes().into_iter())
+                let replayed: BTreeSet<NodeId> = (self.space.nodes().into_iter())
                     .filter(|node| node.status == NodeStatus::Live as i32)
-                    .filter(|node| node.edit_rev < node.content_rev)
+                    .filter(|node| {
+                        node.edit_rev < node.content_rev
+                            || self.rolled_back.get(&node.node_id).is_some_and(|digest| {
+                                node.current
+                                    .as_ref()
+                                    .and_then(|current| current.content.as_ref())
+                                    .is_some_and(|content| content.manifest_digest == *digest)
+                            })
+                    })
                     .map(|node| node.node_id)
                     .collect();
                 match self.space.commit(&session, now_ms, &sent) {
@@ -1778,7 +1786,7 @@ impl World {
                                 });
                                 if asked(&self.removed[d])
                                     || resent && self.removed.iter().any(asked)
-                                    || resends.contains(node)
+                                    || replayed.contains(node)
                                         && (nodes.iter()).any(|trashed| {
                                             trashed.node_id == *node
                                                 && trashed.status != NodeStatus::Live as i32
