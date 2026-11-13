@@ -714,7 +714,6 @@ impl Engine {
         now_ms: u64,
         whole: bool,
     ) -> BTreeSet<NodeId> {
-        self.trees.release_halves(now_ms);
         let mut touched = BTreeSet::new();
         let mut gone = Gone::new();
         self.take_links(changes, now_ms, &mut touched, &mut gone);
@@ -996,9 +995,8 @@ impl Engine {
             }
         }
         self.vanishing = None;
-        if whole {
-            self.trees.release_halves(u64::MAX);
-        }
+        self.trees
+            .release_halves(if whole { u64::MAX } else { now_ms });
         touched
     }
 
@@ -2804,6 +2802,66 @@ mod tests {
                 assert_eq!(holding(&engine, "x/d"), None, "{case}");
                 assert_eq!(engine.trees.check(), Ok(()), "{case}");
             }
+        }
+    }
+
+    #[test]
+    fn a_file_moved_out_of_a_removed_folder_keeps_its_node_when_the_restart_comes_after_the_wait() {
+        for restart_at in [1_001, 3_001] {
+            let (dir, mut engine, file) = moved_out_of_a_removed_folder(false);
+            let mut local = engine.trees.local().get(&file).unwrap().clone();
+            local.identity.birth_ns = Some(10);
+            engine.trees.set_local(file.clone(), local);
+            engine.observe_part(
+                &[Observed::Removed {
+                    path: "x/d".into(),
+                    kind: EntryKind::Dir,
+                }],
+                1_000,
+            );
+            let path = dir.path().join("restart.db");
+            let mut store = koidrive_store::Store::open(&path).unwrap();
+            store
+                .transaction(|tx| {
+                    for (id, remote) in engine.trees.remote().iter() {
+                        tx.put_remote_node(&NodeState {
+                            node_id: id.clone(),
+                            parent_id: remote.shape.parent.clone(),
+                            name: remote.shape.name.clone(),
+                            kind: match remote.shape.kind {
+                                Kind::File => NodeKind::File,
+                                Kind::Dir => NodeKind::Dir,
+                            } as i32,
+                            status: koidrive_proto::v1::NodeStatus::Live as i32,
+                            content_rev: 1,
+                            meta_rev: 1,
+                            edit_rev: 1,
+                            current: remote.shape.content.clone().map(|content| {
+                                koidrive_proto::v1::VersionInfo {
+                                    content: Some(content),
+                                    ..Default::default()
+                                }
+                            }),
+                            ..Default::default()
+                        })?;
+                    }
+                    engine.checkpoint(tx)
+                })
+                .unwrap();
+            drop(store);
+            let mut store = koidrive_store::Store::open(&path).unwrap();
+            let mut restored = store.transaction(|tx| Engine::load(tx, ROOT)).unwrap();
+            assert!(restored.trees.halves_due().is_some());
+            let identity = FileId {
+                birth_ns: Some(10),
+                ..ino(10)
+            };
+            restored.observe(&[created("e/moved.txt", identity, false, 5)], restart_at);
+            assert_eq!(
+                holding(&restored, "e/moved.txt").map(|(id, _, _)| id),
+                Some(file),
+                "restart at {restart_at}"
+            );
         }
     }
 
