@@ -1140,8 +1140,11 @@ pub async fn follow_newest(paths: Paths) {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/executable.rs"]
+mod fixture;
+
+#[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1150,9 +1153,7 @@ mod tests {
     use super::*;
 
     fn executable(path: &Path, script: &str) {
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, script).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        super::fixture::executable(path, script.as_bytes());
     }
 
     #[test]
@@ -1450,11 +1451,10 @@ mod tests {
                 serde_json::to_string(state).unwrap(),
                 serde_json::to_string(&problem).unwrap()
             );
-            fs::write(
+            executable(
                 helper.path(),
-                original.replace("\"state\":\"running\"", &fields),
-            )
-            .unwrap();
+                &original.replace("\"state\":\"running\"", &fields),
+            );
             let deadline = tokio::time::Instant::now() + RECONCILE;
             let from = discover_app_version(&helper, deadline).await.unwrap();
             assert_eq!(from, version);
@@ -1591,13 +1591,21 @@ mod tests {
                     fs::rename(&binary, binary.with_extension("old")).unwrap();
                     executable(&binary, "#!/bin/sh\necho unsafe > \"$0.calls\"\n");
                 }
-                "during_version" => fs::write(&binary, format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\nprintf OTHERTEAM > '{}/Signer'\necho 'koi 98.0.0'\n", bundle.display()
-                )).unwrap(),
-                "during_helper" => fs::write(&binary,
-                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\n/bin/mv \"$0\" \"$0.old\"\n/bin/cp \"$0.old\" \"$0\"\necho 'koi 98.0.0'\n"
-                ).unwrap(),
-                _ => fs::write(&binary, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\necho 'not-a-version'\n").unwrap(),
+                "during_version" => executable(
+                    &binary,
+                    &format!(
+                        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\nprintf OTHERTEAM > '{}/Signer'\necho 'koi 98.0.0'\n",
+                        bundle.display()
+                    ),
+                ),
+                "during_helper" => executable(
+                    &binary,
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\n/bin/mv \"$0\" \"$0.old\"\n/bin/cp \"$0.old\" \"$0\"\necho 'koi 98.0.0'\n",
+                ),
+                _ => executable(
+                    &binary,
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\necho 'not-a-version'\n",
+                ),
             }
             let error = discover_app_version(&helper, tokio::time::Instant::now() + RECONCILE)
                 .await
@@ -1671,7 +1679,7 @@ mod tests {
             let (_fixture, helper) = crate::app_install::verified_helper_fixture("99.0.0").await;
             let binary = helper.path().to_path_buf();
             let bundle = binary.ancestors().nth(3).unwrap().to_path_buf();
-            fs::write(&binary, format!("#!/bin/sh\necho 'koi {actual}'\n")).unwrap();
+            executable(&binary, &format!("#!/bin/sh\necho 'koi {actual}'\n"));
             let committed = if committed {
                 serde_json::json!([{"path":bundle, "version":"99.0.0", "change":"replaced"}])
             } else {
@@ -1727,9 +1735,13 @@ mod tests {
             let prepared = crate::app::Prepared::fixture(serde_json::from_value(serde_json::json!({
                 "state":"present", "path":bundle, "version":"99.0.0", "change":"unchanged", "launch":"not_requested"
             })).unwrap());
-            fs::write(&binary, format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\nprintf OTHERTEAM > '{}/Signer'\necho 'koi {actual}'\n", bundle.display()
-            )).unwrap();
+            executable(
+                &binary,
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\nprintf OTHERTEAM > '{}/Signer'\necho 'koi {actual}'\n",
+                    bundle.display()
+                ),
+            );
             let dir = tempfile::tempdir().unwrap();
             let paths = Paths::under(dir.path());
             let manager = service::system();
@@ -1833,9 +1845,13 @@ mod tests {
                     fs::rename(&binary, binary.with_extension("old")).unwrap();
                     executable(&binary, "#!/bin/sh\necho unsafe > \"$0.calls\"\n");
                 }
-                "during_version" => fs::write(&binary, format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\ncase \"$1\" in\n--version) printf OTHERTEAM > '{}/Signer'; echo 'koi 99.0.0' ;;\n_reconcile) echo unsafe >> \"$0.calls\" ;;\nesac\n", bundle.display()
-                )).unwrap(),
+                "during_version" => executable(
+                    &binary,
+                    &format!(
+                        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\ncase \"$1\" in\n--version) printf OTHERTEAM > '{}/Signer'; echo 'koi 99.0.0' ;;\n_reconcile) echo unsafe >> \"$0.calls\" ;;\nesac\n",
+                        bundle.display()
+                    ),
+                ),
                 _ => {
                     fs::rename(&bundle, bundle.with_extension("displaced")).unwrap();
                     fs::create_dir_all(binary.parent().unwrap()).unwrap();
@@ -2569,19 +2585,12 @@ mod tests {
         );
 
         let later = |seconds| SystemTime::now() + Duration::from_secs(seconds);
-        fs::write(&brew, "#!/bin/sh\necho 'koi 0.2.0'\n").unwrap();
-        File::options()
-            .write(true)
-            .open(&brew)
-            .unwrap()
-            .set_modified(later(60))
-            .unwrap();
+        executable(&brew, "#!/bin/sh\necho 'koi 0.2.0'\n");
+        File::open(&brew).unwrap().set_modified(later(60)).unwrap();
         assert_eq!(scan(&mut seen, &candidates, &runs), Some(brew.clone()));
 
-        fs::write(&script, "#!/bin/sh\necho 'koi 0.0.9'\n").unwrap();
-        File::options()
-            .write(true)
-            .open(&script)
+        executable(&script, "#!/bin/sh\necho 'koi 0.0.9'\n");
+        File::open(&script)
             .unwrap()
             .set_modified(later(120))
             .unwrap();

@@ -2,7 +2,6 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -12,6 +11,9 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 mod schema;
+
+#[path = "support/executable.rs"]
+mod fixture;
 
 fn asset() -> String {
     let os = match std::env::consts::OS {
@@ -71,9 +73,7 @@ fn http_before_reply(body: String, before_reply: impl Fn() + Send + 'static) -> 
 }
 
 fn executable(path: &Path, script: &str) {
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(path, script).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fixture::executable(path, script.as_bytes());
 }
 
 fn koi(home: &Path, github: &GitHub, args: &[&str]) -> Command {
@@ -138,7 +138,12 @@ const REPORT: &str = r#"{"schema_version":1,"command":"_reconcile","outcome":"ok
 
 fn copy_koi(path: &Path) -> PathBuf {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::copy(env!("CARGO_BIN_EXE_koi"), path).unwrap();
+    let status = Command::new("/bin/cp")
+        .arg(env!("CARGO_BIN_EXE_koi"))
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "fixture copy failed: {status}");
     path.to_path_buf()
 }
 
@@ -979,8 +984,7 @@ fn koi_update_uses_the_custom_homebrew_of_the_running_koi_without_a_prefix_varia
     let github = github("v99.0.0");
     let prefix = home.path().join("custombrew");
     let keg = prefix.join("Cellar/koidrive/0.1.0/bin/koi");
-    std::fs::create_dir_all(keg.parent().unwrap()).unwrap();
-    std::fs::copy(env!("CARGO_BIN_EXE_koi"), &keg).unwrap();
+    copy_koi(&keg);
     let opt = prefix.join("opt/koidrive");
     std::fs::create_dir_all(opt.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(keg.parent().unwrap().parent().unwrap(), &opt).unwrap();
