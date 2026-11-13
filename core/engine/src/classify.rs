@@ -609,6 +609,7 @@ impl Trees {
         if node.trashed {
             self.displaced.remove(&id);
         }
+        self.discarded.remove(&id);
         if (self.edited_here.get(&id)).is_some_and(|&seq| node.trashed || node.edit_rev != seq) {
             self.edited_here.remove(&id);
         }

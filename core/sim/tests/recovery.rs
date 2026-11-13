@@ -3102,3 +3102,33 @@ fn a_write_a_rewind_took_and_a_restore_brings_back_is_no_resend() {
         )
         .unwrap();
 }
+
+#[test]
+fn a_file_a_device_deletes_after_another_device_keeps_it_through_a_rewind_stays_deleted() {
+    let user = |kind, target, name| {
+        Step::User(Action {
+            kind,
+            target,
+            parent: 0,
+            name,
+            text: 0,
+        })
+    };
+    let phases = vec![
+        vec![(1, user(1, 0, 0)), (0, Step::Backup)],
+        vec![
+            (2, user(0, 0, 1)),
+            (0, Step::Rewind),
+            (2, Step::Connect),
+            (2, Step::Work(1540128748179039060)),
+        ],
+        vec![
+            (0, user(0, 0, 2)),
+            (2, user(4, 6878815396834242546, 0)),
+            (2, Step::Work(0)),
+            (2, Step::Work(3265949467000100339)),
+            (2, Step::Work(2407435917824306126)),
+        ],
+    ];
+    synced(3, &phases);
+}
