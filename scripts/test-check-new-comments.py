@@ -321,6 +321,26 @@ class NewComments(unittest.TestCase):
                     ("core/a/src/lib.rs", 4),
                 )
 
+    def test_moving_different_block_docs_between_pub_fns_passes(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "/**\n * Acknowledges.\n */\npub fn a() {}\npub fn b() {}\n"},
+            {"core/a/src/lib.rs": "pub fn a() {}\n/**\n * Lists.\n */\npub fn b() {}\n"},
+        )
+
+    def test_a_block_doc_moved_onto_a_helper_fails(self):
+        self.assertFlags(
+            {"core/a/src/lib.rs": "/**\n * Acknowledges.\n */\npub fn ack() {}\n"},
+            {"core/a/src/lib.rs": "/**\n * Acknowledges.\n */\nfn helper() {}\npub fn ack() {}\n"},
+            ("core/a/src/lib.rs", 4),
+            ("core/a/src/lib.rs", 5),
+        )
+
+    def test_a_code_edit_below_a_shebang_passes(self):
+        self.assertFlags(
+            {"core/a/src/main.rs": "#!/usr/bin/env rust-script\npub fn a() {}\n"},
+            {"core/a/src/main.rs": "#!/usr/bin/env rust-script\npub fn a() { let _x = 1; }\n"},
+        )
+
     def test_deleting_a_pub_fn_doc_comment_passes(self):
         self.assertFlags(
             {"core/a/src/lib.rs": "/// Acknowledges.\npub fn ack() {}\n"},

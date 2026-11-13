@@ -40,7 +40,7 @@ MESSAGES = {
 }
 
 
-def comment_spans(src, lang, tokens=None):
+def comment_spans(src, lang, tokens=None, starts=None):
     found = []
     n = len(src)
     tokens_end = [None]
@@ -50,6 +50,8 @@ def comment_spans(src, lang, tokens=None):
         joint = bool(tokens and tokens_end[0] == start)
         tokens.append((text, lang == "js" and tokens_end[0] is not None and "\n" in src[tokens_end[0]:start], joint))
         tokens_end[0] = end
+        if starts is not None:
+            starts.append(start)
 
     def block(i):
         depth, j = 1, i + 2
@@ -188,30 +190,18 @@ def comment_lines(src, lang):
 
 def rust_fns(src):
     lines = src.split("\n")
-    tokens = []
-    spans = comment_spans(src, "rust", tokens)
-    events, pos, k = [], 0, 0
-    for text, *_ in tokens:
-        while True:
-            while pos < len(src) and src[pos].isspace():
-                pos += 1
-            if k < len(spans) and spans[k][0] == pos:
-                start, end = spans[k]
-                if is_doc(src[start:end], "rust") and not src.startswith(("//!", "/*!"), start):
-                    events.append((src.count("\n", 0, start) + 1, None))
-                pos, k = end, k + 1
-            else:
-                break
-        assert src.startswith(text, pos), (text, pos)
-        events.append((src.count("\n", 0, pos) + 1, text))
-        pos += len(text)
+    tokens, starts = [], []
+    spans = comment_spans(src, "rust", tokens, starts)
+    docs = [(start, src[start:end]) for start, end in spans if is_doc(src[start:end], "rust") and not src.startswith(("//!", "/*!"), start)]
+    events = sorted([(start, None, text) for start, text in docs] + [(start, text, None) for start, (text, *_) in zip(starts, tokens)])
+    events = [(src.count("\n", 0, start) + 1, text, doc) for start, text, doc in events]
     fns, seen = {}, {}
     docs = []
     i = 0
     while i < len(events):
-        line, text = events[i]
+        line, text, doc = events[i]
         if text is None:
-            docs.append(line)
+            docs.append((line, doc))
             i += 1
             continue
         if text == "#":
@@ -239,8 +229,8 @@ def rust_fns(src):
         name = events[j + 1][1] if j + 1 < len(events) and events[j][1] == "fn" else None
         if name and IDENT.fullmatch(name):
             seen[name] = seen.get(name, 0) + 1
-            doc_text = "\n".join(lines[n - 1].strip() for n in sorted(set(docs)))
-            fns[(name, seen[name])] = (public, doc_text, line, lines[line - 1], min(docs, default=line))
+            doc_text = "\n".join(part.strip() for _, doc in docs for part in doc.split("\n"))
+            fns[(name, seen[name])] = (public, doc_text, line, lines[line - 1], docs[0][0] if docs else line)
             i = j + 2
         else:
             i += 1
