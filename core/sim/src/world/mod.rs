@@ -392,6 +392,7 @@ struct Backup {
     held: Held,
     in_history: Held,
     spent: Vec<Spent>,
+    pending_authors: BTreeMap<NodeId, usize>,
 }
 
 fn unspend(spent: &mut Vec<Spent>, touches: &mut [BTreeMap<u128, BTreeSet<u64>>], backup: &Backup) {
@@ -461,6 +462,7 @@ pub struct World {
     /// restored server holds, until the devices are quiet again.
     rolled_back: BTreeMap<NodeId, Vec<u8>>,
     rewound: BTreeMap<i64, BTreeSet<usize>>,
+    pending_authors: BTreeMap<NodeId, usize>,
     clock: u64,
     touches: Vec<BTreeMap<u128, BTreeSet<u64>>>,
     touched_nodes: Vec<BTreeMap<NodeId, u128>>,
@@ -527,6 +529,7 @@ impl World {
             exposed: BTreeMap::new(),
             rolled_back: BTreeMap::new(),
             rewound: BTreeMap::new(),
+            pending_authors: BTreeMap::new(),
             clock: 0,
             touches: vec![BTreeMap::new(); count],
             touched_nodes: vec![BTreeMap::new(); count],
@@ -589,6 +592,11 @@ impl World {
     /// the restore took from the server, and a write the restore took stays in the files the
     /// server holds it in now.
     fn recovered(&mut self) {
+        for device in &mut self.devices {
+            if device.recovering.is_none() {
+                device.rolled_back = false;
+            }
+        }
         for names in &mut self.restored_names {
             names.clear();
         }
@@ -620,6 +628,7 @@ impl World {
                     held: self.held.clone(),
                     in_history: self.in_history.clone(),
                     spent: self.spent.clone(),
+                    pending_authors: self.pending_authors.clone(),
                 });
             }
             Step::Restore => self.restore(false),
@@ -799,6 +808,7 @@ impl World {
             .copied()
             .collect();
         self.space.rewind(&backup.space, self.server_now());
+        self.pending_authors = backup.pending_authors.clone();
         self.in_history = backup.in_history.clone();
         self.rewound
             .retain(|write, _| !stored(&backup.in_history, *write));
@@ -877,6 +887,7 @@ impl World {
         let before = shapes(&self.space);
         let held_before = writes(&self.space);
         self.space.restore(&backup.space);
+        self.pending_authors = backup.pending_authors.clone();
         self.in_history = backup.in_history.clone();
         let after = shapes(&self.space);
         let held_after = writes(&self.space);
@@ -1582,6 +1593,9 @@ impl World {
                     ),
                 };
                 let before = live_writes(&self.space);
+                let names: BTreeMap<NodeId, String> = (self.space.nodes().into_iter())
+                    .map(|node| (node.node_id, node.name))
+                    .collect();
                 let session = device.session.clone();
                 let sent = Commit { receipts, ..commit };
                 let made_up = sent.ops.iter().find_map(|op| match &op.op {
@@ -1618,6 +1632,13 @@ impl World {
                         if let Some(record) = committed.record {
                             let built = self.built[d];
                             let nodes = self.space.nodes();
+                            for node in &nodes {
+                                if pending_stem(&node.name).is_none() {
+                                    self.pending_authors.remove(&node.node_id);
+                                } else if names.get(&node.node_id) != Some(&node.name) {
+                                    self.pending_authors.insert(node.node_id.clone(), d);
+                                }
+                            }
                             let parents: BTreeMap<&str, &str> = (nodes.iter())
                                 .map(|node| (node.node_id.as_str(), node.parent_id.as_str()))
                                 .collect();
@@ -2230,9 +2251,13 @@ impl World {
             }
         }
         let named: BTreeSet<&str> = self.named.iter().flatten().copied().collect();
-        let kept = (nodes.iter()).find(|(_, node)| {
+        let kept = (nodes.iter()).find(|(id, node)| {
             let name = node.shape.name.as_str();
-            !node.trashed && pending_stem(name).is_some() && !named.contains(name)
+            let recovering = self
+                .pending_authors
+                .get(id)
+                .is_some_and(|author| self.devices[*author].recovering.is_some());
+            !node.trashed && pending_stem(name).is_some() && !named.contains(name) && !recovering
         });
         if let Some((id, node)) = kept {
             return Err(Failure::Diverged(format!(
@@ -2296,6 +2321,66 @@ mod tests {
     use koidrive_engine::tree::{Kind, Shape};
 
     use super::*;
+
+    #[test]
+    fn a_completed_phase_retires_only_live_devices_rollback_evidence() {
+        let mut world = World::new(2);
+        world.step(0, &Step::CopyStore).unwrap();
+        world.step(0, &Step::RollBack).unwrap();
+        world.devices[1].rolled_back = true;
+        world.devices[1].recovering = Some("store recovery".into());
+        world.phase(0, &[]).unwrap();
+        assert!(!world.devices[0].rolled_back);
+        assert!(world.devices[1].rolled_back);
+        assert!(matches!(
+            world.recover(0, "spurious recovery".into()),
+            Err(Failure::Broken(_))
+        ));
+    }
+
+    #[test]
+    fn a_stuck_pending_name_requires_its_own_author_to_be_recovering() {
+        let mut world = World::new(2);
+        world.devices[0]
+            .disk
+            .create(Place::Root, "a (pending)", None)
+            .unwrap();
+        let stuck = world.quiesce().unwrap_err();
+        assert!(matches!(&stuck, Failure::Diverged(why) if why.contains("keeps the pending name")));
+        let id = world
+            .space
+            .nodes()
+            .into_iter()
+            .find(|node| node.name == "a (pending)")
+            .unwrap()
+            .node_id;
+        assert_eq!(world.pending_authors.get(&id), Some(&0));
+        world.devices[1].recovering = Some("unrelated recovery".into());
+        assert_eq!(world.converged(), Err(stuck.clone()));
+        world.devices[0].recovering = Some("pending-name author recovery".into());
+        world.converged().unwrap();
+        world.pending_authors.clear();
+        assert_eq!(world.converged(), Err(stuck));
+    }
+
+    #[test]
+    fn a_backup_restores_the_pending_names_author() {
+        let mut world = World::new(2);
+        world.devices[0]
+            .disk
+            .create(Place::Root, "a (pending)", None)
+            .unwrap();
+        assert!(world.quiesce().is_err());
+        let authors = world.pending_authors.clone();
+        assert_eq!(authors.len(), 1);
+        world.step(0, &Step::Backup).unwrap();
+        world.pending_authors.clear();
+        world.restore(false);
+        assert_eq!(world.pending_authors, authors);
+        world.pending_authors.clear();
+        world.rewind();
+        assert_eq!(world.pending_authors, authors);
+    }
 
     /// A write a restore took from another file does not excuse an overwrite of a's change back
     /// to its rolled-back bytes.
