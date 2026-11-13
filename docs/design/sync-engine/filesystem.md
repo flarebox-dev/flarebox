@@ -66,13 +66,23 @@ The no-lost-bytes guarantee covers every write that reaches the file before step
 - An empty folder takes no room under the cap, so only the period reclaims it.
 - The server's trash and version history remain the primary way to recover a file.
 
+### Batches
+
+The engine plans up to 1,000 independent effects at a time, whose writes hold at most 64 MiB of content besides the first. An effect joins a batch only when every name it changes is under the root, outside the parked area and not a rules file (§5.10), and no other effect of the batch takes its name. A move of a folder, an effect on a parked entry and a write of a rules file are planned alone, and nothing is planned while a batch is in flight. Each effect keeps its own record, and one store transaction persists them all.
+
+The driver downloads the distinct chunks of the batch's writes in one transfer, so a chunk that several files hold is fetched once. A chunk the server lost fails only the writes that list it. The driver then applies the batch in one section and acknowledges every outcome in one store transaction.
+
 ### Ordering
 
-The staged file is flushed before it is renamed into place. After every rename, the driver flushes the source directory and then the destination directory, since a cross-directory rename changes both. The store transaction that acknowledges the effect comes after the last flush. On macOS the driver uses `F_FULLFSYNC` for the staged file and both directories, because `fsync` there does not ask the drive to write its cache. Process-crash recovery needs only the order of the steps and the record.
+The driver applies effects in sections: it writes the root marker, carries out the effects, and acknowledges them in one store transaction. Every staged file is flushed before its section begins. After every rename or `mkdir`, the driver flushes the directories it changed, source first, since a cross-directory rename changes both.
+
+On macOS `fsync` hands the data to the drive, which may write it late and out of order, so the driver also uses `F_BARRIERFSYNC` and `F_FULLFSYNC` ([fcntl(2)](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/fcntl.2)). The marker, like every file replaced through a temporary name, is flushed behind a barrier before its rename, and that barrier also orders every staged file ahead of the section's renames. Each displacing step (the rename into quarantine, the return of a quarantined entry, the move to the local trash) ends with a barrier. The section ends with one `F_FULLFSYNC` of the root, and the store acknowledges nothing before it. Elsewhere every flush is an `fsync`.
+
+Process-crash recovery needs only the order of the steps and the records.
 
 ## 5.3 Recovering an interrupted effect
 
-After a crash the driver recovers the effect in flight, if any, before it rescans. It inspects the target, the staging path and the quarantine path, and every combination has one safe action:
+After a crash the driver recovers the effects in flight, if any, in one section before it rescans. It inspects the target, the staging path and the quarantine path, and every combination has one safe action:
 
 | Found | Meaning | Action |
 |---|---|---|

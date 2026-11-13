@@ -2,7 +2,7 @@
 
 ## 2.1 The engine persists observations, not work
 
-The engine derives every disk effect and every commit op from the differences between three trees (§2.2). The only intents it persists are the commit in flight, the effect in flight, the queued restores and the open questions. Each is recorded before it starts and bound to the server history it was planned against.
+The engine derives every disk effect and every commit op from the differences between three trees (§2.2). The only intents it persists are the commit in flight, the effects in flight, the queued restores and the open questions. Each is recorded before it starts and bound to the server history it was planned against.
 
 ## 2.2 Three trees, keyed by node ID
 
@@ -17,7 +17,7 @@ Names are compared after NFC normalization. Whether a name is taken is decided b
 Besides the trees, the engine persists:
 
 - the commit in flight, at most one (spec §8): `commit_id`, its `device_seq` (§2.8), the `history_id` and `base_seq` it was built against with the commit token at `base_seq` (RFC 0013), the ops with the shape each op sent, and a received result that cannot be applied yet (§4.4);
-- the effect in flight, at most one: the effect record of §5.2;
+- the effects in flight, at most one batch: an effect record of §5.2 for each;
 - the mass-delete state of §6.1;
 - the restores a person asked for (§2.6, §6.3): each one without an outcome under its request ID, and the outcomes of the last 1,000 that ended;
 - the pending names (§2.6): each node this device sent under a pending name, with that name and the name it takes later. A record lasts while R holds the node at the pending name, live or trashed, checked after the records of each commit, and until a move of this device that takes the node off that name is acknowledged.
@@ -217,7 +217,7 @@ The store writes, per `handle` call and in one transaction:
 
 - R with `history_id`, `last_seq` and whether the server reported that it is behind `last_seq` (§4.4), S, and L with file identities;
 - the commit in flight with its `history_id`, `device_seq` and any buffered result, and the accepted device counter;
-- the effect in flight and the effect counter;
+- the effects in flight and the effect counter;
 - the mass-delete state of §6.1 (`koidrive_engine::guard::GuardState`);
 - the commit layer's reverted nodes, merged folders (§2.7), folders whose delete is split (§2.6, §5.10), the reduced op count after `LIMIT_EXCEEDED`, and the waiting S updates with the slot each came from;
 - the nodes recorded as trashed or edited here, and the seqs of the last acknowledged commits by slot (§4.4);
@@ -228,11 +228,11 @@ The store writes, per `handle` call and in one transaction:
 - every open question with what it holds;
 - the ID generator's state (`IdGen::state`).
 
-Connection state and queued outputs other than the commit and effect in flight are not persisted. Restoring `koidrive_engine::state` refuses a state that breaks an invariant. After a restart the engine emits `AskUser` again for every unanswered question; the driver shows a question ID once, so a repeat is harmless.
+Connection state and queued outputs other than the commit and effects in flight are not persisted. Restoring `koidrive_engine::state` refuses a state that breaks an invariant. After a restart the engine emits `AskUser` again for every unanswered question; the driver shows a question ID once, so a repeat is harmless.
 
 ### Restart
 
-After a crash the fs driver first recovers the effect in flight from its record (§5.3) and reports the outcome. Only then does it rescan the whole root. Everything on disk that L does not know is then a new local node. A device with no store, on a first link or after losing its store, adopts entries by path and content instead (§6.4).
+After a crash the fs driver first recovers the effects in flight from their records (§5.3) and reports the outcomes. Only then does it rescan the whole root. Everything on disk that L does not know is then a new local node. A device with no store, on a first link or after losing its store, adopts entries by path and content instead (§6.4).
 
 ### The device counter detects a store older than the server's history
 
@@ -263,8 +263,8 @@ These ordering rules keep the counter comparison sound:
 
 A store restored to before it applied a remote change, with no commit of its own since, still shows *w* = *a*, yet the disk holds effects the store does not remember. So the store keeps an effect counter *e*, the number of disk effects it has acknowledged, and the root marker `.koidrive/space.json` (§6.2) keeps a copy *m*.
 
-- The effect is recorded in the store first (§5.2). Before the effect touches the disk, the driver writes *e* + 1 to the marker and flushes it. The transaction that clears the effect in flight, done or failed, sets *e* to that value. A healthy device has *m* = *e*, or *m* = *e* + 1 while an effect is in flight.
-- On startup, after recovering the effect in flight (§5.3) and before planning from a rescan, the driver compares the two. When *m* is above *e* plus the effect in flight (one if an effect is recorded, zero otherwise), the store is older than the disk: nothing is planned from it, and the space enters recovery (§6.4) with the store as evidence.
+- The effects of a batch of *n* are recorded in the store first (§5.2). Before the batch touches the disk, the driver writes *e* + *n* to the marker and flushes it. The transaction that clears the batch, each effect done or failed, sets *e* to that value. A healthy device has *m* = *e*, or *m* = *e* + *n* while a batch of *n* is in flight.
+- On startup, after recovering the effects in flight (§5.3) and before planning from a rescan, the driver compares the two. When *m* is above *e* plus the number of effects recorded in flight, the store is older than the disk: nothing is planned from it, and the space enters recovery (§6.4) with the store as evidence.
 - When *m* is below *e*, the disk or its marker was restored from an older state. The space pauses with a problem (§6.2) instead of reading the older files as local edits.
 
 ### The commit in flight follows its history
