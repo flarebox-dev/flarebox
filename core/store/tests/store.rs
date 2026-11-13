@@ -453,7 +453,8 @@ fn engine_state() -> EngineState {
             ]),
             trashed_here: BTreeMap::from([("t".into(), 5)]),
             discarded: nodes(["d"]),
-            outside: nodes(["kept"]),
+            outside: nodes(["kept", "lost"]),
+            lost: nodes(["lost"]),
             displaced: BTreeMap::from([(
                 "displaced".into(),
                 FileIdentity {
@@ -1109,6 +1110,7 @@ fn a_store_from_before_contents_were_watched_opens_with_nothing_watched() {
     before.commits.questions.clear();
     before.commits.guard = GuardState::default();
     before.trees.outside.clear();
+    before.trees.lost.clear();
     before.trees.displaced.clear();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
 }
@@ -1132,6 +1134,8 @@ fn a_store_from_before_edits_were_recorded_opens_with_none_recorded() {
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
     let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
+        .unwrap();
     conn.execute_batch(
         "DROP TABLE edited_here; DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed;
          DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions; DROP TABLE published_nodes; DROP TABLE unsent_edits;",
@@ -1150,6 +1154,7 @@ fn a_store_from_before_edits_were_recorded_opens_with_none_recorded() {
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     before.trees.edited_here.clear();
     before.trees.watched_positions.clear();
+    before.trees.lost.clear();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
 }
 
@@ -1198,6 +1203,7 @@ fn a_store_from_before_deletes_were_recorded_opens_with_none_recorded() {
     before.commits.questions.clear();
     before.commits.guard = GuardState::default();
     before.trees.outside.clear();
+    before.trees.lost.clear();
     before.trees.displaced.clear();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
 }
@@ -1241,6 +1247,7 @@ fn a_store_from_before_the_guard_opens_with_an_empty_guard() {
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     before.trees.discarded.clear();
     before.trees.outside.clear();
+    before.trees.lost.clear();
     before.trees.displaced.clear();
     before.trees.edited_here.clear();
     before.trees.watched_positions.clear();
@@ -1268,6 +1275,7 @@ fn a_store_from_before_questions_showed_local_shapes_keeps_its_questions() {
     }
     before.trees.discarded.clear();
     before.trees.outside.clear();
+    before.trees.lost.clear();
     before.trees.displaced.clear();
     before.trees.edited_here.clear();
     before.trees.watched_positions.clear();
@@ -1335,6 +1343,7 @@ fn a_store_from_before_nodes_in_ignored_folders_were_stored_opens_with_none_reco
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     let after = before.clone();
     before.trees.outside.clear();
+    before.trees.lost.clear();
     before.trees.displaced.clear();
     before.trees.edited_here.clear();
     before.trees.watched_positions.clear();
@@ -1364,6 +1373,8 @@ fn a_store_from_before_remote_removals_were_counted_opens_with_none_counted() {
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
     let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
+        .unwrap();
     conn.execute_batch("DROP TABLE guard_remote; DROP TABLE guard_remote_dismissed; DROP TABLE guard_confirmed_limits; DROP TABLE watched_positions; DROP TABLE published_nodes; DROP TABLE unsent_edits;")
         .unwrap();
     conn.execute_batch("ALTER TABLE waiting_updates DROP COLUMN slot;")
@@ -1381,6 +1392,7 @@ fn a_store_from_before_remote_removals_were_counted_opens_with_none_counted() {
     before.commits.guard.remote.clear();
     before.commits.guard.dismissed.clear();
     before.commits.guard.confirmed_limits.clear();
+    before.trees.lost.clear();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
 }
 
@@ -1396,6 +1408,8 @@ fn a_store_from_before_positions_were_watched_opens_with_none_watched() {
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
     let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
+        .unwrap();
     conn.execute_batch(
         "DROP TABLE watched_positions; DROP TABLE published_nodes; DROP TABLE unsent_edits;",
     )
@@ -1415,6 +1429,7 @@ fn a_store_from_before_positions_were_watched_opens_with_none_watched() {
     before.commits.published.clear();
     before.trees.unsent_edits.clear();
     before.commits.pending.clear();
+    before.trees.lost.clear();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
 }
 
@@ -1476,6 +1491,8 @@ fn a_store_from_before_waiting_updates_kept_their_origin_takes_the_accepted_slot
         })
         .unwrap();
     let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
+        .unwrap();
     conn.execute_batch(
         "ALTER TABLE waiting_updates DROP COLUMN slot;
          ALTER TABLE watched_positions DROP COLUMN parent_id;
@@ -1495,6 +1512,7 @@ fn a_store_from_before_waiting_updates_kept_their_origin_takes_the_accepted_slot
     before.commits.published.clear();
     before.trees.unsent_edits.clear();
     before.commits.pending.clear();
+    before.trees.lost.clear();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
 }
 
@@ -1541,6 +1559,8 @@ fn a_cursor_stored_before_commit_tokens_opens_with_none() {
         .transaction(|tx| tx.set_cursor(&cursor))
         .unwrap();
     let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
+        .unwrap();
     drop_cursor_tokens(&conn);
     conn.execute_batch(
         "DROP TABLE published_nodes; DROP TABLE taken_answers; DROP TABLE unsent_edits;",
@@ -1591,6 +1611,8 @@ fn a_store_from_before_watched_positions_were_kept_takes_them_from_s() {
         .unwrap();
     drop(store);
     let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
+        .unwrap();
     conn.execute_batch(
         "ALTER TABLE watched_positions DROP COLUMN parent_id;
          ALTER TABLE watched_positions DROP COLUMN name;
@@ -1610,7 +1632,38 @@ fn a_store_from_before_watched_positions_were_kept_takes_them_from_s() {
     before.commits.published.clear();
     before.trees.unsent_edits.clear();
     before.commits.pending.clear();
+    before.trees.lost.clear();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
+}
+
+#[test]
+fn a_store_from_before_lost_folders_were_marked_opens_with_none_marked() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let mut before = engine_state();
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| tx.set_engine_state(&before))
+        .unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
+        .unwrap();
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+        .unwrap();
+    drop(conn);
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    let after = before.clone();
+    before.trees.lost.clear();
+    assert!(!after.trees.lost.is_empty());
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
+    store
+        .transaction(|tx| tx.update_engine_state(&before, &after))
+        .unwrap();
+    drop(store);
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), after);
 }
 
 /// A database of the schema before a first link's published entries were recorded keeps its
@@ -1625,6 +1678,8 @@ fn a_store_from_before_published_entries_were_recorded_opens_with_none_recorded(
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
     let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
+        .unwrap();
     conn.execute_batch(
         "DROP TABLE published_nodes; DROP TABLE taken_answers; DROP TABLE unsent_edits;",
     )
@@ -1641,6 +1696,7 @@ fn a_store_from_before_published_entries_were_recorded_opens_with_none_recorded(
     before.trees.unsent_edits.clear();
     before.commits.pending.clear();
     assert!(!after.commits.published.is_empty());
+    before.trees.lost.clear();
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
     store
         .transaction(|tx| tx.update_engine_state(&before, &after))
@@ -1660,6 +1716,8 @@ fn a_store_from_before_unsent_edits_were_recorded_opens_with_none_recorded() {
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
     let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
+        .unwrap();
     conn.execute_batch("DROP TABLE unsent_edits;").unwrap();
     conn.execute_batch("DROP TABLE pending_names;").unwrap();
     drop_ino_high(&conn);
@@ -1671,6 +1729,7 @@ fn a_store_from_before_unsent_edits_were_recorded_opens_with_none_recorded() {
     let after = before.clone();
     before.trees.unsent_edits.clear();
     before.commits.pending.clear();
+    before.trees.lost.clear();
     assert!(!after.trees.unsent_edits.is_empty());
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
     store
@@ -1710,6 +1769,8 @@ fn a_store_from_before_inodes_took_128_bits_keeps_every_identity() {
         .unwrap();
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch("DROP TABLE pending_names;").unwrap();
+    conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
+        .unwrap();
     drop_ino_high(&conn);
     conn.pragma_update(None, "user_version", 19).unwrap();
     let stored: i64 = conn
@@ -1727,6 +1788,8 @@ fn a_store_from_before_inodes_took_128_bits_keeps_every_identity() {
     store
         .transaction(|tx| {
             assert_eq!(tx.local_nodes()?, local);
+            let mut state = state.clone();
+            state.trees.lost.clear();
             assert_eq!(tx.engine_state()?, state);
             Ok::<_, Error>(())
         })
@@ -1803,8 +1866,10 @@ fn a_store_from_before_pending_names_were_recorded_opens_with_none_recorded() {
         .transaction(|tx| tx.set_engine_state(&before))
         .unwrap();
     let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("ALTER TABLE recorded_nodes DROP COLUMN lost;")
+        .unwrap();
     conn.execute_batch("DROP TABLE pending_names;").unwrap();
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION - 2)
         .unwrap();
     drop(conn);
 
@@ -1812,6 +1877,7 @@ fn a_store_from_before_pending_names_were_recorded_opens_with_none_recorded() {
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     let after = before.clone();
     before.commits.pending.clear();
+    before.trees.lost.clear();
     assert!(!after.commits.pending.is_empty());
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
     store
@@ -1844,6 +1910,7 @@ fn a_version_3_store_opens_with_empty_restore_tables() {
     before.commits.questions.clear();
     before.commits.guard = GuardState::default();
     before.trees.outside.clear();
+    before.trees.lost.clear();
     before.trees.displaced.clear();
     Store::open(&path)
         .unwrap()

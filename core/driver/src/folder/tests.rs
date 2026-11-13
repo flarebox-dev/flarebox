@@ -5447,6 +5447,39 @@ fn a_file_moved_back_out_of_an_ignored_folder_after_its_name_was_taken_is_moved_
 }
 
 #[test]
+fn a_link_of_a_file_moved_into_an_ignored_folder_after_its_name_was_taken_is_moved_on_the_server() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site.root.join("source")).unwrap();
+    a.create(&mut remote, &site.root.join("source/file"), b"kept");
+    a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
+    let file = live_id(&server_nodes(&remote), "file");
+    fs::create_dir(site.root.join("ignored")).unwrap();
+    fs::rename(
+        site.root.join("source/file"),
+        site.root.join("ignored/file"),
+    )
+    .unwrap();
+    a.scan_until(|a| a.folder.engine.trees.ignored_local().len() == 1);
+    a.run(&mut remote);
+    fs::create_dir(site.root.join("source/file")).unwrap();
+    a.scan_until(|a| a.folder.engine.trees.displaced_local().len() == 1);
+    for _ in 0..2 {
+        a.run(&mut remote);
+        a.settle();
+    }
+    fs::hard_link(site.root.join("ignored/file"), site.root.join("back")).unwrap();
+    for _ in 0..3 {
+        a.settle();
+        a.run(&mut remote);
+    }
+    let after = server_nodes(&remote);
+    assert_eq!(live_id(&after, "back"), file, "{after:?}");
+    assert!(a.folder.engine.trees.displaced_local().is_empty());
+    assert_eq!(a.folder.engine.trees.check(), Ok(()));
+}
+
+#[test]
 fn a_folder_created_at_the_name_of_a_file_moved_into_an_ignored_folder_keeps_the_file_on_the_server()
  {
     a_name_l_keeps_is_taken(false, Taker::NewFolder);
@@ -5488,6 +5521,170 @@ fn a_file_moved_out_of_a_removed_folder_with_a_link_in_an_ignored_folder_is_move
     assert_eq!(remote.names(), [".koiignore", "moved"]);
     assert_eq!(fs::read(site.root.join("moved")).unwrap(), b"kept");
     assert_eq!(fs::read(site.root.join("ignored/alias")).unwrap(), b"kept");
+    assert_eq!(a.folder.engine.trees.check(), Ok(()));
+}
+
+#[test]
+fn a_file_with_a_link_in_an_ignored_folder_moved_back_in_after_its_folder_was_removed_is_moved_on_the_server()
+ {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site.root.join("source")).unwrap();
+    a.create(&mut remote, &site.root.join("source/file"), b"kept");
+    a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
+    fs::create_dir(site.root.join("ignored")).unwrap();
+    fs::hard_link(
+        site.root.join("source/file"),
+        site.root.join("ignored/alias"),
+    )
+    .unwrap();
+    let away = site.root.with_file_name("away");
+    fs::rename(site.root.join("source/file"), &away).unwrap();
+    fs::remove_dir(site.root.join("source")).unwrap();
+    a.scan_until(|a| !(a.observer.snapshot().entries).contains_key(Path::new("source")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert!(
+        remote.names().contains(&"file".to_owned()),
+        "{:?}",
+        remote.names()
+    );
+    fs::rename(&away, site.root.join("moved")).unwrap();
+    a.scan_until(|a| (a.observer.snapshot().entries).contains_key(Path::new("moved")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(remote.names(), [".koiignore", "moved"]);
+    assert_eq!(fs::read(site.root.join("moved")).unwrap(), b"kept");
+    assert_eq!(fs::read(site.root.join("ignored/alias")).unwrap(), b"kept");
+    assert_eq!(a.folder.engine.trees.check(), Ok(()));
+}
+
+#[test]
+fn two_links_moved_into_an_ignored_folder_and_linked_back_in_turn_keep_their_nodes() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join(".koiignore"), b"ig/\n");
+    a.create(&mut remote, &site.root.join("one"), b"kept");
+    fs::hard_link(site.root.join("one"), site.root.join("two")).unwrap();
+    a.scan_until(|a| (a.observer.snapshot().entries).contains_key(Path::new("two")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    let before = server_nodes(&remote);
+    let (one, two) = (live_id(&before, "one"), live_id(&before, "two"));
+    fs::create_dir(site.root.join("ig")).unwrap();
+    fs::rename(site.root.join("one"), site.root.join("ig/one")).unwrap();
+    fs::rename(site.root.join("two"), site.root.join("ig/two")).unwrap();
+    a.scan_until(|a| !(a.observer.snapshot().entries).contains_key(Path::new("two")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    for back in ["back1", "back2"] {
+        fs::hard_link(site.root.join("ig/one"), site.root.join(back)).unwrap();
+        a.scan_until(|a| (a.observer.snapshot().entries).contains_key(Path::new(back)));
+        a.run(&mut remote);
+        a.settle();
+        a.run(&mut remote);
+    }
+    let after = server_nodes(&remote);
+    assert_eq!(remote.names(), [".koiignore", "back1", "back2"]);
+    assert_eq!(
+        BTreeSet::from([live_id(&after, "back1"), live_id(&after, "back2")]),
+        BTreeSet::from([one, two])
+    );
+    assert_eq!(a.folder.engine.trees.check(), Ok(()));
+}
+
+#[test]
+fn a_file_moved_back_in_from_an_ignored_folder_after_its_folder_was_removed_takes_the_folder_off_the_server()
+ {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site.root.join("source")).unwrap();
+    a.create(&mut remote, &site.root.join("source/file"), b"kept");
+    a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
+    fs::create_dir(site.root.join("ignored")).unwrap();
+    fs::rename(
+        site.root.join("source/file"),
+        site.root.join("ignored/file"),
+    )
+    .unwrap();
+    fs::remove_dir(site.root.join("source")).unwrap();
+    a.scan_until(|a| !(a.observer.snapshot().entries).contains_key(Path::new("source")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(remote.names(), [".koiignore", "file", "source"]);
+    fs::rename(site.root.join("ignored/file"), site.root.join("moved")).unwrap();
+    a.scan_until(|a| (a.observer.snapshot().entries).contains_key(Path::new("moved")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(remote.names(), [".koiignore", "moved"]);
+    assert_eq!(fs::read(site.root.join("moved")).unwrap(), b"kept");
+    assert_eq!(a.folder.engine.trees.check(), Ok(()));
+}
+
+#[test]
+fn a_folder_removed_while_its_file_moves_out_and_its_ignored_file_comes_back_leaves_the_server() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site.root.join("source")).unwrap();
+    a.create(&mut remote, &site.root.join("source/file"), b"kept");
+    a.create(&mut remote, &site.root.join("source/other"), b"other");
+    a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
+    fs::create_dir(site.root.join("ignored")).unwrap();
+    fs::rename(
+        site.root.join("source/file"),
+        site.root.join("ignored/file"),
+    )
+    .unwrap();
+    a.scan_until(|a| a.folder.engine.trees.ignored_local().len() == 1);
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    fs::create_dir(site.root.join("new")).unwrap();
+    fs::rename(site.root.join("source/other"), site.root.join("new/other")).unwrap();
+    fs::rename(site.root.join("ignored/file"), site.root.join("moved")).unwrap();
+    fs::remove_dir(site.root.join("source")).unwrap();
+    a.scan_until(|a| (a.observer.snapshot().entries).contains_key(Path::new("new/other")));
+    for _ in 0..2 {
+        a.run(&mut remote);
+        a.settle();
+    }
+    a.run(&mut remote);
+    assert_eq!(remote.names(), [".koiignore", "moved", "new", "other"]);
+    assert_eq!(a.folder.engine.trees.check(), Ok(()));
+}
+
+#[test]
+fn a_folder_moved_into_an_ignored_folder_after_its_file_stays_on_the_server_when_the_file_comes_back()
+ {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::create_dir(site.root.join("D")).unwrap();
+    a.create(&mut remote, &site.root.join("D/c"), b"kept");
+    a.create(&mut remote, &site.root.join(".koiignore"), b"ignored/\n");
+    fs::create_dir(site.root.join("ignored")).unwrap();
+    fs::rename(site.root.join("D/c"), site.root.join("ignored/c")).unwrap();
+    a.scan_until(|a| !(a.observer.snapshot().entries).contains_key(Path::new("D/c")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    fs::rename(site.root.join("D"), site.root.join("ignored/D")).unwrap();
+    a.scan_until(|a| !(a.observer.snapshot().entries).contains_key(Path::new("D")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    fs::rename(site.root.join("ignored/c"), site.root.join("moved")).unwrap();
+    a.scan_until(|a| (a.observer.snapshot().entries).contains_key(Path::new("moved")));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert!(site.root.join("ignored/D").is_dir());
+    assert_eq!(remote.names(), [".koiignore", "D", "moved"]);
     assert_eq!(a.folder.engine.trees.check(), Ok(()));
 }
 

@@ -619,7 +619,10 @@ impl Engine {
     /// new one. So is a created entry with the path and identity a node had before an earlier change of the batch took
     /// it out of L, unless the batch placed that node again. That keeps a child's node when its folder is replaced
     /// around it. Any other created entry is a new node. An entry that another path also links is a hard link, a file
-    /// of its own (design §5.6), so its identity never takes a node from another path.
+    /// of its own (design §5.6), so its identity never takes a node from another path, except a node L keeps recorded
+    /// outside what this device syncs: no included path holds that node, so a created entry with its identity is that
+    /// node placed again, as when a file with a link in an ignored folder comes back after a scan found it only through
+    /// that link.
     ///
     /// A node that held the name a change puts an entry at is gone from there, so it leaves L with everything under
     /// it. A file that arrives over a file keeps the node of the file it replaces when L's own node for the arriving
@@ -820,10 +823,15 @@ impl Engine {
                         continue;
                     }
                     let identity = file_identity(*id);
-                    let node = (self.trees.local_with_identity(&identity))
+                    let takes = |node: &&NodeId| {
+                        !linked
+                            || self.trees.recorded_local(node)
+                            || self.trees.displaced_local().contains_key(*node)
+                    };
+                    let node = (self.trees.locals_with_identity(&identity).rev())
                         .filter(|node| !staying.contains(*node))
-                        .or_else(|| self.trees.displaced_with_identity(&identity))
-                        .filter(|_| !linked)
+                        .find(takes)
+                        .or_else(|| self.trees.displaced_with_identity(&identity).filter(takes))
                         .cloned()
                         .or_else(|| {
                             (gone.get(path))
@@ -1024,6 +1032,14 @@ impl Engine {
                 self.remove(&holder, moving, false, touched, gone);
             }
         }
+        let left = (self.trees.recorded_local(&id))
+            .then(|| {
+                self.trees
+                    .local()
+                    .get(&id)
+                    .map(|node| node.shape.parent.clone())
+            })
+            .flatten();
         self.trees.set_local(
             id.clone(),
             LocalNode {
@@ -1033,6 +1049,14 @@ impl Engine {
             },
         );
         touched.insert(id);
+        let mut above = left;
+        while let Some(folder) = above.filter(|folder| {
+            self.trees.lost_local().contains(folder)
+                && self.trees.local_children(folder).next().is_none()
+        }) {
+            above = (self.trees.local().get(&folder)).map(|node| node.shape.parent.clone());
+            self.remove(&folder, moving, true, touched, gone);
+        }
     }
 
     /// Removes `id` and every node placed under it from L, except the nodes in `moving`, which the batch moves
@@ -1082,7 +1106,7 @@ impl Engine {
         }
         doomed.retain(|node| !kept.contains(node));
         for folder in &kept {
-            self.trees.ignore_local(folder);
+            self.trees.keep_lost_local(folder);
         }
         for id in &doomed {
             if let (Some(path), Some(node)) = (self.path_of(id), self.trees.local().get(id)) {

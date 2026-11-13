@@ -45,4 +45,4 @@ R2 holds the contents of your files, of the files in each space's trash and of o
 
 ## Known issues
 
-A file with a hard link inside an ignored folder can end up on the server twice. This happens when you move the file out of a folder and then remove the folder, and Koidrive picks up the two changes separately. The server then keeps the old copy as well as the new one. Nothing is lost (GUN-431).
+A file with a hard link inside an ignored folder can end up on the server twice. This happens when you move the file out of a folder and remove the folder, and Koidrive picks up the file's new place before it sees the removal. The server then keeps the old copy as well as the new one. Nothing is lost (GUN-483).
