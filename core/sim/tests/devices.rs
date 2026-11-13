@@ -1387,7 +1387,7 @@ fn a_revival_at_an_unasked_name_or_parent_is_rejected() {
             moved.new_parent_id = folder;
         }
         device.engine.commits = koidrive_engine::commit::Commits::from_state(state).unwrap();
-        device.persist().unwrap();
+        device.store = device.engine.clone();
         let failure = world.phase(2, &[]).unwrap_err();
         assert!(
             matches!(failure, Failure::Diverged(why) if why.contains("never gave to anything"))
