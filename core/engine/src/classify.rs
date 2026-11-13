@@ -490,6 +490,17 @@ impl Trees {
     }
 
     fn place_remote(&mut self, id: NodeId, node: RemoteNode) {
+        let created_over_resend = !node.trashed
+            && self.r.get(&id).is_none()
+            && self.resends.contains(&id)
+            && (self.l.live(&id)).is_some_and(|local| {
+                let at = Shape {
+                    parent: node.shape.parent.clone(),
+                    name: node.shape.name.clone(),
+                    ..local.clone()
+                };
+                at.same(&node.shape)
+            });
         self.mark(&id);
         if node.trashed {
             self.yield_resends(&id);
@@ -542,6 +553,9 @@ impl Trees {
         self.count_trashed(&id, true);
         self.note_position(&id);
         self.record_edit_in_trash(&id);
+        if created_over_resend {
+            self.take_local(id);
+        }
     }
 
     pub(crate) fn resends(&self) -> &BTreeSet<NodeId> {
@@ -1435,8 +1449,9 @@ impl Trees {
     /// did, is sent again with no change of this device's user in it ([`TreesState::resends`]). A
     /// delete that R holds of it, or of a folder L holds it under, before the server takes the
     /// resend was made after the loss by a user who may have held what the resend brings back, so
-    /// the delete beats the resend (GUN-548). The device that made the change sends it again
-    /// itself, as above.
+    /// the delete beats the resend (GUN-548). R taking a node it lacked again, live with the
+    /// content L holds, ends its resend too: another device sent it first, and its position is a
+    /// remote move. The device that made the change sends it again itself, as above.
     ///
     /// `accepted` is the count of this device's commits the server still holds (*w*, section
     /// 2.8). An S update that waits ([`Trees::waiting`]) from a commit above it came from a commit

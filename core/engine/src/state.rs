@@ -98,7 +98,8 @@ pub struct TreesState {
     /// them (section 4.4): a file whose content S took back from R so that the content L holds is
     /// sent again, and a node S forgot that L holds as S did. A delete that R holds of the node, or
     /// of a folder L holds it under, beats the resend: S then takes L's shape, so the delete reaches
-    /// L. The record also ends when S takes L's shape or L changes the node.
+    /// L. So does R taking the node again, live with the content L holds, after R lacked it. The
+    /// record also ends when S takes L's shape or L changes the node.
     pub resends: BTreeSet<NodeId>,
 }
 
