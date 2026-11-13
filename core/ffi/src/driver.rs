@@ -233,6 +233,7 @@ impl DriverCore {
     fn start_driver(&self, driver: &Driver) {
         let _entered = self.runtime.enter();
         driver.start();
+        driver.check_for_updates();
     }
 }
 
@@ -930,6 +931,7 @@ mod tests {
             running: true,
             paused: false,
             version: None,
+            update: driver::Update::Unknown,
             folders: states.iter().map(|state| folder_in(*state, None)).collect(),
         }
     }
@@ -1487,6 +1489,7 @@ mod tests {
     #[test]
     fn a_resume_starts_the_folders_a_failed_sign_out_left_stopped() {
         let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "[updates]\ncheck = false\n").unwrap();
         let listener: Arc<Box<dyn SessionListener>> = Arc::new(Box::new(Recorder(Arc::default())));
         let core = DriverCore::open(dir.path(), Events::new(&listener)).unwrap();
         core.start();
@@ -1502,6 +1505,7 @@ mod tests {
     #[test]
     fn the_pause_outlives_a_relaunch_and_one_session_holds_a_profile() {
         let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "[updates]\ncheck = false\n").unwrap();
         let profile = dir.path().to_str().unwrap().to_owned();
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let open = |seen: &Arc<StdMutex<Vec<SessionEvent>>>| {

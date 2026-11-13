@@ -14,6 +14,7 @@ fn koi(home: &Path, args: &[&str], vars: &[(&str, &str)]) -> Output {
         .env_remove("DO_NOT_TRACK")
         .env_remove("KOIDRIVE_TELEMETRY")
         .env("KOIDRIVE_TELEMETRY_URL", "http://127.0.0.1:9")
+        .env("KOIDRIVE_UPDATE_CHECK", "0")
         .env_remove("KOIDRIVE_TELEMETRY_TOKEN")
         .env_remove("CI");
     for (name, value) in vars {

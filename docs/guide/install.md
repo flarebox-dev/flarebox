@@ -10,7 +10,7 @@ Downloads become available with the first published CLI release. Until then, bui
 
 The installer downloads the latest GitHub Release for x86_64 or arm64, checks its SHA256 checksum, and installs it in `~/.local/bin`. It needs `curl`, `tar`, `awk`, `grep`, `sed`, `mktemp`, and either `sha256sum` or `shasum`. It never needs root. Add `~/.local/bin` to your shell's `PATH` if the installer warns that it is missing, then run `koi --version`. The installer also warns when another program named `koi` comes first on `PATH`, such as the Koi theme switcher for KDE; put `~/.local/bin` before it. It refuses to replace a `koi` in the install directory that is another program.
 
-Run the same command again to upgrade. The installer restarts the [background service](#background-sync) of every profile that runs one, so each runs the new `koi`. To choose a version or another directory, set `KOIDRIVE_VERSION` or `KOIDRIVE_INSTALL_DIR` on the `sh` command:
+Run the same command again, or [`koi update`](#update-koidrive), to upgrade. The installer restarts the [background service](#background-sync) of every profile that runs one, so each runs the new `koi`. To choose a version or another directory, set `KOIDRIVE_VERSION` or `KOIDRIVE_INSTALL_DIR` on the `sh` command:
 
 ```sh
 curl -fsSL https://koidrive.com/install.sh | KOIDRIVE_VERSION=v0.1.0 KOIDRIVE_INSTALL_DIR="$HOME/bin" sh
@@ -34,6 +34,37 @@ To upgrade:
 ```sh
 brew update && brew upgrade koidrive
 ```
+
+## Update Koidrive
+
+```sh
+koi update
+```
+
+`koi update` asks GitHub for the newest release and upgrades the `koi` on this computer. With the Homebrew formula installed, it runs `brew update` and `brew upgrade koidrive/tap/koidrive`. Otherwise it runs the installer above for the folder that holds `koi`. When only the macOS app is installed, it names the release to download. Then the new `koi` takes over the [background service](#background-sync). When this computer runs the newest release, it changes nothing. It runs as your own user and refuses to run as root. Each run writes what it ran and printed to `update.log`, in `~/Library/Logs/Koidrive/` on macOS and in the state folder on Linux.
+
+The background service also looks every hour for a newer `koi` from Homebrew, the installer or the app, and hands itself to the newest one. After `brew upgrade koidrive`, sync runs the new release within the hour.
+
+### Update check
+
+The daemon asks GitHub once a day whether a newer release is out, and `koi status` shows it after the background service:
+
+```
+Update: Koidrive 0.1.2 is out (this device runs 0.1.0). Run: koi update
+```
+
+Each daily check reads Koidrive's public list of releases, `https://api.github.com/repos/koidrive/koidrive/releases`, following its pages with ordinary GitHub requests. It sends the user agent `koidrive` and, for a cached single-page list, the list's ETag, a hash that is the same for everyone. It sends no version, device, account or server address. GitHub sees your IP address, as it does for any download. The check isn't a [usage report](telemetry.md): nothing goes to Koidrive, and turning reports off leaves the check on.
+
+Until a stable release exists, the notice follows prereleases. After that it follows stable releases only, so a computer on a prerelease hears nothing until a newer stable release is out.
+
+To turn the check off, set this in `config.toml` and restart the daemon, or set `KOIDRIVE_UPDATE_CHECK=0`, which wins over the file:
+
+```toml
+[updates]
+check = false
+```
+
+With the check off, the daemon sends nothing and deletes the answer it kept. `koi update` still asks GitHub when you run it.
 
 ## Build from source
 
@@ -109,7 +140,8 @@ The daemon logs at the `info` level. Set `KOIDRIVE_LOG` to change it, for exampl
 
 | Path | What it holds |
 |---|---|
-| `~/.config/koidrive/config.toml` | Your settings: [selective sync](folders.md#sync-only-part-of-a-space-on-this-device), the [local trash](folders.md#the-local-trash) size, how many [uploads run at once](folders.md#uploads-at-once), and whether the [background service](#background-sync) is on. You edit it. Koidrive never writes it |
+| `~/.config/koidrive/config.toml` | Your settings: [selective sync](folders.md#sync-only-part-of-a-space-on-this-device), the [local trash](folders.md#the-local-trash) size, how many [uploads run at once](folders.md#uploads-at-once), whether the [background service](#background-sync) is on, and whether the daemon runs the [update check](#update-check). You edit it. Koidrive never writes it |
+| `~/.local/state/koidrive/update-check.json` | GitHub's last answer to the [update check](#update-check) |
 | `~/.local/state/koidrive/credential.json` | This device's credential. On macOS, Koidrive keeps it out of Time Machine backups |
 | `~/.local/state/koidrive/spaces/` | The sync state of each linked folder |
 | `~/.local/state/koidrive/systemd/koidrive.service` | On Linux, the background service's unit |

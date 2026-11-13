@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::update::Update;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
     /// The paired device, or none before `pair`.
@@ -18,6 +20,9 @@ pub struct Status {
     /// The Koidrive version of the process that reports the status. None from a daemon too old to send it.
     #[serde(default)]
     pub version: Option<String>,
+    /// Whether a newer release is out than `version`. Unknown from a daemon too old to send it.
+    #[serde(default)]
+    pub update: Update,
     pub folders: Vec<FolderStatus>,
 }
 

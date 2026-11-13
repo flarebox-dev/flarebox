@@ -465,7 +465,7 @@ pub async fn write_json(
 
 #[cfg(test)]
 mod tests {
-    use koidrive_driver::RestoreRequest;
+    use koidrive_driver::{RestoreRequest, Update};
     use tokio::net::UnixListener;
 
     use super::*;
@@ -690,10 +690,15 @@ mod tests {
                     running: true,
                     paused: true,
                     version: Some("0.1.0-alpha.2".into()),
+                    update: Update::Available {
+                        latest: "0.1.2".into(),
+                        url: "https://github.com/koidrive/koidrive/releases/tag/v0.1.2".into(),
+                        checked_at_ms: 1_763_000_000_000,
+                    },
                     folders: Vec::new(),
                 },
             },
-            r#"{"response":"status","status":{"account":{"server":"https://files.example.com","user_id":"u1","user_name":"Ada","device_id":"d1","device_name":"laptop"},"running":true,"paused":true,"version":"0.1.0-alpha.2","folders":[]}}"#,
+            r#"{"response":"status","status":{"account":{"server":"https://files.example.com","user_id":"u1","user_name":"Ada","device_id":"d1","device_name":"laptop"},"running":true,"paused":true,"version":"0.1.0-alpha.2","update":{"state":"available","latest":"0.1.2","url":"https://github.com/koidrive/koidrive/releases/tag/v0.1.2","checked_at_ms":1763000000000},"folders":[]}}"#,
         );
         pinned(Response::Paused, r#"{"response":"paused"}"#);
         pinned(Response::AlreadyPaused, r#"{"response":"already_paused"}"#);
@@ -704,7 +709,7 @@ mod tests {
                 status: Status::default(),
                 questions: Vec::new(),
             },
-            r#"{"response":"state","status":{"account":null,"running":false,"paused":false,"version":null,"folders":[]},"questions":[]}"#,
+            r#"{"response":"state","status":{"account":null,"running":false,"paused":false,"version":null,"update":{"state":"unknown"},"folders":[]},"questions":[]}"#,
         );
         pinned(
             Response::Unlinked {

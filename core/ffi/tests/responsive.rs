@@ -83,6 +83,8 @@ fn paired_profile(base: &Path, server: &str, root: PathBuf) -> PathBuf {
 }
 
 fn open(profile: &Path) -> Arc<SyncSession> {
+    std::fs::create_dir_all(profile).unwrap();
+    std::fs::write(profile.join("config.toml"), "[updates]\ncheck = false\n").unwrap();
     SyncSession::open(Box::new(Ignore), profile.to_str().unwrap().into()).unwrap()
 }
 

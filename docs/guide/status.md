@@ -25,6 +25,8 @@ Each linked folder has one line. Its state is one of these:
 | `Offline` | The server can't be reached. The folder keeps trying |
 | `Halted` | A problem stopped the folder. The line below says which |
 
+When a newer release is out, an `Update:` line after `Background service` names it and the command that installs it, `koi update` (see [Update Koidrive](install.md#update-koidrive)).
+
 `seq` counts the changes the space has had: how many this device has applied, and how many the server has. A second line under the folder shows a problem, or the last failure the folder is retrying. Below that come the folder's pending decisions (see [Decisions](#decisions)). `--json` returns all of it, and `--check` makes the exit status say whether anything needs you. See [Agents and scripts](agents.md#check-health-with-status---check).
 
 ## Pause sync

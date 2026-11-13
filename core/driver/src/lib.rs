@@ -12,6 +12,7 @@
 //!   into the remote tree in `core/store`, observations go into the local tree, the engine's effects are applied to
 //!   the folder, and its commits are sent to the server.
 //! - [`policy`]: what to do after the server refuses a call (H1 of reports/BOX-71).
+//! - [`update`]: whether a newer Koidrive release is out, asked of GitHub at most once a day.
 //! - [`ignore`]: the ignore rules of a folder, in the forms the scans and the engine take them.
 //!
 //! New files and folders sync in both directions. Edits, renames, deletes and conflicts go through the same loop and
@@ -34,10 +35,11 @@ mod restore;
 #[cfg(test)]
 mod scripted;
 mod status;
+pub mod update;
 mod volume;
 
 pub use claim::{Flock, Identity as DirectoryIdentity};
-pub use config::{BackgroundService, Config, ConfigError, LocalTrash, SyncRules};
+pub use config::{BackgroundService, Config, ConfigError, LocalTrash, SyncRules, UpdateCheck};
 pub use credential::{Credential, CredentialError, SET_UP_AGAIN, api_for};
 pub use driver::{Answered, Driver, DriverError, LinkApproval, Linked};
 pub use failures::{Failure, failures};
@@ -48,4 +50,5 @@ pub use paths::{Paths, PathsError};
 pub use question::{Answer, HeldItem, Limit, Question, QuestionKind, RecoveryGroup};
 pub use restore::{RestoreRejection, RestoreRequest, RestoreState, RestoreStatus, RestoreWait};
 pub use status::{Account, FolderState, FolderStatus, Status, Wait, WaitKind};
+pub use update::Update;
 pub use volume::{Volume, volume};

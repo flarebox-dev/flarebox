@@ -22,6 +22,9 @@ use serde::Deserialize;
 ///
 /// [service]
 /// background = false
+///
+/// [updates]
+/// check = false
 /// ```
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +37,20 @@ pub struct Config {
     pub upload: Uploads,
     #[serde(default)]
     pub service: BackgroundService,
+    #[serde(default)]
+    pub updates: UpdateCheck,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateCheck {
+    pub check: bool,
+}
+
+impl Default for UpdateCheck {
+    fn default() -> Self {
+        UpdateCheck { check: true }
+    }
 }
 
 /// The background service that the koi command installs and starts while the profile links a folder. With
@@ -392,5 +409,26 @@ mod tests {
         assert!(reason.contains("invalid type"), "{reason}");
         let reason = refused("[upload]\nconcurency = 8\n");
         assert!(reason.contains("unknown field"), "{reason}");
+    }
+
+    #[test]
+    fn the_update_check_is_on_unless_the_updates_table_turns_it_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let load = |text: &str| {
+            std::fs::write(&path, text).unwrap();
+            Config::load(&path).map(|config| config.updates.check)
+        };
+        assert!(load("").unwrap());
+        assert!(load("[updates]\n").unwrap());
+        assert!(!load("[updates]\ncheck = false\n").unwrap());
+        assert!(matches!(
+            load("[updates]\nchecks = false\n"),
+            Err(ConfigError::Invalid { .. })
+        ));
+        assert!(matches!(
+            load("[updates]\ncheck = \"no\"\n"),
+            Err(ConfigError::Invalid { .. })
+        ));
     }
 }

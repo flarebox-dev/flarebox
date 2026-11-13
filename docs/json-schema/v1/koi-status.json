@@ -915,6 +915,16 @@
         },
         "service": {
           "$ref": "#/$defs/Report"
+        },
+        "update": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UpdateNoticeData"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -935,6 +945,59 @@
         "up_to_date",
         "offline",
         "halted"
+      ],
+      "type": "string"
+    },
+    "UpdateNoticeData": {
+      "description": "Whether a newer Koidrive release is out than the version this device runs, from the daemon's last check.",
+      "properties": {
+        "checked_at": {
+          "description": "When GitHub last answered the check, in UTC.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "command": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "latest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/UpdateState"
+        },
+        "url": {
+          "description": "The release's page on GitHub.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "description": "The version this device runs: the daemon's, or this koi's when no daemon runs.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state",
+        "version"
+      ],
+      "type": "object"
+    },
+    "UpdateState": {
+      "description": "`unknown` until a check has had an answer, and `off` when config.toml or `KOIDRIVE_UPDATE_CHECK` turns it off.",
+      "enum": [
+        "available",
+        "up_to_date",
+        "unknown",
+        "off"
       ],
       "type": "string"
     },

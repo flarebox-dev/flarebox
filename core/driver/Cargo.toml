@@ -20,7 +20,9 @@ koidrive-proto = { path = "../proto" }
 koidrive-store = { path = "../store" }
 koidrive-telemetry = { path = "../telemetry" }
 prost.workspace = true
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2"] }
 rustix = { version = "1.1.6", features = ["fs", "process"] }
+semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
@@ -33,7 +35,6 @@ url = "2.5.8"
 futures-util = { version = "0.3.31", default-features = false, features = ["sink", "std"] }
 koidrive-sim = { path = "../sim" }
 proptest = "1.12.0"
-reqwest = { version = "0.13.5", default-features = false }
 tempfile = "3.27.0"
 tokio = { version = "1.48", features = ["full", "test-util"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }

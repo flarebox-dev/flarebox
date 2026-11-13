@@ -15,7 +15,8 @@ fn koi(home: &Path) -> Command {
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_STATE_HOME")
         .env("XDG_RUNTIME_DIR", home.join("run"))
-        .env_remove("KOIDRIVE_LOG");
+        .env_remove("KOIDRIVE_LOG")
+        .env("KOIDRIVE_UPDATE_CHECK", "0");
     command
 }
 

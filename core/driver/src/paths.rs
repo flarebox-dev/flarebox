@@ -81,6 +81,10 @@ impl Paths {
         self.state_dir.join("paused")
     }
 
+    pub fn update_check(&self) -> PathBuf {
+        self.state_dir.join("update-check.json")
+    }
+
     /// Locked while a koi picks the binary that runs the profile's service and installs it.
     pub fn service_lock(&self) -> PathBuf {
         self.state_dir.join("service.lock")

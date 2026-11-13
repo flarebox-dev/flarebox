@@ -6,8 +6,8 @@
 
 use koidrive_driver::{
     Account, FolderState, FolderStatus, Limit, Question, QuestionKind, RecoveryGroup,
-    RestoreRejection, RestoreRequest, RestoreState, RestoreStatus, RestoreWait, Status, Wait,
-    WaitKind,
+    RestoreRejection, RestoreRequest, RestoreState, RestoreStatus, RestoreWait, Status, Update,
+    Wait, WaitKind,
 };
 use koidrive_ipc::{Code, Next};
 use koidrive_proto::v1::{DeviceInfo, SpaceInfo, SpaceUsage, device_info::Kind};
@@ -464,6 +464,113 @@ pub struct StatusData {
     /// Every condition `status --check` weighs, whether or not `--check` was given.
     pub conditions: Vec<Condition>,
     pub service: crate::service::Report,
+    #[schemars(
+        with = "Option<UpdateNoticeData>",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub update: UpdateNoticeData,
+}
+
+/// Whether a newer Koidrive release is out than the version this device runs, from the daemon's last check.
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
+pub struct UpdateNoticeData {
+    pub state: UpdateState,
+    /// The version this device runs: the daemon's, or this koi's when no daemon runs.
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest: Option<String>,
+    /// The release's page on GitHub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// When GitHub last answered the check, in UTC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<String>,
+}
+
+/// `unknown` until a check has had an answer, and `off` when config.toml or `KOIDRIVE_UPDATE_CHECK` turns it off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateState {
+    Available,
+    UpToDate,
+    Unknown,
+    Off,
+}
+
+pub const UPDATE_COMMAND: &str = "koi update";
+
+impl UpdateNoticeData {
+    pub fn of(update: &Update, version: &str) -> Self {
+        let notice = |state| UpdateNoticeData {
+            state,
+            version: version.to_owned(),
+            latest: None,
+            url: None,
+            command: None,
+            checked_at: None,
+        };
+        match update {
+            Update::Available {
+                latest,
+                url,
+                checked_at_ms,
+            } => UpdateNoticeData {
+                latest: Some(latest.clone()),
+                url: Some(url.clone()),
+                command: Some(UPDATE_COMMAND.to_owned()),
+                checked_at: Some(utc(*checked_at_ms)),
+                ..notice(UpdateState::Available)
+            },
+            Update::UpToDate { checked_at_ms } => UpdateNoticeData {
+                checked_at: Some(utc(*checked_at_ms)),
+                ..notice(UpdateState::UpToDate)
+            },
+            Update::Unknown => notice(UpdateState::Unknown),
+            Update::Off => notice(UpdateState::Off),
+        }
+    }
+}
+
+fn utc(at_ms: i64) -> String {
+    let time = std::time::UNIX_EPOCH + std::time::Duration::from_millis(at_ms.max(0) as u64);
+    let seconds = at_ms.max(0) / 1000 % 86_400;
+    format!(
+        "{}T{:02}:{:02}:{:02}Z",
+        koidrive_fs::utc_date(time),
+        seconds / 3600,
+        seconds % 3600 / 60,
+        seconds % 60
+    )
+}
+
+/// What `koi update` did: `updated` from `from` to `to` through `via`, or `unchanged` when this device runs the newest
+/// release. `service` is the background service once the new koi took it.
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
+pub struct UpdatedData {
+    pub from: String,
+    pub to: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<Via>,
+    pub result: UpdateResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<crate::service::Report>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Via {
+    Homebrew,
+    Installer,
+    App,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateResult {
+    Updated,
+    Unchanged,
 }
 
 /// Something `status --check` reports. Connecting and catching up are not conditions: they pass on their own.
@@ -1031,6 +1138,42 @@ mod tests {
             problem: None,
             wait: None,
         }
+    }
+
+    #[test]
+    fn the_update_notice_carries_latest_url_and_command_only_while_a_release_is_out() {
+        let json =
+            |update: &Update| serde_json::to_value(UpdateNoticeData::of(update, "0.1.0")).unwrap();
+        let checked_at_ms = 1_763_006_400_000;
+        assert_eq!(
+            json(&Update::Available {
+                latest: "0.1.2".into(),
+                url: "https://github.com/koidrive/koidrive/releases/tag/v0.1.2".into(),
+                checked_at_ms,
+            }),
+            serde_json::json!({
+                "state": "available",
+                "version": "0.1.0",
+                "latest": "0.1.2",
+                "url": "https://github.com/koidrive/koidrive/releases/tag/v0.1.2",
+                "command": "koi update",
+                "checked_at": "2025-11-13T04:00:00Z",
+            })
+        );
+        assert_eq!(
+            json(&Update::UpToDate { checked_at_ms }),
+            serde_json::json!({ "state": "up_to_date", "version": "0.1.0", "checked_at": "2025-11-13T04:00:00Z" })
+        );
+        assert_eq!(
+            json(&Update::Unknown),
+            serde_json::json!({ "state": "unknown", "version": "0.1.0" })
+        );
+        assert_eq!(
+            json(&Update::Off),
+            serde_json::json!({ "state": "off", "version": "0.1.0" })
+        );
+        assert_eq!(utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(utc(951_825_599_999), "2000-02-29T11:59:59Z");
     }
 
     fn status(signed_in: bool, folders: Vec<FolderStatus>) -> Status {

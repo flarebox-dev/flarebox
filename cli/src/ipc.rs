@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use koidrive_driver::{
-    Answered, Driver, DriverError, FolderState, FolderStatus, Linked, Paths, Status,
+    Answered, Driver, DriverError, FolderState, FolderStatus, Linked, Paths, Status, Update,
 };
 use koidrive_engine::commit::Lift;
 use koidrive_ipc::{Blocked, Key, Request, RequestId, Response, read_line, write_json, write_line};
@@ -303,8 +303,15 @@ pub async fn run(paths: &Paths, request: Request) -> Result<Response, CliError> 
     let response = match koidrive_ipc::ask(paths, &request).await? {
         Some(response) => response,
         None if matches!(request, Request::Status) && !paths.state_dir.exists() => {
+            let update = match koidrive_driver::update::is_on(paths) {
+                true => Update::Unknown,
+                false => Update::Off,
+            };
             Response::Status {
-                status: Status::default(),
+                status: Status {
+                    update,
+                    ..Status::default()
+                },
             }
         }
         None if matches!(request, Request::Questions) && !paths.state_dir.exists() => {

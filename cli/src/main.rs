@@ -22,6 +22,7 @@ mod service;
 mod setup;
 mod telemetry;
 mod terminal;
+mod update;
 
 use std::ffi::OsString;
 use std::io::{self, IsTerminal};
@@ -33,7 +34,7 @@ use clap::error::ErrorKind;
 use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use koidrive_driver::{
     Answer, Credential, Driver, DriverError, FolderState, FolderStatus, Limit, MAX_DELETIONS,
-    Paths, Question, QuestionKind, RecoveryGroup, Status,
+    Paths, Question, QuestionKind, RecoveryGroup, Status, Update,
 };
 use koidrive_ipc::{Code, Key, Request, RequestId, Response};
 use koidrive_net::{ApiError, Auth, Reload};
@@ -50,7 +51,8 @@ use crate::error::CliError;
 use crate::report::{
     AccountData, AnsweredData, Decision, DeviceData, DevicesData, Done, Empty, Envelope,
     FolderData, HelpData, InvitationData, Lifecycle, RefusedSpace, RevokedData, SpaceData,
-    SpacesData, StatusData, UnlinkedData, UsageData, UsagesData, VersionInfoData, WithService,
+    SpacesData, StatusData, UPDATE_COMMAND, UnlinkedData, UpdateNoticeData, UsageData, UsagesData,
+    VersionInfoData, WithService,
 };
 use crate::request::Begun;
 
@@ -167,6 +169,8 @@ enum Command {
         #[command(subcommand)]
         action: telemetry::TelemetryAction,
     },
+    /// Upgrade Koidrive to the newest release.
+    Update,
     /// Write a file for a report of a problem: the version, the system, the status and the daemon's log, with your
     /// paths, file names, space and device names, server address and tokens replaced.
     Diagnose,
@@ -500,6 +504,7 @@ fn telemetry_of(
         Command::Resume => (Name::Resume, None, None),
         Command::Telemetry { .. } => (Name::Telemetry, None, None),
         Command::Diagnose => (Name::Diagnose, None, None),
+        Command::Update => (Name::Update, None, None),
         Command::Daemon { .. } => (Name::Daemon, None, None),
     }
 }
@@ -566,6 +571,7 @@ async fn execute(
         Command::Daemon { .. } => daemon(paths, json).await,
         Command::Status { check } => status(&paths, check).await,
         Command::Diagnose => diagnose::run(&paths).await,
+        Command::Update => update::run(&paths, json).await,
         Command::Resolve { id, answer } => resolve(&paths, id, answer).await,
         Command::Setup {
             device,
@@ -902,6 +908,8 @@ async fn daemon(paths: Paths, json: bool) -> Result<Done, CliError> {
     })?;
     let notifications = notify::decisions(driver.clone());
     driver.start();
+    driver.check_for_updates();
+    let newest = tokio::spawn(update::follow_newest(driver.paths().clone()));
     let server = tokio::spawn(ipc::serve(listener, driver.clone()));
     let notifications = tokio::spawn(notifications);
     let (stop_telemetry, telemetry_stopped) = tokio::sync::oneshot::channel();
@@ -932,6 +940,7 @@ async fn daemon(paths: Paths, json: bool) -> Result<Done, CliError> {
     emit(Lifecycle::Stopping { signal });
     server.abort();
     notifications.abort();
+    newest.abort();
     let _ = std::fs::remove_file(&socket);
     driver.stop().await;
     let _ = stop_telemetry.send(());
@@ -1025,6 +1034,7 @@ async fn status(paths: &Paths, check: bool) -> Result<Done, CliError> {
     };
     let service = service::inspect(paths, status.running).await;
     let text = status_text(&status, &questions, &service.status_line());
+    let version = (status.version.as_deref()).unwrap_or(env!("CARGO_PKG_VERSION"));
     let data = StatusData {
         account: status.account.as_ref().map(AccountData::of),
         running: status.running,
@@ -1032,6 +1042,7 @@ async fn status(paths: &Paths, check: bool) -> Result<Done, CliError> {
         folders: status.folders.iter().map(FolderData::of).collect(),
         conditions,
         service,
+        update: UpdateNoticeData::of(&status.update, version),
     };
     let mut done = Done::ok(data, text);
     done.decisions = questions.iter().map(Decision::of).collect();
@@ -1788,6 +1799,18 @@ fn status_text(status: &Status, questions: &[Question], service: &str) -> String
         }
     ));
     text.push_str(service);
+    if let Update::Available { latest, .. } = &status.update {
+        text.push_str(&format!(
+            "Update: Koidrive {} is out (this device runs {}). Run: {UPDATE_COMMAND}\n",
+            printable(latest),
+            printable(
+                status
+                    .version
+                    .as_deref()
+                    .unwrap_or(env!("CARGO_PKG_VERSION"))
+            )
+        ));
+    }
     if status.paused {
         text.push_str("Sync: paused. To sync again, run: koi resume\n");
     }
@@ -2867,6 +2890,46 @@ mod tests {
                  \x20   koi resolve q1 keep-both\n"
             )
         );
+    }
+
+    #[test]
+    fn status_names_a_newer_release_after_the_service_line_only_while_one_is_out() {
+        let service = "Background service: running (koidrive.service)\n";
+        let status = |update| Status {
+            running: true,
+            version: Some("0.1.0".into()),
+            update,
+            ..Status::default()
+        };
+        let available = status(Update::Available {
+            latest: "0.1.2".into(),
+            url: "https://github.com/koidrive/koidrive/releases/tag/v0.1.2".into(),
+            checked_at_ms: 1,
+        });
+        let text = status_text(&available, &[], service);
+        assert!(
+            text.contains(&format!(
+                "{service}Update: Koidrive 0.1.2 is out (this device runs 0.1.0). Run: koi update\n"
+            )),
+            "{text}"
+        );
+        for quiet in [
+            Update::UpToDate { checked_at_ms: 1 },
+            Update::Unknown,
+            Update::Off,
+        ] {
+            let text = status_text(&status(quiet), &[], service);
+            assert!(!text.contains("Update:"), "{text}");
+        }
+        let unversioned = Status {
+            version: None,
+            ..available
+        };
+        assert!(status_text(&unversioned, &[], service).contains(concat!(
+            "(this device runs ",
+            env!("CARGO_PKG_VERSION"),
+            ")"
+        )));
     }
 
     #[test]

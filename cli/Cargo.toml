@@ -13,6 +13,13 @@ publish.workspace = true
 name = "koi"
 path = "src/main.rs"
 
+[features]
+test-install-inventory = []
+
+[[test]]
+name = "update"
+required-features = ["test-install-inventory"]
+
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
 cliclack = "0.5.7"
@@ -20,6 +27,7 @@ console = "0.16.6"
 koidrive-cloudflare = { path = "../core/cloudflare" }
 koidrive-driver = { path = "../core/driver" }
 koidrive-engine = { path = "../core/engine" }
+koidrive-fs = { path = "../core/fs" }
 koidrive-ipc = { path = "../core/ipc" }
 koidrive-net = { path = "../core/net" }
 koidrive-proto = { path = "../core/proto" }

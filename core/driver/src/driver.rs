@@ -32,6 +32,7 @@ use crate::paths::{Paths, PathsError};
 use crate::question::{Answer, Limit, Question, QuestionKind};
 use crate::restore::{self, RestoreRequest, RestoreStatus};
 use crate::status::{Account, FolderState, FolderStatus, Status};
+use crate::update::{self, Updates};
 
 /// How long a sign-out waits for each call to the server before it goes on without it.
 const SERVER_WAIT: Duration = Duration::from_secs(10);
@@ -248,9 +249,16 @@ struct Inner {
     folders: Mutex<BTreeMap<String, Folder>>,
     running: AtomicBool,
     paused: AtomicBool,
+    updates: Arc<Updates>,
     changed: Arc<watch::Sender<()>>,
     #[cfg(test)]
     observe_fault: Option<Arc<crate::folder::ObserveFault>>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.updates.stop();
+    }
 }
 
 /// A linked folder. It stays in the driver's map until unlinking it has finished, so a stop, an unlink or a sign-out
@@ -378,6 +386,11 @@ impl Driver {
         let credential = stored.map(|stored| stored.credential);
         let folders = load_folders(&paths)?;
         let paused = paths.paused().is_file();
+        let variable = std::env::var(update::VARIABLE).ok();
+        let updates = Updates::open(
+            update::switched_on(&config.updates, variable.as_deref()),
+            paths.update_check(),
+        );
         Ok(Driver {
             inner: Arc::new(Inner {
                 matcher,
@@ -394,6 +407,7 @@ impl Driver {
                 folders: Mutex::new(folders),
                 running: AtomicBool::new(false),
                 paused: AtomicBool::new(paused),
+                updates: Arc::new(updates),
                 changed: Arc::new(watch::Sender::new(())),
                 #[cfg(test)]
                 observe_fault: None,
@@ -435,6 +449,7 @@ impl Driver {
             running: self.inner.running.load(Ordering::SeqCst),
             paused: self.inner.paused.load(Ordering::SeqCst),
             version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            update: self.inner.updates.notice(),
             folders,
         }
     }
@@ -557,6 +572,7 @@ impl Driver {
     /// The sign-out itself, run while the caller holds the lifecycle lock.
     async fn signing_out(&self, confirm_last_device: bool) -> Result<(), DriverError> {
         let was_running = self.inner.running.load(Ordering::SeqCst);
+        let was_checking = self.inner.updates.is_running();
         self.stop().await;
         let signed_in = self.inner.credential.lock().unwrap().clone();
         if let Some(credential) = &signed_in
@@ -565,6 +581,9 @@ impl Driver {
         {
             if was_running {
                 self.start();
+            }
+            if was_checking {
+                self.check_for_updates();
             }
             return Err(refused);
         }
@@ -1200,10 +1219,19 @@ impl Driver {
         }
     }
 
-    /// Stops every folder and waits for their tasks to end, also those an earlier stop or unlink is still waiting for.
-    /// State on disk is kept.
+    /// Starts asking GitHub, on the current Tokio runtime, whether a newer Koidrive release is out: when it is a day
+    /// since GitHub last answered, and again after that. Only the process that syncs the profile calls it, and it keeps
+    /// the answer in the profile for every [`Driver::status`]. With the check switched off it removes that answer
+    /// instead. Calling it while the check runs does nothing, and [`Driver::stop`] stops it.
+    pub fn check_for_updates(&self) {
+        self.inner.updates.start(self.inner.changed.clone());
+    }
+
+    /// Stops every folder and the update check, and waits for the folders' tasks to end, also those an earlier stop or
+    /// unlink is still waiting for. State on disk is kept.
     pub async fn stop(&self) {
         self.inner.running.store(false, Ordering::SeqCst);
+        self.inner.updates.stop();
         self.stop_folders().await;
     }
 
@@ -2797,6 +2825,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_status_reports_the_saved_update_check_and_off_once_config_toml_turns_it_off() {
+        let (_dir, paths, _root) = profile(&[]);
+        let release = serde_json::json!({
+            "asset": crate::update::this_asset(),
+            "checked_at": 7,
+            "release": { "version": "999.0.0", "url": "https://example.com/v999.0.0" },
+        });
+        fs::write(paths.update_check(), release.to_string()).unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+        assert_eq!(
+            driver.status().update,
+            crate::Update::Available {
+                latest: "999.0.0".into(),
+                url: "https://example.com/v999.0.0".into(),
+                checked_at_ms: 7,
+            }
+        );
+        drop(driver);
+
+        fs::write(&paths.config_file, "[updates]\ncheck = false\n").unwrap();
+        let driver = Driver::open(paths.clone()).unwrap();
+        assert_eq!(driver.status().update, crate::Update::Off);
+        driver.check_for_updates();
+        assert!(!paths.update_check().exists());
+    }
+
+    #[tokio::test]
     async fn only_a_file_marks_a_profile_paused() {
         let (_dir, paths, _root) = profile(&[]);
         fs::create_dir_all(paths.paused()).unwrap();
@@ -3229,6 +3284,46 @@ mod tests {
             assert!(expected, "{case}: {refused:?}");
             assert!(paths.credential().exists(), "{case}");
             assert_eq!(driver.status().folders.len(), 1, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_signout_restores_only_previously_active_update_checks() {
+        for response in [
+            b"HTTP/1.1 409 Conflict\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".as_slice(),
+            b"HTTP/1.1 500 Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".as_slice(),
+        ] {
+            for active in [true, false] {
+                let dir = tempfile::tempdir().unwrap();
+                let base = fs::canonicalize(dir.path()).unwrap();
+                let server = revocation_answered_with(response, false).await;
+                let paths = linked_with_server(&base, server);
+                fs::write(
+                    paths.update_check(),
+                    serde_json::json!({
+                        "asset": crate::update::this_asset(),
+                        "checked_at": i64::MAX - 1000,
+                        "successful_at": 100,
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+                let driver = Driver::open(paths).unwrap();
+                if active {
+                    driver.check_for_updates();
+                }
+                tokio::task::yield_now().await;
+                assert_eq!(driver.inner.updates.is_running(), active);
+                let refused = driver.sign_out(false).await.unwrap_err();
+                assert!(matches!(
+                    refused,
+                    DriverError::LastDevice | DriverError::NotRevoked(_)
+                ));
+                tokio::task::yield_now().await;
+                assert_eq!(driver.inner.updates.is_running(), active, "{refused:?}");
+                driver.stop().await;
+                assert!(!driver.inner.updates.is_running());
+            }
         }
     }
 

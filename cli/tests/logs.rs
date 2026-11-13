@@ -17,6 +17,7 @@ fn logs_to_a_pipe_are_plain_text() {
         .env("XDG_RUNTIME_DIR", home.path().join("run"))
         .env_remove("NO_COLOR")
         .env_remove("KOIDRIVE_LOG")
+        .env("KOIDRIVE_UPDATE_CHECK", "0")
         .stderr(Stdio::piped())
         .spawn()
         .expect("run koi");
@@ -46,6 +47,7 @@ fn the_daemon_under_json_prints_its_lifecycle_as_json_lines() {
             .env("CLICOLOR_FORCE", "1")
             .env_remove("NO_COLOR")
             .env_remove("KOIDRIVE_LOG")
+            .env("KOIDRIVE_UPDATE_CHECK", "0")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if json {
@@ -132,6 +134,7 @@ fn profiles_that_share_a_runtime_directory_run_daemons_side_by_side() {
             .env("XDG_STATE_HOME", home.path().join(profile).join("state"))
             .env("XDG_RUNTIME_DIR", home.path().join("run"))
             .env_remove("KOIDRIVE_LOG")
+            .env("KOIDRIVE_UPDATE_CHECK", "0")
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
