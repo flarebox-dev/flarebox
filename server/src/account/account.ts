@@ -4,6 +4,7 @@ import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { type ClaimAttempt, MAX_SETUP_ATTEMPT_LENGTH, MIN_RECOVERY_KEY_LENGTH, ownerOf, redeemClaim, stillUnused, storeClaimCode, wrongCode } from "./claim";
 import { ACCESS_TOKEN_MS, type ServerKey, signAccessToken } from "../auth";
 import { base64url, deriveSpaceKey, sha256 } from "../crypto";
+import { errorText } from "../errors";
 import {
   type AccessToken,
   AccessTokenSchema,
@@ -222,7 +223,7 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       if (!outcome.ok) return outcome;
       for (const deviceId of outcome.revoke) {
         if (!stillUnused(this.sql, deviceId, setupAttempt, userId)) continue;
-        await this.revokeDevice(deviceId).catch((error: unknown) => console.error("setup attempt cleanup failed", deviceId, error));
+        await this.revokeDevice(deviceId).catch((error: unknown) => console.error("setup attempt cleanup failed", deviceId, errorText(error)));
       }
       if (this.activeDevice(device.credentials.deviceId) === undefined) {
         return failure(Error_Code.FORBIDDEN, "a later claim of this setup attempt replaced this one; set a new recovery key and claim again");
@@ -423,7 +424,7 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
             await this.spaceStub(String(space_id)).closeDevice(String(device_id));
             this.sql.exec("DELETE FROM revocation_notices WHERE device_id = ? AND space_id = ?", device_id, space_id);
           } catch (error) {
-            console.error("revocation notice failed", device_id, space_id, error);
+            console.error("revocation notice failed", device_id, space_id, errorText(error));
             this.sql.exec("UPDATE revocation_notices SET next_try_ms = ? WHERE device_id = ? AND space_id = ?", Date.now() + NOTICE_RETRY_MS, device_id, space_id);
           }
         }),
@@ -538,7 +539,7 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
         try {
           info = await this.spaceStub(args.spaceId).rewindInfo(point);
         } catch (error) {
-          console.error("rewind admission failed", error instanceof Error ? error.name + ": " + error.message : String(error));
+          console.error("rewind admission failed", errorText(error));
           return failure(Error_Code.RETRY_LATER, "the space could not be read; retry the rewind");
         }
         if (info.historyId !== args.expectedHistoryId) return failure(Error_Code.HISTORY_MISMATCH, "expected_history_id is not the space's current history");
@@ -649,7 +650,7 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       } catch (error) {
         const row = this.rewindRow(rewindId)!;
         const delay = Math.min(REWIND_RETRY_MAX_MS, REWIND_RETRY_MIN_MS * 2 ** Math.min(row.tries, 20));
-        console.error("rewind phase failed", rewindId, row.phase, error);
+        console.error("rewind phase failed", rewindId, row.phase, errorText(error));
         this.sql.exec(
           "UPDATE rewinds SET tries = tries + 1, error = ?, next_try_ms = ? WHERE rewind_id = ?",
           error instanceof Error ? error.message : String(error),

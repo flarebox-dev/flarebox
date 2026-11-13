@@ -21,6 +21,7 @@ import {
 } from "./gen/koidrive/v1/auth_pb";
 import { UploadReceiptSchema } from "./gen/koidrive/v1/commit_pb";
 import { Error_Code, ErrorSchema } from "./gen/koidrive/v1/rpc_pb";
+import { errorText } from "./errors";
 import type { ObjectStore } from "./host";
 import { BadRequest, errorReply, readMessage, reply } from "./http";
 import { type ChunkObject, deriveSpaceKey, signChunkGrant, verifyChunkGrant } from "./crypto";
@@ -168,7 +169,7 @@ async function chunk(request: Request, env: Env, objects: ObjectStore, spaceId: 
     await objects.put(key, request.body, { sha256: hex, onlyIf: { etagDoesNotMatch: "*" } });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error("chunk upload failed", spaceId, hex, message);
+    console.error("chunk upload failed", spaceId, hex, errorText(error));
     if (/checksum/i.test(message)) return errorReply(request, Error_Code.INVALID_ARGUMENT, "the body does not match the chunk hash");
     const throttled = /\b429\b|10058|too many|rate/i.test(message);
     return errorReply(request, Error_Code.RETRY_LATER, "chunk storage is unavailable; retry the upload", throttled ? 429 : 503);
@@ -308,7 +309,7 @@ export default {
       if (error instanceof BadRequest) return errorReply(request, Error_Code.INVALID_ARGUMENT, error.message);
       const quota = quotaRefusal(error, Date.now());
       if (!quota) throw error;
-      console.error("request stopped at a platform limit", error);
+      console.error("request stopped at a platform limit", errorText(error));
       return reply(request, ErrorSchema, create(ErrorSchema, { code: Error_Code.QUOTA_EXCEEDED, message: quota.message, retryAfterMs: BigInt(quota.retryAfterMs) }), 429);
     }
   },

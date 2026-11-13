@@ -597,6 +597,25 @@ describe("space rewind (RFC 0003)", () => {
     }
   });
 
+  it("logs the error the Space DO raised when the admission cannot read the space, and answers retry later", async () => {
+    const { spaceId, createdAtMs, creds, device } = await newSpace();
+    const token = creds.access!.token;
+    const a = device();
+    await createFile(a, spaceId, "a.txt", "a");
+    const point = createdAtMs + MINUTE;
+    await snapshot(spaceId, point);
+    const history = await a.history();
+    await setAccountClock(createdAtMs + 5 * MINUTE);
+
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    simulatedPitr.bookmarkFor = () => {
+      throw new RangeError("no bookmark at that time");
+    };
+    const refused = await rewind(token, spaceId, { restorePointMs: point, expectedHistoryId: history });
+    expect([refused.status, refused.error?.code]).toEqual([503, Error_Code.RETRY_LATER]);
+    expect(logged.mock.calls).toContainEqual(["rewind admission failed", "RangeError: no bookmark at that time"]);
+  });
+
   it("answers the space closed to a check the Space DO makes while the admission waits for rewindInfo (RFC 0014)", async () => {
     const { spaceId, createdAtMs, creds, device } = await newSpace();
     const token = creds.access!.token;

@@ -57,6 +57,7 @@ import type { SessionCheck } from "../account/account";
 import type { AccountDO } from "../account-do";
 import { type Identity, verifyAccessToken } from "../auth";
 import { type ChunkObject, sha256, signChunkGrant, verifyChunkGrant } from "../crypto";
+import { errorText } from "../errors";
 import type { Database, ObjectState, ObjectStore, Socket, Sql } from "../host";
 import { fromHex, isUuidV7, toHex, uuidv7 } from "../ids";
 import { policy } from "../policy";
@@ -317,7 +318,7 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       try {
         await this.runExport();
       } catch (error) {
-        console.error("space export failed", error);
+        console.error("space export failed", errorText(error));
       }
       await this.schedule("gc", this.clock() + DAY_MS);
     }
@@ -350,7 +351,7 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       } catch (error) {
         const quota = quotaRefusal(error, this.clock());
         if (!quota) throw error;
-        console.error("space session stopped at a platform limit", error);
+        console.error("space session stopped at a platform limit", errorText(error));
         this.send(ws, { case: "notice", value: create(NoticeSchema, { kind: Notice_Kind.QUOTA_EXCEEDED, message: quota.message, retryAfterMs: BigInt(quota.retryAfterMs) }) });
         this.goodbye(ws, Close.TRY_AGAIN_LATER, quota.message);
       }
@@ -445,7 +446,7 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
             this.storeLease(deviceId, check, askedAtMs);
           }
         })
-        .catch((error) => console.error("account lease renewal failed", error))
+        .catch((error) => console.error("account lease renewal failed", errorText(error)))
         .finally(() => {
           if (this.renewing === renewal) this.renewing = undefined;
         });
@@ -504,7 +505,7 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
           for (const [deviceId, check] of Object.entries(answers)) this.storeLease(deviceId, check, askedAtMs);
           return answers;
         } catch (error) {
-          console.error("account device check failed", error);
+          console.error("account device check failed", errorText(error));
           return undefined;
         }
       });
@@ -694,7 +695,7 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
         }
       } catch (error) {
         if (!(error instanceof CallFailure)) {
-          console.error("space rpc failed", error);
+          console.error("space rpc failed", errorText(error));
           const quota = quotaRefusal(error, this.clock());
           error = quota ? new CallFailure(Error_Code.QUOTA_EXCEEDED, quota.message, [], quota.retryAfterMs) : new CallFailure(Error_Code.INTERNAL, "internal error");
         }
@@ -913,7 +914,7 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
         this.alarmStale = false;
       } catch (error) {
         this.alarmStale = true;
-        console.error("space alarm write failed", error);
+        console.error("space alarm write failed", errorText(error));
       }
     }
 
@@ -1322,7 +1323,7 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       try {
         resolved = await this.account().shareResolve({ ...link, counted: false });
       } catch (error) {
-        console.error("account link check failed", error);
+        console.error("account link check failed", errorText(error));
         return SHARE_CLOSED;
       }
       return checkFence(this.sql, this.spaceId, resolved, fence);
@@ -1334,7 +1335,7 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       try {
         return await this.account().isSpaceClosed(String(spaceId));
       } catch (error) {
-        console.error("account rewind check failed", error);
+        console.error("account rewind check failed", errorText(error));
         return true;
       }
     }
@@ -1371,7 +1372,7 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
             const report = await this.collectGarbage(nowMs);
             nextMs = nowMs + (report.more ? 60_000 : DAY_MS);
           } catch (error) {
-            console.error("space gc failed", error);
+            console.error("space gc failed", errorText(error));
           }
           this.sql.exec("UPDATE schedule SET due_ms = ? WHERE task = 'gc'", nextMs);
         }
@@ -1379,7 +1380,7 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
           try {
             await this.runExport();
           } catch (error) {
-            console.error("space export failed", error);
+            console.error("space export failed", errorText(error));
             this.sql.exec("UPDATE schedule SET due_ms = ? WHERE task = 'export'", nowMs + EXPORT_RETRY_MS);
           }
         }

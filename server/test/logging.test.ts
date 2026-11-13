@@ -39,6 +39,15 @@ function recordLogs(): string[] {
   return lines;
 }
 
+const sources = import.meta.glob<string>("../src/**/*.ts", { query: "?raw", import: "default", eager: true });
+
+function rawCaughtErrors(source: string): string[] {
+  const caught = [...source.matchAll(/catch\s*\(\s*\(?\s*(\w+)/g)].map((match) => match[1]!);
+  return [...source.matchAll(/console\.\w+\((.*)\)/g)].flatMap(([call, args]) =>
+    caught.some((name) => args!.replaceAll("errorText(" + name + ")", "").match(new RegExp("\\b" + name + "\\b"))) ? [call] : [],
+  );
+}
+
 describe("server logs", () => {
   it("carry no ticket, receipt, token or credential through an upload, a failed upload and a download", async () => {
     const claimLog = vi.spyOn(console, "log");
@@ -101,5 +110,11 @@ describe("server logs", () => {
       expect(lines.filter((line) => line.includes(secret))).toEqual([]);
     }
     expect(lines.filter((line) => /ticket=|Bearer /.test(line))).toEqual([]);
+  });
+
+  it("format every caught error with errorText, so its name and message reach Workers Logs", () => {
+    expect(Object.keys(sources).length).toBeGreaterThan(10);
+    expect(rawCaughtErrors('try {} catch (error) { console.error("x failed", error); }'), "the check finds a raw caught error").toHaveLength(1);
+    expect(Object.entries(sources).flatMap(([path, source]) => rawCaughtErrors(source).map((call) => path + ": " + call))).toEqual([]);
   });
 });
