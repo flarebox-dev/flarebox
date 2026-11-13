@@ -689,32 +689,37 @@ fn a_scoped_rescan_finds_a_hard_link_outside_its_scope_as_a_full_one_does() {
 #[test]
 fn a_held_entry_under_a_folder_that_cannot_be_read_is_not_removed() {
     use std::os::unix::fs::PermissionsExt;
-    let dir = large_ignored_tree();
-    let root = dir.path();
-    write(root, "d/x", "x");
-    write(root, "d/y", "y");
-    let mut rules = rules().with_search_budget(100);
-    let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
-    fs::rename(root.join("d/x"), root.join("ig/zz/deep/x")).unwrap();
-    let first = snapshot
-        .rescan_with_rules(root, whole(), &mut rules)
-        .unwrap();
-    assert_eq!(first.unsettled, [PathBuf::from("d/x")]);
-    fs::rename(root.join("ig/zz/deep/x"), root.join("d/x")).unwrap();
-    fs::set_permissions(root.join("d"), fs::Permissions::from_mode(0o000)).unwrap();
+    for left_out in [false, true] {
+        let dir = large_ignored_tree();
+        let root = dir.path();
+        write(root, "d/x", "x");
+        write(root, "d/y", "y");
+        let mut rules = rules().with_search_budget(100);
+        let mut snapshot = Snapshot::scan_with_rules(root, &mut rules).unwrap();
+        fs::rename(root.join("d/x"), root.join("ig/zz/deep/x")).unwrap();
+        let first = snapshot
+            .rescan_with_rules(root, whole(), &mut rules)
+            .unwrap();
+        assert_eq!(first.unsettled, [PathBuf::from("d/x")]);
+        fs::rename(root.join("ig/zz/deep/x"), root.join("d/x")).unwrap();
+        fs::set_permissions(root.join("d"), fs::Permissions::from_mode(0o000)).unwrap();
+        if left_out {
+            write(root, RULES_FILE, "ig/\nd/\n");
+        }
 
-    let mut changes = Vec::new();
-    for _ in 0..10 {
-        let rescan = snapshot.rescan_with_rules(root, whole(), &mut rules);
-        changes.extend(rescan.unwrap().changes);
+        let mut changes = Vec::new();
+        for _ in 0..10 {
+            let rescan = snapshot.rescan_with_rules(root, whole(), &mut rules);
+            changes.extend(rescan.unwrap().changes);
+        }
+        fs::set_permissions(root.join("d"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            !changes
+                .iter()
+                .any(|change| matches!(change, Change::Removed { .. })),
+            "{left_out} {changes:?}"
+        );
     }
-    fs::set_permissions(root.join("d"), fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(
-        !changes
-            .iter()
-            .any(|change| matches!(change, Change::Removed { .. })),
-        "{changes:?}"
-    );
 }
 
 #[test]

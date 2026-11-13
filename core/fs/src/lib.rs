@@ -596,7 +596,8 @@ impl Snapshot {
     /// below a folder the rescan cannot read is not counted as scanned. A held entry whose
     /// removal the scan cannot confirm, as below a folder it cannot read,
     /// stays held. One whose path the rules now leave out is left to the
-    /// search, whatever the disk holds at that path.
+    /// search once its folder can be read, whatever the disk holds at that
+    /// path.
     ///
     /// On any error `rules` are unchanged too.
     pub fn rescan_with_rules(
@@ -825,8 +826,8 @@ impl Snapshot {
         )?;
         let stays = match &scan.rules {
             Some(rules) => {
-                let held: BTreeMap<PathBuf, Entry> = (rules.held_in(&scan.replaced).into_iter())
-                    .filter(|(path, entry)| {
+                let (held, left_out): (BTreeMap<PathBuf, Entry>, BTreeMap<PathBuf, Entry>) =
+                    (rules.held_in(&scan.replaced).into_iter()).partition(|(path, entry)| {
                         (path
                             .ancestors()
                             .take_while(|above| !above.as_os_str().is_empty()))
@@ -838,19 +839,23 @@ impl Snapshot {
                             };
                             rules.status(above, kind) == Ignored::No
                         })
-                    })
-                    .collect();
+                    });
                 let mut there: BTreeMap<PathBuf, Entry> = (held.keys())
                     .filter_map(|path| Some((path.clone(), *scan.new.get(path)?)))
                     .collect();
-                keep_unconfirmed(
+                let mut stays = keep_unconfirmed(
                     root,
                     &root_stat.id,
                     again.as_fd(),
                     &held,
                     &mut there,
                     &mut *scan.cut,
-                )?
+                )?;
+                stays.extend(left_out.into_keys().filter(|path| {
+                    let parent = path.parent().unwrap_or(Path::new(""));
+                    observe(again.as_fd(), parent, &mut *scan.cut).is_none()
+                }));
+                stays
             }
             None => Vec::new(),
         };
