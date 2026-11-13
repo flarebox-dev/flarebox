@@ -1766,6 +1766,22 @@ fn rebase(
         }
         rekey(trees, id, &ids.uuid_v7(now_ms));
     }
+    for id in &dirty {
+        let (Some(local), Some(remote)) = (trees.local().get(id), trees.remote().live(id)) else {
+            continue;
+        };
+        if !local.parked
+            || trees.acknowledged_class(id) != Class::Remote
+            || trees.excluded(id)
+            || !effects::held_by_excluded(trees, id, remote)
+        {
+            continue;
+        }
+        let mut node = local.clone();
+        node.shape.parent = remote.parent.clone();
+        node.shape.name = remote.name.clone();
+        trees.set_local(id.clone(), node);
+    }
     let mut needed = BTreeSet::new();
     let mut agreed = Vec::new();
     for id in &dirty {

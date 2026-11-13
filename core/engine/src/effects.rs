@@ -489,6 +489,10 @@ fn within(trees: &Trees, node: &NodeId) -> Vec<NodeId> {
     within
 }
 
+pub(crate) fn held_by_excluded(trees: &Trees, id: &str, target: &Shape) -> bool {
+    View::new(trees).held_by_excluded(id, target)
+}
+
 pub(crate) fn kept_out(trees: &Trees, id: &str) -> bool {
     let view = View::new(trees);
     trees.local().get(id).is_some_and(|node| node.parked)
