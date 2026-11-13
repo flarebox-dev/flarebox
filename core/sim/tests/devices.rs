@@ -1447,6 +1447,98 @@ fn a_copy_of_a_rolled_back_write_after_the_recovery_is_refused() {
     );
 }
 
+fn copies_of(world: &World, write: i64) -> usize {
+    (files_on(world, 0).into_iter())
+        .filter(|(_, content)| content.as_ref().is_some_and(|c| c.mtime_ns == write))
+        .count()
+}
+
+fn a_write_a_restore_kept_and_another_device_then_edited() -> Vec<Vec<(usize, Step)>> {
+    vec![
+        vec![
+            (0, file("a")),
+            (0, Step::Work(0)),
+            (2, file("a")),
+            (0, Step::Work(0)),
+            (2, Step::Work(0)),
+            (0, SCAN),
+            (2, Step::Work(0)),
+            (2, Step::Work(0)),
+            (1, Step::Work(0)),
+            (2, folder("A")),
+            (2, DELIVER),
+            (2, user(4, 1175486844842293939, 0, "a")),
+            (2, rename(0, 0, "ß")),
+            (0, file("A")),
+            (0, user(2, 294041810860057272, 0, "a")),
+        ],
+        vec![(0, rename(0, 0, "A")), (0, BACKUP)],
+        vec![
+            (0, RESTORE),
+            (0, user(2, 3337042255730594815, 0, "a")),
+            (2, folder("b")),
+            (0, Step::Work(0)),
+            (2, user(3, 7894732180522727006, 10174581841506759649, "a")),
+            (0, Step::Connect),
+            (0, Step::Work(0)),
+            (0, Step::Work(3083887596059364753)),
+            (0, Step::Work(13851926561577354009)),
+        ],
+    ]
+}
+
+#[test]
+fn each_device_that_cannot_tell_a_restore_kept_a_write_keeps_its_copy_beside_a_later_edit() {
+    let world = converge(3, &a_write_a_restore_kept_and_another_device_then_edited()).unwrap();
+    assert_eq!(copies_of(&world, 3), 2);
+}
+
+#[test]
+fn a_copy_beside_the_copies_of_a_write_a_restore_kept_is_refused() {
+    let mut world = converge(3, &a_write_a_restore_kept_and_another_device_then_edited()).unwrap();
+    let kept = (world.devices[0].disk.entries().values())
+        .find_map(|entry| (entry.content.clone()).filter(|content| content.mtime_ns == 3));
+    world.devices[0]
+        .disk
+        .create(Place::Root, "c.txt", kept)
+        .unwrap();
+    let failure = world.phase(3, &[]).unwrap_err();
+    assert!(
+        failure
+            .to_string()
+            .contains("write 3 is in more than one file"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn a_copy_of_a_kept_write_by_a_device_whose_own_commit_shows_the_server_kept_it_is_refused() {
+    let phases = [
+        vec![(0, file("a"))],
+        vec![(2, delete(0)), (0, rename(0, 0, "ß")), (0, BACKUP)],
+        vec![
+            (0, RESTORE),
+            (2, Step::Connect),
+            (2, Step::Work(0)),
+            (2, EFFECT),
+            (2, overwrite(0)),
+            (2, Step::Work(2940287964182624177)),
+            (2, Step::Work(0)),
+            (2, Step::Work(0)),
+            (2, Step::Work(0)),
+        ],
+    ];
+    match converge(3, &phases) {
+        Ok(world) => assert_eq!(copies_of(&world, 1), 1),
+        Err(failure) => assert!(
+            failure
+                .to_string()
+                .contains("write 1 is in more than one file"),
+            "{failure}"
+        ),
+    }
+}
+
 #[test]
 fn an_edit_back_to_the_bytes_a_restore_left_keeps_its_file_and_the_lost_edit_beside_it() {
     let world = converge(
