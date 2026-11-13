@@ -16,26 +16,26 @@ class SplitRegressionsTests(unittest.TestCase):
     def test_moves_each_line_unchanged_and_can_run_again(self):
         with tempfile.TemporaryDirectory() as root:
             legacy = Path(root) / "property.proptest-regressions"
-            lines = [f"cc {'1' * 64} # shrinks to a\n", f"cc {'2' * 64}\n"]
-            legacy.write_text("# header\n" + "".join(lines))
+            lines = [f"cc {'1' * 64} # shrinks to ß\n", f"cc {'2' * 64}\n"]
+            legacy.write_text("# header\n" + "".join(lines), encoding="utf-8")
             self.assertEqual(module.split(legacy), 2)
-            self.assertEqual(legacy.read_text(), "# header\n")
+            self.assertEqual(legacy.read_text(encoding="utf-8"), "# header\n")
             cases = sorted(legacy.with_suffix(".cases").glob("*.txt"))
-            self.assertEqual([path.read_text() for path in cases], lines)
+            self.assertEqual([path.read_text(encoding="utf-8") for path in cases], lines)
             self.assertEqual(module.split(legacy), 0)
 
     def test_conflicting_destination_preserves_the_legacy_file(self):
         with tempfile.TemporaryDirectory() as root:
             legacy = Path(root) / "property.txt"
             line = f"cc {'1' * 64}\n"
-            legacy.write_text(line)
+            legacy.write_text(line, encoding="utf-8")
             destination = legacy.with_suffix(".cases") / f"cc-{'1' * 64}.txt"
             destination.parent.mkdir()
-            destination.write_text("other\n")
+            destination.write_text("other\n", encoding="utf-8")
             with self.assertRaises(ValueError):
                 module.split(legacy)
-            self.assertEqual(legacy.read_text(), line)
-            self.assertEqual(destination.read_text(), "other\n")
+            self.assertEqual(legacy.read_text(encoding="utf-8"), line)
+            self.assertEqual(destination.read_text(encoding="utf-8"), "other\n")
 
 
 if __name__ == "__main__":
