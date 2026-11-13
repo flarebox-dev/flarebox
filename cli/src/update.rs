@@ -2,6 +2,7 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -106,10 +107,10 @@ pub fn homebrew_link(binary: &Path) -> Option<PathBuf> {
         .then(|| prefix.join("opt/koidrive/bin/koi"))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Method {
-    Cask,
-    Formula,
+    Cask { brew: PathBuf },
+    Formula { brew: PathBuf },
     Installer,
     App,
     Development,
@@ -118,7 +119,7 @@ enum Method {
 impl Method {
     fn via(&self) -> Option<Via> {
         match self {
-            Method::Cask | Method::Formula => Some(Via::Homebrew),
+            Method::Cask { .. } | Method::Formula { .. } => Some(Via::Homebrew),
             Method::Installer => Some(Via::Installer),
             Method::App => Some(Via::App),
             Method::Development => None,
@@ -165,26 +166,75 @@ impl Install {
         }
         let resolved = fs::canonicalize(binary)
             .map_err(|error| failed(format!("Cannot resolve {}: {error}", binary.display())))?;
-        let method = if homebrew_link(&resolved).is_some() {
-            Method::Formula
-        } else if resolved.ends_with("Koidrive.app/Contents/Helpers/koi") {
-            let inferred = binary
+        let mut candidates = Vec::new();
+        let mut link = binary.to_path_buf();
+        for _ in 0..40 {
+            if let Some(prefix) =
+                homebrew_link(&link).and_then(|opt| opt.ancestors().nth(4).map(Path::to_path_buf))
+            {
+                candidates.push(prefix);
+            }
+            if let Some(prefix) = link
                 .parent()
                 .filter(|bin| bin.ends_with("bin"))
-                .and_then(Path::parent);
-            let owned = prefixes
-                .iter()
-                .map(PathBuf::as_path)
-                .chain(inferred)
-                .any(|prefix| {
-                    fs::read_dir(prefix.join("Caskroom/koidrive")).is_ok_and(|entries| {
-                        entries.flatten().any(|entry| {
-                            fs::canonicalize(entry.path().join("Koidrive.app/Contents/Helpers/koi"))
-                                .is_ok_and(|helper| helper == resolved)
-                        })
+                .and_then(Path::parent)
+            {
+                candidates.push(prefix.to_path_buf());
+            }
+            let Ok(target) = fs::read_link(&link) else {
+                break;
+            };
+            link = match target.is_absolute() {
+                true => target,
+                false => link.parent().unwrap_or(Path::new("/")).join(target),
+            };
+        }
+        candidates.extend_from_slice(prefixes);
+        let formula = candidates.iter().find(|prefix| {
+            fs::canonicalize(prefix.join("opt/koidrive/bin/koi"))
+                .is_ok_and(|helper| helper == resolved)
+        });
+        let method = if let Some(prefix) = formula {
+            Method::Formula {
+                brew: fs::canonicalize(prefix)
+                    .map_err(|error| {
+                        failed(format!(
+                            "Cannot resolve Homebrew at {}: {error}",
+                            prefix.display()
+                        ))
+                    })?
+                    .join("bin/brew"),
+            }
+        } else if let Some(opt) = homebrew_link(&resolved) {
+            Method::Formula {
+                brew: opt
+                    .ancestors()
+                    .nth(4)
+                    .expect("a formula path has a prefix")
+                    .join("bin/brew"),
+            }
+        } else if resolved.ends_with("Koidrive.app/Contents/Helpers/koi") {
+            let owned = candidates.iter().find(|prefix| {
+                fs::read_dir(prefix.join("Caskroom/koidrive")).is_ok_and(|entries| {
+                    entries.flatten().any(|entry| {
+                        fs::canonicalize(entry.path().join("Koidrive.app/Contents/Helpers/koi"))
+                            .is_ok_and(|helper| helper == resolved)
                     })
-                });
-            if owned { Method::Cask } else { Method::App }
+                })
+            });
+            match owned {
+                Some(prefix) => Method::Cask {
+                    brew: fs::canonicalize(prefix)
+                        .map_err(|error| {
+                            failed(format!(
+                                "Cannot resolve Homebrew at {}: {error}",
+                                prefix.display()
+                            ))
+                        })?
+                        .join("bin/brew"),
+                },
+                None => Method::App,
+            }
         } else if resolved.file_name().is_some_and(|name| name == "koi")
             && !resolved
                 .components()
@@ -204,22 +254,43 @@ impl Install {
     }
 
     fn command(&self) -> Option<Vec<&str>> {
-        match self.method {
-            Method::Cask => Some(vec!["brew", "upgrade", "--cask", "koidrive"]),
-            Method::Formula => Some(vec!["brew", "upgrade", "koidrive"]),
+        match &self.method {
+            Method::Cask { brew } | Method::Formula { brew } => {
+                let path = std::env::var_os("PATH");
+                let selected = path
+                    .as_ref()
+                    .and_then(|path| {
+                        std::env::split_paths(path)
+                            .map(|bin| bin.join("brew"))
+                            .find(|candidate| {
+                                fs::metadata(candidate).is_ok_and(|metadata| {
+                                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                                })
+                            })
+                    })
+                    .and_then(|selected| {
+                        selected.parent().and_then(|bin| fs::canonicalize(bin).ok())
+                    });
+                let owned = brew.parent().and_then(|bin| fs::canonicalize(bin).ok());
+                let executable = if owned.is_some() && selected == owned {
+                    "brew"
+                } else {
+                    brew.to_str()?
+                };
+                let mut command = vec![executable, "upgrade"];
+                if matches!(self.method, Method::Cask { .. }) {
+                    command.push("--cask");
+                }
+                command.push("koidrive");
+                Some(command)
+            }
             Method::Installer => Some(vec![self.binary.to_str()?, "update"]),
             Method::App | Method::Development => None,
         }
     }
 
     pub(crate) fn notice(&self, update: &update::Update, version: &str) -> UpdateNoticeData {
-        let command = self.command().map(|command| {
-            command
-                .iter()
-                .map(|word| crate::pairing::shell_word(word))
-                .collect::<Vec<_>>()
-                .join(" ")
-        });
+        let command = self.command().map(|command| command_text(&command));
         let update = if self.method == Method::Development {
             &update::Update::Off
         } else {
@@ -227,6 +298,14 @@ impl Install {
         };
         UpdateNoticeData::of(update, version, command.as_deref())
     }
+}
+
+fn command_text(command: &[&str]) -> String {
+    command
+        .iter()
+        .map(|word| crate::pairing::shell_word(word))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn refuse_root(root: bool) -> Result<(), CliError> {
@@ -520,8 +599,10 @@ pub async fn run(paths: &Paths, json: bool) -> Result<Done, CliError> {
         )
         .unchanged());
     }
-    if matches!(install.method, Method::Cask | Method::Formula) {
-        let command = install.command().expect("Homebrew has an upgrade command");
+    if matches!(install.method, Method::Cask { .. } | Method::Formula { .. }) {
+        let command = install.command().ok_or_else(|| {
+            failed("Homebrew's path cannot be represented as a shell command".to_owned())
+        })?;
         return Ok(Done::ok(
             UpdatedData {
                 from: env!("CARGO_PKG_VERSION").to_owned(),
@@ -533,7 +614,7 @@ pub async fn run(paths: &Paths, json: bool) -> Result<Done, CliError> {
             },
             format!(
                 "Koidrive is managed by Homebrew. To update, run: {}\n",
-                command.join(" ")
+                command_text(&command)
             ),
         )
         .unchanged()
@@ -645,7 +726,7 @@ pub async fn run(paths: &Paths, json: bool) -> Result<Done, CliError> {
             installer(script_url()?, dir, &to, &mut echo).await?
         }
         Method::Installer => (),
-        Method::Cask | Method::Formula | Method::Development => unreachable!(),
+        Method::Cask { .. } | Method::Formula { .. } | Method::Development => unreachable!(),
     }
     let koi = koi.expect("an installation has a koi path");
     let changed = prepared_app
@@ -1008,10 +1089,16 @@ mod tests {
         let formula = dir.path().join("brew/Cellar/koidrive/0.1.0/bin/koi");
         executable(&script, "#!/bin/sh\nexit 0\n");
         let script_command = format!("{} update", fs::canonicalize(&script).unwrap().display());
+        let formula_brew = fs::canonicalize(dir.path()).unwrap().join("brew/bin/brew");
+        let formula_command = format!("{} upgrade koidrive", formula_brew.display());
         for (binary, method, command) in [
             (&script, Method::Installer, Some(script_command.as_str())),
             (&app, Method::App, None),
-            (&formula, Method::Formula, Some("brew upgrade koidrive")),
+            (
+                &formula,
+                Method::Formula { brew: formula_brew },
+                Some(formula_command.as_str()),
+            ),
         ] {
             executable(binary, "#!/bin/sh\nexit 0\n");
             let install = Install::resolve(binary, "0.1.0", &[]).unwrap();
@@ -2165,10 +2252,11 @@ mod tests {
         fs::remove_file(&registration).unwrap();
         std::os::unix::fs::symlink(&app, &registration).unwrap();
         let cask = classify();
-        assert_eq!(cask.method, Method::Cask);
+        let brew = fs::canonicalize(&prefix).unwrap().join("bin/brew");
+        assert_eq!(cask.method, Method::Cask { brew: brew.clone() });
         assert_eq!(
             cask.command().as_deref(),
-            Some(["brew", "upgrade", "--cask", "koidrive"].as_slice())
+            Some([brew.to_str().unwrap(), "upgrade", "--cask", "koidrive"].as_slice())
         );
         let available = update::Update::Available {
             latest: "0.2.0".into(),
@@ -2177,7 +2265,7 @@ mod tests {
         };
         assert_eq!(
             cask.notice(&available, "0.1.0").command.as_deref(),
-            Some("brew upgrade --cask koidrive")
+            Some(format!("{} upgrade --cask koidrive", brew.display()).as_str())
         );
         assert!(!prefix.join("bin/koi").exists());
     }
@@ -2200,8 +2288,23 @@ mod tests {
         fs::create_dir_all(registration.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&app, registration).unwrap();
         let cask = Install::resolve(&link, "0.1.0", &[]).unwrap();
-        assert_eq!(cask.method, Method::Cask);
+        assert_eq!(
+            cask.method,
+            Method::Cask {
+                brew: fs::canonicalize(&prefix).unwrap().join("bin/brew")
+            }
+        );
         assert_eq!(cask.binary, fs::canonicalize(&helper).unwrap());
+        let other_prefix = dir.path().join("otherbrew");
+        let other_registration = other_prefix.join("Caskroom/koidrive/0.1.0/Koidrive.app");
+        fs::create_dir_all(other_registration.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&app, other_registration).unwrap();
+        assert_eq!(
+            Install::resolve(&link, "0.1.0", &[other_prefix])
+                .unwrap()
+                .method,
+            cask.method,
+        );
         let script = dir.path().join("standalone/koi");
         executable(&script, "#!/bin/sh\nexit 0\n");
         let alias = dir.path().join("alias");
@@ -2411,10 +2514,11 @@ mod tests {
         std::os::unix::fs::symlink("../opt/koidrive/bin/koi", &link).unwrap();
         for binary in [&keg, &opt.join("bin/koi"), &link] {
             let install = Install::resolve(binary, "0.1.0", &[]).unwrap();
-            assert_eq!(install.method, Method::Formula);
+            let brew = fs::canonicalize(&prefix).unwrap().join("bin/brew");
+            assert_eq!(install.method, Method::Formula { brew: brew.clone() });
             assert_eq!(
                 install.command().as_deref(),
-                Some(["brew", "upgrade", "koidrive"].as_slice())
+                Some([brew.to_str().unwrap(), "upgrade", "koidrive"].as_slice())
             );
         }
         fs::remove_file(keg).unwrap();
@@ -2431,5 +2535,32 @@ mod tests {
         let install = Install::resolve(&script, "0.1.0", &[prefix]).unwrap();
         assert_eq!(install.method, Method::Installer);
         assert_eq!(install.binary, fs::canonicalize(script).unwrap());
+    }
+
+    #[test]
+    fn formula_ownership_survives_a_linked_cellar_and_invocation_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("brew");
+        let version = dir.path().join("external store/koidrive/0.1.0");
+        let binary = version.join("bin/koi");
+        executable(&binary, "#!/bin/sh\nexit 0\n");
+        let opt = prefix.join("opt/koidrive");
+        fs::create_dir_all(opt.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&version, &opt).unwrap();
+        let link = prefix.join("bin/koi");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("../opt/koidrive/bin/koi", &link).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&link, &alias).unwrap();
+        for invoked in [&alias, &link, &opt.join("bin/koi")] {
+            let install = Install::resolve(invoked, "0.1.0", &[]).unwrap();
+            assert_eq!(
+                install.method,
+                Method::Formula {
+                    brew: fs::canonicalize(&prefix).unwrap().join("bin/brew")
+                }
+            );
+            assert_eq!(install.binary, fs::canonicalize(&binary).unwrap());
+        }
     }
 }
