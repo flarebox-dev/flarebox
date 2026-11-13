@@ -1780,6 +1780,10 @@ fn rebase(
         {
             continue;
         }
+        if trees.write_held_beside(id) {
+            trees.take_local(id.clone());
+            continue;
+        }
         rekey(trees, id, &ids.uuid_v7(now_ms));
     }
     for id in &dirty {
