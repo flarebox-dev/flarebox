@@ -1775,9 +1775,45 @@ impl Trees {
         for (id, shape) in self.s.iter() {
             children.entry(&shape.parent).or_default().push(id);
         }
-        let deleted: BTreeSet<NodeId> = (untaken.iter())
-            .filter(|(_, change)| *change == Untaken::Delete)
-            .map(|(id, _)| id.clone())
+        let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for (id, shape) in self.s.iter() {
+            children.entry(&shape.parent).or_default().push(id);
+        }
+        let holds_live_below = |id: &str| {
+            let mut below = vec![id];
+            while let Some(id) = below.pop() {
+                for &child in children.get(id).into_iter().flatten() {
+                    if self.r.live(child).is_some() {
+                        return true;
+                    }
+                    below.push(child);
+                }
+            }
+            false
+        };
+        let candidates: BTreeSet<&str> = (untaken.iter())
+            .filter(|(id, change)| *change == Untaken::Delete && !holds_live_below(id))
+            .map(|(id, _)| id.as_str())
+            .collect();
+        let in_place = |id: &str| {
+            let mut parent = self.s.get(id).map(|synced| synced.parent.as_str());
+            while let Some(id) = parent {
+                if self.r.get(id).is_some() {
+                    return true;
+                }
+                let Some(synced) = self.s.get(id) else {
+                    return true;
+                };
+                if !candidates.contains(id) {
+                    return false;
+                }
+                parent = Some(synced.parent.as_str());
+            }
+            true
+        };
+        let deleted: BTreeSet<NodeId> = (candidates.iter())
+            .filter(|id| in_place(id))
+            .map(|id| (*id).to_owned())
             .collect();
         let taken_late: BTreeSet<NodeId> = (untaken.iter())
             .filter(|(_, change)| {
@@ -1836,10 +1872,6 @@ impl Trees {
             })
             .map(|(id, _)| id.as_str())
             .collect();
-        let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for (id, shape) in self.s.iter() {
-            children.entry(&shape.parent).or_default().push(id);
-        }
         let mut below: Vec<&str> = lost.iter().copied().collect();
         while let Some(id) = below.pop() {
             for &child in children.get(id).into_iter().flatten() {
