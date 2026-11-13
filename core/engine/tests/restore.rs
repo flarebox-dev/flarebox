@@ -1082,6 +1082,54 @@ fn a_trashed_folder_restored_into_itself_or_below_itself_is_sent_for_the_server_
 }
 
 #[test]
+fn a_move_onto_the_name_of_a_folder_moving_into_a_folder_restored_into_it_goes_through_a_pending_name()
+ {
+    let (p, a, b, c) = (id(1), id(2), id(3), id(4));
+    let rows = [
+        in_trash(p.clone(), dir(&root(), "p")),
+        (
+            a.clone(),
+            Some(dir(&root(), "n")),
+            Some(dir(&root(), "a")),
+            Some(trashed(dir(&p, "a"))),
+        ),
+        (
+            b.clone(),
+            Some(dir(&c, "n")),
+            Some(dir(&root(), "n")),
+            Some(remote(dir(&root(), "n"))),
+        ),
+        (
+            c.clone(),
+            Some(dir(&root(), "c")),
+            Some(dir(&root(), "c")),
+            Some(trashed(dir(&p, "c"))),
+        ),
+    ];
+    let mut trees = trees(&rows);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let intent = RestoreIntent::from_trash(c.clone(), Some(a.clone()), None).unwrap();
+    commits.restore(id(100), intent.clone());
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    let mv = |node: &str, parent: &str, name: &str| {
+        op::Op::Move(proto::Move {
+            node_id: node.into(),
+            new_parent_id: parent.into(),
+            new_name: name.into(),
+        })
+    };
+    assert_eq!(
+        ops(&commit),
+        [
+            mv(&a, &root(), "n (pending)"),
+            restore_op(&intent),
+            mv(&b, &c, "n"),
+            mv(&a, &root(), "n"),
+        ]
+    );
+}
+
+#[test]
 fn two_trashed_folders_restored_into_each_other_are_both_sent() {
     let (a, b) = (id(1), id(2));
     let mut trees = trees(&[

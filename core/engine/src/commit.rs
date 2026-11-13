@@ -2840,13 +2840,15 @@ fn name_cycle(
     let mut blocked: BTreeMap<&str, usize> = BTreeMap::new();
     let mut returns: BTreeMap<&str, &str> = BTreeMap::new();
     for (at, slot) in wants.iter().enumerate() {
-        let Some(want @ Want::Move { id, .. }) = slot else {
-            continue;
+        let (want, node) = match slot {
+            Some(want @ Want::Move { id, .. }) => (want, id),
+            Some(want @ Want::Restore { op, .. }) => (want, &op.node_id),
+            _ => continue,
         };
         if let Some(returning) = scratch.awaited_return(want, moving) {
-            returns.insert(id, returning);
-        } else if scratch.fit(want, moving) == Fit::NameTaken {
-            blocked.insert(id, at);
+            returns.insert(node, returning);
+        } else if matches!(want, Want::Move { .. }) && scratch.fit(want, moving) == Fit::NameTaken {
+            blocked.insert(node, at);
         }
     }
     for &start in blocked.keys() {
