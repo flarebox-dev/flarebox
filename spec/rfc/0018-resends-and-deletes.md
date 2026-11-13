@@ -39,7 +39,7 @@ An `UpdateContent` with `resend` whose target is in the trash is answered `SUPER
 
 ## 6. Request digest
 
-The digest of a commit request (RFC 0006 §8) becomes digest v2. It is digest v1's projection, plus `UpdateContent` field 3. The server stores the digest's version beside each digest, in `commits` and in `device_commits`. A row stored before this RFC holds v1 and is checked with v1. So a reuse of a `commit_id` that differs only in `resend` is refused with `INVALID_ARGUMENT`. Since proto3 omits a false bool, the v2 digest of a request without `resend` equals its v1 digest.
+The digest of a commit request (RFC 0006 §8) becomes digest v2. It is digest v1's projection, plus `UpdateContent` field 3. The server stores the digest's version beside each digest, in `commits` and in `device_commits`. A row that holds a digest from before this RFC holds v1 and is checked with v1, and a row with no digest is still checked as RFC 0006 §8 says. A reuse of a `commit_id` that differs only in `resend` is refused with `INVALID_ARGUMENT` when its row holds v2. A v1 row cannot tell such requests apart, so the reuse gets the stored result: an old server ignored `resend` when it applied the commit, so that result is what either request was answered. Since proto3 omits a false bool, the v2 digest of a request without `resend` equals its v1 digest.
 
 ## 7. Clients
 
@@ -47,14 +47,14 @@ A device sets `resend` on an `UpdateContent` that sends again content another de
 
 A device takes a missing `edit_rev` (0) as equal to `content_rev`.
 
-A device whose user deleted a file it held as S does, before a resend of it arrived in the log, plans the delete against the resend. S takes the record's shape when all of these hold:
+A device whose user deleted a file it held as S does, before a resend of it arrived in the log, plans the delete against the resend. S takes the shape of a record of another device's commit when all of these hold:
 - the record moves the file's `content_rev` and changes nothing else: its `edit_rev`, `meta_rev`, parent and name equal R's just before it;
 - R held S's content and position just before it;
 - L no longer holds the file.
 
 The delete is then sent with a base past the resend, and §4 applies it. A record that also renames or moves the file is not taken, so R7 still keeps a move the delete did not see. A listing shows no such step and changes nothing here (GUN-581).
 
-A record that moves a file's edit revision but not its `content_rev` (§3) is a remote edit to a device whose L no longer holds the file. S forgets the file, and the device downloads it again, as it does for an edit that brings new content. A device that adopted a resend above therefore keeps the author's edit that follows it, and it sends no delete over that edit.
+A record of another device's commit that moves a file's edit revision but not its `content_rev` (§3) is a remote edit to a device whose L no longer holds the file. S forgets the file, and the device downloads it again, as it does for an edit that brings new content. A device that adopted a resend above therefore keeps the author's edit that follows it, and it sends no delete over that edit. A record of the device's own commit is neither: the author that deletes the file after sending its edit sends the delete, with a base past its own edit, and §4 applies it.
 
 A device that upgrades its store sets each stored node's edit revision to its `content_rev`. It does this with an `ALTER TABLE` that adds the column, then an `UPDATE`, or with a nullable column whose NULL reads as `content_rev`.
 
