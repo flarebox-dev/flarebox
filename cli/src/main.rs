@@ -15,6 +15,7 @@ mod ipc;
 mod logfile;
 mod manifest;
 mod notify;
+mod output;
 mod pairing;
 mod report;
 mod request;
@@ -927,22 +928,35 @@ fn finish(
     outcome: Result<Done, CliError>,
     pending: Vec<Question>,
 ) -> ExitCode {
-    let (exit, envelope, text, stderr) = match outcome {
+    let (exit, envelope, text, stderr, presentation, outcome) = match outcome {
         Ok(done) => {
             let exit = done.exit;
             let (text, note) = (done.text.clone(), done.note.clone());
-            (exit, Envelope::of(command, done), text, note)
+            let (presentation, outcome) = (done.presentation, done.outcome);
+            (
+                exit,
+                Envelope::of(command, done),
+                text,
+                note,
+                presentation,
+                outcome,
+            )
         }
         Err(mut error) => {
             let partial = error.partial.take().map(|partial| *partial);
             let text = (partial.as_ref()).map_or_else(String::new, |done| done.text.clone());
-            let message = format!("koi: {}\n", printable(&error.message));
+            let presentation = partial
+                .as_ref()
+                .map_or(output::Presentation::Text, |done| done.presentation);
+            let message = format!("{}\n", printable(&error.message));
             let exit = error.code.exit();
             (
                 exit,
                 Envelope::failed(command, error, partial),
                 text,
                 message,
+                presentation,
+                report::Outcome::Error,
             )
         }
     };
@@ -964,11 +978,18 @@ fn finish(
         );
         return ExitCode::from(exit);
     }
-    print!("{text}");
-    eprint!("{stderr}");
-    if let Some(banner) = banner(&pending) {
-        eprintln!("{banner}");
-    }
+    output::print(
+        command,
+        presentation,
+        outcome,
+        exit,
+        &text,
+        match outcome {
+            report::Outcome::Error => output::Note::Error(&stderr),
+            _ => output::Note::Information(&stderr),
+        },
+        banner(&pending).as_deref(),
+    );
     ExitCode::from(exit)
 }
 
@@ -987,7 +1008,15 @@ fn parse_failure(error: clap::Error, args: &[OsString], command: &str, json: boo
     }
     let rendered = escape_echoed(&error, args);
     if !json && !bare_group {
-        eprint!("{rendered}");
+        output::print(
+            command,
+            output::Presentation::Text,
+            report::Outcome::Error,
+            2,
+            "",
+            output::Note::Usage(&rendered),
+            None,
+        );
         return ExitCode::from(2);
     }
     let outcome = match kind {
@@ -1064,7 +1093,10 @@ fn help_done(help: String, command: &str) -> Done {
         help: help.clone(),
         commands: manifest::commands(command),
     };
-    Done::ok(data, help)
+    Done {
+        presentation: output::Presentation::Literal,
+        ..Done::ok(data, help)
+    }
 }
 
 /// Whether the arguments ask for JSON, read before clap parses them so that a usage error is JSON too.

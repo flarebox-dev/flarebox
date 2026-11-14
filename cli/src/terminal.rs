@@ -424,7 +424,7 @@ fn nonempty(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|value| !value.is_empty())
 }
 
-fn plain_requested() -> bool {
+pub(crate) fn plain_requested() -> bool {
     std::env::var_os("KOI_PLAIN").is_some_and(|value| value == "1")
         || std::env::var_os("TERM").is_some_and(|value| value == "dumb")
         || std::env::args_os()
@@ -441,7 +441,7 @@ pub fn clap_color() -> clap::ColorChoice {
     }
 }
 
-fn colors(plain: bool) {
+pub(crate) fn colors(plain: bool) {
     let forced =
         std::env::var_os("CLICOLOR_FORCE").is_some_and(|value| !value.is_empty() && value != "0");
     let enabled = !plain
