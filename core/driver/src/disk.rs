@@ -256,6 +256,7 @@ pub(crate) struct Disk {
     /// or removed a rules file, or it moved a folder, whose rules files the trees hold by path. Set until a batch
     /// answers that request, and so has passed the rules of a scan of the section's paths.
     rules_after: Option<Requests>,
+    rescan_after: Option<Requests>,
     /// The most each batch of effects holds: [`BATCH`] outside tests.
     batch: BatchLimit,
     hook: Hook,
@@ -368,6 +369,7 @@ impl Disk {
             spans: VecDeque::new(),
             forgotten: 0,
             rules_after: None,
+            rescan_after: None,
             batch: BATCH,
             hook,
         };
@@ -643,6 +645,9 @@ impl Disk {
         if (self.rules_after).is_some_and(|requested| answered >= Some(requested)) {
             self.rules_after = None;
         }
+        if (self.rescan_after).is_some_and(|requested| answered >= Some(requested)) {
+            self.rescan_after = None;
+        }
         if stamp.0 < self.forgotten {
             tracing::debug!(
                 space_id = self.space_id.as_str(),
@@ -718,8 +723,12 @@ impl Disk {
     }
 
     /// Asks the observer to reset `paths` to L and scan them again.
-    pub fn rescan(&self, engine: &Engine, paths: Vec<PathBuf>) {
-        self.sections.request(engine.resets(paths));
+    pub fn rescan(&mut self, engine: &Engine, paths: Vec<PathBuf>) {
+        self.rescan_after = Some(self.sections.request(engine.resets(paths)));
+    }
+
+    pub fn awaits_rescan(&self) -> bool {
+        self.rescan_after.is_some()
     }
 
     /// The chunks `commit` adds, with where the bytes of each are: for every content the commit creates or
@@ -808,7 +817,7 @@ impl Upload {
         };
         let source = self.sources.get(&chunk.hash).ok_or_else(gone)?;
         let at = source.at.as_ref().ok_or_else(gone)?;
-        let (folder, name) = self.space.parent(at).map_err(|_| gone())?;
+        let (folder, name) = self.space.parent(at)?;
         let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
         let file = File::from(rustix::fs::openat(folder.fd(), name, flags, Mode::empty())?);
         let meta = file.metadata()?;
@@ -1328,7 +1337,8 @@ fn paths(change: &Observed) -> impl Iterator<Item = &Path> {
     let (first, second) = match change {
         Observed::Created { path, .. }
         | Observed::Modified { path, .. }
-        | Observed::Removed { path, .. } => (path, None),
+        | Observed::Removed { path, .. }
+        | Observed::Reidentified { path, .. } => (path, None),
         Observed::Renamed { from, to, .. } => (from, Some(to)),
     };
     std::iter::once(first.as_path()).chain(second.map(PathBuf::as_path))

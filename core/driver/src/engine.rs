@@ -714,7 +714,9 @@ impl Engine {
                 Observed::Renamed {
                     from, id, linked, ..
                 } => resolve(&self.trees, from, &file_identity(*id), *linked),
-                Observed::Created { .. } | Observed::Modified { .. } => None,
+                Observed::Created { .. }
+                | Observed::Modified { .. }
+                | Observed::Reidentified { .. } => None,
             })
             .collect();
         let left: Vec<&Path> = (changes.iter())
@@ -722,7 +724,9 @@ impl Engine {
                 Observed::Removed { path, .. } | Observed::Renamed { from: path, .. } => {
                     Some(path.as_path())
                 }
-                Observed::Created { .. } | Observed::Modified { .. } => None,
+                Observed::Created { .. }
+                | Observed::Modified { .. }
+                | Observed::Reidentified { .. } => None,
             })
             .collect();
         let staying: BTreeSet<NodeId> = (changes.iter())
@@ -752,15 +756,18 @@ impl Engine {
                 Observed::Created { path, .. } | Observed::Renamed { to: path, .. } => {
                     Some((path.as_path(), at))
                 }
-                Observed::Removed { .. } | Observed::Modified { .. } => None,
+                Observed::Removed { .. }
+                | Observed::Modified { .. }
+                | Observed::Reidentified { .. } => None,
             })
             .collect();
         let leaving: BTreeMap<&Path, usize> = (changes.iter().enumerate())
             .filter_map(|(at, change)| match change {
                 Observed::Renamed { from, .. } => Some((from.as_path(), at)),
-                Observed::Removed { .. } | Observed::Created { .. } | Observed::Modified { .. } => {
-                    None
-                }
+                Observed::Removed { .. }
+                | Observed::Created { .. }
+                | Observed::Modified { .. }
+                | Observed::Reidentified { .. } => None,
             })
             .collect();
         let folder = |path: &Path| path.ancestors().skip(1).find_map(|dir| arrival.get(dir));
@@ -775,6 +782,7 @@ impl Engine {
                 Observed::Modified { path, .. } => {
                     [(folder(path), true), (arrival.get(path.as_path()), true)]
                 }
+                Observed::Reidentified { path, .. } => [(folder(path), true), (None, false)],
                 Observed::Removed { .. } => [(None, false), (None, false)],
             };
             for (first, arrives) in firsts {
@@ -845,6 +853,25 @@ impl Engine {
                 Observed::Removed { .. } => {
                     if let Some(id) = before {
                         self.remove(&id, &moving, true, &mut touched, &mut gone);
+                    }
+                }
+                Observed::Reidentified { path, id } => {
+                    let folder = local_at(&self.trees, path).filter(|node| {
+                        (self.trees.local().get(node))
+                            .is_some_and(|held| held.shape.kind == Kind::Dir)
+                    });
+                    if folder.is_some() {
+                        self.place(
+                            folder,
+                            path,
+                            EntryKind::Dir,
+                            file_identity(*id),
+                            None,
+                            now_ms,
+                            &moving,
+                            &mut touched,
+                            &mut gone,
+                        );
                     }
                 }
                 Observed::Renamed { to, kind, id, .. } => {
@@ -2521,6 +2548,10 @@ mod tests {
                     linked: false,
                 },
                 Change::Removed { path, kind } => Observed::Removed { path, kind },
+                Change::Reidentified { path } => Observed::Reidentified {
+                    id: entry(&path).id,
+                    path,
+                },
             })
             .collect();
         engine.observe(&batch, 0);
@@ -2907,16 +2938,24 @@ mod tests {
         let changes = snapshot.rescan(&root, [PathBuf::new()]).unwrap().changes;
         assert_eq!(
             changes,
-            [koidrive_fs::Change::Created {
-                path: "d/x".into(),
-                kind: EntryKind::File,
-            }]
+            [
+                koidrive_fs::Change::Created {
+                    path: "d/x".into(),
+                    kind: EntryKind::File,
+                },
+                koidrive_fs::Change::Reidentified { path: "d".into() },
+            ]
         );
-        engine.observe(&[created("d/x", id, false, 3)], 2);
+        let made_anew = Observed::Reidentified {
+            path: "d".into(),
+            id: snapshot.entries[Path::new("d")].id,
+        };
+        engine.observe(&[created("d/x", id, false, 3), made_anew], 2);
         assert_eq!(
             holding(&engine, "d/x").map(|(node, _, _)| node),
             Some(synced)
         );
+        assert_eq!(in_l(&engine), on_disk(&snapshot));
     }
 
     /// A reset queued before a child entered L leaves the snapshot without the
@@ -3299,6 +3338,10 @@ mod tests {
                     kind,
                 }),
                 Change::Removed { path, kind } => Some(Observed::Removed { path, kind }),
+                Change::Reidentified { path } => Some(Observed::Reidentified {
+                    id: entry(&path).id,
+                    path,
+                }),
                 Change::Ignored { .. } => unreachable!("a scan without rules ignores nothing"),
             })
             .collect()
@@ -3309,9 +3352,6 @@ mod tests {
             concat!(env!("CARGO_MANIFEST_DIR"), "/proptest-regressions/engine.txt"),
             ProptestConfig::default().cases,
         ))]
-        /// Whatever a person does to the folder between scans, each batch leaves L a tree that holds every entry on
-        /// disk at its path, with its kind and a file's identity, and nothing else. A scan takes a folder at the
-        /// same path for the same folder whatever its identity, so a folder's identity is not compared.
         #[test]
         fn batches_leave_l_a_tree_that_holds_the_disk(
             rounds in prop::collection::vec(prop::collection::vec(edit(), 1..8), 1..5),
@@ -3331,22 +3371,20 @@ mod tests {
         }
     }
 
-    /// Each entry on disk by its path, with a file's identity.
-    fn on_disk(snapshot: &Snapshot) -> BTreeMap<PathBuf, Option<FileIdentity>> {
+    fn on_disk(snapshot: &Snapshot) -> BTreeMap<PathBuf, (EntryKind, FileIdentity)> {
         (snapshot.entries.iter())
-            .map(|(path, entry)| {
-                let file = entry.kind == EntryKind::File;
-                (path.clone(), file.then(|| file_identity(entry.id)))
-            })
+            .map(|(path, entry)| (path.clone(), (entry.kind, file_identity(entry.id))))
             .collect()
     }
 
-    /// Each placed node of L by its path, with a file's identity.
-    fn in_l(engine: &Engine) -> BTreeMap<PathBuf, Option<FileIdentity>> {
+    fn in_l(engine: &Engine) -> BTreeMap<PathBuf, (EntryKind, FileIdentity)> {
         (engine.trees.local().iter())
             .filter_map(|(id, node)| {
-                let file = node.shape.kind == Kind::File;
-                Some((engine.path_of(id)?, file.then_some(node.identity)))
+                let kind = match node.shape.kind {
+                    Kind::File => EntryKind::File,
+                    Kind::Dir => EntryKind::Dir,
+                };
+                Some((engine.path_of(id)?, (kind, node.identity)))
             })
             .collect()
     }
@@ -3378,6 +3416,14 @@ mod tests {
                 _ => panic!("{edit}"),
             }
         }
+    }
+
+    #[test]
+    fn a_folder_swapped_for_a_new_one_holding_its_entries_keeps_l_on_the_disk() {
+        replay(&[
+            &["mkdir a", "write a/x"],
+            &["mkdir b", "mv a/x b/x", "rmdir a", "mv b a"],
+        ]);
     }
 
     /// The saved property case `cc 4707a502`: the folder `ß/ß` moves out to `a`, and `ß` moves below it into

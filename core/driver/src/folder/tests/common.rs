@@ -100,7 +100,7 @@ impl Remote {
     }
 
     /// What `Transfer::upload` does: asks which chunks the space lacks, reads those from the folder and stores them.
-    fn store(&mut self, caller: &Caller, upload: &Upload) -> Vec<UploadReceipt> {
+    fn store(&mut self, caller: &Caller, upload: &Upload) -> Result<Vec<UploadReceipt>, ChunkError> {
         let mut chunks = upload.chunks.clone();
         chunks.sort_by(|a, b| a.hash.cmp(&b.hash));
         chunks.dedup_by(|a, b| a.hash == b.hash);
@@ -121,8 +121,15 @@ impl Remote {
         }
         let mut receipts = Vec::new();
         for chunk in chunks.iter().filter(|chunk| wanted(chunk)) {
-            let bytes = upload.read(chunk).unwrap();
-            assert!(koidrive_net::matches(chunk, &bytes));
+            let bytes = upload.read(chunk).map_err(|source| ChunkError::Io {
+                hash: chunk.hash.clone(),
+                source,
+            })?;
+            if !koidrive_net::matches(chunk, &bytes) {
+                return Err(ChunkError::SourceChanged {
+                    hash: chunk.hash.clone(),
+                });
+            }
             self.chunks
                 .chunks
                 .insert(chunk.hash.clone(), bytes.to_vec());
@@ -130,7 +137,7 @@ impl Remote {
             crate::timing::add_bytes(&upload.timing_bytes, u64::from(chunk.size));
             upload.credit.chunk(&chunk.hash);
         }
-        receipts
+        Ok(receipts)
     }
 
     /// What `Session::commit` does.
@@ -456,7 +463,7 @@ impl Device {
             }
             Work::Upload(upload) => {
                 let receipts = remote.store(&self.caller, &upload);
-                self.folder.uploaded(Ok(receipts))
+                self.folder.uploaded(receipts)
             }
             Work::Send(commit) => {
                 self.sent.push(commit.clone());
