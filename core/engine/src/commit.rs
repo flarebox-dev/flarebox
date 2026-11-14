@@ -1268,7 +1268,9 @@ impl Commits {
                         content: None,
                     };
                     let into = &outcome.node_id;
-                    if code == Code::MergedInto && trees.local().get(into).is_some() {
+                    if code == Code::MergedInto
+                        && (trees.local().get(into).is_some() || trees.waits_for_half(into))
+                    {
                         trees.revert(create.node_id.clone());
                         merged.insert(create.node_id.clone(), into.clone());
                         self.aliases.insert(create.node_id.clone(), into.clone());

@@ -5571,3 +5571,21 @@ fn a_file_trashed_while_its_renamed_folder_waits_for_its_move_stays_trashed_thro
     ]);
     converge(2, &[made, split]).unwrap();
 }
+
+#[test]
+fn a_create_merged_into_a_waiting_folder_keeps_the_folder_waiting() {
+    let made = vec![(0, folder("b")), (0, user(1, 0, 1, "c.txt"))];
+    let mut split = vec![(0, rename(0, 0, "A")), (0, delete(1))];
+    split.extend(commit(0));
+    split.extend([
+        (1, folder("a")),
+        (1, SCAN),
+        (1, rename(0, 0, "ss")),
+        (1, Step::ScanLeft),
+        (1, COMMIT),
+        (1, COMMIT),
+        (1, DELIVER),
+        (1, DELIVER),
+    ]);
+    converge(2, &[made, split]).unwrap();
+}
