@@ -87,13 +87,14 @@ After a crash the driver recovers the effects in flight, if any, in one section 
 | Found | Meaning | Action |
 |---|---|---|
 | a quarantine entry | the effect reached step 3 | Compare the quarantined entry with the expected state, whatever the target holds now. On a match: when the staging file still exists and the target name is free, rename it into place; then move the entry to the trash and report `EffectDone`, or `EffectFailed` as overtaken if the staging file could not be placed. On a mismatch: rename it back when the target name is free, otherwise make it a recovered file, and report `EffectFailed` |
-| no quarantine entry, no staging file, target in the effect's final state (the new content, the moved entry, or absent after a removal whose entry is in the local trash under the effect's ID) | the effect finished | Report `EffectDone` |
+| no quarantine entry, no staging file, a removal's entry in the local trash under the effect's ID | the removal finished, wherever the user has since moved its folder or put something at its name | Report `EffectDone` |
+| no quarantine entry, no staging file, target in the effect's final state (the new content or the moved entry) | the effect finished | Report `EffectDone` |
 | no quarantine entry, no staging file, the replaced entry in the local trash under the effect's ID, and the target without the new content | the effect finished, and the user changed or removed the file it wrote | Report `EffectFailed` as overtaken |
 | no quarantine entry, anything else | the effect stopped before step 3, or the user changed the target | Delete the staging file (server bytes, downloadable again) and report `EffectFailed`, so the next plan sees the current disk |
 
 These rules complete the table:
 
-- The second row judges the target by name and content alone, so the engine takes `EffectDone` from recovery only when L confirms that the entry found is the effect's own. An entry L holds as another node is that node's. A removal whose node L places elsewhere found the name empty because the user moved the node. In both cases the driver reports `EffectFailed`.
+- The second and third rows judge the effect by what the disk holds alone, so the engine takes `EffectDone` from recovery only when L confirms that the entry found is the effect's own. An entry L holds as another node is that node's, and a removal whose node L places elsewhere is not the removal L planned. In both cases the driver reports `EffectFailed`.
 - A removal that finds its name empty also needs its entry in the local trash. Without one, the user moved or deleted the entry before the effect reached it, and recovery reports `EffectFailed` with the entry missing, so the rescan does not upload the moved entry as a new file.
 - A write is overtaken whenever the entry it replaced matched and went to the local trash while its target does not hold the new content: the user changed or removed the written file, or took its name before it was placed. An overtaken write leaves the node out of S and L, so R's content is downloaded again and what the user left on disk is kept beside it as a new file. S never stays at the content the write replaced.
 - In every row, quarantine is either moved to the trash after it is verified as synced content, or returned to the user.

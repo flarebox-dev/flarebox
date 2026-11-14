@@ -5523,3 +5523,112 @@ fn a_file_edited_after_another_device_deleted_it_converges() {
     ]);
     converge(3, &[vec![(0, file("a"))], steps]).unwrap();
 }
+
+fn drawn(kind: u8, target: usize, parent: usize, name: usize) -> Step {
+    Step::User(Action {
+        kind,
+        target,
+        parent,
+        name,
+        text: 0,
+    })
+}
+
+#[test]
+fn a_removal_done_before_a_crash_stays_the_engines_when_a_later_removal_of_the_batch_quarantines_its_folder()
+ {
+    use Step::{Commit, Effect, Work};
+    let phases = [
+        vec![(0, drawn(1, 0, 0, 0))],
+        vec![
+            (0, drawn(0, 0, 0, 1)),
+            (0, drawn(3, 0, 1, 0)),
+            (0, Work(0)),
+            (0, Work(0)),
+            (0, Work(0)),
+            (0, Work(0)),
+            (0, Work(0)),
+            (1, Work(0)),
+            (1, Work(0)),
+            (1, Work(0)),
+            (1, Work(0)),
+            (1, Work(0)),
+            (1, Work(0)),
+            (1, Work(0)),
+            (1, Work(0)),
+            (1, drawn(3, 1, 0, 2)),
+            (0, drawn(0, 0, 7517258053377794243, 0)),
+            (2, Work(0)),
+            (0, drawn(2, 10523306665153133971, 0, 0)),
+            (0, drawn(1, 0, 0, 5)),
+            (0, drawn(0, 0, 3671704290190332164, 5)),
+            (0, drawn(0, 0, 2655090210972650204, 3)),
+            (1, drawn(2, 3181243908948293186, 0, 0)),
+            (2, Work(0)),
+            (1, drawn(1, 0, 690241634734802743, 1)),
+        ],
+        vec![
+            (0, drawn(4, 7989535778489345035, 0, 0)),
+            (0, drawn(2, 0, 0, 0)),
+            (0, Work(0)),
+            (0, Commit(Reply::Served)),
+            (0, Work(0)),
+            (2, Work(0)),
+            (2, Effect(Outcome::Crash(Cut::Quarantined))),
+            (2, drawn(3, 2582439459331434606, 3460261510432762190, 0)),
+        ],
+    ];
+    converge(3, &phases).unwrap();
+}
+
+#[test]
+fn a_removal_done_before_a_crash_stays_the_engines_when_the_user_renames_its_folder_before_the_restart()
+ {
+    use Step::{Deliver, Effect, Work};
+    let phases = [
+        vec![(0, drawn(1, 0, 0, 0))],
+        vec![
+            (0, drawn(0, 0, 0, 1)),
+            (0, drawn(3, 0, 1, 0)),
+            (0, Work(0)),
+            (0, Work(0)),
+            (0, Work(0)),
+            (0, Work(0)),
+            (0, Work(0)),
+            (1, Work(0)),
+            (1, Work(0)),
+            (1, Work(0)),
+            (1, Work(0)),
+            (1, Work(0)),
+            (1, Work(0)),
+            (1, Work(0)),
+            (1, Work(0)),
+            (0, Work(0)),
+            (0, drawn(0, 0, 70021216061850914, 1)),
+            (0, Work(0)),
+            (2, drawn(4, 6524570367564971971, 0, 0)),
+            (0, Work(0)),
+            (1, Work(0)),
+            (2, drawn(0, 0, 0, 0)),
+            (0, Work(7978978420301962992)),
+            (2, Work(5960645924473209624)),
+            (0, drawn(0, 0, 0, 0)),
+            (1, Deliver(0)),
+            (1, Effect(Outcome::Crash(Cut::Done))),
+            (1, drawn(3, 1, 0, 2)),
+            (0, drawn(0, 0, 0, 0)),
+            (0, drawn(0, 0, 0, 0)),
+            (0, drawn(0, 0, 0, 0)),
+            (0, drawn(0, 0, 0, 0)),
+            (0, drawn(0, 0, 0, 0)),
+            (0, drawn(0, 0, 0, 0)),
+            (2, drawn(0, 0, 0, 0)),
+            (0, drawn(0, 0, 0, 0)),
+            (0, drawn(0, 0, 0, 0)),
+            (0, drawn(0, 0, 0, 0)),
+            (1, drawn(3, 0, 2436352964411405372, 0)),
+            (0, drawn(0, 0, 0, 0)),
+        ],
+    ];
+    converge(2, &phases).unwrap();
+}

@@ -414,11 +414,15 @@ impl Disk {
                 to,
                 ..
             } => (at(to)? == Some(moved.ino)).then_some(None),
+            Effect::RemoveFile { .. } | Effect::RemoveDir { .. }
+                if self.trash.contains(&record.effect_id) =>
+            {
+                Some(None)
+            }
             Effect::RemoveFile {
                 displaced: Displaced { at: place, .. },
             }
             | Effect::RemoveDir { at: place, .. } => match at(place)? {
-                None if self.trash.contains(&record.effect_id) => Some(None),
                 None => return Err(Refused::Moved),
                 Some(_) => None,
             },

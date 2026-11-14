@@ -9,8 +9,8 @@ use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 
 use common::{
-    RETURNS, SCENARIOS, Scenario, apply_one, assert_settled, bind, decode, encode, entries,
-    prepare, recover_one, scenario,
+    FOLDER_MOVED, RETURNS, SCENARIOS, Scenario, apply_one, assert_settled, bind, decode, encode,
+    entries, prepare, recover_one, scenario,
 };
 use koidrive_fs::{Effect, Outcome, Step};
 
@@ -220,6 +220,22 @@ fn kill_during_a_folder_removal_then_recover() {
 fn kill_during_the_removal_of_a_folder_that_holds_platform_files_then_recover() {
     assert_eq!(
         kill_at_every_step_then_recover(&SCENARIOS[6]),
+        [Step::Marked, Step::Compared, Step::Trashed]
+    );
+}
+
+#[test]
+fn kill_during_a_file_removal_whose_folder_moves_then_recover() {
+    assert_eq!(
+        kill_at_every_step_then_recover(&FOLDER_MOVED[0]),
+        [Step::Marked, Step::Compared, Step::Trashed]
+    );
+}
+
+#[test]
+fn kill_during_a_folder_removal_whose_folder_moves_then_recover() {
+    assert_eq!(
+        kill_at_every_step_then_recover(&FOLDER_MOVED[1]),
         [Step::Marked, Step::Compared, Step::Trashed]
     );
 }
