@@ -24,11 +24,11 @@ const SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'.')
     .remove(b'~');
 
-const R2_PAGE: usize = 1000;
+const R2_MAX_PAGE_SIZE: usize = 1000;
 
-const ACCOUNTS_PAGE: usize = 50;
+const ACCOUNTS_MAX_PER_PAGE: usize = 50;
 
-const ACCOUNTS_PAGES: usize = 100;
+const MAX_ACCOUNT_PAGES_READ: usize = 100;
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct CloudflareMessage {
@@ -221,14 +221,14 @@ impl Cloudflare {
     pub async fn accounts(&self) -> Result<Vec<Account>, ApiError> {
         const CALL: &str = "list accounts";
         let mut accounts = Vec::new();
-        for page in 1..=ACCOUNTS_PAGES {
+        for page in 1..=MAX_ACCOUNT_PAGES_READ {
             let mut url = self.url(&["accounts"])?;
             url.query_pairs_mut()
                 .append_pair("page", &page.to_string())
-                .append_pair("per_page", &ACCOUNTS_PAGE.to_string());
+                .append_pair("per_page", &ACCOUNTS_MAX_PER_PAGE.to_string());
             let (batch, _): (Vec<Account>, _) =
                 self.send(CALL, self.request(Method::GET, url)).await?;
-            let last = batch.len() < ACCOUNTS_PAGE;
+            let last = batch.len() < ACCOUNTS_MAX_PER_PAGE;
             accounts.extend(batch);
             if last {
                 return Ok(accounts);
@@ -259,14 +259,14 @@ impl Cloudflare {
         loop {
             let mut url = self.url(&["accounts", account, "r2", "buckets"])?;
             url.query_pairs_mut()
-                .append_pair("per_page", &R2_PAGE.to_string());
+                .append_pair("per_page", &R2_MAX_PAGE_SIZE.to_string());
             if let Some(cursor) = &cursor {
                 url.query_pairs_mut().append_pair("cursor", cursor);
             }
             let (page, info): (Buckets, _) = self
                 .send("list R2 buckets", self.r2(Method::GET, url, jurisdiction))
                 .await?;
-            let full = page.buckets.len() == R2_PAGE;
+            let full = page.buckets.len() == R2_MAX_PAGE_SIZE;
             names.extend(page.buckets.into_iter().map(|bucket| bucket.name));
             let next = info.cursor.filter(|next| full && !next.is_empty());
             if next.is_some() && next == cursor {
@@ -341,7 +341,7 @@ impl Cloudflare {
         }
         let mut url = self.url(&["accounts", account, "r2", "buckets", bucket, "objects"])?;
         url.query_pairs_mut()
-            .append_pair("per_page", &R2_PAGE.to_string());
+            .append_pair("per_page", &R2_MAX_PAGE_SIZE.to_string());
         if let Some(cursor) = cursor {
             url.query_pairs_mut().append_pair("cursor", cursor);
         }
