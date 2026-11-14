@@ -468,7 +468,7 @@ impl Effects {
             }
             _ => same(local, base),
         };
-        if unchanged {
+        if unchanged || record.after.is_none() {
             let synced = match (&record.effect, &record.after, base) {
                 (Effect::Move { .. }, Some(after), Some(base)) => Some(Shape {
                     parent: after.parent.clone(),
