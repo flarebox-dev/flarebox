@@ -549,7 +549,8 @@ impl Trees {
         if edited_here {
             self.edited_here.insert(id.clone(), node.edit_rev);
         }
-        self.place_remote(id.clone(), node);
+        let deleted_after_landing = self.deleted_after_landing(&id, &node);
+        self.place_remote(id.clone(), node, deleted_after_landing);
         if let Some(sent) = sent
             && !self.set_synced_if_valid(id.clone(), Some(sent.clone()))
         {
@@ -595,10 +596,10 @@ impl Trees {
                 self.replaced_versions.remove(&id);
             }
         }
-        self.place_remote(id, node);
+        self.place_remote(id, node, false);
     }
 
-    fn place_remote(&mut self, id: NodeId, node: RemoteNode) {
+    fn place_remote(&mut self, id: NodeId, node: RemoteNode, deleted_after_landing: bool) {
         let sent_by_another = !node.trashed
             && self.resends.contains(&id)
             && !self.watched_positions.contains_key(&id)
@@ -615,7 +616,6 @@ impl Trees {
             });
         self.mark(&id);
         let trashed = node.trashed;
-        let deleted_after_landing = self.deleted_after_landing(&id, &node);
         if (self.trashed_here.get(&id)).is_some_and(|&seq| !(node.trashed && node.meta_rev == seq))
         {
             self.trashed_here.remove(&id);

@@ -535,3 +535,102 @@ fn a_move_result_does_not_acknowledge_a_lost_edit_omitted_by_the_commit_cap() {
     let sent = next.map_or_else(Vec::new, |commit| ops(&commit));
     assert!(sent.iter().any(|op| matches!(op, op::Op::UpdateContent(update) if update.node_id == "n" && !update.resend)), "the move lost the author's unsent edit: {sent:?}");
 }
+
+#[test]
+fn a_lost_rename_beats_a_later_delete_only_when_its_user_did_not_see_the_position() {
+    for seen in [false, true] {
+        let mut trees = trees(&[synced("n", file(ROOT, "m", 1))]);
+        trees.set_remote("n".into(), remote_at(file(ROOT, "m", 1), 5));
+        trees.record_moved("n", 5);
+        let moved = trees.moved_here();
+        let taken = trees.taken_from_others(|seq| seq == 5);
+        let records = trees.remote_records();
+        trees.set_listed_remote("n".into(), remote(file(ROOT, "n", 1)));
+        trees.forget_lost(vec![], vec![], taken, moved, vec![], records, 1, 1);
+        trees.settle();
+        trees.set_remote(
+            "n".into(),
+            RemoteNode {
+                meta_rev: 2,
+                meta_edit_rev: if seen { 2 } else { 1 },
+                ..remote(file(ROOT, "m", 1))
+            },
+        );
+        trees.set_remote(
+            "n".into(),
+            RemoteNode {
+                meta_rev: 3,
+                meta_edit_rev: 3,
+                ..trashed(file(ROOT, "m", 1))
+            },
+        );
+        trees.settle();
+        let mut commits = Commits::from_state(CommitsState {
+            accepted: 3,
+            slots: [(1, 1)].into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut ids = IdGen::new(1);
+        let sent = commits
+            .build(&mut trees, &mut ids, NOW, HISTORY, 3u64)
+            .cloned()
+            .map_or_else(Vec::new, |commit| ops(&commit));
+        let revived = sent.iter().any(|op| matches!(op, op::Op::Move(moved) if moved.node_id == "n" && moved.from.is_none()));
+        assert_eq!(revived, !seen, "seen={seen}: {sent:?}");
+    }
+}
+
+
+#[test]
+fn a_delete_in_a_restore_listing_does_not_take_back_an_unsent_edit() {
+    let mut trees = trees(&[(
+        "n",
+        Some(file(ROOT, "a", 1)),
+        Some(file(ROOT, "a", 1)),
+        Some(RemoteNode {
+            content_rev: 3,
+            edit_rev: 3,
+            ..remote_at(file(ROOT, "a", 1), 3)
+        }),
+    )]);
+    trees.set_local_changed("n".into(), local(file(ROOT, "b", 2), 1));
+    trees.set_remote(
+        "n".into(),
+        RemoteNode {
+            content_rev: 3,
+            edit_rev: 3,
+            ..remote_at(file(ROOT, "b", 1), 5)
+        },
+    );
+    trees.settle();
+    let moved = trees.moved_here();
+    assert!(trees.state().local_changes.contains("n"));
+    assert_eq!(trees.synced().get("n").unwrap().name, "a");
+    assert!(!trees.unsent_edits().contains("n"));
+    let records = trees.remote_records();
+    let taken = trees.taken_from_others(|seq| seq == 5);
+    trees.set_listed_remote(
+        "n".into(),
+        RemoteNode {
+            meta_rev: 2,
+            meta_edit_rev: 2,
+            trash_group: "2:0".into(),
+            ..trashed(file(ROOT, "b", 2))
+        },
+    );
+    trees.forget_lost(vec![], vec![], taken, moved, vec![], records, 1, 1);
+    trees.settle();
+    let mut commits = Commits::from_state(CommitsState {
+        accepted: 1,
+        slots: [(1, 1)].into(),
+        ..Default::default()
+    })
+    .unwrap();
+    let mut ids = IdGen::new(1);
+    let sent = commits
+        .build(&mut trees, &mut ids, NOW, HISTORY, 2u64)
+        .cloned()
+        .map_or_else(Vec::new, |commit| ops(&commit));
+    assert!(sent.iter().any(|op| matches!(op, op::Op::UpdateContent(update) if update.node_id == "n" && update.content == Some(content(2)) && !update.resend)), "the restore listing suppressed the user's unsent edit: {sent:?}");
+}
