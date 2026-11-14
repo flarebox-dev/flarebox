@@ -2508,8 +2508,8 @@ fn edited_on_both_sides(trees: &Trees, id: &str) -> bool {
 fn holds_server_entry(trees: &Trees, id: &str) -> bool {
     trees.local_children(id).any(|child| {
         !trees.excluded(child)
-            && (trees.remote().live(child).is_some()
-                || trees.synced().live(child).is_some()
+            && (trees.remote().get(child).is_some()
+                || trees.synced().get(child).is_some()
                 || holds_server_entry(trees, child))
     })
 }

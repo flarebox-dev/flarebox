@@ -867,6 +867,40 @@ fn a_discarded_folder_the_user_moves_a_synced_entry_into_is_kept_after_another_d
 }
 
 #[test]
+fn a_discarded_folder_holding_an_entry_the_server_trashed_and_s_forgot_is_sent_instead_of_asked_again()
+ {
+    let mut trees = trees(
+        &[
+            ("l-new", dir(ROOT, "new")),
+            ("l-notes", file(ROOT, "notes", 9)),
+        ],
+        &[("r-notes", file(ROOT, "notes", 9))],
+    );
+    let mut commits = Commits::default();
+    let mut ids = IdGen::new(7);
+    commits.first_link(&mut trees, &mut ids, NOW);
+    trees.settle();
+    let asked = question(&commits);
+    assert!(commits.decide(&asked.id, Answer::Discard));
+    assert_eq!(ops(&mut commits, &mut trees, &mut ids), []);
+    let mut moved = trees.local().get("r-notes").unwrap().clone();
+    moved.shape.parent = "l-new".into();
+    trees.set_local("r-notes".into(), moved);
+    let mut deleted = trees.remote().get("r-notes").unwrap().clone();
+    deleted.trashed = true;
+    trees.set_remote("r-notes".into(), deleted);
+    trees.set_synced("r-notes".into(), None);
+    trees.settle();
+    let sent = ops(&mut commits, &mut trees, &mut ids);
+    assert!(commits.questions().is_empty(), "{:?}", commits.questions());
+    assert_eq!(
+        sent.first(),
+        Some(&("create dir", "l-new".to_owned())),
+        "{sent:?}"
+    );
+}
+
+#[test]
 fn a_discarded_folder_whose_subfolder_the_user_puts_an_entry_in_is_asked_about_again() {
     let mut trees = trees(
         &[
