@@ -5589,3 +5589,75 @@ fn a_create_merged_into_a_waiting_folder_keeps_the_folder_waiting() {
     ]);
     converge(2, &[made, split]).unwrap();
 }
+#[test]
+fn a_file_whose_folder_waits_for_its_move_keeps_its_synced_state_and_stays_deleted() {
+    let phases = vec![
+        vec![(0, act(1, 0, 0, 0))],
+        vec![
+            (0, act(0, 0, 0, 1)),
+            (0, act(3, 0, 1, 0)),
+            (0, Step::Work(0)),
+            (0, Step::Work(0)),
+            (0, Step::Work(0)),
+            (0, Step::Work(0)),
+            (0, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, act(4, 1, 0, 0)),
+            (2, Step::Deliver(0)),
+            (0, act(0, 0, 0, 0)),
+            (1, act(2, 0, 0, 0)),
+            (0, Step::Work(143701157526920)),
+            (0, act(0, 0, 7915577750495416137, 0)),
+            (2, Step::Work(3707532753024513298)),
+            (2, Step::Work(0)),
+            (2, Step::Work(0)),
+            (2, Step::Effect(Outcome::Run)),
+            (2, Step::Work(0)),
+            (2, act(4, 0, 0, 0)),
+            (2, Step::ScanLeft),
+        ],
+    ];
+    converge(3, &phases).unwrap();
+}
+
+#[test]
+fn a_file_its_user_moved_while_its_node_waits_for_its_move_counts_as_changed_by_that_user() {
+    let phases = vec![
+        vec![(0, act(1, 0, 0, 0))],
+        vec![
+            (0, act(0, 0, 0, 1)),
+            (0, act(3, 0, 1, 0)),
+            (0, Step::Work(0)),
+            (0, Step::Work(0)),
+            (0, Step::Work(0)),
+            (0, Step::Work(0)),
+            (0, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, act(3, 6641794941499446059, 3892537303969588314, 0)),
+            (0, Step::Work(0)),
+            (2, Step::Work(0)),
+            (1, Step::ScanLeft),
+            (0, act(4, 0, 0, 0)),
+            (1, act(3, 2101935095430557774, 0, 1)),
+            (1, act(4, 1, 0, 0)),
+            (1, Step::Work(4008556074246547561)),
+            (1, act(4, 0, 0, 0)),
+            (1, Step::Work(75556449497822577)),
+        ],
+    ];
+    converge(2, &phases).unwrap();
+}

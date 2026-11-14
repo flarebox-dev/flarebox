@@ -1345,7 +1345,6 @@ impl Trees {
         if let Some(ignored) = self.ignored_by_paths(id) {
             return ignored;
         }
-        let deleted_here = self.l.get(id).is_none() && self.s.live(id).is_some();
         let mut above = Vec::new();
         let mut current = id;
         for _ in 0..self.r.len() {
@@ -1361,8 +1360,7 @@ impl Trees {
             let apart = apart(self.l.get(folder).map(|node| &node.shape))
                 || apart(self.s.live(folder))
                 || self.outside.contains(folder)
-                || (self.displaced.contains_key(folder)
-                    && !(deleted_here && self.halves.contains_key(folder)));
+                || (self.displaced.contains_key(folder) && !self.halves.contains_key(folder));
             above.push((folder, current, apart));
             current = folder;
         }

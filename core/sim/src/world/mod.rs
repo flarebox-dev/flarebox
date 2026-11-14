@@ -826,13 +826,21 @@ impl World {
             }
             _ => {}
         }
-        let local = self.devices[d].engine.trees.local();
+        let trees = &self.devices[d].engine.trees;
         if let Some(own) = touched.first() {
             self.actions[d].insert(self.clock, *own);
         }
         for ino in touched {
             self.touches[d].entry(ino).or_default().insert(self.clock);
-            if let Some((node, _)) = local.iter().find(|(_, node)| node.identity.ino == ino) {
+            let node = (trees.local().iter())
+                .find(|(_, node)| node.identity.ino == ino)
+                .map(|(node, _)| node)
+                .or_else(|| {
+                    (trees.displaced_local().iter())
+                        .find(|(_, identity)| identity.ino == ino)
+                        .map(|(node, _)| node)
+                });
+            if let Some(node) = node {
                 self.touched_nodes[d].insert(node.clone(), ino);
             }
         }
