@@ -210,6 +210,7 @@ pub struct Trees {
     /// The nodes a delete of this device trashed, each with the seq of its commit, while R holds
     /// them trashed by that commit.
     trashed_here: TrackedMap<NodeId, u64>,
+    removed_here: TrackedMap<NodeId, u64>,
     /// See [`TreesState::discarded`].
     discarded: TrackedMap<NodeId, Shape>,
     /// The files whose content an edit of this device set, each with the seq of its commit, while
@@ -292,6 +293,7 @@ impl Trees {
             watched: TrackedMap::default(),
             watched_positions: TrackedMap::default(),
             trashed_here: TrackedMap::default(),
+            removed_here: TrackedMap::default(),
             discarded: TrackedMap::default(),
             edited_here: TrackedMap::default(),
             moved_here: TrackedMap::default(),
@@ -522,11 +524,18 @@ impl Trees {
         let edited_here = edit
             && !node.trashed
             && (self.r.get(&id)).is_some_and(|old| old.edit_rev != node.edit_rev);
+        let removed_again = made_here
+            && !node.trashed
+            && self.l.get(&id).is_none()
+            && self.removed_here.contains_key(&id);
         let shape = node.shape.clone();
         if edited_here {
             self.edited_here.insert(id.clone(), node.edit_rev);
         }
         self.place_remote(id.clone(), node);
+        if removed_again && !self.set_synced_if_valid(id.clone(), Some(shape.clone())) {
+            self.wait(id.clone(), Some(shape.clone()), Origin::Other);
+        }
         if hidden && !self.set_synced_if_valid(id.clone(), None) {
             self.wait(id.clone(), None, Origin::Other);
         }
@@ -587,6 +596,10 @@ impl Trees {
         {
             self.trashed_here.remove(&id);
             self.kept_originals.remove(&id);
+        }
+        if (self.removed_here.get(&id)).is_some_and(|&seq| !(node.trashed && node.meta_rev == seq))
+        {
+            self.removed_here.remove(&id);
         }
         if node.trashed && !self.trashed_here.contains_key(&id) {
             self.kept_originals.remove(&id);
@@ -751,6 +764,7 @@ impl Trees {
     pub fn remove_remote(&mut self, id: &str) {
         self.remote_rules_files.remove(id);
         self.trashed_here.remove(id);
+        self.removed_here.remove(id);
         self.kept_originals.remove(id);
         self.count_held_trash(id, false);
         self.count_trashed(id, false);
@@ -1404,6 +1418,70 @@ impl Trees {
                 None => self.kept_originals.remove(id),
             };
         }
+    }
+
+    pub fn is_removed_here(&self, id: &str) -> bool {
+        self.removed_here.contains_key(id)
+    }
+
+    pub fn removed_here(&self) -> BTreeMap<NodeId, u64> {
+        (*self.removed_here).clone()
+    }
+
+    /// After a listing replaces R, makes each node of `removed` that R now holds live and L
+    /// doesn't hold a local delete again when `here` says this device brought it back at the
+    /// node's revision.
+    pub fn listed_removals(&mut self, removed: BTreeMap<NodeId, u64>, here: impl Fn(u64) -> bool) {
+        for (id, removed_at) in removed {
+            let Some(node) = self.r.get(&id).filter(|node| !node.trashed) else {
+                continue;
+            };
+            let edited_since = node.content_rev.max(node.edit_rev) > removed_at;
+            if self.l.get(&id).is_some() || edited_since || !here(node.meta_rev) {
+                continue;
+            }
+            let shape = node.shape.clone();
+            if !self.set_synced_if_valid(id.clone(), Some(shape.clone())) {
+                self.wait(id, Some(shape), Origin::Other);
+            }
+        }
+    }
+
+    pub(crate) fn removed_restored(&self, id: &str, target: &str) -> Vec<NodeId> {
+        let Some(node) = self.r.get(id).filter(|node| node.trashed) else {
+            return Vec::new();
+        };
+        let in_group = |member: &str| {
+            let mut current = member;
+            for _ in 0..=self.r.len() {
+                if current == id {
+                    return true;
+                }
+                match self.r.get(current) {
+                    Some(above) if above.trashed && above.trash_group == node.trash_group => {
+                        current = &above.shape.parent
+                    }
+                    _ => return false,
+                }
+            }
+            false
+        };
+        let mut parents = BTreeSet::new();
+        let mut current = if target.is_empty() {
+            &node.shape.parent
+        } else {
+            target
+        };
+        while let Some(parent) = self.r.get(current).filter(|parent| parent.trashed) {
+            if !parents.insert(current) {
+                break;
+            }
+            current = &parent.shape.parent;
+        }
+        (self.removed_here.keys())
+            .filter(|member| in_group(member) || parents.contains(member.as_str()))
+            .cloned()
+            .collect()
     }
 
     pub fn kept_original(&self, id: &str) -> Option<&NodeId> {
@@ -2229,6 +2307,10 @@ impl Trees {
             }
         }
         self.unsearched.clear();
+        let seen: BTreeMap<NodeId, Shape> = (pending.iter())
+            .filter(|id| self.l.get(id).is_none())
+            .filter_map(|id| Some((id.clone(), self.s.get(id)?.clone())))
+            .collect();
         let mut taken = Vec::new();
         loop {
             let before = pending.len();
@@ -2254,6 +2336,17 @@ impl Trees {
             taken.extend(together);
         }
         for id in taken {
+            if self.l.get(&id).is_none()
+                && let Some(remote) = self.r.get(&id).filter(|remote| remote.trashed)
+                && seen
+                    .get(&id)
+                    .is_some_and(|seen| match (&seen.content, &remote.shape.content) {
+                        (Some(seen), Some(held)) => same_content(seen, held),
+                        (seen, held) => seen.is_none() && held.is_none(),
+                    })
+            {
+                self.removed_here.insert(id.clone(), remote.meta_rev);
+            }
             if !self.parked(&id) && !self.unsent_edits.contains(&id) {
                 self.dirty.remove(&id);
             }
@@ -2651,6 +2744,7 @@ impl Trees {
             watched: (*self.watched).clone(),
             watched_positions: (*self.watched_positions).clone(),
             trashed_here: (*self.trashed_here).clone(),
+            removed_here: (*self.removed_here).clone(),
             discarded: (*self.discarded).clone(),
             outside: (*self.outside).clone(),
             lost: (*self.lost).clone(),
@@ -2684,6 +2778,7 @@ impl Trees {
             watched,
             watched_positions,
             trashed_here,
+            removed_here,
             discarded,
             edited_here,
             moved_here,
@@ -2719,6 +2814,7 @@ impl Trees {
             watched: watched.take_changes(),
             watched_positions: watched_positions.take_changes(),
             trashed_here: trashed_here.take_changes(),
+            removed_here: removed_here.take_changes(),
             discarded: discarded.take_changes(),
             outside: outside.take_changes(),
             lost: lost.take_changes(),
@@ -2770,6 +2866,9 @@ impl Trees {
         };
         if let Some((id, _)) = state.trashed_here.iter().find(|entry| !trashed(entry)) {
             return Err(StateError::NotTrashedHere(id.clone()));
+        }
+        if let Some((id, _)) = state.removed_here.iter().find(|entry| !trashed(entry)) {
+            return Err(StateError::NotRemovedHere(id.clone()));
         }
         if let Some(id) = (state.outside.iter()).find(|id| self.l.get(id).is_none()) {
             return Err(StateError::NotIgnoredLocal(id.clone()));
@@ -2825,6 +2924,7 @@ impl Trees {
             watched,
             watched_positions,
             trashed_here,
+            removed_here,
             discarded,
             outside,
             lost,
@@ -2850,6 +2950,7 @@ impl Trees {
         self.watched = watched.into();
         self.watched_positions = watched_positions.into();
         self.trashed_here = trashed_here.into();
+        self.removed_here = removed_here.into();
         self.discarded = discarded.into();
         self.outside = outside.into();
         self.lost = lost.into();

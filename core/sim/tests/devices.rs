@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use koidrive_engine::restore::RestoreIntent;
 use koidrive_engine::tree::Content;
 use koidrive_proto::v1::error;
 use koidrive_sim::world::disk::Place;
@@ -4247,6 +4248,304 @@ fn a_folder_deleted_while_its_creator_writes_into_it_takes_its_own_name() {
     steps.extend([(1, delete(1)), (1, SCAN)]);
     world.phase(1, &steps).unwrap();
     assert_eq!(names(&world), [["A", "c.txt"], ["A", "c.txt"]]);
+}
+
+#[test]
+fn a_file_deleted_in_the_commit_that_renames_its_deleted_folder_stays_deleted() {
+    let synced = vec![(0, folder("a")), (0, user(1, 0, 1, "b"))];
+    let mut racing = vec![(0, delete(0))];
+    racing.extend(commit(0));
+    racing.extend([(1, rename(0, 0, "A")), (1, delete(1))]);
+    racing.extend(commit(1));
+    let world = converge(2, &[synced, racing]).unwrap();
+    for device in 0..2 {
+        assert_eq!(
+            files_on(&world, device),
+            [("A".into(), None)],
+            "device {device}"
+        );
+    }
+}
+
+#[test]
+fn a_file_deleted_before_its_folder_is_renamed_out_of_the_trash_stays_deleted() {
+    let synced = vec![(0, folder("a")), (0, user(1, 0, 1, "b"))];
+    let mut racing = vec![(0, delete(0))];
+    racing.extend(commit(0));
+    racing.extend([
+        (1, delete(1)),
+        (1, SCAN),
+        (1, DELIVER),
+        (1, rename(0, 0, "A")),
+    ]);
+    racing.extend(commit(1));
+    let world = converge(2, &[synced, racing]).unwrap();
+    for device in 0..2 {
+        assert_eq!(
+            files_on(&world, device),
+            [("A".into(), None)],
+            "device {device}"
+        );
+    }
+}
+
+#[test]
+fn an_edit_made_before_a_rename_out_of_the_trash_brings_its_file_back_survives_the_delete_sent_with_it()
+ {
+    let mut world = World::new(3);
+    world
+        .phase(0, &[(0, folder("a")), (0, user(1, 0, 1, "b"))])
+        .unwrap();
+    world
+        .run(
+            1,
+            &[
+                (1, rename(0, 0, "A")),
+                (1, delete(1)),
+                (1, SCAN),
+                (1, COMMIT),
+            ],
+        )
+        .unwrap();
+    world
+        .run(
+            2,
+            &[
+                (2, user(2, 1, 0, "a")),
+                (2, SCAN),
+                (2, COMMIT),
+                (2, COMMIT),
+                (2, DELIVER),
+            ],
+        )
+        .unwrap();
+    for _ in 0..20 {
+        world.run(3, &[(0, DELIVER), (0, Step::Work(1))]).unwrap();
+    }
+    world
+        .run(
+            4,
+            &[
+                (0, delete(0)),
+                (0, SCAN),
+                (0, COMMIT),
+                (0, COMMIT),
+                (0, DELIVER),
+            ],
+        )
+        .unwrap();
+    world.run(5, &[(1, COMMIT)]).unwrap();
+    world.phase(6, &[]).unwrap();
+    let b = (world.space().nodes().into_iter())
+        .find(|node| node.name == "b")
+        .unwrap();
+    assert_eq!(b.status, koidrive_proto::v1::NodeStatus::Live as i32);
+}
+
+#[test]
+fn an_edit_that_reaches_a_device_after_its_user_removed_the_file_survives_a_rename_out_of_the_trash()
+ {
+    let mut world = World::new(3);
+    world
+        .phase(0, &[(0, folder("a")), (0, user(1, 0, 1, "b"))])
+        .unwrap();
+    world
+        .run(1, &[(1, rename(0, 0, "A")), (1, delete(1)), (1, SCAN)])
+        .unwrap();
+    world
+        .run(
+            2,
+            &[
+                (2, user(2, 1, 0, "a")),
+                (2, SCAN),
+                (2, COMMIT),
+                (2, COMMIT),
+                (2, DELIVER),
+            ],
+        )
+        .unwrap();
+    for _ in 0..20 {
+        world.run(3, &[(0, DELIVER), (0, Step::Work(1))]).unwrap();
+    }
+    world
+        .run(
+            4,
+            &[
+                (0, delete(0)),
+                (0, SCAN),
+                (0, COMMIT),
+                (0, COMMIT),
+                (0, DELIVER),
+            ],
+        )
+        .unwrap();
+    for _ in 0..20 {
+        world.run(5, &[(1, DELIVER)]).unwrap();
+    }
+    world.phase(6, &[]).unwrap();
+    let b = (world.space().nodes().into_iter())
+        .find(|node| node.name == "b")
+        .unwrap();
+    assert_eq!(b.status, koidrive_proto::v1::NodeStatus::Live as i32);
+}
+
+#[test]
+fn a_file_replaced_in_a_folder_moved_out_of_the_trash_keeps_its_name() {
+    let synced = vec![
+        (0, folder("c.txt")),
+        (0, user(0, 0, 1, "a")),
+        (0, user(1, 0, 2, "b")),
+    ];
+    let old = content_on(&converge(2, std::slice::from_ref(&synced)).unwrap(), 1, "b");
+    let mut racing = vec![(0, delete(0))];
+    racing.extend(commit(0));
+    racing.extend([
+        (1, delete(2)),
+        (1, SCAN),
+        (1, DELIVER),
+        (1, user(1, 0, 2, "b")),
+        (1, rename(1, 0, "a")),
+    ]);
+    racing.extend(commit(1));
+    let world = converge(2, &[synced, racing]).unwrap();
+    let new = content_on(&world, 1, "b");
+    assert_ne!(new, old);
+    for device in 0..2 {
+        let files = [("a".into(), None), ("b".into(), Some(new.clone()))];
+        assert_eq!(files_on(&world, device), files, "device {device}");
+    }
+}
+
+#[test]
+fn a_file_its_user_removed_and_then_restores_from_the_trash_stays_restored() {
+    let synced = vec![(0, folder("a")), (0, user(1, 0, 1, "b"))];
+    let mut racing = vec![(0, delete(0))];
+    racing.extend(commit(0));
+    racing.extend([(1, delete(1)), (1, SCAN), (1, DELIVER)]);
+    let mut world = converge(2, &[synced, racing]).unwrap();
+    let engine = &mut world.devices[1].engine;
+    let b = (engine.trees.remote().iter())
+        .find(|(_, node)| node.shape.name == "b")
+        .map(|(id, _)| id.clone())
+        .unwrap();
+    let request = engine.ids.uuid_v7(1_700_000_000_000);
+    let intent = RestoreIntent::from_trash(b, None, None).unwrap();
+    assert!(engine.commits.restore(request, intent));
+    world.phase(2, &commit(1)).unwrap();
+    for device in 0..2 {
+        let names: Vec<String> = (files_on(&world, device).into_iter())
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["a", "b"], "device {device}");
+    }
+}
+
+#[test]
+fn a_file_restored_after_its_user_removed_it_keeps_a_rename_made_before_the_restore_is_acknowledged()
+ {
+    let synced = vec![(0, folder("a")), (0, user(1, 0, 1, "b"))];
+    let mut racing = vec![(0, delete(0))];
+    racing.extend(commit(0));
+    racing.extend([(1, delete(1)), (1, SCAN), (1, DELIVER)]);
+    let mut world = converge(2, &[synced, racing]).unwrap();
+    let engine = &mut world.devices[1].engine;
+    let b = (engine.trees.remote().iter())
+        .find(|(_, node)| node.shape.name == "b")
+        .map(|(id, _)| id.clone())
+        .unwrap();
+    let request = engine.ids.uuid_v7(1_700_000_000_000);
+    let intent = RestoreIntent::from_trash(b, None, None).unwrap();
+    assert!(engine.commits.restore(request, intent));
+    world
+        .run(2, &[(1, SCAN), (1, COMMIT), (1, COMMIT)])
+        .unwrap();
+    let mut steps = vec![(0, DELIVER); 6];
+    steps.extend([(0, Step::Work(1)); 6]);
+    world.run(3, &steps).unwrap();
+    let b = (world.devices[0].disk.entries().values())
+        .position(|entry| entry.name == "b")
+        .unwrap();
+    let renamed = [(0, rename(b, 1, "ss")), (0, SCAN), (0, COMMIT), (0, COMMIT)];
+    world.run(4, &renamed).unwrap();
+    world.phase(5, &[]).unwrap();
+    for device in 0..2 {
+        let names: Vec<String> = (files_on(&world, device).into_iter())
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["a", "ss"], "device {device}");
+    }
+}
+
+#[test]
+fn a_version_restore_the_server_rejects_leaves_a_file_its_user_removed_deleted() {
+    let mut world = world(2);
+    world
+        .phase(0, &[(0, folder("a")), (0, user(1, 0, 1, "b"))])
+        .unwrap();
+    let mut racing = vec![(0, delete(0))];
+    racing.extend(commit(0));
+    racing.extend([
+        (1, delete(1)),
+        (1, SCAN),
+        (1, DELIVER),
+        (1, rename(0, 0, "A")),
+        (1, SCAN),
+    ]);
+    world.run(1, &racing).unwrap();
+    let engine = &mut world.devices[1].engine;
+    let b = (engine.trees.remote().iter())
+        .find(|(_, node)| node.shape.name == "b")
+        .map(|(id, _)| id.clone())
+        .unwrap();
+    let request = engine.ids.uuid_v7(1_700_000_000_000);
+    let missing = engine.ids.uuid_v7(1_700_000_000_000);
+    let intent = RestoreIntent::version(b, missing).unwrap();
+    assert!(engine.commits.restore(request, intent));
+    world.phase(2, &commit(1)).unwrap();
+    for device in 0..2 {
+        assert_eq!(
+            files_on(&world, device),
+            [("A".into(), None)],
+            "device {device}"
+        );
+    }
+}
+
+#[test]
+fn a_file_restored_while_another_device_deletes_its_folder_stays_restored() {
+    let mut world = world(2);
+    world
+        .phase(0, &[(0, folder("a")), (0, user(1, 0, 1, "b"))])
+        .unwrap();
+    world
+        .run(1, &[(1, delete(1)), (1, rename(0, 0, "A"))])
+        .unwrap();
+    let engine = &mut world.devices[1].engine;
+    let b = (engine.trees.remote().iter())
+        .find(|(_, node)| node.shape.name == "b")
+        .map(|(id, _)| id.clone())
+        .unwrap();
+    let request = engine.ids.uuid_v7(1_700_000_000_000);
+    let intent = RestoreIntent::from_trash(b, None, None).unwrap();
+    assert!(engine.commits.restore(request.clone(), intent));
+    world.run(2, &[(1, SCAN), (1, COMMIT)]).unwrap();
+    let mut remote = vec![(0, delete(0))];
+    remote.extend(commit(0));
+    world.run(3, &remote).unwrap();
+    world.run(4, &[(1, COMMIT)]).unwrap();
+    world.phase(5, &[]).unwrap();
+    let resolved = world.devices[1].engine.commits.resolved();
+    let restored = resolved.iter().find(|ended| ended.id == request).unwrap();
+    assert_eq!(
+        restored.outcome,
+        koidrive_engine::restore::Outcome::Restored
+    );
+    for device in 0..2 {
+        let names: Vec<String> = (files_on(&world, device).into_iter())
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["A", "b"], "device {device}");
+    }
 }
 
 #[test]

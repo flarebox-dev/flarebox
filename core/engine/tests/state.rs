@@ -101,6 +101,7 @@ fn trees_state() -> TreesState {
         ]
         .into(),
         trashed_here: [("t".into(), 5)].into(),
+        removed_here: [("t".into(), 5)].into(),
         discarded: [("a".into(), dir(ROOT, "x"))].into(),
         outside: ["a".into()].into(),
         lost: ["a".into()].into(),
@@ -250,6 +251,7 @@ fn commits_state() -> CommitsState {
                 ..Default::default()
             },
             deletes: [("d".into(), vec!["d".into(), "e".into()])].into(),
+            restores: [(2, vec!["r".into(), "s".into()])].into(),
             result: Some(CommitResult {
                 results: vec![OpResult::default(); 3],
                 ..Default::default()
@@ -451,6 +453,22 @@ fn trees_restore_a_valid_state_and_refuse_each_broken_one() {
                 state.trashed_here.insert("t".into(), 4);
             }),
             StateError::NotTrashedHere("t".into()),
+        ),
+        (
+            "a node removed here that R holds live",
+            trees(),
+            broken(trees_state(), |state| {
+                state.removed_here.insert("a".into(), 5);
+            }),
+            StateError::NotRemovedHere("a".into()),
+        ),
+        (
+            "a node removed here that R holds trashed by another commit",
+            trees(),
+            broken(trees_state(), |state| {
+                state.removed_here.insert("t".into(), 4);
+            }),
+            StateError::NotRemovedHere("t".into()),
         ),
         (
             "a node recorded in an ignored folder that L does not hold",

@@ -88,6 +88,7 @@ fn migrations_apply_from_empty() {
             "commit_in_flight",
             "commit_in_flight_delete_members",
             "commit_in_flight_deletes",
+            "commit_in_flight_restore_members",
             "commit_slots",
             "commit_state",
             "discarded_nodes",
@@ -122,6 +123,7 @@ fn migrations_apply_from_empty() {
             "recorded_nodes",
             "remote_cursor",
             "remote_nodes",
+            "removed_here",
             "replaced_versions",
             "resends",
             "restore_intents",
@@ -1242,6 +1244,7 @@ fn engine_state() -> EngineState {
                 ("placed".into(), None),
             ]),
             trashed_here: BTreeMap::from([("t".into(), 5)]),
+            removed_here: BTreeMap::from([("r".into(), 6)]),
             discarded: BTreeMap::from([("d".into(), engine_shape("root", "d.txt"))]),
             outside: nodes(["kept", "lost"]),
             lost: nodes(["lost"]),
@@ -1309,6 +1312,7 @@ fn engine_state() -> EngineState {
                     ),
                     ("empty".into(), vec![]),
                 ]),
+                restores: BTreeMap::new(),
                 result: Some(CommitResult {
                     seq: 30,
                     results: vec![applied.clone(), applied.clone(), applied],
@@ -1497,7 +1501,7 @@ fn engine_state_survives_a_reopen() {
 }
 
 /// The tables of the engine state besides the nodes of R, L and S.
-const ENGINE_TABLES: [&str; 34] = [
+const ENGINE_TABLES: [&str; 36] = [
     "node_sets",
     "node_maps",
     "waiting_updates",
@@ -1505,6 +1509,7 @@ const ENGINE_TABLES: [&str; 34] = [
     "commit_in_flight",
     "commit_in_flight_deletes",
     "commit_in_flight_delete_members",
+    "commit_in_flight_restore_members",
     "watched_contents",
     "trashed_here",
     "recorded_nodes",
@@ -1532,6 +1537,7 @@ const ENGINE_TABLES: [&str; 34] = [
     "moved_here",
     "past_positions",
     "dropped_edits",
+    "removed_here",
 ];
 
 /// Counts each row inserted, updated or deleted in the engine's tables from now on in the table
@@ -1763,6 +1769,7 @@ fn a_policy_halt_outlasts_a_restart_and_resends_nothing() {
                     ..Default::default()
                 },
                 deletes: BTreeMap::new(),
+                restores: BTreeMap::new(),
                 result: None,
             }),
             halted: Some(halt),
@@ -3592,6 +3599,33 @@ fn a_store_from_before_kept_originals_were_recorded_opens_with_none_recorded() {
     let after = before.clone();
     before.trees.kept_originals.clear();
     assert!(!after.trees.kept_originals.is_empty());
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
+    store
+        .transaction(|tx| tx.update_engine_state(&before, &after))
+        .unwrap();
+    drop(store);
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), after);
+}
+
+#[test]
+fn a_store_from_before_removals_here_were_recorded_opens_with_none_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let mut before = engine_state();
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| tx.set_engine_state(&before))
+        .unwrap();
+    store_before(&path, "removed_here");
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(applied(&path), all_migrations());
+    let mut after = before.clone();
+    let flight = after.commits.in_flight.as_mut().unwrap();
+    flight.restores = BTreeMap::from([(2, vec!["r".into(), "r-child".into()])]);
+    before.trees.removed_here.clear();
+    assert!(!after.trees.removed_here.is_empty());
     assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), before);
     store
         .transaction(|tx| tx.update_engine_state(&before, &after))

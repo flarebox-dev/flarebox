@@ -61,6 +61,9 @@ pub struct InFlight {
     pub commit: proto::Commit,
     /// For each `Delete` op, by its target, every node the client planned to delete with it.
     pub deletes: BTreeMap<NodeId, Vec<NodeId>>,
+    /// For each `Restore` op, by its index in the commit, the nodes this device's user removed that
+    /// it brings back. When the restore is applied, they are downloaded instead of deleted again.
+    pub restores: BTreeMap<usize, Vec<NodeId>>,
     /// The result once it has arrived, kept until R holds its records.
     pub result: Option<proto::CommitResult>,
 }
@@ -385,6 +388,15 @@ impl Commits {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Whether a listed node at revision `seq` was placed there by this device: by a commit of
+    /// this device that the server kept, or by the commit in flight, whose result has that seq.
+    pub fn listed_here(&self, seq: u64) -> bool {
+        (self.made_here(seq) && !self.lost_here(seq))
+            || (self.in_flight.as_ref())
+                .and_then(|flight| flight.result.as_ref())
+                .is_some_and(|result| result.seq == seq)
     }
 
     /// Whether one of this device's commits that the server lost has seq `seq`: one above
@@ -841,6 +853,17 @@ impl Commits {
 
         let require_head = (ops.iter().filter_map(|op| op.op.as_ref()))
             .any(|op| trees.resends().contains(op_node(op)));
+        let restores = (ops.iter().enumerate())
+            .filter_map(|(index, op)| match &op.op {
+                Some(op::Op::Restore(restore)) => Some((index, restore)),
+                _ => None,
+            })
+            .map(|(index, restore)| {
+                let removed = trees.removed_restored(&restore.node_id, &restore.target_parent_id);
+                (index, removed)
+            })
+            .filter(|(_, removed)| !removed.is_empty())
+            .collect();
         let commit_id = ids.uuid_v7(now_ms);
         for question in self.questions.get_mut() {
             if let QuestionKind::Conflict { sent_in, .. } = &mut question.kind
@@ -862,6 +885,7 @@ impl Commits {
                 ..Default::default()
             },
             deletes,
+            restores,
             result: None,
         }));
         self.in_flight.as_ref().map(|flight| &flight.commit)
@@ -1205,6 +1229,13 @@ impl Commits {
         let aliases = self.aliases.clone();
         let mut conflicts: Vec<(usize, NodeId, NodeId)> = Vec::new();
         let mut answers = Vec::new();
+        let revivers: BTreeSet<&str> = (flight.commit.ops.iter())
+            .filter_map(|op| match &op.op {
+                Some(op::Op::Move(moved)) => Some(moved.node_id.as_str()),
+                Some(op::Op::Restore(restore)) => Some(restore.node_id.as_str()),
+                _ => None,
+            })
+            .collect();
         for (index, (op, outcome)) in flight.commit.ops.iter().zip(&result.results).enumerate() {
             use op_result::Code;
             let code = Code::try_from(outcome.code).unwrap_or(Code::Unspecified);
@@ -1368,6 +1399,17 @@ impl Commits {
                     if done {
                         let kept = delete.requires.as_ref().map(|kept| kept.node_id.as_str());
                         for id in flight.deletes.get(&delete.node_id).into_iter().flatten() {
+                            let revived = (trees.remote().get(id)).filter(|node| {
+                                code == Code::Superseded
+                                    && !node.trashed
+                                    && node.meta_rev == result.seq
+                                    && node.content_rev.max(node.edit_rev) <= flight.commit.base_seq
+                                    && remote_below(trees, id, &revivers)
+                            });
+                            if let Some(revived) = revived {
+                                synced.set(id, Some(revived.shape.clone()));
+                                continue;
+                            }
                             synced.set(id, None);
                             let kept = kept.filter(|_| *id == delete.node_id);
                             trees.record_trashed(id, result.seq, kept);
@@ -1430,6 +1472,34 @@ impl Commits {
             }
             if !done {
                 self.problems.insert(node.clone());
+            }
+        }
+        for (index, (op, outcome)) in flight.commit.ops.iter().zip(&result.results).enumerate() {
+            let Some(op::Op::Restore(restore)) = &op.op else {
+                continue;
+            };
+            let code = op_result::Code::try_from(outcome.code);
+            if !matches!(
+                code,
+                Ok(op_result::Code::Applied | op_result::Code::AppliedRenamed)
+            ) {
+                continue;
+            }
+            let restored = BTreeSet::from([restore.node_id.as_str()]);
+            let deleted = (flight.deletes.values())
+                .filter(|planned| planned.contains(&restore.node_id))
+                .flatten()
+                .filter(|id| **id == restore.node_id || remote_below(trees, id, &restored));
+            for id in flight
+                .restores
+                .get(&index)
+                .into_iter()
+                .flatten()
+                .chain(deleted)
+            {
+                if trees.local().get(id).is_none() && trees.remote().live(id).is_some() {
+                    synced.set(id, None);
+                }
             }
         }
         let mut rest = synced.apply(trees);
@@ -2602,6 +2672,10 @@ fn plan(
     let mut wants: Vec<Option<Want>> = wants.into_iter().map(Some).collect();
     let mut ops = Vec::new();
     let mut deletes = BTreeMap::new();
+    let removed = |id: &NodeId| {
+        trees.local().get(id).is_none()
+            && (trees.synced().get(id).is_some() || trees.is_removed_here(id))
+    };
     let mut emit = |want: Want, scratch: &mut Scratch, moving: &mut BTreeSet<NodeId>| {
         for node in want.nodes() {
             if let Some(left) = scratch.unsent.get_mut(node) {
@@ -2645,7 +2719,14 @@ fn plan(
                     parent_id: held.parent.clone(),
                     name: held.name.clone(),
                 });
-                scratch.place(&id, &parent, &name, held.kind);
+                let (kind, group) = (held.kind, held.group.clone().filter(|_| !held.live));
+                scratch.place(&id, &parent, &name, kind);
+                if let Some(group) = group {
+                    let revived = scratch.revive_group(&id, &group);
+                    scratch
+                        .owed
+                        .extend(revived.into_iter().filter(|id| removed(id)));
+                }
                 op::Op::Move(proto::Move {
                     node_id: id,
                     new_parent_id: parent,
@@ -2691,6 +2772,7 @@ fn plan(
                         let fit = scratch.fit_at(&op.node_id, parent, name);
                         if matches!(fit, Fit::Valid | Fit::NameTaken) {
                             scratch.place(&op.node_id, parent, name, node.shape.kind);
+                            scratch.revive_group(&op.node_id, &node.trash_group);
                         }
                     }
                     None => scratch.revive(&op.node_id),
@@ -2828,8 +2910,10 @@ fn plan(
         let forced = wants.iter_mut().find(|slot| {
             slot.as_ref().is_some_and(|want| {
                 scratch.fit(want, &moving) == Fit::NameTaken
-                    && !(scratch.name_holders(want))
-                        .any(|holder| held.iter().any(|id| scratch.inside(holder, id)))
+                    && !(scratch.name_holders(want)).any(|holder| {
+                        scratch.owed.contains(holder)
+                            || held.iter().any(|id| scratch.inside(holder, id))
+                    })
             })
         });
         let Some(slot) = forced else {
@@ -2873,6 +2957,20 @@ fn plan(
         last == Some(&pending.sent)
     });
     (ops, deletes, reverts, pending)
+}
+
+fn remote_below(trees: &Trees, id: &str, ancestors: &BTreeSet<&str>) -> bool {
+    let mut current = id;
+    for _ in 0..=trees.remote().len() {
+        let Some(node) = trees.remote().get(current) else {
+            return false;
+        };
+        if ancestors.contains(node.shape.parent.as_str()) {
+            return true;
+        }
+        current = &node.shape.parent;
+    }
+    false
 }
 
 fn deletes_before_create(
@@ -3001,6 +3099,7 @@ struct Entry {
     key: String,
     kind: Kind,
     live: bool,
+    group: Option<String>,
 }
 
 /// R as the ops emitted so far leave it on the server, as far as their order depends on it.
@@ -3023,6 +3122,8 @@ struct Scratch {
     /// holds.
     unsent: BTreeMap<NodeId, usize>,
     restoring: BTreeSet<NodeId>,
+    trashed: BTreeMap<NodeId, Vec<NodeId>>,
+    owed: BTreeSet<NodeId>,
 }
 
 impl Scratch {
@@ -3035,6 +3136,8 @@ impl Scratch {
             protected: BTreeSet::new(),
             unsent: BTreeMap::new(),
             restoring: BTreeSet::new(),
+            trashed: BTreeMap::new(),
+            owed: BTreeSet::new(),
         };
         for (id, node) in trees.remote().iter() {
             let entry = Entry {
@@ -3043,9 +3146,16 @@ impl Scratch {
                 key: name_key(&node.shape.name),
                 kind: node.shape.kind,
                 live: false,
+                group: node.trashed.then(|| node.trash_group.clone()),
             };
             scratch.nodes.insert(id.clone(), entry);
-            if !node.trashed {
+            if node.trashed {
+                let siblings = scratch
+                    .trashed
+                    .entry(node.shape.parent.clone())
+                    .or_default();
+                siblings.push(id.clone());
+            } else {
                 scratch.link(id);
             }
         }
@@ -3215,10 +3325,28 @@ impl Scratch {
             key: name_key(name),
             kind,
             live: false,
+            group: None,
         };
         self.nodes.insert(id.to_owned(), entry);
         self.link(id);
         self.revive(parent);
+    }
+
+    fn revive_group(&mut self, id: &str, group: &str) -> Vec<NodeId> {
+        let mut revived = Vec::new();
+        let mut parents = vec![id.to_owned()];
+        while let Some(parent) = parents.pop() {
+            for child in self.trashed.get(&parent).cloned().unwrap_or_default() {
+                let entry = &self.nodes[&child];
+                if entry.live || entry.group.as_deref() != Some(group) {
+                    continue;
+                }
+                self.link(&child);
+                parents.push(child.clone());
+                revived.push(child);
+            }
+        }
+        revived
     }
 
     /// Makes `id` live with the trashed ancestors it needs, as R8 does.

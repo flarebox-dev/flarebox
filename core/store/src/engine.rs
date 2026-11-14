@@ -152,6 +152,13 @@ impl Tx<'_> {
         while let Some(row) = rows.next()? {
             state.trees.trashed_here.insert(row.get(0)?, row.get(1)?);
         }
+        let mut stmt = self
+            .0
+            .prepare_cached("SELECT node_id, seq FROM removed_here")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            state.trees.removed_here.insert(row.get(0)?, row.get(1)?);
+        }
         let mut stmt = self.0.prepare_cached(
             "SELECT node_id, parent_id, name, kind, content FROM discarded_nodes",
         )?;
@@ -363,9 +370,11 @@ impl Tx<'_> {
             "commit_in_flight",
             "commit_in_flight_deletes",
             "commit_in_flight_delete_members",
+            "commit_in_flight_restore_members",
             "watched_contents",
             "watched_positions",
             "trashed_here",
+            "removed_here",
             "discarded_nodes",
             "published_nodes",
             "pending_names",
@@ -424,6 +433,7 @@ impl Tx<'_> {
             watched,
             watched_positions,
             trashed_here,
+            removed_here,
             discarded,
             outside,
             lost,
@@ -545,6 +555,12 @@ impl Tx<'_> {
             |put, node, seq| put.execute(params![node, seq]),
         )?;
         self.write_map(
+            removed_here,
+            "DELETE FROM removed_here WHERE node_id = ?1",
+            "INSERT OR REPLACE INTO removed_here (node_id, seq) VALUES (?1, ?2)",
+            |put, node, seq| put.execute(params![node, seq]),
+        )?;
+        self.write_map(
             discarded,
             "DELETE FROM discarded_nodes WHERE node_id = ?1",
             "INSERT OR REPLACE INTO discarded_nodes (node_id, parent_id, name, kind, content)
@@ -658,6 +674,7 @@ impl Tx<'_> {
                 "commit_in_flight",
                 "commit_in_flight_deletes",
                 "commit_in_flight_delete_members",
+                "commit_in_flight_restore_members",
             ] {
                 self.0.execute(&format!("DELETE FROM {table}"), [])?;
             }
@@ -679,6 +696,14 @@ impl Tx<'_> {
                     targets.execute([target])?;
                     for (position, node) in nodes.iter().enumerate() {
                         members.execute(params![target, position, node])?;
+                    }
+                }
+                let mut restored = self.0.prepare_cached(
+                    "INSERT INTO commit_in_flight_restore_members (op, position, node_id) VALUES (?1, ?2, ?3)",
+                )?;
+                for (index, nodes) in &flight.restores {
+                    for (position, node) in nodes.iter().enumerate() {
+                        restored.execute(params![index, position, node])?;
                     }
                 }
             }
@@ -858,9 +883,18 @@ impl Tx<'_> {
             };
             nodes.push(row.get(1)?);
         }
+        let mut restores: BTreeMap<usize, Vec<NodeId>> = BTreeMap::new();
+        let mut stmt = self.0.prepare_cached(
+            "SELECT op, node_id FROM commit_in_flight_restore_members ORDER BY op, position",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            restores.entry(row.get(0)?).or_default().push(row.get(1)?);
+        }
         Ok(Some(InFlight {
             commit: Commit::decode(commit.as_slice())?,
             deletes,
+            restores,
             result: decode(result)?,
         }))
     }
