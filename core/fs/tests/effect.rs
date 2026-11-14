@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The effect protocol of design §5.2 against a user acting at each hook
-//! point, on the file system the tests run on (design §7.4).
-
 mod common;
 
 use std::fs::{self, OpenOptions};
@@ -34,17 +31,14 @@ fn failed(reason: Reason) -> Outcome {
     }
 }
 
-/// The outcome of an effect that made the entry now at `path`.
 fn made(root: &Path, path: &str) -> Outcome {
     Outcome::Done {
         identity: Some(entries(root, &[path])[0].id),
     }
 }
 
-/// The outcome of a move or a removal.
 const MOVED_OR_REMOVED: Outcome = Outcome::Done { identity: None };
 
-/// Moves the root at `root` to `moved` and puts an empty folder at its path.
 fn withdraw(root: &Path, moved: &Path) {
     fs::rename(root, moved).unwrap();
     fs::create_dir(root).unwrap();
@@ -313,9 +307,6 @@ fn folder_that_holds_only_platform_files_enters_the_trash_empty() {
     assert_eq!(reclaimed.recovered, Vec::<std::ffi::OsString>::new());
 }
 
-/// A file a rule leaves out, a folder with a platform file's name and a
-/// symbolic link with one each keep the folder, and nothing in it is deleted.
-/// The removal fails naming the entry, but not the platform file.
 #[test]
 fn folder_that_holds_anything_but_platform_files_is_put_back_as_it_was() {
     let others: [fn(&Path); 3] = [
@@ -704,9 +695,6 @@ fn space_changes_nothing_once_its_root_is_moved_away() {
     assert_settled(&moved);
     assert!(listing(&root).is_empty());
 }
-/// A crash after the record of a removal and before the effect reached the file, while the user
-/// moved the entry away: recovery finds the name empty with nothing in the local trash, so the
-/// effect did not remove the entry, and it fails as it would have had it run.
 #[test]
 fn recovery_of_a_removal_whose_file_the_user_moved_first_fails() {
     for scenario in ["remove_file", "remove_dir"] {

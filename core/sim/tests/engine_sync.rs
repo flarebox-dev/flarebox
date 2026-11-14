@@ -1,14 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The engine's commits and effects against the reference server (docs/design/sync-engine.md
-//! section 7.2, planner property). A device with offline local changes meets another device's
-//! concurrent commits, then plans until nothing is left. It must end with L = S = R equal to the
-//! server's tree, and every write either device made must still be on the server.
-//!
-//! Both devices also restore from the trash and restore earlier versions (section 6.3). The other
-//! device commits its restores; this one asks its engine for them, as an app does, and every
-//! request must end with the result the server gave its `Restore` op, sent once.
-
 include!("engine_sync/common.rs");
 include!("engine_sync/first_link.rs");
 include!("engine_sync/moves_and_deletes.rs");
@@ -45,10 +36,6 @@ proptest! {
         run_cut(&seed, &local, &remote, fits, fresh_dir_names, &during, cut)?;
     }
 
-    /// Section 5.10: becoming ignored never deletes anything, on either side. Neither device
-    /// deletes here, so whatever the rules and the moves into and out of ignored paths do, the
-    /// device sends no `Delete`, removes nothing from its disk, and the server trashes nothing,
-    /// across the restart the run makes at every step.
     #[test]
     fn a_device_whose_rules_change_deletes_nothing_on_either_side(
         seed in prop::collection::vec(action(2), 0..12),
@@ -83,11 +70,6 @@ proptest! {
         128,
     ))]
 
-    /// Section 6.1: removing a folder that holds more than half of a space of at least 20 files
-    /// is held, among other local changes that still sync. No `Delete` of a held node goes out
-    /// before the person answers, across the restart the run makes at every step. After
-    /// `restore` the files come back on disk and the server trashes nothing; after `delete` the
-    /// server trashes the folder and every file in it.
     #[test]
     fn removing_most_of_a_space_is_held_until_the_person_answers(
         inside in 11usize..20,
@@ -128,12 +110,6 @@ proptest! {
         256,
     ))]
 
-    /// Section 6.4: on the first link of a folder to a space that holds something, what both hold
-    /// alike is adopted and the rest of the folder is held. No create of a held entry goes out
-    /// before the person publishes it, across the restart the run makes at every step, while the
-    /// user and the other device go on changing things. After `publish` every local write is on the
-    /// server; after `discard` the discarded entries are in the local trash and every other write
-    /// is on the server.
     #[test]
     fn a_first_link_sends_nothing_it_holds_until_the_person_publishes_it(
         seed in prop::collection::vec(action(2), 1..12),

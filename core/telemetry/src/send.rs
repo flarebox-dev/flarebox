@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Posting the queue to PostHog's batch API (https://posthog.com/docs/api/capture) through `tel.koidrive.com`,
-//! PostHog's managed reverse proxy for the project (https://posthog.com/docs/advanced/proxy). Events are anonymous:
-//! no person profile is made and no location is looked up from the address.
-
 use std::ffi::OsString;
 use std::io;
 use std::time::Duration;
@@ -16,10 +12,7 @@ use crate::schema::{DailyReport, EventUuid, InstallId, SCHEMA};
 use crate::store::{Batch, Store};
 use crate::system::Environment;
 
-/// The project's host, a CNAME to PostHog's managed reverse proxy.
 pub const ENDPOINT: &str = "https://tel.koidrive.com";
-/// The PostHog project token (US Cloud). A client can only add events and evaluate feature flags with it, and PostHog
-/// documents it as public. A build with an empty token sends nothing and its queue waits.
 pub const PROJECT_TOKEN: &str = "phc_zS5sUnZrgWmsxoiodya3UeRdNfBkk5Pvdpsqiii4XqZ8";
 pub const ENDPOINT_VARIABLE: &str = "KOIDRIVE_TELEMETRY_URL";
 pub const TOKEN_VARIABLE: &str = "KOIDRIVE_TELEMETRY_TOKEN";
@@ -219,8 +212,6 @@ fn common(id: &InstallId, environment: &Environment) -> Map<String, Value> {
     properties
 }
 
-/// Counters as `c.<metric>.<label>` numbers, levels as `l.<metric>.<label>` numbers and histograms as
-/// `h.<metric>.<label>` objects, so each is one column in PostHog.
 fn daily(report: &DailyReport) -> Map<String, Value> {
     let mut properties = Map::new();
     for (metric, labels) in &report.counters {
@@ -346,8 +337,6 @@ mod tests {
         assert_eq!(events[2]["properties"]["file"], SourceFile::EXTERNAL);
     }
 
-    /// Every string a batch can carry is the install id, the token, a time, a version number or a name from a closed
-    /// set, so no path, name or message can be in it.
     #[test]
     fn a_batch_holds_no_free_text() {
         let dir = tempfile::tempdir().unwrap();
@@ -383,7 +372,6 @@ mod tests {
         }
     }
 
-    /// A queue file with paths and names for keys, as a bug or another program could leave, sends none of them.
     #[tokio::test]
     async fn keys_outside_the_closed_set_never_reach_a_request() {
         let (address, bodies) = server(200).await;
@@ -454,7 +442,6 @@ mod tests {
         assert!(store.peek().unwrap().is_empty());
     }
 
-    /// A send cancelled before any answer, as by a timeout around it, leaves its batch to the next send.
     #[tokio::test]
     async fn a_cancelled_send_keeps_the_batch() {
         let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -506,7 +493,6 @@ mod tests {
         }
     }
 
-    /// A server that answers every request with `status` and keeps the bodies it got.
     async fn server(status: u16) -> (String, Arc<Mutex<Vec<Value>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = format!("http://{}", listener.local_addr().unwrap());

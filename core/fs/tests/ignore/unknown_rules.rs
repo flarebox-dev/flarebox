@@ -62,8 +62,6 @@ fn a_rules_file_that_cannot_be_read_at_the_first_scan_leaves_its_folder_unknown(
     assert_eq!(known(&snapshot), ["keep.txt", "sub", "sub/.koiignore"]);
 }
 
-/// A folder whose rules were unknown is reported read once a scan lists it, also with no rules file left to read and
-/// no rules changed. A folder that is gone is not reported: the caller forgets it with the folder.
 #[test]
 fn a_folder_whose_rules_were_unknown_is_reported_once_they_are_known() {
     for how in ["the rules file is deleted", "the folder is deleted"] {
@@ -101,8 +99,6 @@ fn a_folder_whose_rules_were_unknown_is_reported_once_they_are_known() {
     }
 }
 
-/// On a case-sensitive volume `proj` and `PROJ` are two folders. A scan that reads only `proj` says nothing about
-/// `PROJ`, whose rules stay unknown.
 #[cfg(target_os = "linux")]
 #[test]
 fn reading_a_folder_leaves_its_unread_namesake_in_another_case_unknown() {
@@ -122,8 +118,6 @@ fn reading_a_folder_leaves_its_unread_namesake_in_another_case_unknown() {
     assert_eq!(partial.rules, [], "only proj was read");
 }
 
-/// On a case-sensitive volume a folder can hold `.koiignore` and `.KOIIGNORE`, two rules files. Which of them other
-/// devices would see is not known, so the folder's rules are unknown until one of them is gone.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_folder_with_two_rules_files_that_differ_only_in_case_is_unknown_until_one_is_gone() {
@@ -151,8 +145,6 @@ fn a_folder_with_two_rules_files_that_differ_only_in_case_is_unknown_until_one_i
     assert_eq!(known(&snapshot), ["sub", "sub/.koiignore", "sub/b"]);
 }
 
-/// On a case-sensitive volume a folder can hold a folder named `.koiignore` beside the regular file `.KOIIGNORE`. Only
-/// the regular file is a rules file, so its rules are in force.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_folder_named_like_the_rules_file_does_not_hide_a_rules_file_in_another_case() {
@@ -204,9 +196,6 @@ fn review_renaming_an_unread_folder_and_removing_its_rules_reports_the_current_p
     );
 }
 
-/// A folder moved over an empty folder while its rules file cannot be read
-/// keeps the entries it had: the scan cannot list it at its new path, but what
-/// lies below it is what lay below it before the move.
 #[test]
 fn a_folder_moved_over_an_empty_folder_with_unreadable_rules_keeps_its_entries() {
     let dir = tempfile::tempdir().unwrap();

@@ -232,8 +232,6 @@ fn a_file_moved_out_of_a_removed_folder_with_a_link_in_an_ignored_folder_is_rena
     assert!(!rescan.changes.iter().any(ignored), "{:?}", rescan.changes);
 }
 
-/// `d/g.txt` and `d/h.txt` are links of one file. One goes to an included path and the other into the ignored
-/// folder, so the scan reports one rename and one ignore.
 #[test]
 fn a_file_moved_out_of_a_removed_folder_is_renamed_and_its_link_moved_into_an_ignored_folder_is_ignored()
  {
@@ -273,8 +271,6 @@ fn a_file_moved_out_of_a_removed_folder_is_renamed_and_its_link_moved_into_an_ig
     );
 }
 
-/// The folder `d/a` is renamed to `dest/a`, and the folder `x` inside it to `y`. The second rename carries
-/// the file, so its link in the ignored folder does not count as a move.
 #[test]
 fn a_file_in_a_folder_renamed_inside_a_renamed_folder_with_a_link_in_an_ignored_folder_is_not_ignored()
  {

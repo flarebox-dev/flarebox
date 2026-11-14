@@ -39,12 +39,6 @@ fn a_server_file_moved_into_a_held_folder_while_its_s_update_waits_is_not_held()
     }
 }
 
-/// A minimal interleaving the property found. The user asks for an earlier version of a file
-/// the other device renamed, and the disk gets the version under the new name while S still
-/// waits for a parked folder to leave that name. Then the user asks for the newer version back.
-/// Sent at once, that restore would leave L with the earlier version and S without it, and the
-/// engine would upload the earlier version over the restored one as if the user had written
-/// it. The restore waits for S, so the version asked for last is current at the end.
 #[test]
 fn a_second_version_restore_waits_until_s_has_the_first() {
     let seed = [
@@ -86,8 +80,6 @@ fn a_second_version_restore_waits_until_s_has_the_first() {
     }
 }
 
-/// A file whose S update waits blocks a remote create, and the server then deletes it. It holds
-/// no edit against its waiting shape, so it is removed rather than uploaded again.
 #[test]
 fn a_parked_file_whose_server_update_waits_is_removed_when_the_server_deletes_it() {
     let seed = vec![
@@ -212,9 +204,6 @@ fn a_parked_file_whose_server_update_waits_is_removed_when_the_server_deletes_it
     run(&seed, &local, &remote, fits, fresh_dir_names, &during).unwrap();
 }
 
-/// A created file's S update waits, and settling then gives S the other device's content. The user
-/// then writes the content the file was created with again; the stale update must not make that
-/// write look uploaded.
 #[test]
 fn a_waiting_update_that_settling_replaced_does_not_hide_a_later_edit() {
     let seed = vec![
@@ -397,8 +386,6 @@ fn a_waiting_update_that_settling_replaced_does_not_hide_a_later_edit() {
     run(&seed, &local, &remote, fits, fresh_dir_names, &during).unwrap();
 }
 
-/// A move's S update waits, and the other device moves the file back before it is made. Once L
-/// follows, the update is stale, so the user's edit to the file is uploaded.
 #[test]
 fn a_waiting_update_both_sides_moved_past_does_not_hold_back_an_edit() {
     let seed = vec![
@@ -552,8 +539,6 @@ fn a_waiting_update_both_sides_moved_past_does_not_hold_back_an_edit() {
     run(&seed, &local, &remote, fits, fresh_dir_names, &during).unwrap();
 }
 
-/// A created file whose S update waits is deleted on both sides before the update fits, so the
-/// update is dropped instead of holding the device out of convergence.
 #[test]
 fn a_waiting_update_of_a_file_both_sides_deleted_is_dropped() {
     let seed = vec![
@@ -685,10 +670,6 @@ fn a_waiting_update_of_a_file_both_sides_deleted_is_dropped() {
     run(&seed, &local, &remote, fits, fresh_dir_names, &during).unwrap();
 }
 
-/// The server merges the user's new folder ß into the other device's ß, whose S update waits
-/// because S still holds a parked file at ss, the same name after case folding. The other device
-/// has moved that file into the folder, and the user deletes the folder. The folder is brought
-/// back for the file instead of its update holding both out of convergence.
 #[test]
 fn a_waiting_folder_the_user_deleted_is_brought_back_for_a_file_moved_into_it() {
     let seed = vec![
@@ -853,11 +834,6 @@ fn a_waiting_folder_the_user_deleted_is_brought_back_for_a_file_moved_into_it() 
     run(&seed, &local, &remote, fits, fresh_dir_names, &during).unwrap();
 }
 
-/// The user moves folder A into folder B, while the other device moves B into A and then trashes
-/// the folder both are in. The effects remove A's old parent C, whose removal from S waits because
-/// S still holds A there. A folder the user creates in A makes the server revive A, C and the folder
-/// above them (R8), and A's move would close a cycle, so A is reverted. C is created again for A to
-/// go back into, instead of C, A and B each waiting for another.
 #[test]
 fn a_removed_folder_the_server_revives_is_created_again_while_its_removal_waits() {
     let seed = [

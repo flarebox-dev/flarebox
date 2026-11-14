@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-/// The other device deletes a folder with a file in it, and the person restores the folder from
-/// the trash on this device. Wherever the process stops on the way, the folder and the file come
-/// back on the server and on disk as the nodes they were, and the file keeps its one version.
 #[test]
 fn a_deleted_folder_comes_back_with_the_same_node_ids() {
     let seed = a_folder_with_a_file();
@@ -24,9 +21,6 @@ fn a_deleted_folder_comes_back_with_the_same_node_ids() {
     }
 }
 
-/// A minimal interleaving the property found: a folder created here is merged into a folder this
-/// device holds elsewhere, and a node the user moved into the new folder, which the server already
-/// has in the merge target, must still follow it on disk.
 #[test]
 fn a_node_moved_into_a_merged_folder_follows_it_on_disk() {
     let seed = vec![
@@ -124,9 +118,6 @@ fn a_node_moved_into_a_merged_folder_follows_it_on_disk() {
     run(&seed, &local, &remote, fits, fresh_dir_names, &during).unwrap();
 }
 
-/// A minimal interleaving the property found: a file the server renamed is edited and then deleted
-/// by the other device while its old name blocks another renamed file, so the edit must be
-/// uploaded as a new file.
 #[test]
 fn an_edited_renamed_file_deleted_remotely_is_uploaded_as_a_new_file() {
     let seed = vec![Action {
@@ -254,9 +245,6 @@ fn an_edited_renamed_file_deleted_remotely_is_uploaded_as_a_new_file() {
     run(&seed, &local, &remote, fits, fresh_dir_names, &during).unwrap();
 }
 
-/// A minimal interleaving the property found: the user moves a folder into a folder created here,
-/// which the server merges into one this device holds elsewhere, while the other device moves it
-/// away, so on disk it must follow the other device's move.
 #[test]
 fn a_node_moved_into_a_merged_folder_follows_a_remote_move() {
     let seed = vec![Action {
