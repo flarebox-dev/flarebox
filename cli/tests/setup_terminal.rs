@@ -1382,7 +1382,9 @@ fn a_new_shared_folder_takes_the_name_typed() {
 fn a_lost_create_answer_links_the_shared_folder_it_made_once() {
     let home = Home::new(&[]);
     home.lose_create.store(true, Ordering::Relaxed);
-    let output = home.setup(&full(false, "n\n"), &[], &[], true, false, None);
+    let mut steps = pairing(false);
+    steps.extend([step(SPACE, choose(false, 0)), step(TELEMETRY, "n\n")]);
+    let output = home.setup(&steps, &[], &[], true, false, None);
     let text = shown(output.clone());
     assert!(output.status.success(), "{text}");
     let created = (home.requests().iter())
@@ -1392,6 +1394,44 @@ fn a_lost_create_answer_links_the_shared_folder_it_made_once() {
     assert_eq!(home.spaces.lock().unwrap().len(), 1);
     assert_eq!(home.links().len(), 1);
     assert!(home.links()[0].ends_with(&home.space_id("Koidrive")));
+}
+
+#[test]
+fn a_default_collision_choice_can_be_cancelled_without_linking_local_files() {
+    for rich in [false, true] {
+        let home = Home::new(&[]);
+        home.connect();
+        home.lose_create.store(true, Ordering::Relaxed);
+        let folder = home.path().join("Koidrive");
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("report.docx"), b"draft").unwrap();
+        let steps = [
+            step(FILES, choose(rich, 1)),
+            after(&["A shared folder named Koidrive is available.", SPACE], ""),
+        ];
+        let output = home.setup(
+            &steps,
+            &["--telemetry", "off"],
+            &[],
+            true,
+            rich,
+            Some((1, rustix::process::Signal::INT)),
+        );
+        let text = shown(output.clone());
+        assert_eq!(output.status.code(), Some(130), "{text}");
+        assert!(home.links().is_empty(), "{text}");
+        assert!(!folder.join(".koidrive/device.json").exists());
+        assert!(!folder.join(".koidrive/space.json").exists());
+        assert_eq!(fs::read(folder.join("report.docx")).unwrap(), b"draft");
+        assert_eq!(home.spaces.lock().unwrap().len(), 1);
+        assert_eq!(
+            home.requests()
+                .iter()
+                .filter(|request| *request == "POST /v1/spaces")
+                .count(),
+            1
+        );
+    }
 }
 
 #[test]

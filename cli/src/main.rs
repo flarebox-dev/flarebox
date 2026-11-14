@@ -714,21 +714,31 @@ async fn finish_setup(
                     if final_service.is_some() && status.running && !status.folders.is_empty() =>
                 {
                     let blocked = status.folders.iter().find(|folder| {
-                        matches!(
-                            folder.state,
-                            FolderState::Stopped | FolderState::Halted | FolderState::Offline
-                        )
+                        folder.questions > 0
+                            || matches!(
+                                folder.state,
+                                FolderState::Stopped | FolderState::Halted | FolderState::Offline
+                            )
                     });
                     if let Some(folder) = blocked {
                         let state = match folder.state {
-                            FolderState::Stopped => "stopped",
-                            FolderState::Halted => "halted",
-                            _ => "offline",
+                            FolderState::Stopped => Some("stopped"),
+                            FolderState::Halted => Some("halted"),
+                            FolderState::Offline => Some("offline"),
+                            _ => None,
                         };
-                        terminal.message(&format!(
-                            "Sync is {state} for {}.",
-                            setup::shown_folder(Path::new(&folder.path))
-                        ));
+                        if let Some(state) = state {
+                            terminal.message(&format!(
+                                "Sync is {state} for {}.",
+                                setup::shown_folder(Path::new(&folder.path))
+                            ));
+                        }
+                        if folder.questions > 0 {
+                            terminal.message(&format!(
+                                "Review pending decisions for {}: koi resolve",
+                                setup::shown_folder(Path::new(&folder.path))
+                            ));
+                        }
                         if let Some(problem) = &folder.problem {
                             terminal.message(problem);
                         }
@@ -3089,6 +3099,100 @@ mod tests {
         assert!(!done.note.contains("Setup complete"));
         assert!(!done.note.contains("Background sync is running"));
         assert_eq!(done.data["service"]["state"], "running");
+    }
+
+    #[tokio::test]
+    async fn setup_finish_reports_pending_decisions_in_active_folders() {
+        const FIXTURE: &str = "KOIDRIVE_TEST_SETUP_PENDING";
+        let Ok(case) = std::env::var(FIXTURE) else {
+            for case in ["connecting", "bootstrapping", "catching_up", "up_to_date"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::setup_finish_reports_pending_decisions_in_active_folders",
+                        "--nocapture",
+                    ])
+                    .env(FIXTURE, case)
+                    .output()
+                    .unwrap();
+                let text = String::from_utf8(output.stderr).unwrap();
+                assert!(
+                    output.status.success(),
+                    "{case}: {text}\n{}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+                assert!(
+                    text.contains("Review pending decisions for /fixture/Koidrive: koi resolve"),
+                    "{case}: {text}"
+                );
+                assert!(
+                    !text.contains("Background sync is running"),
+                    "{case}: {text}"
+                );
+                assert!(!text.contains("Sync is offline"), "{case}: {text}");
+            }
+            return;
+        };
+        let state = match case.as_str() {
+            "connecting" => FolderState::Connecting,
+            "bootstrapping" => FolderState::Bootstrapping,
+            "catching_up" => FolderState::CatchingUp,
+            "up_to_date" => FolderState::UpToDate,
+            _ => panic!("unknown fixture {case}"),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let listener = koidrive_ipc::bind(&paths.socket()).unwrap();
+        let served = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = koidrive_ipc::read_line(&mut stream).await.unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&request).unwrap(),
+                Request::Status
+            ));
+            let status = Status {
+                running: true,
+                folders: vec![FolderStatus {
+                    space_id: "s1".into(),
+                    space_name: "Koidrive".into(),
+                    path: "/fixture/Koidrive".into(),
+                    state,
+                    history_id: None,
+                    last_seq: None,
+                    head_seq: None,
+                    remote_nodes: 0,
+                    local_entries: None,
+                    questions: 1,
+                    problem: None,
+                    wait: None,
+                }],
+                ..Status::default()
+            };
+            koidrive_ipc::write_line(&mut stream, &Response::Status { status })
+                .await
+                .unwrap();
+        });
+        let report: service::Report = serde_json::from_value(serde_json::json!({
+            "manager":"systemd", "name":"fixture", "state":"running", "lingers":true
+        }))
+        .unwrap();
+        let done = finish_setup(
+            &paths,
+            Done {
+                note: "Setup complete. Add files to ~/Koidrive.\nCheck sync: koi status\n".into(),
+                ..Done::printed()
+            },
+            Some(report),
+            None,
+            &terminal::Terminal::setup(true, true),
+        )
+        .await
+        .unwrap();
+        served.await.unwrap();
+        assert_eq!(
+            done.note,
+            "Folder linked. Sync needs attention.\nCheck sync: koi status\n"
+        );
     }
 
     #[tokio::test]

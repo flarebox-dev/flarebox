@@ -1410,6 +1410,96 @@ fn metadata_only_setup_links_with_the_real_driver_without_upload_consent() {
 }
 
 #[test]
+fn a_default_creation_collision_requires_a_choice_and_fresh_file_consent() {
+    for rich in [true, false] {
+        for sync_files in [false, true] {
+            let home = Home::new(&[], &[]);
+            home.real_driver();
+            home.state.lock().unwrap().collide_create = true;
+            let root = home.path().join("Koidrive");
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("report.docx"), b"draft").unwrap();
+            let mut command = home.command();
+            command.args(["setup", "--interactive", "--no-app", "--telemetry", "off"]);
+            if !rich {
+                command.arg("--plain");
+            }
+            let mut steps = vec![
+                ("What should Koidrive do?", pick(rich, 1)),
+                (SPACES, pick(rich, 0)),
+                (
+                    "What should Koidrive do?",
+                    pick(rich, usize::from(sync_files)),
+                ),
+            ];
+            if !sync_files {
+                steps.push(("Folder to sync", typed(rich, "~/Empty")));
+            }
+            let text = home.finish_run(rich, command, &steps);
+            let initial = text
+                .find("They will upload to a new shared folder named Koidrive.")
+                .unwrap();
+            let collision = text
+                .find("A shared folder named Koidrive is available.")
+                .unwrap();
+            let choice = text.find(SPACES).unwrap();
+            let existing = text
+                .find("Files in Koidrive will download into ~/Koidrive.")
+                .unwrap();
+            assert!(
+                initial < collision && collision < choice && choice < existing,
+                "{text}"
+            );
+            let screen = rendered(&fs::read(home.path().join("terminal.ansi")).unwrap());
+            assert!(screen.contains(SPACES), "{screen}");
+            assert!(
+                screen.contains("A shared folder named Koidrive is available."),
+                "{screen}"
+            );
+            assert!(
+                screen.contains("~/Koidrive contains files. They will upload to Koidrive."),
+                "{screen}"
+            );
+            assert!(
+                screen.contains("Files in Koidrive will download into ~/Koidrive."),
+                "{screen}"
+            );
+            let driver = Driver::open(home.paths()).unwrap();
+            let status = driver.status();
+            let linked = if sync_files {
+                root.clone()
+            } else {
+                home.path().join("Empty")
+            };
+            assert_eq!(status.folders.len(), 1);
+            assert_eq!(
+                Path::new(&status.folders[0].path),
+                fs::canonicalize(linked).unwrap()
+            );
+            assert_eq!(root.join(".koidrive/device.json").exists(), sync_files);
+            assert_eq!(root.join(".koidrive/space.json").exists(), sync_files);
+            assert_eq!(fs::read(root.join("report.docx")).unwrap(), b"draft");
+            let state = home.state.lock().unwrap();
+            assert_eq!(state.spaces.len(), 1);
+            assert!(state.created.is_empty());
+            assert!(
+                state.links.is_empty(),
+                "the fake daemon must not perform this link"
+            );
+            assert_eq!(status.folders[0].space_id, state.spaces[0].space_id);
+            assert_eq!(
+                state
+                    .requests
+                    .iter()
+                    .filter(|request| request.as_str() == "POST /v1/spaces")
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
 fn scripted_metadata_only_folders_still_require_existing_files_consent() {
     let home = Home::new(&[], &["Work"]);
     home.real_driver();

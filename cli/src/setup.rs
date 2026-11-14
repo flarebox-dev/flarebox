@@ -387,10 +387,12 @@ async fn onboard(paths: &Paths, terminal: &Terminal) -> Result<Done, CliError> {
     let auth = crate::reading(paths, &credential)?;
     let mut progress = Some(terminal.progress("Preparing ~/Koidrive..."));
     let spaces = auth.api().list_spaces(&auth).await?.spaces;
-    if !spaces.is_empty() {
+    let mut target = if spaces.is_empty() {
+        Target::Default
+    } else {
         drop(progress.take());
-    }
-    let mut target = shared_folder(terminal, &spaces).await?;
+        shared_folder(terminal, &spaces).await?
+    };
     loop {
         let SelectedFolder {
             folder,
@@ -413,10 +415,18 @@ async fn onboard(paths: &Paths, terminal: &Terminal) -> Result<Done, CliError> {
             .unwrap_or_else(|| directory_identity(&folder))?;
         let space = match &target {
             Target::Existing(space) => space.clone(),
-            Target::Default => crate::named_space(&auth, &spaces, DEFAULT_FOLDER)
-                .await?
-                .space()
-                .clone(),
+            Target::Default => match crate::named_space(&auth, &spaces, DEFAULT_FOLDER).await? {
+                crate::Named::Created(space) => space,
+                crate::Named::Existing(_) => {
+                    drop(linking);
+                    terminal.message(&format!(
+                        "A shared folder named {DEFAULT_FOLDER} is available. Choose which folder to sync."
+                    ));
+                    let now = auth.api().list_spaces(&auth).await?;
+                    target = shared_folder(terminal, &now.spaces).await?;
+                    continue;
+                }
+            },
             Target::New(name) => {
                 let request = CreateSpaceRequest { name: name.clone() };
                 match auth.api().create_space(&auth, &request).await {
@@ -476,9 +486,6 @@ impl Target {
 }
 
 async fn shared_folder(terminal: &Terminal, spaces: &[SpaceInfo]) -> Result<Target, CliError> {
-    if spaces.is_empty() {
-        return Ok(Target::Default);
-    }
     let mut items: Vec<String> = (spaces.iter())
         .map(|space| {
             let twins = (spaces.iter())
