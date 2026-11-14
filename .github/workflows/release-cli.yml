@@ -166,7 +166,7 @@ jobs:
         run: |
           shellcheck -s sh install.sh scripts/test-install.sh
           shellcheck scripts/publish-release.sh scripts/test-publish-release.sh
-          shellcheck scripts/homebrew-formula.sh scripts/homebrew-cask.sh scripts/homebrew-track.sh scripts/test-homebrew-formula.sh scripts/test-homebrew-cask.sh scripts/test-homebrew-install.sh scripts/test-homebrew-cask-install.sh
+          shellcheck scripts/homebrew-formula.sh scripts/homebrew-cask.sh scripts/homebrew-track.sh scripts/test-homebrew-formula.sh scripts/test-homebrew-cask.sh scripts/test-homebrew-install.sh scripts/test-homebrew-cask-install.sh scripts/test-homebrew-cask-install-errors.sh
       - name: Test publishing a release against a stub gh
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
