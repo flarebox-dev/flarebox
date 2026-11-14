@@ -1110,3 +1110,125 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn content_held_again_stays_among_the_newest_held() {
+    let mut trees = Trees::new(ROOT);
+    let hold = |trees: &mut Trees, digest: u8, version: usize| {
+        let shape = file(ROOT, "a", digest);
+        trees.set_remote(
+            "n".into(),
+            RemoteNode {
+                version_id: format!("v{version}"),
+                ..remote(shape.clone())
+            },
+        );
+        trees.set_local("n".into(), local(shape.clone(), 1));
+        trees.set_synced("n".into(), Some(shape));
+    };
+    let digests = (1..=64u8).chain([1, 65, 66]);
+    for (version, digest) in digests.enumerate() {
+        hold(&mut trees, digest, version);
+    }
+    let held = trees.state().held_contents["n"].clone();
+    assert!(held.contains(&vec![1; 32]), "{held:?}");
+    assert!(!held.contains(&vec![2; 32]), "{held:?}");
+}
+
+#[test]
+fn a_delete_after_a_second_loss_downloads_restored_content_this_device_never_held() {
+    let at = |digest: u8, revision: u64| RemoteNode {
+        content_rev: revision,
+        edit_rev: revision,
+        version_id: format!("v{digest}"),
+        ..remote(file(ROOT, "f", digest))
+    };
+    let mut trees = Trees::new(ROOT);
+    trees.set_remote("f".into(), at(1, 1));
+    trees.set_local("f".into(), local(file(ROOT, "f", 66), 1));
+    trees.set_synced("f".into(), Some(file(ROOT, "f", 66)));
+    let records = std::collections::BTreeMap::from([("f".into(), at(66, 70))]);
+    trees.forget_lost(
+        vec![],
+        vec![("f".into(), 70)],
+        vec![],
+        vec![],
+        vec![],
+        records,
+        5,
+        1,
+    );
+    assert!(trees.unsent_edits().contains("f"));
+    trees.record_dropped_edits(["f".into()]);
+    let records = trees.remote_records();
+    trees.forget_lost(vec![], vec![], vec![], vec![], vec![], records, 5, 1);
+    trees.remove_local("f");
+    assert_eq!(trees.class("f"), Class::Remote);
+}
+
+fn version(digest: u8) -> RemoteNode {
+    RemoteNode {
+        content_rev: digest.into(),
+        edit_rev: digest.into(),
+        version_id: format!("v{digest}"),
+        ..remote(file(ROOT, "f", digest))
+    }
+}
+
+fn hold(trees: &mut Trees, digest: u8) {
+    trees.set_local("f".into(), local(file(ROOT, "f", digest), 1));
+    trees.set_synced("f".into(), Some(file(ROOT, "f", digest)));
+}
+
+fn delete_before_the_resend_of(mut trees: Trees, restored: u8) -> Class {
+    trees.set_listed_remote("f".into(), version(restored));
+    let records = trees.remote_records();
+    trees.forget_lost(
+        vec![],
+        vec![],
+        vec!["f".into()],
+        vec![],
+        vec![],
+        records,
+        5,
+        1,
+    );
+    assert!(trees.state().resends.contains("f"));
+    trees.remove_local("f");
+    trees.class("f")
+}
+
+#[test]
+fn a_delete_before_a_resend_lands_downloads_a_restored_version_this_device_never_held() {
+    let mut trees = Trees::new(ROOT);
+    trees.set_remote("f".into(), version(1));
+    hold(&mut trees, 1);
+    trees.set_remote("f".into(), version(2));
+    trees.set_remote("f".into(), version(3));
+    hold(&mut trees, 3);
+    assert_eq!(delete_before_the_resend_of(trees, 2), Class::Remote);
+}
+
+#[test]
+fn a_delete_before_a_resend_lands_removes_a_restored_version_this_device_downloaded() {
+    let mut trees = Trees::new(ROOT);
+    trees.set_remote("f".into(), version(1));
+    hold(&mut trees, 1);
+    trees.set_remote("f".into(), version(2));
+    hold(&mut trees, 2);
+    trees.set_remote("f".into(), version(3));
+    hold(&mut trees, 3);
+    assert_eq!(delete_before_the_resend_of(trees, 2), Class::Local);
+}
+
+#[test]
+fn a_delete_before_a_resend_lands_removes_a_restored_version_this_device_wrote() {
+    let mut trees = Trees::new(ROOT);
+    trees.set_remote("f".into(), version(1));
+    hold(&mut trees, 1);
+    hold(&mut trees, 2);
+    trees.set_remote("f".into(), version(2));
+    trees.set_remote("f".into(), version(3));
+    hold(&mut trees, 3);
+    assert_eq!(delete_before_the_resend_of(trees, 2), Class::Local);
+}

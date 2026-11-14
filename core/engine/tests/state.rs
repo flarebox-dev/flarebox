@@ -132,6 +132,7 @@ fn trees_state() -> TreesState {
         local_changes: ["b".into()].into(),
         replaced_versions: [("a".into(), vec!["v1".into()])].into(),
         kept_originals: [("t".into(), "a".into())].into(),
+        held_contents: [("a".into(), vec![vec![1; 32]])].into(),
     }
 }
 

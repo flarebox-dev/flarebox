@@ -117,6 +117,12 @@ pub struct TreesState {
     /// takes L's shape, a scan finds L back at the shape S holds, L, S and R hold the same shape,
     /// or L no longer holds it.
     pub local_changes: BTreeSet<NodeId>,
+    /// For each file, the manifest digests of the contents this device held, least recently held
+    /// first, at most [`HELD_CONTENTS_KEPT`](crate::classify::HELD_CONTENTS_KEPT): each content L
+    /// held while R held the same bytes at a version, and each content this device sent that the
+    /// server took. A user's delete of a file with a lost edit or
+    /// a content resend removes only content listed here (section 4.4).
+    pub held_contents: BTreeMap<NodeId, Vec<Vec<u8>>>,
 }
 
 /// A node this device sent under a pending name (docs/design/sync-engine.md section 2.6).
@@ -216,6 +222,7 @@ pub struct TreesChanges {
     pub resends: SetChanges<NodeId>,
     pub local_changes: SetChanges<NodeId>,
     pub kept_originals: MapChanges<NodeId, NodeId>,
+    pub held_contents: MapChanges<NodeId, Vec<Vec<u8>>>,
 }
 
 impl TreesChanges {
@@ -244,6 +251,7 @@ impl TreesChanges {
             resends,
             local_changes,
             kept_originals,
+            held_contents,
         } = after;
         Self {
             dirty: set_changes(&before.dirty, dirty),
@@ -268,6 +276,7 @@ impl TreesChanges {
             resends: set_changes(&before.resends, resends),
             local_changes: set_changes(&before.local_changes, local_changes),
             kept_originals: map_changes(&before.kept_originals, kept_originals),
+            held_contents: map_changes(&before.held_contents, held_contents),
         }
     }
 }

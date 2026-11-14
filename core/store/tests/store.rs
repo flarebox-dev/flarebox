@@ -105,6 +105,7 @@ fn migrations_apply_from_empty() {
             "guard_ledger",
             "guard_remote",
             "guard_remote_dismissed",
+            "held_contents",
             "kept_originals",
             "link",
             "local_changes",
@@ -1302,6 +1303,7 @@ fn engine_state() -> EngineState {
                 ],
             )]),
             kept_originals: BTreeMap::from([("t".into(), "kept".into())]),
+            held_contents: BTreeMap::from([("e".into(), vec![vec![1; 32], vec![2; 32]])]),
         },
         commits: CommitsState {
             accepted: 4,
@@ -1505,7 +1507,7 @@ fn engine_state_survives_a_reopen() {
 }
 
 /// The tables of the engine state besides the nodes of R, L and S.
-const ENGINE_TABLES: [&str; 36] = [
+const ENGINE_TABLES: [&str; 37] = [
     "node_sets",
     "node_maps",
     "waiting_updates",
@@ -1520,6 +1522,7 @@ const ENGINE_TABLES: [&str; 36] = [
     "commit_slots",
     "edited_here",
     "replaced_versions",
+    "held_contents",
     "resends",
     "local_changes",
     "kept_originals",

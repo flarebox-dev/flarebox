@@ -276,6 +276,13 @@ impl Tx<'_> {
                 .or_default())
             .push(row.get(1)?);
         }
+        let mut stmt = self.0.prepare_cached(
+            "SELECT node_id, digest FROM held_contents ORDER BY node_id, position",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            (state.trees.held_contents.entry(row.get(0)?).or_default()).push(row.get(1)?);
+        }
         let mut stmt = self.0.prepare_cached("SELECT node_id FROM resends")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
@@ -390,6 +397,7 @@ impl Tx<'_> {
             "unsent_edits",
             "dropped_edits",
             "replaced_versions",
+            "held_contents",
             "resends",
             "local_changes",
             "kept_originals",
@@ -452,6 +460,7 @@ impl Tx<'_> {
             resends,
             local_changes,
             kept_originals,
+            held_contents,
         } = trees;
         let CommitsChanges {
             accepted,
@@ -632,6 +641,18 @@ impl Tx<'_> {
             remove.execute([node])?;
             for (position, version) in versions.iter().flatten().enumerate() {
                 put.execute(params![node, position, version])?;
+            }
+        }
+        let mut remove = self
+            .0
+            .prepare_cached("DELETE FROM held_contents WHERE node_id = ?1")?;
+        let mut put = self.0.prepare_cached(
+            "INSERT INTO held_contents (node_id, position, digest) VALUES (?1, ?2, ?3)",
+        )?;
+        for (node, digests) in held_contents {
+            remove.execute([node])?;
+            for (position, digest) in digests.iter().flatten().enumerate() {
+                put.execute(params![node, position, digest])?;
             }
         }
         self.write_set(

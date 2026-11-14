@@ -25,6 +25,9 @@ pub const SETTLE_GROUP_LIMIT: usize = 12;
 /// proven, and the file's content is kept beside R's as a conflict copy.
 pub const REPLACED_VERSIONS_KEPT: usize = 64;
 
+/// How many contents of one file [`TreesState::held_contents`] keeps.
+pub const HELD_CONTENTS_KEPT: usize = 64;
+
 /// How many of the earlier live records R held of one node [`TreesState::past_positions`] keeps.
 /// A restore that takes a node back further than that does not prove a move of this device lost,
 /// and R's position is taken as a remote move.
@@ -228,6 +231,7 @@ pub struct Trees {
     resends: TrackedSet<NodeId>,
     local_changes: TrackedSet<NodeId>,
     kept_originals: TrackedMap<NodeId, NodeId>,
+    held_contents: TrackedMap<NodeId, Vec<Vec<u8>>>,
     ignore: Matcher,
     /// Nodes whose local copy the user moved into an ignored folder that is no node. L keeps the
     /// entry each had before the move.
@@ -307,6 +311,7 @@ impl Trees {
             resends: TrackedSet::default(),
             local_changes: TrackedSet::default(),
             kept_originals: TrackedMap::default(),
+            held_contents: TrackedMap::default(),
             ignore: Matcher::new(LocalRules::default()),
             outside: TrackedSet::default(),
             lost: TrackedSet::default(),
@@ -512,13 +517,12 @@ impl Trees {
             && old.is_some_and(|old| {
                 old.meta_rev == node.meta_rev && old.meta_edit_rev != node.meta_edit_rev
             });
-        if let Some(replaced) = (self.r.get(&id))
-            .map(|old| &old.version_id)
-            .filter(|old| !old.is_empty() && **old != node.version_id)
+        if let Some(old) = (self.r.get(&id))
+            .filter(|old| !old.version_id.is_empty() && old.version_id != node.version_id)
         {
             let versions = (self.replaced_versions).get_or_insert_with(id.clone(), Vec::new);
-            if !versions.contains(replaced) {
-                versions.push(replaced.clone());
+            if !versions.contains(&old.version_id) {
+                versions.push(old.version_id.clone());
             }
             if versions.len() > REPLACED_VERSIONS_KEPT {
                 versions.remove(0);
@@ -646,6 +650,7 @@ impl Trees {
         self.r.insert(id.clone(), node);
         self.count_held_trash(&id, true);
         self.count_trashed(&id, true);
+        self.hold_shared_content(&id);
         self.note_position(&id);
         self.record_edit_in_trash(&id);
         self.end_change_all_trees_hold(&id);
@@ -780,6 +785,7 @@ impl Trees {
         self.displaced.remove(id);
         self.edited_here.remove(id);
         self.replaced_versions.remove(id);
+        self.held_contents.remove(id);
         self.resends.remove(id);
         self.moved_here.remove(id);
         self.past_positions.remove(id);
@@ -828,6 +834,7 @@ impl Trees {
         self.count_held_trash(&id, false);
         self.l.insert(id.clone(), node);
         self.count_held_trash(&id, true);
+        self.hold_shared_content(&id);
         self.note_position(&id);
         self.record_edit_in_trash(&id);
         self.end_change_all_trees_hold(&id);
@@ -859,13 +866,46 @@ impl Trees {
         }
     }
 
+    fn hold_content(&mut self, id: &str, digest: Vec<u8>) {
+        let held = (self.held_contents).get_or_insert_with(id.to_owned(), Vec::new);
+        held.retain(|other| *other != digest);
+        held.push(digest);
+        if held.len() > HELD_CONTENTS_KEPT {
+            held.remove(0);
+        }
+    }
+
+    fn hold_shared_content(&mut self, id: &str) {
+        let shared = (self.l.get(id).zip(self.r.get(id)))
+            .filter(|(_, remote)| !remote.version_id.is_empty())
+            .and_then(|(local, remote)| {
+                (local.shape.content.as_ref()).zip(remote.shape.content.as_ref())
+            })
+            .filter(|(local, remote)| same_content(local, remote))
+            .map(|(local, _)| local.manifest_digest.clone());
+        if let Some(digest) = shared {
+            self.hold_content(id, digest);
+        }
+    }
+
+    fn synced_content_unheld(&self, id: &str) -> bool {
+        (self.s.live(id).and_then(|synced| synced.content.as_ref())).is_some_and(|content| {
+            !(self.held_contents.get(id))
+                .is_some_and(|held| held.contains(&content.manifest_digest))
+        })
+    }
+
     pub fn remove_local(&mut self, id: &str) {
         self.parked_as.remove(id);
         self.unknown_rules.remove(id);
         self.outside.remove(id);
         self.lost.remove(id);
         self.count_held_trash(id, false);
-        self.unsent_edits.remove(id);
+        if (self.unsent_edits.remove(id) || self.resends.contains(id))
+            && self.synced_content_unheld(id)
+        {
+            self.set_synced(id.to_owned(), None);
+        }
         self.resends.remove(id);
         self.local_changes.remove(id);
         self.reverted.remove(id);
@@ -1866,7 +1906,11 @@ impl Trees {
     /// from before the edit, so the edit beats it (R8): the server revives the file instead of this
     /// device moving the edit to the local trash. That also undoes a delete by a device that saw the
     /// edit before the loss, which the engine cannot tell apart: the revived file can be deleted
-    /// again, while an edit in the local trash would be missing from the server.
+    /// again, while an edit in the local trash would be missing from the server. A file L no longer
+    /// holds takes R's content only when this device held those bytes
+    /// ([`TreesState::held_contents`]), so a delete made after the edit removes only content this
+    /// device's user had. Otherwise S forgets the file and R's content is downloaded. A delete
+    /// made after the bootstrap, while the edit is unsent, follows the same rule.
     ///
     /// A file S forgets that L and R hold may hold, or later get, an edit of this device to the
     /// bytes R now holds, such as the content the server went back to (GUN-438). So may a file of
@@ -1884,7 +1928,9 @@ impl Trees {
     /// A file of it that R now holds live at the position S holds, at a version the log replaced for it before
     /// ([`TreesState::replaced_versions`]), holds content from before the loss that S's
     /// content replaced: nothing changed it since. S takes R's shape, so the content L holds is sent
-    /// again as an edit instead of being kept beside R's as a conflict copy. Any other file of it may
+    /// again as an edit instead of being kept beside R's as a conflict copy. A delete made before the
+    /// server takes it removes R's content only if this device held those bytes, as for an edit.
+    /// Any other file of it may
     /// hold an edit another device made after the loss, or content older than R's that a listing
     /// gave, so it stays on the path below.
     ///
@@ -2051,6 +2097,13 @@ impl Trees {
                 .filter(|remote| {
                     remote.content_rev <= held_through
                         || replaced.is_some_and(|versions| versions.contains(&remote.version_id))
+                })
+                .filter(|remote| {
+                    self.l.get(&id).is_some()
+                        || (remote.shape.content.as_ref()).is_some_and(|content| {
+                            (self.held_contents.get(&id))
+                                .is_some_and(|held| held.contains(&content.manifest_digest))
+                        })
                 })
                 .and_then(|remote| {
                     let s = waits_at.or(self.s.live(&id))?;
@@ -2338,9 +2391,13 @@ impl Trees {
         }
     }
 
-    /// Records that the server acknowledged an edit of `id` to `sent`, so L's content is no longer
-    /// an edit it lacks ([`Trees::unsent_edits`]), unless L has since taken other content.
+    /// Records that the server acknowledged an edit of `id` to `sent`: this device held the content
+    /// ([`TreesState::held_contents`]), and L's content is no longer an edit the server lacks
+    /// ([`Trees::unsent_edits`]), unless L has since taken other content.
     pub fn sent_edit(&mut self, id: &str, sent: Option<&Content>) {
+        if let Some(sent) = sent {
+            self.hold_content(id, sent.manifest_digest.clone());
+        }
         let local = self.l.live(id).and_then(|shape| shape.content.as_ref());
         if matches!((local, sent), (Some(local), Some(sent)) if !same_content(local, sent)) {
             return;
@@ -2903,6 +2960,7 @@ impl Trees {
             resends: (*self.resends).clone(),
             local_changes: (*self.local_changes).clone(),
             kept_originals: (*self.kept_originals).clone(),
+            held_contents: (*self.held_contents).clone(),
         }
     }
 
@@ -2935,6 +2993,7 @@ impl Trees {
             resends,
             local_changes,
             kept_originals,
+            held_contents,
             ignore: _,
             outside,
             lost,
@@ -2974,6 +3033,7 @@ impl Trees {
             resends: resends.take_changes(),
             local_changes: local_changes.take_changes(),
             kept_originals: kept_originals.take_changes(),
+            held_contents: held_contents.take_changes(),
         }
     }
 
@@ -3084,6 +3144,7 @@ impl Trees {
             resends,
             local_changes,
             kept_originals,
+            held_contents,
         } = state;
         self.unsettled = dirty.clone();
         self.same.clear();
@@ -3110,6 +3171,7 @@ impl Trees {
         self.resends = resends.into();
         self.local_changes = local_changes.into();
         self.kept_originals = kept_originals.into();
+        self.held_contents = held_contents.into();
         self.rules_known = false;
         self.unknown_rules.clear();
         Ok(())
