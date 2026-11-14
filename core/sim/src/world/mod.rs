@@ -704,13 +704,6 @@ impl World {
     fn step(&mut self, d: usize, step: &Step) -> Result<(), Failure> {
         self.clock += 1;
         match step {
-            _ if self.devices[d].left => {}
-            Step::Leave => {
-                let device = &mut self.devices[d];
-                device.left = true;
-                device.link = None;
-            }
-            Step::User(action) => self.act(d, action),
             Step::Backup => {
                 self.earlier_backup = self.backup.replace(Backup {
                     space: self.space.clone(),
@@ -723,6 +716,13 @@ impl World {
             Step::Restore => self.restore(false),
             Step::RestoreEarlier => self.restore(true),
             Step::Rewind => self.rewind(),
+            _ if self.devices[d].left => {}
+            Step::Leave => {
+                let device = &mut self.devices[d];
+                device.left = true;
+                device.link = None;
+            }
+            Step::User(action) => self.act(d, action),
             Step::Answer(choice) => {
                 self.answer(d, *choice)?;
             }

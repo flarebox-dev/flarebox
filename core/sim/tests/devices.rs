@@ -1614,6 +1614,15 @@ fn a_write_its_device_takes_away_before_sending_it_is_not_lost() {
 }
 
 #[test]
+fn a_device_that_left_still_takes_a_backup_of_the_server() {
+    let mut steps = vec![(0, Step::Leave), (0, BACKUP), (1, file("b"))];
+    steps.extend(commit(1));
+    steps.push((1, Step::Restore));
+    let world = converge(2, &[vec![(0, file("a"))], steps]).unwrap();
+    assert!(world.seen.contains_key("server restored, commits lost"));
+}
+
+#[test]
 fn a_pending_folder_whose_device_never_returns_is_renamed_by_another_device() {
     let world = converge(
         2,
