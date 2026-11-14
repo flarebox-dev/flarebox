@@ -8,7 +8,7 @@ import SwiftUI
 struct MenuBarLabel: View {
     let model: AppModel
     @Environment(\.openWindow) private var openWindow
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
     @State private var turningArrows = TurningArrows()
 
     var body: some View {
@@ -16,6 +16,9 @@ struct MenuBarLabel: View {
             .accessibilityLabel(Text("Koidrive: \(model.headline == .questions ? String(localized: "Needs you") : model.headlineTitle)"))
             .onChange(of: model.turnsMenuBarArrows(reduceMotion: reduceMotion), initial: true) { _, turns in
                 turningArrows.turn(turns)
+            }
+            .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification)) { _ in
+                reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
             }
             .task {
                 if model.needsSetup {
