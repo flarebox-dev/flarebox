@@ -527,14 +527,6 @@ impl Trees {
             if versions.len() > REPLACED_VERSIONS_KEPT {
                 versions.remove(0);
             }
-            let synced = self.s.live(&id).and_then(|synced| synced.content.as_ref());
-            let held = (old.shape.content.as_ref())
-                .filter(|old| synced.is_some_and(|synced| same_content(synced, old)))
-                .filter(|_| !self.unsent_edits.contains(&id))
-                .map(|content| content.manifest_digest.clone());
-            if let Some(digest) = held {
-                self.hold_content(&id, digest);
-            }
         }
         let edited_here = edit
             && !node.trashed
@@ -658,6 +650,7 @@ impl Trees {
         self.r.insert(id.clone(), node);
         self.count_held_trash(&id, true);
         self.count_trashed(&id, true);
+        self.hold_shared_content(&id);
         self.note_position(&id);
         self.record_edit_in_trash(&id);
         self.end_change_all_trees_hold(&id);
@@ -841,6 +834,7 @@ impl Trees {
         self.count_held_trash(&id, false);
         self.l.insert(id.clone(), node);
         self.count_held_trash(&id, true);
+        self.hold_shared_content(&id);
         self.note_position(&id);
         self.record_edit_in_trash(&id);
         self.end_change_all_trees_hold(&id);
@@ -881,9 +875,23 @@ impl Trees {
         }
     }
 
-    fn holds_synced_content(&self, id: &str) -> bool {
+    fn hold_shared_content(&mut self, id: &str) {
+        let shared = (self.l.get(id).zip(self.r.get(id)))
+            .filter(|(_, remote)| !remote.version_id.is_empty())
+            .and_then(|(local, remote)| {
+                (local.shape.content.as_ref()).zip(remote.shape.content.as_ref())
+            })
+            .filter(|(local, remote)| same_content(local, remote))
+            .map(|(local, _)| local.manifest_digest.clone());
+        if let Some(digest) = shared {
+            self.hold_content(id, digest);
+        }
+    }
+
+    fn synced_content_unheld(&self, id: &str) -> bool {
         (self.s.live(id).and_then(|synced| synced.content.as_ref())).is_some_and(|content| {
-            (self.held_contents.get(id)).is_some_and(|held| held.contains(&content.manifest_digest))
+            !(self.held_contents.get(id))
+                .is_some_and(|held| held.contains(&content.manifest_digest))
         })
     }
 
@@ -893,7 +901,9 @@ impl Trees {
         self.outside.remove(id);
         self.lost.remove(id);
         self.count_held_trash(id, false);
-        if self.unsent_edits.remove(id) && !self.holds_synced_content(id) {
+        if (self.unsent_edits.remove(id) || self.resends.contains(id))
+            && self.synced_content_unheld(id)
+        {
             self.set_synced(id.to_owned(), None);
         }
         self.resends.remove(id);
@@ -1918,7 +1928,9 @@ impl Trees {
     /// A file of it that R now holds live at the position S holds, at a version the log replaced for it before
     /// ([`TreesState::replaced_versions`]), holds content from before the loss that S's
     /// content replaced: nothing changed it since. S takes R's shape, so the content L holds is sent
-    /// again as an edit instead of being kept beside R's as a conflict copy. Any other file of it may
+    /// again as an edit instead of being kept beside R's as a conflict copy. A delete made before the
+    /// server takes it removes R's content only if this device held those bytes, as for an edit.
+    /// Any other file of it may
     /// hold an edit another device made after the loss, or content older than R's that a listing
     /// gave, so it stays on the path below.
     ///
@@ -2077,12 +2089,6 @@ impl Trees {
             }
         }
         for (id, _) in edited {
-            if let Some(content) = (self.s.live(&id))
-                .filter(|_| !self.unsent_edits.contains(&id))
-                .and_then(|synced| synced.content.clone())
-            {
-                self.hold_content(&id, content.manifest_digest);
-            }
             let replaced = self.replaced_versions.get(&id);
             let waits_at = (self.waiting.get(&id))
                 .filter(|_| queued.contains(&id))

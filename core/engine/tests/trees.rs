@@ -1165,3 +1165,70 @@ fn a_delete_after_a_second_loss_downloads_restored_content_this_device_never_hel
     trees.remove_local("f");
     assert_eq!(trees.class("f"), Class::Remote);
 }
+
+fn version(digest: u8) -> RemoteNode {
+    RemoteNode {
+        content_rev: digest.into(),
+        edit_rev: digest.into(),
+        version_id: format!("v{digest}"),
+        ..remote(file(ROOT, "f", digest))
+    }
+}
+
+fn hold(trees: &mut Trees, digest: u8) {
+    trees.set_local("f".into(), local(file(ROOT, "f", digest), 1));
+    trees.set_synced("f".into(), Some(file(ROOT, "f", digest)));
+}
+
+fn delete_before_the_resend_of(mut trees: Trees, restored: u8) -> Class {
+    trees.set_listed_remote("f".into(), version(restored));
+    let records = trees.remote_records();
+    trees.forget_lost(
+        vec![],
+        vec![],
+        vec!["f".into()],
+        vec![],
+        vec![],
+        records,
+        5,
+        1,
+    );
+    assert!(trees.state().resends.contains("f"));
+    trees.remove_local("f");
+    trees.class("f")
+}
+
+#[test]
+fn a_delete_before_a_resend_lands_downloads_a_restored_version_this_device_never_held() {
+    let mut trees = Trees::new(ROOT);
+    trees.set_remote("f".into(), version(1));
+    hold(&mut trees, 1);
+    trees.set_remote("f".into(), version(2));
+    trees.set_remote("f".into(), version(3));
+    hold(&mut trees, 3);
+    assert_eq!(delete_before_the_resend_of(trees, 2), Class::Remote);
+}
+
+#[test]
+fn a_delete_before_a_resend_lands_removes_a_restored_version_this_device_downloaded() {
+    let mut trees = Trees::new(ROOT);
+    trees.set_remote("f".into(), version(1));
+    hold(&mut trees, 1);
+    trees.set_remote("f".into(), version(2));
+    hold(&mut trees, 2);
+    trees.set_remote("f".into(), version(3));
+    hold(&mut trees, 3);
+    assert_eq!(delete_before_the_resend_of(trees, 2), Class::Local);
+}
+
+#[test]
+fn a_delete_before_a_resend_lands_removes_a_restored_version_this_device_wrote() {
+    let mut trees = Trees::new(ROOT);
+    trees.set_remote("f".into(), version(1));
+    hold(&mut trees, 1);
+    hold(&mut trees, 2);
+    trees.set_remote("f".into(), version(2));
+    trees.set_remote("f".into(), version(3));
+    hold(&mut trees, 3);
+    assert_eq!(delete_before_the_resend_of(trees, 2), Class::Local);
+}
