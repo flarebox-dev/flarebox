@@ -12,7 +12,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = ROOT / ".github/workflows/ci.yml"
-JOBS = ("macos_app", "rust", "rust_driver", "rust_engine", "server", "spec", "runner_hook")
+JOBS = ("macos_app", "rust", "rust_driver", "rust_engine", "rust_sim", "server", "spec", "runner_hook")
 SELF_HOSTED = ["self-hosted", "custom-mac", "ARM64"]
 XCODE = "/Applications/Xcode_27.2.app/Contents/Developer"
 SELF_XCODE = "/Applications/Xcode.app/Contents/Developer"
@@ -134,7 +134,8 @@ class Picker(unittest.TestCase):
 
     def test_idle_runners_go_to_app_then_rust(self):
         outputs = self.pick(labels=SELF_HOSTED, runners=[runner(), runner(), runner(busy=True)])
-        self.assert_routes(outputs, ("macos_app", "rust"))
+        self.assert_routes(outputs, ("macos_app", "rust", "runner_hook"))
+        self.assertIn("to_self_hosted=3 to_hosted=5", self.log)
 
     def test_skipped_jobs_do_not_consume_idle_or_hosted_capacity(self):
         outputs = self.pick(labels=SELF_HOSTED, wanted=("server", "spec", "runner_hook"), runners=[runner()])
@@ -142,7 +143,7 @@ class Picker(unittest.TestCase):
         self.assertIn("to_self_hosted=1 to_hosted=2", self.log)
 
     def test_enough_idle_runners_avoid_hosted_api(self):
-        self.assert_routes(self.pick(labels=SELF_HOSTED, runners=[runner()] * 7), JOBS)
+        self.assert_routes(self.pick(labels=SELF_HOSTED, runners=[runner()] * len(JOBS)), JOBS)
         self.assertEqual(self.requests, ["runners?per_page=100"])
 
     def test_shared_cap_counts_both_labels_once_and_ignores_self_hosted_and_completed(self):
@@ -151,8 +152,8 @@ class Picker(unittest.TestCase):
                 hosted_job("SELF-HOSTED", "xcode-27"), hosted_job("macos-15", status="completed"),
                 hosted_job("xcode-27", status="completed"), hosted_job("ubuntu-latest")]
         outputs = self.pick(labels=SELF_HOSTED, runners=[runner(busy=True)], jobs=jobs)
-        self.assert_routes(outputs, ("rust", "rust_driver", "rust_engine", "server", "spec", "runner_hook"))
-        self.assertIn("hosted_load=4 hosted_cap=5 to_self_hosted=6 to_hosted=1", self.log)
+        self.assert_routes(outputs, ("rust", "rust_driver", "rust_engine", "rust_sim", "server", "spec", "runner_hook"))
+        self.assertIn("hosted_load=4 hosted_cap=5 to_self_hosted=7 to_hosted=1", self.log)
         self.assertEqual(self.requests.count("runs/1/jobs?filter=latest&per_page=100&page=1"), 1)
 
     def test_full_shared_cap_queues_for_self_hosted(self):
@@ -163,16 +164,16 @@ class Picker(unittest.TestCase):
     def test_hosted_cap_preserves_priority_after_idle_assignment(self):
         jobs = [hosted_job("xcode-27")] * 4
         outputs = self.pick(labels=SELF_HOSTED, runners=[runner()], jobs=jobs)
-        self.assert_routes(outputs, ("macos_app", "rust_driver", "rust_engine", "server", "spec", "runner_hook"))
+        self.assert_routes(outputs, ("macos_app", "rust_driver", "rust_engine", "rust_sim", "server", "spec", "runner_hook"))
 
     def test_rust_shards_consume_separate_slots(self):
-        outputs = self.pick(labels=SELF_HOSTED, wanted=("rust", "rust_driver", "rust_engine"),
+        outputs = self.pick(labels=SELF_HOSTED, wanted=("rust", "rust_driver", "rust_engine", "rust_sim"),
                             runners=[runner()], jobs=[hosted_job("macos-15")] * 4)
-        self.assert_routes(outputs, ("rust", "rust_engine"))
-        self.assertIn("hosted_load=4 hosted_cap=5 to_self_hosted=2 to_hosted=1", self.log)
+        self.assert_routes(outputs, ("rust", "rust_engine", "rust_sim"))
+        self.assertIn("hosted_load=4 hosted_cap=5 to_self_hosted=3 to_hosted=1", self.log)
 
     def test_push_reuses_rust_only_when_all_macos_shards_pass(self):
-        names = ("rust (macos)", "rust tests (macos, driver)", "rust tests (macos, engine)")
+        names = ("rust (macos)", "rust tests (macos, driver)", "rust tests (macos, engine)", "rust tests (macos, sim)")
         for missing in (None, *names):
             with self.subTest(missing=missing):
                 fixtures = {
