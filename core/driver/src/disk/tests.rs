@@ -446,6 +446,7 @@ impl Fetch for Server {
                 return Err(ChunkError::Unavailable {
                     hash: chunks[0].hash.clone(),
                     message: "the server is busy".into(),
+                    cause: None,
                 });
             }
         }

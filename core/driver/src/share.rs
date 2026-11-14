@@ -704,6 +704,7 @@ mod tests {
             questions: 0,
             problem: None,
             wait: None,
+            unreachable: None,
             recovery: None,
             progress: None,
         }
