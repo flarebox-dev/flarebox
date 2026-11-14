@@ -5,7 +5,6 @@ use std::process::{Command, Stdio};
 
 mod schema;
 
-/// Logs written to anything but a terminal, such as the journal of the systemd unit, carry no ANSI escapes.
 #[test]
 fn logs_to_a_pipe_are_plain_text() {
     let home = tempfile::tempdir().unwrap();
@@ -31,8 +30,6 @@ fn logs_to_a_pipe_are_plain_text() {
     assert!(!log.contains('\u{1b}'), "{log:?}");
 }
 
-/// With --json the daemon prints its lifecycle as one JSON object per line on stdout, and its logs as JSON lines on
-/// stderr, with no ANSI escapes even when it was asked for colours.
 #[test]
 fn the_daemon_under_json_prints_its_lifecycle_as_json_lines() {
     let home = tempfile::tempdir().unwrap();

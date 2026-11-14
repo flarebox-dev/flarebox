@@ -1,12 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The background service that runs `koi _daemon` for this profile: a systemd user unit on Linux and a launch agent on
-//! macOS (docs/guide/install.md#background-sync). The commands that link or unlink a folder or pair this device,
-//! `koi service start` and `koi _reconcile` bring it in line with the profile through [`reconcile`]: installed and
-//! running while the profile links a folder, removed once it links none. Only `koi service start` loads a launch agent
-//! that the person switched off in Login Items. `background = false` in config.toml's `[service]` table leaves it
-//! alone. When several koi binaries share the profile, the newest one runs it.
-
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -21,14 +14,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::ipc;
 
-/// The unit that koi fills in with this profile's binary and directories.
 const UNIT: &str = include_str!("../systemd/koidrive.service");
 
-/// How long a command waits for a service it started to answer on the socket.
 const STARTUP: Duration = Duration::from_secs(10);
 
-/// How long a started service may take to show as running. launchd spawns a job a moment after `launchctl bootstrap`
-/// returns, so the first read can still find it not running.
 const SPAWN: Duration = Duration::from_secs(5);
 
 const PROBE: Duration = Duration::from_secs(5);
@@ -37,22 +26,16 @@ pub const DELEGATED: Duration = Duration::from_secs(7 * 60);
 
 const LOCK_WAIT: Duration = Duration::from_secs(60);
 
-/// One profile's service: what the unit or the launch agent runs, and the names they go by.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Service {
-    /// A hash of the state directory, for a profile outside the default directories, so that each profile has a
-    /// service of its own.
     suffix: Option<String>,
     binary: String,
     home: PathBuf,
     state_dir: PathBuf,
-    /// The XDG variables `koi _daemon` needs to open this profile and its socket, with `None` to unset one.
     env: Vec<(&'static str, Option<String>)>,
 }
 
 impl Service {
-    /// The service of the profile at `paths`, run by `binary`. Paths that a unit or a property list cannot carry
-    /// exactly, because they are not UTF-8 or hold control characters, are refused.
     pub fn new(paths: &Paths, home: &Path, binary: &Path) -> Result<Self, String> {
         let text = |path: &Path| match path.to_str() {
             Some(text) if !text.chars().any(char::is_control) => Ok(text.to_owned()),
@@ -99,7 +82,6 @@ impl Service {
         }
     }
 
-    /// The unit lives in the profile's state directory, and `systemctl --user enable` links it into the unit path.
     fn unit_file(&self) -> PathBuf {
         self.state_dir.join("systemd").join(self.unit_name())
     }
@@ -112,7 +94,6 @@ impl Service {
         (self.home.join("Library/Logs/Koidrive")).join(format!("{}.log", self.label()))
     }
 
-    /// The systemd user unit: cli/systemd/koidrive.service with this binary and this profile's directories.
     pub fn unit(&self) -> String {
         let mut unit = String::new();
         for line in UNIT.lines() {
@@ -138,8 +119,6 @@ impl Service {
         unit
     }
 
-    /// The launch agent's property list. A plist cannot unset a variable that launchd's own environment sets, so an
-    /// unset one is written empty, which the daemon reads as unset.
     pub fn plist(&self) -> String {
         let mut env = String::from("\t\t<key>KOIDRIVE_LOG</key>\n\t\t<string>info</string>\n");
         for (name, value) in &self.env {
@@ -180,7 +159,6 @@ impl Service {
         )
     }
 
-    /// Where the service's log is.
     fn log(&self, manager: ServiceManager) -> String {
         match manager {
             ServiceManager::Launchd => self.log_file().display().to_string(),
@@ -251,18 +229,13 @@ pub enum State {
     Off,
 }
 
-/// A service manager. [`Manager::state`] reports `Running`, `Stopped` or `NotInstalled`, or why it cannot be used.
 pub trait Manager {
     fn kind(&self) -> ServiceManager;
     fn name(&self, service: &Service) -> String;
     fn state(&self, service: &Service) -> Result<State, String>;
     fn installed(&self, service: &Service) -> Option<String>;
-    /// Installs the service unless the installed one is the same, and starts it. A running service restarts when it
-    /// changed or on `restart`.
     fn start(&self, service: &Service, restart: bool) -> Result<(), String>;
-    /// Stops and removes the service. Removing a service that is not installed changes nothing.
     fn remove(&self, service: &Service) -> Result<(), String>;
-    /// Whether the service keeps running without a login session, where that is a setting.
     fn lingers(&self) -> Option<bool> {
         None
     }
@@ -278,9 +251,6 @@ pub enum Action {
     Leave,
 }
 
-/// What the service needs while the profile links `folders` folders. Starting is idempotent, so a running service is
-/// started again: that installs a changed unit, for example after the binary moved. A launch agent switched off in
-/// Login Items starts only when the person `asked` for it with `koi service start`.
 pub fn plan(folders: usize, state: State, asked: bool) -> Action {
     match (folders, state) {
         (_, State::Unavailable | State::Off) => Action::Leave,
@@ -351,7 +321,6 @@ impl Report {
         }
     }
 
-    /// What a command prints about the service: a change, a problem, or nothing when it runs as before.
     pub fn text(&self) -> String {
         let mut text = String::new();
         let launchd = self.manager == ServiceManager::Launchd;
@@ -397,7 +366,6 @@ impl Report {
         text
     }
 
-    /// Whether `koi service start` failed to leave the service running.
     pub fn failed(&self) -> bool {
         self.problem.is_some()
             || matches!(
@@ -419,7 +387,6 @@ impl Report {
             .join(" ")
     }
 
-    /// The `koi status` line.
     pub fn status_line(&self) -> String {
         let state = match self.state {
             State::Running => format!("running ({})", self.name),
@@ -444,7 +411,6 @@ impl Report {
     }
 }
 
-/// What to do about a launch agent switched off in Login Items.
 const SWITCHED_OFF: &str = "koi is switched off in System Settings > General > Login Items > Allow in the Background, so the folders don't sync. To sync them in the background, switch it on, then run: koi service start\n";
 
 fn blocked_text(blocked: &[Blocked]) -> String {
@@ -672,8 +638,6 @@ fn start(manager: &dyn Manager, service: &Service, daemon: &Daemon) -> Result<()
     }
 }
 
-/// Brings the service in line with `folders` folders, or leaves it alone when config.toml turns it `off`. `asked` is
-/// true for `koi service start`. `daemon` is what answered on the socket before.
 pub fn converge(
     manager: &dyn Manager,
     service: &Service,
@@ -725,7 +689,6 @@ pub fn converge(
     report
 }
 
-/// launchd on macOS, systemd everywhere else.
 pub fn system() -> Box<dyn Manager> {
     let uid = rustix::process::getuid().as_raw();
     match cfg!(target_os = "macos") {
@@ -734,7 +697,6 @@ pub fn system() -> Box<dyn Manager> {
     }
 }
 
-/// This profile's service, run by this binary.
 pub fn this_service(paths: &Paths) -> Result<Service, String> {
     let home = (std::env::var_os("HOME").map(PathBuf::from))
         .filter(|home| home.is_absolute())
@@ -750,10 +712,6 @@ fn background_off(paths: &Paths) -> Result<bool, String> {
         .map_err(|error| error.to_string())
 }
 
-/// Brings this profile's service in line with the folders it links, after a command that may have changed them or
-/// the pairing, or after `koi service start`, which `asked` for it. When the service runs, it waits for the daemon to
-/// answer, and on macOS asks it which folders it may not read, so the person sees the privacy prompt while the command
-/// runs.
 pub async fn reconcile(paths: &Paths, asked: bool) -> Report {
     reconcile_with(system().as_ref(), this_service(paths), paths, asked).await
 }
@@ -853,8 +811,6 @@ async fn lock_service(paths: &Paths, within: Duration) -> Result<Option<Flock>, 
     }
 }
 
-/// Whether the daemon answers a status request `within` the time, counting a daemon that takes the connection and
-/// holds its answer.
 async fn answers(paths: &Paths, within: Duration) -> bool {
     let deadline = Instant::now() + within;
     loop {
@@ -870,7 +826,6 @@ async fn answers(paths: &Paths, within: Duration) -> bool {
     }
 }
 
-/// The service as `koi status` shows it, without changing it.
 pub async fn inspect(paths: &Paths, daemon_running: bool) -> Report {
     let manager = system();
     let service = match this_service(paths) {
@@ -897,8 +852,6 @@ pub async fn inspect(paths: &Paths, daemon_running: bool) -> Report {
     report
 }
 
-/// The folders the running daemon may not read. Only macOS keeps a background process out of folders that the person
-/// can read, so nothing is asked elsewhere. A daemon too old to know the request answers with an error, read as none.
 async fn blocked(paths: &Paths) -> Vec<Blocked> {
     if !cfg!(target_os = "macos") {
         return Vec::new();
@@ -909,8 +862,6 @@ async fn blocked(paths: &Paths) -> Vec<Blocked> {
     }
 }
 
-/// Removes this profile's service after `koi server delete` deleted the server at `deleted`, when it is the server this
-/// device syncs with. The folders stay linked to it.
 pub fn forget(paths: &Paths, deleted: &url::Url) -> Option<Report> {
     let credential = koidrive_driver::Credential::load(&paths.credential()).ok()??;
     let server = url::Url::parse(&credential.server).ok()?;
@@ -929,7 +880,6 @@ pub fn forget(paths: &Paths, deleted: &url::Url) -> Option<Report> {
     ))
 }
 
-/// Writes `text` to `path` unless it already holds it, and returns whether it wrote.
 fn write(path: &Path, text: &str) -> Result<bool, String> {
     if fs::read(path).is_ok_and(|old| old == text.as_bytes()) {
         return Ok(false);
@@ -962,7 +912,6 @@ fn run(program: &str, args: &[&str]) -> Result<Output, String> {
         })
 }
 
-/// Runs a command that must succeed, and returns its output, or an error with what it printed on stderr.
 fn ok(program: &str, args: &[&str]) -> Result<String, String> {
     let output = run(program, args)?;
     match output.status.success() {
@@ -975,7 +924,6 @@ fn ok(program: &str, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// The systemd user instance. Lingering keeps it running without a login session, from boot on.
 pub struct Systemd {
     uid: u32,
 }
@@ -1058,7 +1006,6 @@ impl Manager for Systemd {
     }
 }
 
-/// launchd's GUI domain of the user, which runs agents while the user is logged in and starts them at each login.
 pub struct Launchd {
     uid: u32,
 }
@@ -1077,7 +1024,6 @@ impl Launchd {
         Ok(launchd_disabled(&disabled, &service.label()))
     }
 
-    /// What `launchctl print` says about the loaded job, or `None` when it is not loaded.
     fn loaded(&self, service: &Service) -> Result<Option<String>, String> {
         let output = run("launchctl", &["print", &self.target(service)])?;
         Ok((output.status.success()).then(|| String::from_utf8_lossy(&output.stdout).into_owned()))
@@ -1435,7 +1381,6 @@ mod tests {
         assert_eq!(plan(0, SwitchedOff, false), Action::Remove);
     }
 
-    /// A service manager in memory: the unit it holds, and whether it runs.
     #[derive(Default)]
     struct Fake {
         unavailable: bool,
@@ -1444,9 +1389,7 @@ mod tests {
         restarts: Cell<u32>,
         lingers: Cell<Option<bool>>,
         linger_refused: bool,
-        /// How many more reads find a started service not running yet.
         spawning: Cell<u32>,
-        /// The person switched it off, as Login Items does: installed and disabled.
         switched_off: Cell<bool>,
         remove_problem: Option<&'static str>,
         service_lock: Option<PathBuf>,

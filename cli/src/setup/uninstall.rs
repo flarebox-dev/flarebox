@@ -1,29 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `koi server delete` (docs/design/cli-setup.md section 5): record the Worker's and the bucket's identities,
-//! delete the Worker, then empty and delete the bucket unless it turns out to be another one or someone else's. A
-//! missing identity stops the uninstall before it deletes anything.
-
 use koidrive_cloudflare::{Jurisdiction, Script};
 
 use super::Cloud;
 use super::state::{SetupState, StateFile, Step};
 use crate::error::CliError;
 
-/// The server writes only keys under this prefix, so any other key belongs to another application.
 const SERVER_PREFIX: &str = "spaces/";
 
-/// What a listing of the whole bucket found.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Contents {
     pub objects: usize,
-    /// The first key that the server does not write.
     pub foreign: Option<String>,
 }
 
-/// Steps 1 and 2: reads the identities an uninstall checks before each delete, the Worker's creation time and the
-/// bucket's creation date, and counts the bucket's objects for the confirmation. `script` is `None` for
-/// `--bucket`, whose Worker is gone already. Any identity Cloudflare does not send stops here.
 pub async fn plan(
     cloud: &mut impl Cloud,
     script: Option<&Script>,
@@ -81,7 +71,6 @@ pub async fn plan(
     Ok((state, contents))
 }
 
-/// Steps 3 to 6, from the state file, so a rerun repeats only what is left and passes every check again.
 pub async fn finish(
     cloud: &mut impl Cloud,
     file: &StateFile,
@@ -197,7 +186,6 @@ fn gone(file: &StateFile, bucket: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Step 3: deletes the Worker only if it is the one the state file recorded.
 async fn delete_worker(cloud: &mut impl Cloud, state: &SetupState) -> Result<(), CliError> {
     let account = cloud.account().to_owned();
     let api = cloud.fresh().await?;
@@ -237,7 +225,6 @@ async fn delete_worker(cloud: &mut impl Cloud, state: &SetupState) -> Result<(),
     }
 }
 
-/// The first Worker in the account that binds `bucket` in `jurisdiction`.
 async fn binder(
     cloud: &mut impl Cloud,
     bucket: &str,
@@ -276,7 +263,6 @@ async fn binder(
     Ok(None)
 }
 
-/// Lists the whole bucket, or `None` if it does not exist.
 async fn scan(
     cloud: &mut impl Cloud,
     bucket: &str,
@@ -435,7 +421,6 @@ mod tests {
         (dir, file)
     }
 
-    /// Every R2 call named the jurisdiction the uninstall recorded.
     fn assert_r2_in(fake: &Fake, jurisdiction: &str) {
         for seen in fake.seen() {
             if seen.path.contains("/r2/") {

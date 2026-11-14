@@ -10,7 +10,6 @@ use tracing_subscriber::fmt::MakeWriter;
 
 pub const MAX: u64 = 10 * 1024 * 1024;
 
-// launchd appends to the file the property list names and never rotates it.
 pub struct CappedLog {
     path: PathBuf,
     max: u64,

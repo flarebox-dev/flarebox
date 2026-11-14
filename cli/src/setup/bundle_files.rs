@@ -1,13 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The files of a server bundle directory, which `build.rs` embeds. It applies the checks of `Bundle::from_dir` at
-//! build time, so a release cannot embed a file from outside the directory.
-
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-/// Every file under `dir` with its path relative to `dir`, sorted. A symbolic link, an entry that is neither a regular
-/// file nor a directory, a missing `manifest.json` or a `main_module` that is not a plain file name stops it.
 pub fn bundle_files(dir: &Path) -> Result<Vec<(String, PathBuf)>, String> {
     let mut files = Vec::new();
     collect(dir, dir, &mut files)?;

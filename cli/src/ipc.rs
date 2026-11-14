@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The daemon's side of the socket. Every command is a [`Request`] that [`handle`] runs against a [`Driver`]: the
-//! daemon's driver through the socket when the daemon runs, or a driver the command opens itself when it does not.
-//! The daemon refuses a peer running as another user.
-
 use std::collections::BTreeSet;
 use std::fs;
 use std::io;
@@ -33,11 +29,6 @@ impl From<CliError> for Response {
     }
 }
 
-/// Runs `request` unless an earlier run of `request_id` recorded its response, and records the response. A response
-/// the CLI reports as a failure removes the record instead, so the next run with the ID tries again: an error, where the
-/// driver fails before its change or rolls it back, and a restart or lift that left the folder halted, which is safe
-/// to repeat once the cause is fixed. A run cancelled midway leaves the record without an outcome. The record is written in the
-/// process that runs the driver, so a client that stops waiting does not keep the outcome from being recorded.
 async fn once(driver: &Driver, request_id: RequestId, key: Key, request: Request) -> Response {
     let mut inner = &request;
     while let Request::Once { run, .. } = inner {
@@ -76,7 +67,6 @@ async fn once(driver: &Driver, request_id: RequestId, key: Key, request: Request
     response
 }
 
-/// Runs one request.
 pub async fn handle(driver: &Driver, request: Request) -> Response {
     let outcome: Result<Response, DriverError> = match request {
         Request::Status => Ok(Response::Status {
@@ -215,13 +205,8 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
     outcome.unwrap_or_else(|error| Response::from(CliError::from(error)))
 }
 
-/// The folders whose read by [`unreadable`] has not ended.
 static READING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
-/// The linked folders this process may not read. macOS keeps a launch agent out of the folders that its privacy
-/// settings guard, such as Documents, until the person allows it, and asks while the first read waits. Each read
-/// runs on a thread of its own, which a read waiting for the person keeps until the answer, so the runtime never waits
-/// for it. A folder whose earlier read still waits gets no second thread, however often the status is asked for.
 async fn unreadable(folders: Vec<FolderStatus>) -> Vec<Blocked> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     let reads: Vec<_> = (folders.into_iter())
@@ -257,7 +242,6 @@ async fn unreadable(folders: Vec<FolderStatus>) -> Vec<Blocked> {
     blocked
 }
 
-/// Serves requests until the task is dropped.
 pub async fn serve(listener: UnixListener, driver: Driver) {
     let uid = rustix::process::getuid().as_raw();
     loop {
@@ -320,7 +304,6 @@ async fn watch(
     }
 }
 
-/// The error for a profile that a process holds while its socket does not answer.
 pub fn busy(paths: &Paths) -> String {
     format!(
         "a Koidrive process holds this profile, but its socket {} does not answer",
@@ -328,9 +311,6 @@ pub fn busy(paths: &Paths) -> String {
     )
 }
 
-/// Runs `request` in the daemon, or in a driver of its own when no daemon runs. A failed request is an error. Without
-/// a daemon and without a state directory, the status and the questions, answered or not, are read as a profile that is not set up,
-/// and a resume finds nothing paused, without opening a driver, so they create nothing.
 pub async fn run(paths: &Paths, request: Request) -> Result<Response, CliError> {
     let response = match koidrive_ipc::ask(paths, &request).await? {
         Some(response) => response,
@@ -508,7 +488,6 @@ pub(crate) mod tests {
 
     pub(crate) const SPACE: &str = "0190f0a0-0000-7000-8000-000000000001";
 
-    /// A profile whose folder `Koidrive` syncs one space, which waits on the decision `q1`.
     pub(crate) fn linked_profile() -> (tempfile::TempDir, Paths, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(dir.path()).unwrap();

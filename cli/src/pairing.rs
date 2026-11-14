@@ -1,19 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pairing codes that carry their server: `<code>@<host>`, such as `K7QM-2XPD@koidrive.alice.workers.dev`
-//! (docs/design/cli-setup.md section 1).
-
 use url::Url;
 
-/// A pairing code and the server it was issued by.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Invitation {
     pub code: String,
     pub server: String,
 }
 
-/// Splits `text` on its last `@` and puts `https://` before the host. `server` replaces the host, and is required
-/// for a bare code.
 pub fn parse(text: &str, server: Option<&str>) -> Result<Invitation, String> {
     let text = text.trim();
     let (code, host) = match text.rsplit_once('@') {
@@ -39,8 +33,6 @@ pub fn parse(text: &str, server: Option<&str>) -> Result<Invitation, String> {
     })
 }
 
-/// The arguments of `koi join` for `code` from `server`: `<code>@<host>`, which [`parse`] reads back, for an https
-/// address with no path, and the code with `--server` for any other.
 pub fn join_argv(code: &str, server: &Url) -> Vec<String> {
     match (
         server.scheme(),
@@ -56,7 +48,6 @@ pub fn join_argv(code: &str, server: &Url) -> Vec<String> {
     }
 }
 
-/// [`join_argv`] as shell words.
 pub fn join_args(code: &str, server: &Url) -> String {
     let words: Vec<String> = join_argv(code, server)
         .iter()
@@ -65,7 +56,6 @@ pub fn join_args(code: &str, server: &Url) -> String {
     words.join(" ")
 }
 
-/// The text as one POSIX shell word: quoted unless every character is safe bare.
 pub fn shell_word(text: &str) -> String {
     if !text.is_empty()
         && text
@@ -77,7 +67,6 @@ pub fn shell_word(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 
-/// A server address as typed: `https://` goes before a bare host name.
 pub fn server_url(text: &str) -> String {
     let text = text.trim();
     if text.contains("://") {

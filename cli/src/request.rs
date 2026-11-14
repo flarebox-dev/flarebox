@@ -1,17 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Records that let an agent run a change again without making it twice. `--request-id` names one change: the first
-//! run records the command, its arguments and its outcome under the ID, and a later run with the same ID and arguments
-//! returns that outcome and changes nothing, also after a restart.
-//!
-//! Each record is one file in the profile's state directory, 0600 in a 0700 directory, named by the SHA-256 of the ID
-//! so that IDs differing only in case stay apart on a file system that folds case. A file is written under a
-//! temporary name and then moved into place, so a reader never sees half of one. A request's record is created before
-//! the change, which fails when another run created it first, and gets the outcome after the change. A run that stops
-//! in between, or that cannot tell whether its change happened, leaves a record without an outcome, and the next run
-//! with that ID refuses instead of guessing. A change known to have failed records nothing, so the next run with its
-//! ID tries again.
-
 use std::fs::{DirBuilder, File};
 use std::io::{self, Write};
 use std::os::unix::fs::DirBuilderExt;
@@ -29,12 +17,9 @@ use crate::error::CliError;
 struct Record {
     id: RequestId,
     key: Key,
-    /// None while the change runs, and after a run that stopped before it recorded what happened.
     outcome: Option<Value>,
 }
 
-/// The outcome of the earlier run of `id`, or none when no run of it is recorded. It fails as a stale request when
-/// the ID was used with other arguments, and as interrupted when the earlier run has not recorded its outcome.
 pub fn recorded(paths: &Paths, id: &RequestId, key: &Key) -> Result<Option<Value>, CliError> {
     let path = request_file(paths, id);
     let record = match std::fs::read(&path) {
@@ -67,15 +52,11 @@ pub fn recorded(paths: &Paths, id: &RequestId, key: &Key) -> Result<Option<Value
     }
 }
 
-/// What [`begin`] found.
 pub enum Begun {
-    /// An earlier run of the request finished with this outcome.
     Done(Value),
-    /// No run of the request is recorded. This one makes the change and records it.
     Claimed(Claim),
 }
 
-/// Claims `id` for a run of `key` before it makes the change, or returns the outcome of the run that claimed it first.
 pub fn begin(paths: &Paths, id: &RequestId, key: &Key) -> Result<Begun, CliError> {
     let path = request_file(paths, id);
     let record = Record {
@@ -93,16 +74,12 @@ pub fn begin(paths: &Paths, id: &RequestId, key: &Key) -> Result<Begun, CliError
     }
 }
 
-/// A request this run makes. Unless [`Claim::finish`] or [`Claim::abandon`] settles it, the record stays without an
-/// outcome: a run cancelled or stopped while it made the change cannot tell whether the change happened.
 pub struct Claim {
     path: PathBuf,
     record: Record,
 }
 
 impl Claim {
-    /// Records the outcome of the change. Should that fail, the record stays without an outcome, since the change
-    /// happened.
     pub fn finish(mut self, outcome: &impl Serialize) -> Result<(), CliError> {
         self.record.outcome = Some(serde_json::to_value(outcome).expect("an outcome serializes"));
         write(&self.path, &self.record, true)
@@ -110,8 +87,6 @@ impl Claim {
             .map_err(|error| format!("{}: {error}", self.path.display()).into())
     }
 
-    /// Removes the record, for a change known to have failed without an effect, so that the next run with the ID
-    /// tries again.
     pub fn abandon(self) {
         let _ = std::fs::remove_file(&self.path);
     }
@@ -124,8 +99,6 @@ pub(crate) fn request_file(paths: &Paths, id: &RequestId) -> PathBuf {
     paths.requests().join(format!("{name}.json"))
 }
 
-/// Writes `value` to `path` whole: to a temporary file in the same directory, then moved into place. Without
-/// `replace` it returns false, writing nothing, when `path` exists.
 fn write(path: &Path, value: &impl Serialize, replace: bool) -> io::Result<bool> {
     let dir = path.parent().expect("a record has a directory");
     DirBuilder::new().recursive(true).mode(0o700).create(dir)?;

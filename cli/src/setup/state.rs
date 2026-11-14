@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The state file of a setup, upgrade or uninstall that may stop halfway (docs/design/cli-setup.md section 4.6). It
-//! names what the run created and how far it got, so a rerun on this machine continues. It holds no secret.
-
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -15,14 +12,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Step {
-    /// Names are chosen; nothing exists yet.
     #[default]
     Planned,
     BucketCreated,
     ScriptUploaded,
-    /// The server answers on workers.dev and is waiting for this device's claim.
     Serving,
-    /// An uninstall is under way; the Worker may already be gone.
     Uninstalling,
 }
 
@@ -33,17 +27,12 @@ pub struct SetupState {
     pub script: String,
     pub bucket: String,
     pub step: Step,
-    /// This CLI may have set a one-time `KOIDRIVE_RECOVERY_KEY` that is not deleted yet.
     pub secret_set: bool,
-    /// The setup attempt id the claims of this run send, until one claim's credential is saved.
     pub setup_attempt: Option<String>,
-    /// During an uninstall, when the Worker was created, which tells it apart from a new Worker of the same name.
     #[serde(default)]
     pub script_created_on: Option<String>,
-    /// The jurisdiction of the bucket, which every R2 call names.
     #[serde(default)]
     pub jurisdiction: Jurisdiction,
-    /// During an uninstall, when the bucket was created, which tells it apart from a new bucket of the same name.
     #[serde(default)]
     pub bucket_created_on: Option<String>,
 }
@@ -76,8 +65,6 @@ impl StateFile {
         }
     }
 
-    /// Writes the state to a temporary file, syncs it and renames it into place, so a crash leaves the old state or
-    /// the new one.
     pub fn save(&self, state: &SetupState) -> Result<(), String> {
         let write = || -> io::Result<()> {
             let dir = self.path.parent().expect("the state file has a directory");
