@@ -256,16 +256,22 @@ enum Call {
     Commit,
 }
 
-/// Calls of one kind that keep failing: since when, the latest failure and when the call is sent again.
 #[derive(Debug)]
 struct Unreadable {
     failures: u32,
     why: String,
+    left_out: Option<LeftOut>,
+}
+
+#[derive(Debug)]
+struct LeftOut {
     at: SystemTime,
     due: Instant,
     seen: Option<LocalNode>,
 }
 
+/// Calls of one kind that keep failing: since when, the latest failure and when the call is sent again.
+#[derive(Debug)]
 struct Retrying {
     since: Instant,
     why: String,
@@ -513,18 +519,13 @@ impl Folder {
         let changed: Vec<String> = (self.unreadable.iter())
             .filter(|(node, unreadable)| {
                 problems.contains(*node)
-                    && self.engine.trees.local().get(node.as_str()) != unreadable.seen.as_ref()
+                    && (unreadable.left_out.as_ref()).is_some_and(|left_out| {
+                        self.engine.trees.local().get(node.as_str()) != left_out.seen.as_ref()
+                    })
             })
             .map(|(node, _)| node.clone())
             .collect();
-        if !changed.is_empty() {
-            self.step(|engine, _| {
-                for node in &changed {
-                    engine.commits.clear_problem(node);
-                }
-                Ok(())
-            })?;
-        }
+        self.let_back_in(&changed)?;
         let mut work = Vec::new();
         self.drive(&mut work)?;
         Ok(work)
@@ -658,25 +659,27 @@ impl Folder {
         let now = Instant::now();
         let problems = self.engine.commits.problems();
         let due: Vec<String> = (self.unreadable.iter())
-            .filter(|(node, unreadable)| problems.contains(*node) && unreadable.due <= now)
+            .filter(|(node, unreadable)| {
+                problems.contains(*node)
+                    && (unreadable.left_out.as_ref()).is_some_and(|left_out| left_out.due <= now)
+            })
             .map(|(node, _)| node.clone())
             .collect();
-        if !timed.is_empty() || !due.is_empty() {
+        if !timed.is_empty() {
             self.step(|engine, _| {
                 for node in &timed {
                     engine.effects.unblock(node);
                 }
-                for node in &due {
-                    engine.commits.clear_problem(node);
-                }
                 Ok(())
             })?;
         }
+        self.let_back_in(&due)?;
         let mut work = Vec::new();
         let problems = self.engine.commits.problems();
         let next = (self.unreadable.iter())
             .filter(|(node, _)| problems.contains(*node))
-            .map(|(_, unreadable)| unreadable.due)
+            .filter_map(|(_, unreadable)| unreadable.left_out.as_ref())
+            .map(|left_out| left_out.due)
             .min();
         if let Some(next) = next {
             self.retry_at = Some(next);
@@ -684,6 +687,24 @@ impl Folder {
         }
         self.drive(&mut work)?;
         Ok(work)
+    }
+
+    fn let_back_in(&mut self, nodes: &[String]) -> Result<(), Stop> {
+        if nodes.is_empty() {
+            return Ok(());
+        }
+        self.step(|engine, _| {
+            for node in nodes {
+                engine.commits.clear_problem(node);
+            }
+            Ok(())
+        })?;
+        for node in nodes {
+            if let Some(unreadable) = self.unreadable.get_mut(node) {
+                unreadable.left_out = None;
+            }
+        }
+        Ok(())
     }
 
     /// The upload of the content a commit adds ended. With its receipts the commit is sent. A file that changed
@@ -826,9 +847,7 @@ impl Folder {
                 Unreadable {
                     failures,
                     why,
-                    at: SystemTime::now(),
-                    due: Instant::now(),
-                    seen: None,
+                    left_out: None,
                 },
             );
             self.flight = Flight::Waiting(Next::Build);
@@ -844,9 +863,11 @@ impl Folder {
             Unreadable {
                 failures,
                 why,
-                at: SystemTime::now() + wait,
-                due: at,
-                seen,
+                left_out: Some(LeftOut {
+                    at: SystemTime::now() + wait,
+                    due: at,
+                    seen,
+                }),
             },
         );
         if self.retry_at.is_none_or(|out| at < out) {
@@ -989,11 +1010,13 @@ impl Folder {
             reasons.entry(id).or_default().push(why);
         }
         for id in self.engine.commits.problems() {
-            let why = match self.unreadable.get(id) {
-                Some(unreadable) => format!(
+            let left_out = (self.unreadable.get(id))
+                .and_then(|unreadable| Some((unreadable, unreadable.left_out.as_ref()?)));
+            let why = match left_out {
+                Some((unreadable, left_out)) => format!(
                     "it could not be read: {}; trying again at {}",
                     unreadable.why,
-                    utc(unreadable.at)
+                    utc(left_out.at)
                 ),
                 None => {
                     restart = true;

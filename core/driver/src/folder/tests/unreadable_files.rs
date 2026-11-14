@@ -264,3 +264,67 @@ fn a_left_out_file_that_changes_again_is_left_out_at_its_next_failure() {
     assert!(problem.contains("secret.txt"), "the file went back to abandoning commits: {problem:?}");
 }
 
+
+
+#[test]
+fn a_file_let_back_in_without_an_upload_keeps_the_servers_refusal_of_its_next_change() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    let secret = site.root.join("secret.txt");
+    fs::write(&secret, b"first").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.rest(&mut remote);
+
+    fs::write(&secret, b"second version").unwrap();
+    leave_out_until_the_upload_fails(&mut a, &mut remote, &secret);
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::write(&secret, b"first").unwrap();
+    eventually("the file is let back in", || {
+        a.scan(Duration::from_millis(100));
+        while let Some(work) = a.work.pop_front() {
+            if !matches!(work, Work::RetryAfter(_)) {
+                a.perform(work, &mut remote).unwrap();
+            }
+        }
+        a.folder.engine.commits.problems().is_empty()
+    });
+
+    fs::rename(&secret, site.root.join("renamed.txt")).unwrap();
+    let mut sent = None;
+    eventually("the rename is sent", || {
+        a.scan(Duration::from_millis(100));
+        while let Some(work) = a.work.pop_front() {
+            match work {
+                Work::Send(commit) => sent = Some(commit),
+                Work::RetryAfter(_) => {}
+                work => a.perform(work, &mut remote).unwrap(),
+            }
+        }
+        sent.is_some()
+    });
+    let last_seq = a.folder.engine.cursor.as_ref().unwrap().last_seq;
+    let result = CommitResult {
+        seq: last_seq + 1,
+        results: vec![
+            koidrive_proto::v1::OpResult {
+                code: op_result::Code::Rejected as i32,
+                reject_reason: "INVALID_NAME".into(),
+                ..Default::default()
+            };
+            sent.as_ref().unwrap().ops.len()
+        ],
+        changes: Vec::new(),
+        ..Default::default()
+    };
+    let step = a.folder.sent(Ok(result));
+    a.take(step).unwrap();
+    let problem = a.folder.view().problem.unwrap_or_default();
+    assert!(problem.contains("INVALID_NAME"), "{problem}");
+    assert!(problem.contains("run koi folder restart"), "{problem}");
+    a.scan(Duration::from_millis(100));
+    let problem = a.folder.view().problem.unwrap_or_default();
+    assert!(problem.contains("INVALID_NAME"), "the next batch cleared the refusal: {problem}");
+}
+
