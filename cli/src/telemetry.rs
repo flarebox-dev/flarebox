@@ -85,8 +85,6 @@ pub async fn start(
         store.status(var).map(|status| status.mode),
         Ok(Mode::On | Mode::Debug)
     );
-    let recorder = if on { Recorder::on() } else { Recorder::off() };
-    recorder.count(Counter::Command(command), 1);
     let id = on
         .then(|| {
             (store.install_id())
@@ -96,6 +94,9 @@ pub async fn start(
                 .ok()
         })
         .flatten();
+    let recorder = Recorder::off();
+    recorder.record_for(id.as_ref());
+    recorder.count(Counter::Command(command), 1);
     install_panic_hook(store.clone());
     let _ = RUN.set(Run {
         store,
@@ -228,7 +229,6 @@ impl Run {
     fn flush(&self, mode: Mode) {
         let on = matches!(mode, Mode::On | Mode::Debug);
         let pending = self.recorder.take();
-        self.recorder.switch(on);
         let Ok(mut id) = self.id.lock() else { return };
         if on
             && let Some(recorded) = id.as_ref()
@@ -239,6 +239,7 @@ impl Run {
         if let Ok(settings) = self.store.settings() {
             *id = settings.install_id;
         }
+        self.recorder.record_for(id.as_ref().filter(|_| on));
     }
 }
 
@@ -649,6 +650,40 @@ mod tests {
         store.set(true).unwrap();
         run.flush(Mode::On);
         run.flush(Mode::On);
+        assert!(store.peek().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_new_install_id_between_ticks_starts_a_new_collector_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let id = store.set(true).unwrap().install_id;
+        let run = Run {
+            store: store.clone(),
+            recorder: Recorder::off(),
+            id: Mutex::new(id),
+            flow: Mutex::new(None),
+        };
+        run.flush(Mode::On);
+        let changes: [fn(&Store); 2] = [
+            |store: &Store| {
+                store.set(false).unwrap();
+                store.set(true).unwrap();
+            },
+            |store: &Store| drop(store.reset().unwrap()),
+        ];
+        for change in changes {
+            let before = run.recorder.session();
+            run.recorder.count(Counter::Sync(Synced::CommitsSent), 1);
+            change(&store);
+            run.flush(Mode::On);
+            assert!(before.is_some());
+            assert_ne!(run.recorder.session(), before);
+            assert_eq!(
+                run.recorder.install_id(),
+                store.settings().unwrap().install_id
+            );
+        }
         assert!(store.peek().unwrap().is_empty());
     }
 

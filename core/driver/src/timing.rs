@@ -17,7 +17,7 @@ use koidrive_proto::v1::{
     ChangeRecord, Commit, CommitRecord, CommitResult, change_record, op, op_result,
 };
 use koidrive_telemetry::{
-    Recorder,
+    InstallId, Recorder,
     schema::{FileCount, Measure},
 };
 
@@ -83,6 +83,8 @@ impl Live {
 struct First {
     path: PathBuf,
     linked_ms: i64,
+    install: InstallId,
+    session: Option<u64>,
     opened: Time,
 }
 
@@ -119,7 +121,10 @@ struct Planned {
 }
 
 impl Timing {
-    pub fn initialize(store: &Path, linked_ms: i64) {
+    pub fn initialize(store: &Path, linked_ms: i64, recorder: &Recorder) {
+        let Some(install) = recorder.install_id() else {
+            return;
+        };
         let path = store.with_file_name("first-sync");
         let _ = (|| -> std::io::Result<()> {
             let mut file = OpenOptions::new()
@@ -127,7 +132,7 @@ impl Timing {
                 .write(true)
                 .mode(0o600)
                 .open(&path)?;
-            write!(file, "{linked_ms}")?;
+            write!(file, "{linked_ms} {install}")?;
             file.sync_all()?;
             File::open(path.parent().unwrap())?.sync_all()
         })();
@@ -139,16 +144,20 @@ impl Timing {
 
     fn open_at(store: &Path, linked_ms: i64, opened: Time) -> Self {
         let path = store.with_file_name("first-sync");
-        let eligible = fs::read_to_string(&path)
-            .ok()
-            .and_then(|value| value.parse::<i64>().ok())
-            == Some(linked_ms);
+        let install = fs::read_to_string(&path).ok().and_then(|value| {
+            let (linked, install) = value.split_once(' ')?;
+            (linked.parse::<i64>().ok()? == linked_ms)
+                .then(|| InstallId::try_from(install.to_owned()).ok())
+                .flatten()
+        });
         Self {
             recorder: Recorder::off(),
             state: Live::default(),
-            first: eligible.then_some(First {
+            first: install.map(|install| First {
                 path,
                 linked_ms,
+                install,
+                session: None,
                 opened,
             }),
         }
@@ -157,6 +166,21 @@ impl Timing {
     pub fn enable(&mut self, recorder: Recorder) {
         self.state = Live::default();
         self.recorder = recorder;
+        self.check_first();
+    }
+
+    fn check_first(&mut self) {
+        let Some(first) = &mut self.first else { return };
+        let session = self.recorder.session();
+        let unbroken = session.is_some()
+            && self.recorder.install_id().as_ref() == Some(&first.install)
+            && first.session.is_none_or(|held| Some(held) == session);
+        if unbroken {
+            first.session = session;
+        } else {
+            let _ = fs::remove_file(&first.path);
+            self.first = None;
+        }
     }
 
     pub fn linked(&mut self, started: Option<Time>) {
@@ -176,11 +200,13 @@ impl Timing {
         self.first.is_some()
     }
 
-    pub fn first_pending(&self) -> bool {
-        self.first.is_some() && self.recorder.is_on()
+    pub fn first_pending(&mut self) -> bool {
+        self.check_first();
+        self.first.is_some()
     }
 
     pub fn first_sync(&mut self, files: u64, at: Time) {
+        self.check_first();
         let Some(first) = self.first.take() else {
             return;
         };
@@ -214,6 +240,7 @@ impl Timing {
     }
 
     pub fn status(&mut self, status: FolderState, at: Time) {
+        self.check_first();
         let Some(state) = self.state.get(&self.recorder) else {
             return;
         };
@@ -531,6 +558,47 @@ mod tests {
     }
 
     #[test]
+    fn a_first_sync_is_timed_only_if_reports_stayed_on_since_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store.sqlite");
+        let at = time();
+        let first_sync = |timing: &mut Timing, recorder: &Recorder| {
+            timing.enable(recorder.clone());
+            timing.first_sync(1, later(at, Duration::from_secs(5)));
+            recorder.take().days.is_empty()
+        };
+
+        let off = Recorder::off();
+        Timing::initialize(&store, at.unix_ms, &off);
+        let on = Recorder::on();
+        assert!(
+            first_sync(&mut Timing::open_at(&store, at.unix_ms, at), &on),
+            "linked while off"
+        );
+
+        Timing::initialize(&store, at.unix_ms, &on);
+        let mut timing = Timing::open_at(&store, at.unix_ms, at);
+        timing.enable(on.clone());
+        on.switch(false);
+        on.switch(true);
+        assert!(first_sync(&mut timing, &on), "off and on in between");
+        assert!(!Timing::open_at(&store, at.unix_ms, at).has_first());
+
+        Timing::initialize(&store, at.unix_ms, &on);
+        let restarted = Recorder::on();
+        assert!(
+            first_sync(&mut Timing::open_at(&store, at.unix_ms, at), &restarted),
+            "another install id after a restart"
+        );
+
+        Timing::initialize(&store, at.unix_ms, &on);
+        assert!(!first_sync(
+            &mut Timing::open_at(&store, at.unix_ms, at),
+            &on
+        ));
+    }
+
+    #[test]
     fn a_span_that_reports_were_off_for_part_of_is_dropped() {
         let recorder = Recorder::on();
         let mut timing = tracker(&recorder);
@@ -655,7 +723,7 @@ mod tests {
         legacy.enable(recorder.clone());
         legacy.first_sync(100_000, at);
         assert!(recorder.take().days.is_empty());
-        Timing::initialize(&store, at.unix_ms - 5000);
+        Timing::initialize(&store, at.unix_ms - 5000, &recorder);
         drop(Timing::open_at(&store, at.unix_ms - 5000, at));
         let mut timing = Timing::open_at(&store, at.unix_ms - 5000, at);
         timing.enable(recorder.clone());
@@ -677,7 +745,7 @@ mod tests {
                 .len(),
             1
         );
-        Timing::initialize(&store, at.unix_ms);
+        Timing::initialize(&store, at.unix_ms, &recorder);
         let mut relinked = Timing::open_at(&store, at.unix_ms, at);
         relinked.enable(recorder.clone());
         relinked.first_sync(400_000, later(at, Duration::from_secs(1)));
@@ -693,7 +761,7 @@ mod tests {
         let store = dir.path().join("store.sqlite");
         let at = time();
         let recorder = Recorder::on();
-        Timing::initialize(&store, at.unix_ms);
+        Timing::initialize(&store, at.unix_ms, &recorder);
         assert!(!Timing::open_at(&store, at.unix_ms + 1, at).has_first());
         let mut timing = Timing::open_at(&store, at.unix_ms, at);
         timing.enable(recorder.clone());
@@ -702,7 +770,7 @@ mod tests {
         timing.first_sync(1, at);
         assert!(recorder.take().days.is_empty());
         fs::remove_dir(store.with_file_name("first-sync")).unwrap();
-        Timing::initialize(&store, at.unix_ms);
+        Timing::initialize(&store, at.unix_ms, &recorder);
         let mut off = Timing::open_at(&store, at.unix_ms, at);
         off.first_sync(1, at);
         assert!(!Timing::open_at(&store, at.unix_ms, at).has_first());
@@ -777,8 +845,8 @@ mod tests {
             ] {
                 let dir = tempfile::tempdir().unwrap();
                 let store = dir.path().join("store.sqlite");
-                Timing::initialize(&store, linked_ms);
                 let recorder = Recorder::on();
+                Timing::initialize(&store, linked_ms, &recorder);
                 let at = Time {
                     mono: Instant::now(),
                     unix_ms: linked_ms,
@@ -839,8 +907,8 @@ mod tests {
         ] {
             let dir = tempfile::tempdir().unwrap();
             let store = dir.path().join("store.sqlite");
-            Timing::initialize(&store, linked_ms);
             let recorder = Recorder::on();
+            Timing::initialize(&store, linked_ms, &recorder);
             let mut timing = Timing::open_at(&store, linked_ms, opened);
             timing.enable(recorder.clone());
             timing.first_sync(1, finished);
@@ -849,8 +917,8 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("store.sqlite");
-        Timing::initialize(&store, now.unix_ms);
         let recorder = Recorder::on();
+        Timing::initialize(&store, now.unix_ms, &recorder);
         let jumped = Time {
             unix_ms: now.unix_ms + 15 * 86_400_000,
             ..later(now, Duration::from_secs(1))

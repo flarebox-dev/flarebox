@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::schema::{Counter, DailyReport, Event, Level, Measure};
+use crate::schema::{Counter, DailyReport, Event, InstallId, Level, Measure};
 
 /// A cheap handle that code passes around to record. Clones share one switch and one set of sums. While it is off it
 /// records nothing and costs one branch per call. Recording takes a short lock on the sums and does no I/O.
@@ -14,6 +14,7 @@ pub struct Recorder(Arc<Shared>);
 #[derive(Debug, Default)]
 struct Shared {
     switches: AtomicU64,
+    install: Mutex<Option<InstallId>>,
     pending: Mutex<Pending>,
 }
 
@@ -39,21 +40,43 @@ impl Recorder {
         self.session().is_some()
     }
 
-    /// Starts or stops recording, for every clone. Stopping drops what is held.
+    /// Starts recording for a new install id, unless it is already on, or stops recording.
     pub fn switch(&self, on: bool) {
-        let Ok(mut pending) = self.0.pending.lock() else {
-            return;
-        };
-        if self.is_on() != on {
-            self.0.switches.fetch_add(1, Ordering::Relaxed);
-        }
-        if !on {
-            *pending = Pending::default();
+        match on {
+            true if self.is_on() => {}
+            true => self.record_for(Some(&InstallId::generate())),
+            false => self.record_for(None),
         }
     }
 
-    /// Names the current stretch of recording, from being switched on to being switched off, or none while off. A
-    /// collector that measures across calls, such as a duration, keeps a start only while the session is the same.
+    /// Records for `id`, or stops recording without one, for every clone. Stopping, and moving to another id, drops
+    /// what is held and starts a new [`session`](Recorder::session).
+    pub fn record_for(&self, id: Option<&InstallId>) {
+        let (Ok(mut pending), Ok(mut install)) = (self.0.pending.lock(), self.0.install.lock())
+        else {
+            return;
+        };
+        if self.is_on() && install.as_ref() == id {
+            return;
+        }
+        if self.is_on() {
+            self.0.switches.fetch_add(1, Ordering::Relaxed);
+            *pending = Pending::default();
+        }
+        *install = id.cloned();
+        if id.is_some() {
+            self.0.switches.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The install id this recorder records for, while it is on.
+    pub fn install_id(&self) -> Option<InstallId> {
+        let install = self.0.install.lock().ok()?;
+        self.is_on().then(|| install.clone()).flatten()
+    }
+
+    /// Names the current stretch of recording for one install id, or none while off. A collector that measures across
+    /// calls, such as a duration, keeps a start only while the session is the same.
     pub fn session(&self) -> Option<u64> {
         let switches = self.0.switches.load(Ordering::Relaxed);
         (switches % 2 == 1).then_some(switches)
@@ -227,6 +250,14 @@ mod tests {
         assert_eq!(recorder.session(), None);
         recorder.switch(true);
         assert_ne!(recorder.session(), Some(first));
+        let id = InstallId::generate();
+        recorder.record_for(Some(&id));
+        let second = recorder.session();
+        recorder.record_for(Some(&id));
+        assert_eq!(recorder.session(), second);
+        assert_eq!(recorder.install_id(), Some(id));
+        recorder.record_for(Some(&InstallId::generate()));
+        assert_ne!(recorder.session(), second);
     }
 
     #[test]

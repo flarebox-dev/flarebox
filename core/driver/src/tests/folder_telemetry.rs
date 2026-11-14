@@ -48,8 +48,8 @@ fn telemetry_folder_hooks_measure_first_sync_transfers_and_successful_apply() {
         .unwrap()
         .transaction(|tx| tx.set_link(&site_b.link))
         .unwrap();
-    Timing::initialize(&site_b.db, site_b.link.linked_at_ms);
     let received = Recorder::on();
+    Timing::initialize(&site_b.db, site_b.link.linked_at_ms, &received);
     let mut b = site_b.start();
     b.folder.timing.enable(received.clone());
     b.connect(&remote);
@@ -144,8 +144,8 @@ fn telemetry_real_folder_release_measurement() {
                 .unwrap()
                 .transaction(|tx| tx.set_link(&site_b.link))
                 .unwrap();
-            Timing::initialize(&site_b.db, site_b.link.linked_at_ms);
             let recorder = if on { Recorder::on() } else { Recorder::off() };
+            Timing::initialize(&site_b.db, site_b.link.linked_at_ms, &recorder);
             let mut b = site_b.start();
             b.folder.timing.enable(recorder.clone());
             let started = Instant::now();
@@ -231,8 +231,8 @@ fn first_sync_waits_for_a_scheduled_disk_effect_retry() {
         .unwrap()
         .transaction(|tx| tx.set_link(&site_b.link))
         .unwrap();
-    Timing::initialize(&site_b.db, site_b.link.linked_at_ms);
     let recorder = Recorder::on();
+    Timing::initialize(&site_b.db, site_b.link.linked_at_ms, &recorder);
     let mut b = site_b.start();
     b.folder.timing.enable(recorder.clone());
     b.connect(&remote);
