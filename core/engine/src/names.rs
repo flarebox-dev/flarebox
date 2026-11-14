@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Name rules of spec v0 section 6.1: NFC names, `name_key` by Unicode case folding, and conflict names.
-
 use unicode_normalization::UnicodeNormalization;
 
 use crate::casefold_data::CASE_FOLDING;
@@ -10,7 +8,6 @@ pub const MAX_NAME_BYTES: usize = 255;
 const MAX_DEVICE_NAME_CHARS: usize = 32;
 const MAX_DEVICE_NAME_BYTES: usize = 128;
 
-/// Unicode default full case folding (CaseFolding.txt statuses C and F).
 pub fn casefold(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -22,7 +19,6 @@ pub fn casefold(text: &str) -> String {
     out
 }
 
-/// The NFC form of a name, as the server stores it.
 pub fn nfc(name: &str) -> String {
     name.nfc().collect()
 }
@@ -101,7 +97,6 @@ pub fn conflict_name(name: &str, device_name: &str, at_ms: i64, attempt: u32) ->
     nfc(&chars.into_iter().collect::<String>())
 }
 
-/// `YYYY-MM-DD` of a Unix time in milliseconds, in UTC.
 fn utc_date(at_ms: i64) -> String {
     let days = at_ms.div_euclid(86_400_000);
     let z = days + 719_468;

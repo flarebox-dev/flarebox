@@ -52,9 +52,6 @@ fn a_late_create_acknowledgement_renamed_by_the_server_keeps_the_position_s_took
     );
 }
 
-/// GUN-450. n's create at b is in flight when a log replay brings the commit at seq 2 and the
-/// other device's move to c at seq 3. L never took c, so S takes the b that was sent. The other
-/// device's move then reaches the disk, and nothing is sent.
 #[test]
 fn a_late_create_acknowledgement_takes_the_sent_position_when_only_r_moved_after_the_commit() {
     let mut trees = trees(&[("n", Some(file(ROOT, "b", 1)), None, None)]);
@@ -77,12 +74,6 @@ fn a_late_create_acknowledgement_takes_the_sent_position_when_only_r_moved_after
     assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
 }
 
-/// GUN-450. n is synced at b with content 2 when the user edits it to content 3 and the server
-/// purges it, so the next commit creates n again at b with content 3 while S still holds content 2.
-/// The user reverts n to content 2 while the create is in flight, and a log replay brings the
-/// create at seq 8 and the other device's moves to c and back to b. S keeps b, the position L and
-/// R came back to, and takes the content that was sent, so the user's revert is sent and nothing
-/// is downloaded.
 #[test]
 fn a_late_create_acknowledgement_that_keeps_a_position_takes_the_sent_content() {
     let mut trees = trees(&[(
@@ -126,10 +117,6 @@ fn a_late_create_acknowledgement_that_keeps_a_position_takes_the_sent_content() 
     );
 }
 
-/// GUN-450. n is created at b with content 1, and before the acknowledgement the user and the
-/// other device both move n to c and edit it to content 2 at seq 9, so S takes c with content 2.
-/// The user moves n back to b and reverts it to content 1. S keeps the position and the content it
-/// took after the create was sent, so the next commit sends both the move back and the revert.
 #[test]
 fn a_late_create_acknowledgement_keeps_the_content_s_took_after_the_commit() {
     let mut trees = trees(&[("n", Some(file(ROOT, "b", 1)), None, None)]);
@@ -188,10 +175,6 @@ fn a_late_move_acknowledgement_keeps_a_later_remote_move_after_a_remote_edit() {
     a_late_acknowledgement_converges_on_a_remote_edit_made_at_the_position_l_took(false, true);
 }
 
-/// GUN-453. n's move to b is in flight when the other device moves n to c and edits it at seq 3,
-/// and the user then moves n to c too, before the other device moves n on to x at seq 4. L took
-/// the position R already held, so that is where they agreed. After the acknowledgement the disk
-/// follows n to x with R's content, and the user's move to c is never sent again.
 #[test]
 fn a_late_move_acknowledgement_keeps_a_later_remote_move_after_l_took_the_position_r_held() {
     let mut trees = trees(&[(
@@ -226,10 +209,6 @@ fn a_late_move_acknowledgement_keeps_a_later_remote_move_after_l_took_the_positi
     assert_eq!(trees.local().live("n"), Some(&file(ROOT, "x", 2)));
 }
 
-/// GUN-453. n's move to b is in flight when the user and the other device both move n to c, and
-/// the other device then moves n on to x and m to c, which the user does too. The user moves n back
-/// to a. S cannot take c for n, since m holds it, so S takes the b that was sent, and the user's
-/// move back to a is sent rather than the disk following n to x.
 #[test]
 fn a_late_move_acknowledgement_takes_the_sent_position_when_another_node_took_the_agreed_one() {
     let mut trees = trees(&[
@@ -270,10 +249,6 @@ fn a_late_move_acknowledgement_takes_the_sent_position_when_another_node_took_th
     assert_eq!(ops(&commit), [mv("n", ROOT, "a")]);
 }
 
-/// GUN-453. One commit moves n to b and m to c. Before the acknowledgement, the user and the other
-/// device both move n to c, which the commit gives to m, and the other device moves n on to x. The
-/// user moves n back to a. S cannot hold both n and m at c, so n takes the b that was sent, and the
-/// user's move back to a is sent rather than the disk following n to x.
 #[test]
 fn a_late_move_acknowledgement_takes_the_sent_position_when_the_commit_gives_the_agreed_one_away() {
     let mut trees = trees(&[
@@ -321,9 +296,6 @@ fn a_late_move_acknowledgement_takes_the_sent_position_when_the_commit_gives_the
     assert!(sent.contains(&mv("n", ROOT, "a")), "{sent:?}");
 }
 
-/// GUN-453. As above, with the user moving n back to b, the position the commit sent, and the
-/// server creating it as "b 2". S cannot hold c for n, so n takes the server's name and is
-/// reverted, so the disk takes that name too.
 #[test]
 fn a_late_move_acknowledgement_renamed_by_the_server_is_reverted_when_another_node_took_the_agreed_position()
  {
@@ -363,10 +335,6 @@ fn a_late_move_acknowledgement_renamed_by_the_server_is_reverted_when_another_no
     assert!(trees.reverted().contains("n"));
 }
 
-/// GUN-453. n's create at b is in flight when L and R agree on c with different contents, so S
-/// never takes n. The other device then deletes n and the server purges it, all before the result
-/// arrives. S takes c, the position L and R agreed on, so the disk follows the purge and the create
-/// is not sent again.
 #[test]
 fn a_late_create_acknowledgement_follows_a_purge_after_l_and_r_agreed_on_a_position() {
     let mut trees = trees(&[("n", Some(file(ROOT, "b", 1)), None, None)]);
@@ -407,13 +375,6 @@ fn a_late_create_acknowledgement_follows_a_purge_after_l_and_r_agreed_on_a_posit
     assert!(trees.local().get("n").is_none());
 }
 
-/// GUN-453. The ack of a create or move of n whose agreed position c may collide with other nodes:
-/// none, a sibling S already holds at c, or another node the same commit moves to c, with its op
-/// before or after n's. With `edited`, the commit also updates n's content. With `purged`, R
-/// deletes and purges n before the result arrives. The
-/// user moves n to y and the other node back to z after the agreement. Every applied node ends
-/// with what it sent or with its agreed position, never with S from before the commit, n takes c
-/// whenever no other node of S holds it, and n keeps the content the commit sent either way.
 #[test]
 fn a_late_acknowledgement_takes_an_agreed_position_only_where_s_can_hold_it() {
     #[derive(Clone, Copy, Debug)]
@@ -550,10 +511,6 @@ fn a_late_acknowledgement_takes_an_agreed_position_only_where_s_can_hold_it() {
     }
 }
 
-/// GUN-453. One commit moves n to b and updates its content to 2. Before the acknowledgement, the
-/// user and the other device both move n to c, which another node m then takes, and the user moves
-/// n back to b and reverts its content to 1. S cannot hold c for n, so n keeps the b that was sent
-/// with the content 2 that was sent, and the user's content 1 is uploaded rather than overwritten.
 #[test]
 fn a_late_acknowledgement_keeps_the_sent_content_when_s_cannot_hold_the_agreed_position() {
     let mut trees = trees(&[

@@ -1,10 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The mass-delete guard (docs/design/sync-engine.md section 6.1). It counts the local deletions
-//! of the last ten minutes and holds every pending one under a question when together they would
-//! remove too much of the space. It counts the removals that apply other devices' deletions the
-//! same way and opens a notice when they cross a limit.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::classify::Trees;
@@ -14,13 +9,11 @@ use crate::state::GuardChanges;
 use crate::tracked::{Marked, TrackedMap, TrackedSet};
 use crate::tree::{Kind, NodeId};
 
-/// How long a deletion counts.
 pub const WINDOW_MS: u64 = 10 * 60 * 1000;
 
 /// The most deletions the window takes without asking.
 pub const MAX_DELETIONS: u64 = 1000;
 
-/// The smallest space whose deletions are held for removing more than half of its files.
 pub const MIN_SPACE_FILES: u64 = 20;
 
 /// What the window counted.
@@ -56,14 +49,9 @@ pub struct Counted {
     pub files: u64,
 }
 
-/// What [`GuardState::check`] decided for the deletions pending now.
 #[derive(Debug, Default)]
 pub(crate) struct Checked {
-    /// The nodes the planner must leave alone.
     pub held: BTreeSet<NodeId>,
-    /// The deletions the person answered with [`Answer::Restore`], by topmost node, with the nodes
-    /// of the question that are still deleted. S is cleared for them, so the effects download them
-    /// again.
     pub restored: BTreeMap<NodeId, Held>,
 }
 
@@ -110,9 +98,6 @@ pub enum Trash {
 }
 
 impl RemoteDeletion {
-    /// The deletion a removal applies: by the record R holds of the removed node, the first of
-    /// `within`, with `last_seq` the seq up to which R holds every change. Its topmost node is
-    /// the outermost of `within` that R holds in the same trash group, or with no record either.
     fn of(trees: &Trees, within: &[NodeId], last_seq: u64) -> Self {
         let trash = |id: &NodeId| {
             (trees.remote().get(id).filter(|node| node.trashed)).map(|node| Trash::Group {
@@ -130,10 +115,6 @@ impl RemoteDeletion {
         }
     }
 
-    /// Whether `removal`, a removal of the deletion `removed` under the folders `within`, is a
-    /// removal of this deletion. Two trash groups must be the same. A deletion whose group R did
-    /// not tell takes a removal under its topmost node, when that group is the same, or one this
-    /// device could not tell apart: trashed at the seq R held then or before.
     fn takes(&self, removed: &RemoteDeletion, within: &[NodeId]) -> bool {
         match (&self.trash, &removed.trash) {
             (Trash::Group { group: a, .. }, Trash::Group { group: b, .. }) => a == b,
@@ -144,10 +125,6 @@ impl RemoteDeletion {
         }
     }
 
-    /// Whether the server no longer holds this deletion: R holds its topmost node, and no node
-    /// trashed in its group, because the server restored them or lost the commit that deleted
-    /// them. Restoring some of its nodes does not end it. Without a group, R holds the topmost
-    /// node live or trashed by a later deletion.
     fn undone(&self, trees: &Trees) -> bool {
         let Some(node) = trees.remote().get(&self.top) else {
             return false;
@@ -158,13 +135,6 @@ impl RemoteDeletion {
         }
     }
 
-    /// Whether this device removed all of this deletion: L holds no node R holds in its trash
-    /// group, and no longer holds its topmost node while that node is still this deletion's. The
-    /// node is no longer this deletion's when R holds it live again, as when the server restored it
-    /// on its own for a node below it, or trashed in another group, as when that restore was
-    /// followed by a later delete. A delete the server applied in part, keeping a folder for a
-    /// change the deleting device had not seen, trashes nodes under no common folder (spec R7),
-    /// and a purge leaves R no record of the nodes L still holds under the topmost node.
     fn removed(&self, trees: &Trees) -> bool {
         let top = trees.remote().get(&self.top);
         let (group, ours) = match &self.trash {
@@ -178,15 +148,12 @@ impl RemoteDeletion {
     }
 }
 
-/// A removal that applied another device's deletion: the node it removed and each folder above it
-/// in L that R no longer holds, innermost first, and the files it removed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteRemoval {
     pub within: Vec<NodeId>,
     pub files: u64,
 }
 
-/// The guard as the commit side keeps it, which records what changed for the store.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Guard {
     ledger: TrackedMap<NodeId, Counted>,
@@ -243,21 +210,6 @@ impl Guard {
         }
     }
 
-    /// Counts `pending`, every deletion planning would make now, and returns the nodes the
-    /// planner must leave alone. `asked` is the guard's open question. A pending deletion that is
-    /// not confirmed is counted, and when the window's deletions cross a limit all of them are held
-    /// under a new question. An open question holds its deletions until it is answered. When they
-    /// change, because the person put a node back, a node changed remotely, or more were deleted,
-    /// the ones left are held under a new question, also when they no longer cross a limit. The
-    /// question ends when none is left. The person's answer waits on the question until this
-    /// check: [`Answer::Delete`] confirms the deletions only when they are still exactly the ones
-    /// the question listed, and is dropped otherwise. [`Answer::Restore`] restores every node of
-    /// the question that is still deleted, under whichever topmost node it is now, and every
-    /// other pending node stays held under a new question. A confirmed deletion stays confirmed
-    /// while each of its nodes that is still pending keeps its revisions. When one changes, the
-    /// deletion is held under a new question, also below the limits, rather than counted as new.
-    /// It also forgets the remote deletions the server no longer holds, and the dismissed ones this
-    /// device removed.
     pub(crate) fn check(
         &mut self,
         asked: &mut Option<Question>,
@@ -366,8 +318,6 @@ impl Guard {
         }
     }
 
-    /// The counts of the deletions in the window. The space is its live files in S and the files
-    /// of the window's deletions S no longer holds, the space before the window's deletions.
     fn window(&self, trees: &Trees) -> Window {
         let gone: u64 = (self.ledger.iter())
             .filter(|(id, _)| trees.synced().live(id).is_none())
@@ -380,11 +330,6 @@ impl Guard {
         }
     }
 
-    /// Counts `removal` and returns the counts of the removals that applied other devices'
-    /// deletions in the window, or `None` for a removal of a deletion a dismissed notice counted.
-    /// `last_seq` is the seq up to which R holds every change. `noticed` says a notice about them
-    /// is open, so none leaves the window by age. S no longer holds the files of the removals, so
-    /// the space is its live files and those.
     pub(crate) fn count_remote(
         &mut self,
         removal: RemoteRemoval,
@@ -425,7 +370,6 @@ impl Guard {
         })
     }
 
-    /// The person dismissed the notice: the deletions it counted are not counted again.
     pub(crate) fn dismiss_remote(&mut self) {
         self.dismissed.extend(self.remote.take_all().into_keys());
     }
@@ -443,8 +387,6 @@ fn not_after<K: Ord + Clone>(counts: &mut TrackedMap<K, Counted>, now_ms: u64) {
     }
 }
 
-/// Every deletion planning would make, by topmost node, from `deleted`, the nodes it would
-/// delete, with the revisions R holds for each.
 pub(crate) fn deletions(trees: &Trees, deleted: &BTreeSet<NodeId>) -> BTreeMap<NodeId, Held> {
     let mut children: BTreeMap<&str, Vec<&NodeId>> = BTreeMap::new();
     let mut tops = Vec::new();
