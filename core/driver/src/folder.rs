@@ -692,6 +692,7 @@ impl Folder {
                         | Unresolved::NotAFolder(folder)
                         | Unresolved::Replaced { path: folder, .. },
                     ) => vec![folder.clone()],
+                    _ if paths.is_empty() => vec![PathBuf::new()],
                     _ => paths,
                 };
                 self.step(|engine, _| Ok(engine.commits.abandon()))?;
