@@ -221,16 +221,16 @@ else
 kickstart -k gui/$(id -u)/dev.koidrive.koi.1a2b3c4d"
 fi
 mkdir "$tmp/daemons"
-mkfifo "$tmp/daemons/_daemon"
+printf 'sleep 300;\n' > "$tmp/daemons/_daemon"
 start_daemon() {
-    program='cat'
+    program=$(command -v perl)
     if [ "$(uname -s)" = Linux ]; then
-        program=$1
         if [ ! -h "$1" ]; then
-            { cat "$(command -v cat)"; printf '\nKoidrive sync client\n'; } > "$1.new"
+            { cat "$program"; printf '\nKoidrive sync client\n'; } > "$1.new"
             chmod 755 "$1.new"
             mv -f "$1.new" "$1"
         fi
+        program=$1
     fi
     (cd "$tmp/daemons" && exec perl -e 'my $program = shift; exec { $program } @ARGV' "$program" "$1" _daemon) &
     printf '%s\n' "$!" >> "$tmp/daemon.pids"
