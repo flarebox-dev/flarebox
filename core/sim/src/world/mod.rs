@@ -1589,7 +1589,10 @@ impl World {
                             }
                         }
                         commit::Failure::Abandoned => {
-                            note(&mut self.seen, "commit refused, planned again")
+                            note(&mut self.seen, "commit refused, planned again");
+                            if device.engine.behind {
+                                device.engine.trees.keep_unsent_edits(in_flight);
+                            }
                         }
                         commit::Failure::Split => note(
                             &mut self.seen,

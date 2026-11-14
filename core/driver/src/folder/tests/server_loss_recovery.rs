@@ -880,122 +880,32 @@ fn a_listing_out_when_the_server_lost_this_devices_commits_is_read_again() {
     assert_eq!(a.state(), FolderState::UpToDate);
 }
 
-/// A reconnect's `Welcome` counts one commit of `a`, and the commit in flight is accepted after it. When the send
-/// finishes while the `Connected` event is still queued, the folder takes the event first, so the count is not older
-/// than what it acknowledged, and the healthy server is not taken for one that lost a commit.
 #[test]
-fn a_welcome_queued_before_a_finished_send_is_taken_first() {
-    let mut remote = Remote::new();
-    let (site, mut a) = linked(&mut remote, "a");
-    a.create(&mut remote, &site.root.join("one.txt"), b"one");
-    fs::write(site.root.join("two.txt"), b"two").unwrap();
-    a.scan_until(|a| !a.work.is_empty());
-    let upload = a.work.pop_front().unwrap();
-    a.perform(upload, &mut remote).unwrap();
-    let Some(Work::Send(commit)) = a.work.pop_front() else {
-        panic!("the commit is sent after its upload");
-    };
-    let queued = remote.space.welcome(&a.caller);
-    assert_eq!(queued.device_seq, 1);
-    let result = remote.commit(&a.caller, &commit).unwrap();
-    let step = sent_in_order(&mut a.folder, [Event::Connected(queued)], Ok(result));
-    a.take(step).unwrap();
-    assert_eq!(a.folder.engine.commits.accepted(), 2);
-    assert!(!a.work.iter().any(|work| matches!(work, Work::List { .. })));
-    a.pull(&remote);
-    a.run(&mut remote);
-    a.settle();
-    fs::write(site.root.join("three.txt"), b"three").unwrap();
-    a.scan_until(|a| !a.work.is_empty());
-    a.try_run(&mut remote).unwrap();
-    assert_eq!(remote.names(), ["one.txt", "three.txt", "two.txt"]);
-    assert_eq!(a.folder.engine.commits.accepted(), 3);
-}
-
-/// A commit in flight when the task stopped has a slot the restored server cannot account for. It is dropped
-/// rather than sent, and what it held is planned again once the tree is listed.
-#[test]
-fn a_commit_in_flight_when_the_server_lost_this_devices_commits_is_planned_again() {
-    let mut remote = Remote::new();
-    let (site, commit) = stopped_with_a_commit_in_flight(&mut remote);
-    let mut restored = Remote::new();
-    let mut a = site.start();
-    let welcome = restored.space.welcome(&a.caller);
-    assert_eq!((welcome.device_seq, commit.device_seq), (0, 2));
-    a.event(Event::Connected(welcome)).unwrap();
-    assert!(a.folder.engine.commits.in_flight().is_none());
-    assert_eq!(a.folder.engine.commits.accepted(), 0);
-    let ran = a.run(&mut restored);
-    assert!(!ran.is_empty() && ran[0] == "list", "{ran:?}");
-    a.settle();
-    a.run(&mut restored);
-    assert_eq!(restored.names(), ["draft.txt", "notes.txt"]);
-    assert!(a.sent.iter().all(|sent| sent.commit_id != commit.commit_id));
-    assert_eq!(a.state(), FolderState::UpToDate);
-}
-
-/// The session reports that it did not send the commit in flight again before the folder has taken the \`Welcome\`
-/// with the server's lower count. The folder waits for that \`Welcome\` instead of stopping, and then goes on as
-/// above.
-#[test]
-fn a_commit_the_session_did_not_send_again_to_a_server_that_lost_commits_waits_for_the_welcome() {
+fn an_edit_whose_commit_is_abandoned_after_the_server_reported_a_loss_is_kept_as_an_unsent_edit() {
     let mut remote = Remote::new();
     let (site, mut a) = linked(&mut remote, "a");
     a.create(&mut remote, &site.root.join("notes.txt"), b"written on a");
-    let mut restored = Remote::new();
-    fs::write(site.root.join("draft.txt"), b"in flight").unwrap();
+    fs::write(site.root.join("notes.txt"), b"edited on a").unwrap();
     a.scan_until(|a| !a.work.is_empty());
     let upload = a.work.pop_front().unwrap();
     a.perform(upload, &mut remote).unwrap();
     let Some(Work::Send(commit)) = a.work.pop_front() else {
-        panic!("the commit is sent after its upload");
+        panic!("the edit is sent after its upload");
     };
-    let not_resent = NotResent::DeviceSeqMismatch {
-        slot: commit.device_seq,
-        welcome: 0,
+    let Some(op::Op::UpdateContent(update)) = &commit.ops[0].op else {
+        panic!("the commit edits notes.txt: {:?}", kinds(&commit));
     };
-    let step = a.folder.sent(Err(CallError::NotResent(not_resent)));
+    a.event(Event::ResyncRequired(ResyncRequired {
+        reason: Reason::AheadOfServer as i32,
+        restore_seq: 0,
+        restore_point_ms: 0,
+    }))
+    .unwrap();
+    assert!(a.folder.engine.commits.in_flight().is_some());
+    let step = a
+        .folder
+        .sent(Err(CallError::Server(put_off(Code::HeadMoved))));
     a.take(step).unwrap();
-    a.connect(&restored);
-    a.run(&mut restored);
-    a.settle();
-    a.run(&mut restored);
-    assert_eq!(restored.names(), ["draft.txt", "notes.txt"]);
-    assert_eq!(a.state(), FolderState::UpToDate);
-}
-
-/// The store is put back to a copy taken before the folder downloaded a file, and the server's storage is restored
-/// from before this device's commit, so the server counts fewer commits than the store and the store is older than
-/// the disk. The root marker shows the latter when the folder opens, before any \`Welcome\`, and the task stops for
-/// recovery instead of sending what the store holds.
-#[test]
-fn a_store_older_than_the_disk_stops_for_recovery_even_when_the_server_lost_its_commits() {
-    let mut remote = Remote::new();
-    let (site, mut a) = linked(&mut remote, "a");
-    a.create(&mut remote, &site.root.join("one.txt"), b"one");
-    drop(a);
-    let copy = site.db.with_extension("copy");
-    fs::copy(&site.db, &copy).unwrap();
-    let (other, mut b) = linked(&mut remote, "b");
-    b.create(&mut remote, &other.root.join("two.txt"), b"two");
-    let mut a = site.start();
-    a.connect(&remote);
-    a.run(&mut remote);
-    a.settle();
-    a.run(&mut remote);
-    assert_eq!(names(&site.root), ["one.txt", "two.txt"]);
-    drop(a);
-    fs::copy(&copy, &site.db).unwrap();
-    let restored = Remote::new();
-    assert_eq!(restored.space.welcome(&site.caller).device_seq, 0);
-
-    let lock = claim::lock(&site.root)
-        .unwrap()
-        .expect("the folder is not locked");
-    let local = local_rules(&SyncRules::default()).unwrap();
-    match Folder::open(site.link.clone(), &lock, &site.db, local) {
-        Err(Stop::StoreBehind { .. }) => {}
-        Err(stop) => panic!("{stop}"),
-        Ok(_) => panic!("the folder opened with a store older than the disk"),
-    }
+    assert!(a.folder.engine.commits.in_flight().is_none());
+    assert!(a.folder.engine.trees.unsent_edits().contains(&update.node_id));
 }

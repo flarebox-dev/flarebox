@@ -1312,8 +1312,11 @@ impl Folder {
             let failure = (engine.commits.failed(&refusal.0))
                 .map_err(|error| Stop::Protocol(format!("a refused commit: {error:?}")))?;
             if matches!(failure, Failure::Resync) {
-                engine.trees.keep_unsent_edits(in_flight);
                 engine.server_behind(tx)?;
+            }
+            let behind = (engine.cursor.as_ref()).is_some_and(|cursor| cursor.ahead_of_server);
+            if behind && matches!(failure, Failure::Resync | Failure::Abandoned) {
+                engine.trees.keep_unsent_edits(in_flight);
             }
             Ok(failure)
         })?;
