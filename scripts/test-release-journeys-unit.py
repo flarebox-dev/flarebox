@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import shlex
 import sys
 import tempfile
@@ -33,6 +34,21 @@ class ReleaseJourneys(unittest.TestCase):
     def passing_report(self, scenario):
         return {"scenario": scenario, "assertions": [{"name": name, "passed": True}
                 for name in DRIVER.REQUIRED[scenario]], "cleanup": [{"name": "owned state", "passed": True}], "errors": []}
+
+    def zap_spec(self):
+        return {"artifacts": [{"zap": [{"script": {
+            "executable": str(DRIVER.APP / "Contents/MacOS/Koidrive"),
+            "args": ["--unregister-login-item"], "sudo": False},
+            "trash": ["~/Library/Application Support/Koidrive", "~/Library/Preferences/dev.koidrive.Koidrive.plist"]}]}]}
+
+    def service_plist(self, label, state=None, binary=None):
+        path = self.root / "Library/LaunchAgents" / (label + ".plist")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        binary = self.root / ".local/bin/koi" if binary is None else binary
+        state = str(self.root / ".local/state") if state is None else state
+        path.write_bytes(plistlib.dumps({"Label": label, "ProgramArguments": [str(binary), "_daemon"],
+                                         "EnvironmentVariables": {"XDG_STATE_HOME": state}}))
+        return path
 
     def test_strict_tags(self):
         for tag in ("v0.1.0-alpha.3", "v1.2.3", "v10.20.30-rc.0"):
@@ -195,7 +211,7 @@ class ReleaseJourneys(unittest.TestCase):
                 return 0, "koidrive/tap\n", ""
             if argv[:2] == ["brew", "info"]:
                 data = {"casks": [{"version": next(versions), "sha256": digest,
-                        "url": DRIVER.RELEASE + "/v0.1.0-alpha.3/" + name, "depends_on": {}}]}
+                        "url": DRIVER.RELEASE + "/v0.1.0-alpha.3/" + name, "depends_on": {}, **self.zap_spec()}]}
                 return 0, json.dumps(data), ""
             return 0, "real tap source", ""
 
@@ -276,6 +292,141 @@ class ReleaseJourneys(unittest.TestCase):
                                (1, f"Already installed formula {binary}; network error")):
             with self.subTest(status=status, output=output):
                 self.assertFalse(DRIVER.binary_conflict(status, output, binary))
+
+    def test_formula_conflict_distinguishes_skipped_link_from_failed_rollback(self):
+        binary = self.root / "bin/koi"
+        warning = f"::warning::It seems there is already a Binary at '{binary}' from formula koidrive; skipping link."
+        error = f"Error: It seems there is already a Binary at '{binary}'."
+        self.assertEqual(DRIVER.conflict_state(0, warning, binary), "installed-with-skipped-link")
+        self.assertEqual(DRIVER.conflict_state(1, error, binary), "failed-with-rollback")
+        self.assertEqual(DRIVER.skipped_link_text("downloaded\n" + warning + "\n", binary), warning)
+        for status, output in ((1, warning), (124, warning), (-9, warning), (0, error),
+                               (0, warning.replace(str(binary), "/foreign/koi")),
+                               (0, warning.replace("formula koidrive", "formula other")),
+                               (0, warning.replace("::warning::", "Warning: ")),
+                               (0, warning.replace("; skipping link.", ".")),
+                               (0, warning + "\n" + error), (1, "network failure"),
+                               (0, "skipping link"), (1, "tap is not trusted")):
+            with self.subTest(status=status, output=output):
+                self.assertIsNone(DRIVER.conflict_state(status, output, binary))
+
+    def test_native_zap_hook_rejects_missing_changed_or_duplicate_metadata(self):
+        valid = self.zap_spec()
+        self.assertEqual(DRIVER.native_zap_hook(valid), valid["artifacts"][0]["zap"][0]["script"])
+        self.assertIsNone(DRIVER.native_zap_hook({}))
+        for change in ({"executable": "/foreign/Koidrive"}, {"args": []},
+                       {"args": ["--unregister-login-item", "--other"]}, {"sudo": True}, {"sudo": 0}):
+            altered = copy.deepcopy(valid)
+            altered["artifacts"][0]["zap"][0]["script"].update(change)
+            with self.subTest(change=change):
+                self.assertIsNone(DRIVER.native_zap_hook(altered))
+        missing = copy.deepcopy(valid)
+        del missing["artifacts"][0]["zap"][0]["script"]["sudo"]
+        self.assertIsNone(DRIVER.native_zap_hook(missing))
+        duplicate = copy.deepcopy(valid)
+        duplicate["artifacts"] *= 2
+        self.assertIsNone(DRIVER.native_zap_hook(duplicate))
+
+    def test_tap_preflight_refuses_missing_or_changed_native_hook(self):
+        evidence = self.evidence("cask")
+        digest = "a" * 64
+        name = "Koidrive-0.1.0-alpha.3-arm64.dmg"
+        changed = self.zap_spec()
+        changed["artifacts"][0]["zap"][0]["script"]["args"] = []
+        for metadata in ({}, changed):
+            spec = {"version": "0.1.0-alpha.3", "sha256": digest,
+                    "url": DRIVER.RELEASE + "/v0.1.0-alpha.3/" + name, **metadata}
+
+            def brew(argv, **_):
+                if argv[:2] == ["brew", "info"]:
+                    return 0, json.dumps({"casks": [spec]}), ""
+                return 0, "Homebrew 6.0.0\n" if argv[1] == "--version" else "koidrive/tap\n", ""
+
+            with self.subTest(metadata=metadata), patch.object(evidence, "run", side_effect=brew):
+                with self.assertRaisesRegex(RuntimeError, "native zap hook metadata"):
+                    DRIVER.brew_prepare(evidence, {name: digest}, "cask")
+
+    def test_zap_evidence_requires_exact_validated_executable_and_success(self):
+        executable = str(DRIVER.APP / "Contents/MacOS/Koidrive")
+        line = "==> Running uninstall script " + executable
+        self.assertTrue(DRIVER.zap_invoked(0, "==> Zapping Cask koidrive\n" + line + "\n", executable))
+        for status, output in ((1, line), (124, line), (0, line + "-other"),
+                               (0, line.replace(executable, "/foreign/Koidrive")),
+                               (0, "--unregister-login-item"), (0, "Mentioned " + line)):
+            self.assertFalse(DRIVER.zap_invoked(status, output, executable))
+
+    def formula_collision(self, unlink_on_zap=False, rollback=False):
+        evidence = DRIVER.Evidence(self.root / ("evidence-" + str(unlink_on_zap)), "v0.1.0-alpha.3", "formula-conflict")
+        home = self.root / "home"
+        home.mkdir()
+        app = home / "Applications/Koidrive.app"
+        prefix = self.root / "brew"
+        link = prefix / "bin/koi"
+        link.parent.mkdir(parents=True)
+        formula = prefix / "Cellar/koidrive/koi"
+        formula.parent.mkdir(parents=True)
+        formula.write_bytes(b"unit-only formula bytes")
+        warning = f"::warning::It seems there is already a Binary at '{link}' from formula koidrive; skipping link."
+        collision = f"Error: It seems there is already a Binary at '{link}'." if rollback else warning
+
+        def command(argv, **_):
+            if argv == ["brew", "--prefix"]:
+                return 0, str(prefix) + "\n", ""
+            if argv == ["brew", "install", "--formula", DRIVER.TAP]:
+                link.symlink_to(formula)
+            elif argv == ["koi", "--version"]:
+                return (0, "koi 0.1.0-alpha.3\n", "") if link.exists() else (127, "", "not found")
+            elif argv == ["brew", "install", "--cask", DRIVER.TAP]:
+                if rollback:
+                    return 1, "", collision + "\n"
+                app.mkdir(parents=True)
+                return 0, "Cask installed\n", warning + "\n"
+            elif argv == ["brew", "list", "--cask", "--versions"]:
+                return 0, "" if rollback else "koidrive 0.1.0-alpha.3\n", ""
+            elif argv == ["brew", "--caskroom"]:
+                return 0, str(prefix / "Caskroom") + "\n", ""
+            elif argv == ["brew", "uninstall", "--zap", "--cask", DRIVER.TAP]:
+                app.rmdir()
+                if unlink_on_zap:
+                    link.unlink()
+            elif argv == ["brew", "uninstall", "--formula", DRIVER.TAP]:
+                link.unlink(missing_ok=True)
+            else:
+                raise AssertionError(argv)
+            return 0, "", ""
+
+        with patch.object(DRIVER.Path, "home", return_value=home), patch.object(DRIVER, "APP", app), \
+                patch.object(DRIVER, "brew_prepare"), patch.object(DRIVER, "state_paths", return_value=[app, home / "user-app", home / "koi"]), \
+                patch.object(evidence, "run", side_effect=command) as run:
+            DRIVER.brew_scenario(evidence, self.root, DRIVER.Ownership(), {}, True)
+        return evidence, run, collision
+
+    def test_warning_install_proves_registered_app_and_cleans_it_with_zap(self):
+        evidence, run, warning = self.formula_collision()
+        self.assertEqual(evidence.report["conflict_state"], "installed-with-skipped-link")
+        self.assertEqual(evidence.report["conflict_status"], 0)
+        self.assertEqual(evidence.report["conflict"], warning)
+        self.assertEqual(evidence.report["formula_before"], evidence.report["formula_after"])
+        self.assertEqual(evidence.report["formula_before"], evidence.report["formula_after_cask_uninstall"])
+        self.assertTrue(evidence.report["conflict_installation"]["app_exists"])
+        self.assertIn(unittest.mock.call(["brew", "uninstall", "--zap", "--cask", DRIVER.TAP]), run.call_args_list)
+        self.assertTrue(all(item["passed"] for item in evidence.report["cleanup"]))
+
+    def test_cask_cleanup_cannot_hide_deleting_a_skipped_formula_link(self):
+        evidence, run, _ = self.formula_collision(unlink_on_zap=True)
+        checks = {item["name"]: item["passed"] for item in evidence.report["cleanup"]}
+        self.assertFalse(checks["formula survives cask uninstall"])
+        self.assertTrue(checks["formula uninstall"])
+        self.assertIn(unittest.mock.call(["brew", "uninstall", "--formula", DRIVER.TAP]), run.call_args_list)
+
+    def test_nonzero_binary_collision_still_requires_rollback(self):
+        evidence, run, error = self.formula_collision(rollback=True)
+        self.assertEqual(evidence.report["conflict_state"], "failed-with-rollback")
+        self.assertEqual(evidence.report["conflict_status"], 1)
+        self.assertEqual(evidence.report["conflict"], error)
+        self.assertFalse(evidence.report["conflict_installation"]["app_exists"])
+        self.assertNotIn(unittest.mock.call(["brew", "uninstall", "--zap", "--cask", DRIVER.TAP]), run.call_args_list)
+        self.assertTrue(all(item["passed"] for item in evidence.report["cleanup"]))
 
     def test_capture_redacts_before_persisting_claim_stream(self):
         evidence = self.evidence()
@@ -395,7 +546,7 @@ class ReleaseJourneys(unittest.TestCase):
             path.write_bytes(plistlib.dumps({**spec, **change}))
             with patch.object(DRIVER.Path, "home", return_value=self.root), patch.object(evidence, "run") as run:
                 with self.assertRaisesRegex(RuntimeError, "foreign launch agent"):
-                    DRIVER.service_cleanup(evidence, {own_state}, [binary])
+                    DRIVER.service_cleanup(evidence, {own_state}, [binary], timeout=0)
             run.assert_not_called()
             self.assertTrue(path.exists())
 
@@ -412,7 +563,7 @@ class ReleaseJourneys(unittest.TestCase):
         path.write_bytes(plistlib.dumps(spec))
         with patch.object(DRIVER.Path, "home", return_value=self.root), patch.object(evidence, "run", return_value=(0, "", "")):
             with self.assertRaisesRegex(RuntimeError, "prove owned service unloaded"):
-                DRIVER.service_cleanup(evidence, {own_state}, [binary])
+                DRIVER.service_cleanup(evidence, {own_state}, [binary], timeout=0)
         self.assertTrue(path.exists())
         with patch.object(DRIVER.Path, "home", return_value=self.root), patch.object(evidence, "run", side_effect=[(0, "", ""), (1, "", "Could not find service")]):
             labels = DRIVER.service_cleanup(evidence, {own_state}, [binary])
@@ -442,6 +593,74 @@ class ReleaseJourneys(unittest.TestCase):
         for status, error in ((0, "Could not find service"), (124, "Could not find service"),
                               (-9, "Could not find service"), (1, "Operation not permitted"), (1, "")):
             self.assertFalse(DRIVER.unloaded(status, error))
+
+    @patch.object(DRIVER.os, "getuid", return_value=501, create=True)
+    def test_service_cleanup_waits_for_sigtermed_job_to_become_absent(self, _uid):
+        evidence = self.evidence("installer")
+        label = "dev.koidrive.koi"
+        path = self.service_plist(label)
+        responses = [(0, "", ""), (0, "state = SIGTERMed\nexit timeout = 5", ""),
+                     (113, "", "Could not find service")]
+        with patch.object(DRIVER.Path, "home", return_value=self.root), patch.object(evidence, "run", side_effect=responses) as run, \
+                patch.object(DRIVER.time, "monotonic", side_effect=[0, 0, 0.1, 0.1]), patch.object(DRIVER.time, "sleep") as sleep:
+            labels = DRIVER.service_cleanup(evidence, {str(self.root / ".local/state")}, [self.root / ".local/bin/koi"])
+        self.assertEqual(labels, [label])
+        self.assertFalse(path.exists())
+        self.assertEqual(run.call_count, 3)
+        sleep.assert_called_once_with(0.25)
+
+    @patch.object(DRIVER.os, "getuid", return_value=501, create=True)
+    def test_service_cleanup_rejects_persistent_loaded_and_unknown_probe_failure(self, _uid):
+        evidence = self.evidence("installer")
+        for probe in ((0, "state = SIGTERMed", ""), (1, "", "Operation not permitted"), (124, "", "")):
+            path = self.service_plist("dev.koidrive.koi")
+            with self.subTest(probe=probe), patch.object(DRIVER.Path, "home", return_value=self.root), \
+                    patch.object(evidence, "run", side_effect=[(0, "", ""), probe]), patch.object(DRIVER.time, "sleep") as sleep:
+                with self.assertRaisesRegex(RuntimeError, "Could not prove owned service unloaded"):
+                    DRIVER.service_cleanup(evidence, {str(self.root / ".local/state")}, [self.root / ".local/bin/koi"], timeout=0)
+            self.assertTrue(path.exists())
+            sleep.assert_not_called()
+
+    @patch.object(DRIVER.os, "getuid", return_value=501, create=True)
+    def test_service_cleanup_validates_every_plist_before_any_bootout(self, _uid):
+        evidence = self.evidence("installer")
+        peer = self.service_plist("dev.koidrive.koi.1234abcd")
+        primary = self.service_plist("dev.koidrive.koi", binary=Path("/foreign/koi"))
+        with patch.object(DRIVER.Path, "home", return_value=self.root), patch.object(evidence, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "foreign launch agent"):
+                DRIVER.service_cleanup(evidence, {str(self.root / ".local/state")}, [self.root / ".local/bin/koi"])
+        run.assert_not_called()
+        self.assertTrue(peer.exists() and primary.exists())
+
+    @patch.object(DRIVER.os, "getuid", return_value=501, create=True)
+    def test_service_cleanup_attempts_primary_after_peer_failure_and_aggregates(self, _uid):
+        evidence = self.evidence("installer")
+        peer_label = "dev.koidrive.koi.1234abcd"
+        primary_label = "dev.koidrive.koi"
+        peer = self.service_plist(peer_label)
+        primary = self.service_plist(primary_label)
+        responses = [(0, "", ""), (0, "state = SIGTERMed", ""),
+                     (0, "", ""), (113, "", "Could not find service")]
+        with patch.object(DRIVER.Path, "home", return_value=self.root), patch.object(evidence, "run", side_effect=responses) as run:
+            with self.assertRaisesRegex(RuntimeError, re.escape(peer_label)):
+                DRIVER.service_cleanup(evidence, {str(self.root / ".local/state")}, [self.root / ".local/bin/koi"], timeout=0)
+        self.assertTrue(peer.exists())
+        self.assertFalse(primary.exists())
+        self.assertEqual([call.args[0][1:] for call in run.call_args_list if call.args[0][1] == "bootout"],
+                         [["bootout", "gui/501/" + peer_label], ["bootout", "gui/501/" + primary_label]])
+
+    @patch.object(DRIVER.os, "getuid", return_value=501, create=True)
+    def test_service_cleanup_reports_every_owned_service_failure(self, _uid):
+        evidence = self.evidence("installer")
+        labels = ["dev.koidrive.koi.1234abcd", "dev.koidrive.koi"]
+        paths = [self.service_plist(label) for label in labels]
+        responses = [(0, "", ""), (1, "", "permission denied"),
+                     (0, "", ""), (0, "state = SIGTERMed", "")]
+        with patch.object(DRIVER.Path, "home", return_value=self.root), patch.object(evidence, "run", side_effect=responses):
+            with self.assertRaises(RuntimeError) as caught:
+                DRIVER.service_cleanup(evidence, {str(self.root / ".local/state")}, [self.root / ".local/bin/koi"], timeout=0)
+        self.assertTrue(all(label in str(caught.exception) for label in labels))
+        self.assertTrue(all(path.exists() for path in paths))
 
 
 if __name__ == "__main__":

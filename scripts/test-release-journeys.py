@@ -40,7 +40,7 @@ REQUIRED = {
              "app quarantine", "plain uninstall", "plain uninstall preserves documents",
              "zap native unregister", "zap removes state", "zap preserves documents"},
     "formula-conflict": {"release assets verified", "clean account", "formula version",
-                         "binary conflict", "formula unchanged", "cask rolled back"},
+                         "binary conflict", "formula unchanged", "cask conflict state"},
     "installer": {"release assets verified", "clean account", "held script verified", "bootstrap version",
                   "unlinked before setup", "attended setup", "installed version", "installed app",
                   "xattrs preserved", "healthy native service", "exact byte sync"},
@@ -370,6 +370,9 @@ def brew_prepare(evidence, entries, kind, wait_seconds=180):
         evidence.check("tap cask matches release", spec["version"] == evidence.report["tag"][1:]
                        and spec["sha256"] == entries[name] and spec["url"] == RELEASE + "/" + evidence.report["tag"] + "/" + name)
         evidence.check("cask has no formula dependency", not spec.get("depends_on", {}).get("formula"))
+        hook = native_zap_hook(spec)
+        evidence.check("native zap hook metadata", hook is not None)
+        evidence.report["zap_hook"] = hook
     else:
         _, info, _ = evidence.run(["brew", "info", "--json=v2", "--formula", TAP])
         spec = json.loads(info)["formulae"][0]
@@ -383,6 +386,21 @@ def brew_prepare(evidence, entries, kind, wait_seconds=180):
 def version(evidence, binary, assertion, env=None):
     status, out, _ = evidence.run([binary, "--version"], env=env, required=False)
     evidence.check(assertion, status == 0 and out == "koi " + evidence.report["tag"][1:] + "\n", out)
+    return out.rstrip("\n")
+
+
+def native_zap_hook(spec):
+    scripts = [entry["script"] for artifact in spec.get("artifacts", [])
+               for entry in artifact.get("zap", []) if isinstance(entry, dict) and "script" in entry]
+    expected = {"executable": str(APP / "Contents/MacOS/Koidrive"),
+                "args": ["--unregister-login-item"], "sudo": False}
+    if scripts == [expected] and scripts[0].get("sudo") is False:
+        return scripts[0]
+    return None
+
+
+def zap_invoked(status, output, executable):
+    return status == 0 and "==> Running uninstall script " + executable in output.splitlines()
 
 
 def absent(*paths):
@@ -401,6 +419,26 @@ def conflict_text(output, binary):
     return match[0] if match else None
 
 
+def skipped_link_text(output, binary):
+    line = "::warning::It seems there is already a Binary at '" + str(binary) + "' from formula koidrive; skipping link."
+    return line if line in output.splitlines() else None
+
+
+def conflict_state(status, output, binary):
+    warning = skipped_link_text(output, binary)
+    error = conflict_text(output, binary)
+    if status == 0 and warning and not error:
+        return "installed-with-skipped-link"
+    if binary_conflict(status, output, binary) and not warning:
+        return "failed-with-rollback"
+    return None
+
+
+def formula_identity(evidence, link, assertion):
+    reported = version(evidence, "koi", assertion)
+    return {"resolved": str(link.resolve(strict=True)), "sha256": sha256(link), "version": reported}
+
+
 def brew_scenario(evidence, root, ownership, entries, conflict):
     brew_prepare(evidence, entries, "cask")
     home = Path.home()
@@ -417,22 +455,29 @@ def brew_scenario(evidence, root, ownership, entries, conflict):
             brew_prepare(evidence, entries, "formula")
             formula_attempted = True
             evidence.run(["brew", "install", "--formula", TAP], timeout=600)
-            version(evidence, "koi", "formula version")
-            before = {"resolved": str(link.resolve(strict=True)), "sha256": sha256(link)}
+            before = formula_identity(evidence, link, "formula version")
             evidence.report["formula_before"] = before
             cask_attempted = True
             status, out, err = evidence.run(["brew", "install", "--cask", TAP], required=False, timeout=600)
-            evidence.report["conflict"] = sanitized(conflict_text(out + err, link) or out + err, evidence.secrets).strip()
+            outcome = conflict_state(status, out + err, link)
+            evidence.report["conflict"] = sanitized(skipped_link_text(out + err, link) or conflict_text(out + err, link) or out + err, evidence.secrets).strip()
             evidence.report["conflict_status"] = status
-            evidence.check("binary conflict", binary_conflict(status, out + err, link), out + err)
-            evidence.check("formula unchanged", before == {"resolved": str(link.resolve(strict=True)), "sha256": sha256(link)})
+            evidence.report["conflict_state"] = outcome
+            evidence.check("binary conflict", outcome is not None, out + err)
+            after = formula_identity(evidence, link, "formula version after conflict")
+            evidence.report["formula_after"] = after
+            evidence.check("formula unchanged", before == after)
             _, casks, _ = evidence.run(["brew", "list", "--cask", "--versions"])
             _, caskroom, _ = evidence.run(["brew", "--caskroom"])
             room = Path(caskroom.strip()) / "koidrive"
-            evidence.report["rollback"] = {"app_exists": APP.exists(), "casks": casks,
+            evidence.report["conflict_installation"] = {"app_exists": APP.exists(), "casks": casks,
                                              "caskroom_entries": sorted(str(p.relative_to(room)) for p in room.rglob("*"))}
-            evidence.check("cask rolled back", not APP.exists() and not re.search(r"(?m)^koidrive\s", casks), casks)
-            cask_attempted = False
+            if outcome == "installed-with-skipped-link":
+                evidence.check("cask conflict state", APP.is_dir() and re.search(
+                    r"(?m)^koidrive\s+" + re.escape(evidence.report["tag"][1:]) + r"\s*$", casks), casks)
+            else:
+                evidence.check("cask conflict state", not APP.exists() and not re.search(r"(?m)^koidrive\s", casks), casks)
+                cask_attempted = False
             return
         cask_attempted = True
         evidence.run(["brew", "install", "--cask", TAP], timeout=600)
@@ -453,9 +498,9 @@ def brew_scenario(evidence, root, ownership, entries, conflict):
         evidence.run(["brew", "install", "--cask", TAP], timeout=600)
         version(evidence, "koi", "reinstalled version")
         quarantine(evidence, APP)
-        _, out, err = evidence.run(["brew", "uninstall", "--zap", "--cask", "--verbose", TAP], timeout=180)
+        status, out, err = evidence.run(["brew", "uninstall", "--zap", "--cask", "--verbose", TAP], timeout=180)
         cask_attempted = False
-        evidence.check("zap native unregister", "--unregister-login-item" in out + err, out + err)
+        evidence.check("zap native unregister", zap_invoked(status, out + err, evidence.report["zap_hook"]["executable"]), out + err)
         assert_native_absent(evidence)
         evidence.check("zap removes state", not state.exists()
                        and not (home / "Library/Preferences/dev.koidrive.Koidrive.plist").exists()
@@ -464,6 +509,13 @@ def brew_scenario(evidence, root, ownership, entries, conflict):
     finally:
         if cask_attempted:
             evidence.cleanup("cask uninstall and zap", lambda: evidence.run(["brew", "uninstall", "--zap", "--cask", TAP]))
+            if conflict and formula_attempted:
+                def formula_survives():
+                    identity = formula_identity(evidence, link, "formula version after cask uninstall")
+                    evidence.report["formula_after_cask_uninstall"] = identity
+                    evidence.check("formula survives cask uninstall", before == identity)
+
+                evidence.cleanup("formula survives cask uninstall", formula_survives)
         if formula_attempted:
             evidence.cleanup("formula uninstall", lambda: evidence.run(["brew", "uninstall", "--formula", TAP]))
         evidence.cleanup("app and binary removed", lambda: absent(APP, link))
@@ -584,10 +636,10 @@ def attended(evidence, command, folder, timeout=360):
         (evidence.directory / record["stdout"]).write_text(sanitized(transcript, evidence.secrets))
 
 
-def service_cleanup(evidence, profiles, binaries):
+def service_cleanup(evidence, profiles, binaries, timeout=15):
     agents = Path.home() / "Library/LaunchAgents"
-    labels = []
-    for path in agents.glob("dev.koidrive.koi*.plist"):
+    owned = []
+    for path in sorted(agents.glob("dev.koidrive.koi*.plist")):
         spec = plistlib.loads(path.read_bytes())
         state = spec.get("EnvironmentVariables", {}).get("XDG_STATE_HOME")
         label = spec.get("Label")
@@ -595,15 +647,34 @@ def service_cleanup(evidence, profiles, binaries):
                 or not isinstance(label, str) or not re.fullmatch(r"dev\.koidrive\.koi(?:\.[0-9a-f]{8})?", label)
                 or path.name != label + ".plist"):
             raise RuntimeError("Refusing foreign launch agent " + str(path))
-        status, _, err = evidence.run(["/bin/launchctl", "bootout", f"gui/{os.getuid()}/{label}"], required=False)
-        probe, _, probe_error = evidence.run(["/bin/launchctl", "print", f"gui/{os.getuid()}/{label}"], required=False)
-        if not unloaded(probe, probe_error):
+        owned.append((path, label))
+    errors = []
+    for path, label in owned:
+        try:
+            status, _, err = evidence.run(["/bin/launchctl", "bootout", f"gui/{os.getuid()}/{label}"], required=False)
+            if status != 0 and not unloaded(status, err):
+                raise RuntimeError("Owned service bootout failed: " + label)
+            wait_unloaded(evidence, label, timeout)
+            path.unlink()
+        except Exception as error:
+            errors.append(str(error))
+    if errors:
+        raise RuntimeError("; ".join(errors))
+    return [label for _, label in owned]
+
+
+def wait_unloaded(evidence, label, timeout=15):
+    deadline = time.monotonic() + timeout
+    while True:
+        query_timeout = max(0.01, min(5, deadline - time.monotonic()))
+        status, _, error = evidence.run(["/bin/launchctl", "print", f"gui/{os.getuid()}/{label}"], required=False,
+                                        timeout=query_timeout)
+        if unloaded(status, error):
+            return
+        remaining = deadline - time.monotonic()
+        if status != 0 or remaining <= 0:
             raise RuntimeError("Could not prove owned service unloaded: " + label)
-        if status != 0 and "Could not find service" not in err and "No such process" not in err:
-            raise RuntimeError("Owned service bootout failed")
-        path.unlink()
-        labels.append(label)
-    return labels
+        time.sleep(min(0.25, remaining))
 
 
 def stop_app(evidence, app):

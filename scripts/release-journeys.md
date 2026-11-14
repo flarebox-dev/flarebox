@@ -8,7 +8,7 @@ Each runtime case gets a separate [GitHub-hosted macOS 26 runner](https://docs.g
 | --- | --- |
 | Published assets | The Mac CLI and DMG match `SHA256SUMS`; the signed app and DMG pass Gatekeeper assessment and stapled-ticket validation. |
 | Clean cask | The public cask installs, and the next command, `koi --version`, reports the requested release. Plain uninstall removes the app and CLI. A second installation followed by zap removes app state without deleting a test document. |
-| Formula first | The formula remains intact when cask installation fails on its existing `koi` binary. Evidence includes Homebrew's exact error and resulting installation state. |
+| Formula first | Record whether Homebrew rejects the binary collision or installs the app while skipping its CLI link. The formula's executable and version must remain intact, including after cask removal. Evidence includes the exact warning or error and resulting installation state. |
 | Shell installer | The pinned installer runs through `curl | sh` in a controlling terminal, completes guided setup with the released CLI, and leaves a usable installation. Cleanup stops the test's app and services. |
 
 The shell case uses immutable installer commit `b31c0c0232e1083c8b13210c59893c9eecd057f2`, checked against SHA-256 `ccc71c1fcd8381391ab57109d9d365afeea662c142dbbbda6bc4fe700460c276`. It exercises the installer before publication without deploying it. A local Worker and public CLI commands supply test authentication and a shared folder. They do not substitute for the installer or pre-link its folder.
