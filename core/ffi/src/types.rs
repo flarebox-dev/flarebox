@@ -35,9 +35,9 @@ pub enum SyncStatus {
 /// "Progress counts the files left to sync"). The session sends it with [`SyncStatus::Syncing`], at most four
 /// times a second, and `None` once no file is left to send or fetch.
 ///
-/// A file found while others sync counts at once, in the file counts and in `bytes_total`. A folder that finishes
-/// keeps its bytes in the sum until no folder has a file left, so `bytes_done` never decreases while the session
-/// syncs.
+/// While the session syncs, `bytes_done` never decreases: a folder that finishes, goes offline or reconnects keeps the
+/// bytes it moved in the sum until no folder has a file left. `bytes_total` grows only when new work arrives, so the
+/// fraction falls only when a folder finds more to sync.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct SyncProgress {
     /// Files whose content still goes to the server, including the ones being sent.

@@ -46,9 +46,11 @@ A bootstrap pages through `ListTree`, and once the folder has synced, through `L
 
 A folder counts each file whose content differs between the folder and the server, unless a rule, a question or a problem keeps it out of sync, until both hold the same content. A file found while others sync counts at once in `files_to_upload` or `files_to_download` and in `bytes_total`. The counts start from zero when the folder has files to sync again after none were left.
 
+Until then the numbers stay true to the work: `bytes_done` never decreases, and `bytes_total` grows only when new work arrives. The fraction falls when a folder finds more to sync, and it never falls because credit for work already done is lost.
+
 `bytes_done` counts the content that both sides hold: each chunk once it is stored or fetched, or once the server reports it present already, and the whole content of a file once it is in sync. A chunk sent again after a cut-off upload or a restart counts once, so `bytes_done` never decreases. A file that leaves without syncing, because it was edited again or removed, takes its bytes not done out of `bytes_total`. `current` is the file whose content moved last.
 
-`status()` reports progress while a folder bootstraps or catches up, and none otherwise. A change of progress alone marks no `watch()` receiver unless progress begins or ends. `changes()` reports it at most once every 250 ms (`PROGRESS_INTERVAL`), so the daemon's `watch` socket, `koi status` and the app's `SessionEvent::Progress` carry the same numbers at a bounded rate, and an idle folder sends nothing. The app sums them over its folders and keeps a finished folder's bytes in the sum until every folder is done.
+`status()` reports progress while a folder bootstraps or catches up, and none otherwise. A change of progress alone marks no `watch()` receiver unless progress begins or ends. `changes()` reports it at most once every 250 ms (`PROGRESS_INTERVAL`), so the daemon's `watch` socket, `koi status` and the app's `SessionEvent::Progress` carry the same numbers at a bounded rate, and an idle folder sends nothing. The app sums them over its folders. A folder that finishes, goes offline or reconnects keeps the bytes it moved in the sum until no folder has a file left.
 
 ## A rewound space halts its folders
 

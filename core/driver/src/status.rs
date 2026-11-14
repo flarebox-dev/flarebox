@@ -102,8 +102,9 @@ pub fn describe(cause: &RecoveryCause) -> String {
 /// (docs/design/driver.md, "Progress counts the files left to sync").
 ///
 /// A file counts once its content differs between the folder and the server and no rule, question or problem keeps
-/// it out of sync, until both hold the same content. A file found while others sync counts at once. The progress ends
-/// when no file is left, and the next starts from zero.
+/// it out of sync, until both hold the same content. The progress ends when no file is left, and the next starts from
+/// zero. Until then `bytes_done` never decreases, and `bytes_total` grows only when new work arrives, so the fraction
+/// falls only when the folder finds more to sync.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Progress {
     /// Files whose content still goes to the server, the ones being sent included.
