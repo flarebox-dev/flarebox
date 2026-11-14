@@ -48,7 +48,7 @@ jobs:
             changed="$(tr '\0' '\n' < "$RUNNER_TEMP/changed")"
             echo "Files this pull request changes against $BASE:"
             printf '%s\n' "$changed"
-            pattern='^(cli/|core/|server/|\.cargo/|install\.sh$|scripts/test-install\.sh$|scripts/(stamp|test)-release-version\.py$|scripts/(test-)?publish-release\.sh$|scripts/(test-)?homebrew-[a-z-]+\.sh$|\.github/requirements-musl\.txt$|\.github/workflows/release-cli\.yml$|Cargo\.[^/]*$|rust-toolchain\.toml$)'
+            pattern='^(cli/|core/|server/|\.cargo/|install\.sh$|scripts/test-install\.sh$|scripts/(stamp|test)-release-version\.py$|scripts/(test-)?publish-release\.sh$|scripts/sign-checksums\.sh$|\.github/release-allowed-signers$|scripts/(test-)?homebrew-[a-z-]+\.sh$|\.github/requirements-musl\.txt$|\.github/workflows/release-cli\.yml$|Cargo\.[^/]*$|rust-toolchain\.toml$)'
             if grep -Eq "$pattern" <<<"$changed"; then
               echo "Linux targets: build, because a changed file matches $pattern"
             else
@@ -165,7 +165,7 @@ jobs:
       - name: Lint the installer and the release scripts
         run: |
           shellcheck -s sh install.sh scripts/test-install.sh
-          shellcheck scripts/publish-release.sh scripts/test-publish-release.sh
+          shellcheck scripts/publish-release.sh scripts/test-publish-release.sh scripts/sign-checksums.sh
           shellcheck scripts/homebrew-formula.sh scripts/homebrew-cask.sh scripts/homebrew-track.sh scripts/test-homebrew-formula.sh scripts/test-homebrew-cask.sh scripts/test-homebrew-install.sh scripts/test-homebrew-cask-install.sh scripts/test-homebrew-cask-install-errors.sh
       - name: Test publishing a release against a stub gh
         if: matrix.target == 'x86_64-unknown-linux-musl'
@@ -462,9 +462,35 @@ jobs:
           fi
           echo "All $COUNT CLI targets built and their checksums verified. Homebrew install: $HOMEBREW."
 
+  sign-checksums:
+    name: Sign SHA256SUMS
+    needs: [release-ref, checksums]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: release-signing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+          path: dist
+      - name: Sign SHA256SUMS with the release key
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          RELEASE_ALLOWED_SIGNERS: .github/release-allowed-signers
+        run: scripts/sign-checksums.sh dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-signature
+          path: dist/SHA256SUMS.sig
+          if-no-files-found: error
+
   publish:
     name: Publish the release
-    needs: [release-ref, checksums]
+    needs: [release-ref, checksums, sign-checksums]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -482,12 +508,17 @@ jobs:
         with:
           name: release-assets
           path: dist
-      - name: Attach the tarballs, the app and checksums to the tagged release
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-signature
+          path: dist
+      - name: Attach the tarballs, the app, checksums and their signature to the tagged release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
           PRERELEASE: ${{ needs.release-ref.outputs.prerelease }}
+          RELEASE_ALLOWED_SIGNERS: .github/release-allowed-signers
           # latest: an -alpha.N or -rc.N tag becomes a normal release, and Latest (which install.sh downloads by default) unless a published release has a higher version.
           # prerelease: it becomes a GitHub prerelease, which install.sh skips unless KOIDRIVE_VERSION names it.
           PRERELEASE_TAGS_PUBLISH_AS: latest
