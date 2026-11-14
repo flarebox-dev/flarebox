@@ -7,9 +7,9 @@ use koidrive_driver::{self as driver, FolderState as DriverFolderState, Status};
 
 use crate::helper::Helper;
 use crate::types::{
-    Account, Answer, FolderState, HeldItem, ItemDetail, LinkedFolder, MassDeleteLimit, NodeKind,
-    Notice, NoticeKind, Problem, ProblemKind, Question, QuestionKind, RecoveryCause, RecoveryGroup,
-    RecoveryTrigger, SessionState, SyncStatus,
+    Account, Answer, FolderPath, FolderState, HeldItem, ItemDetail, LinkedFolder, MassDeleteLimit,
+    NodeKind, Notice, NoticeKind, Problem, ProblemKind, Question, QuestionKind, RecoveryCause,
+    RecoveryGroup, RecoveryTrigger, SessionState, SyncProgress, SyncStatus,
 };
 
 pub(crate) type Halted = BTreeMap<String, (String, i64)>;
@@ -21,12 +21,16 @@ pub(crate) fn session_state(
     halted: &mut Halted,
     helper: &Helper,
 ) -> SessionState {
+    let shown = match started {
+        true => sync_status(status),
+        false => SyncStatus::Stopped,
+    };
     SessionState {
-        status: match started {
-            true => sync_status(status),
-            false => SyncStatus::Stopped,
+        status: shown,
+        progress: match shown {
+            SyncStatus::Syncing => progress(status),
+            _ => None,
         },
-        progress: None,
         account: status.account.as_ref().map(account),
         folders: status.folders.iter().map(folder).collect(),
         recent_changes: Vec::new(),
@@ -63,6 +67,22 @@ fn sync_status(status: &Status) -> SyncStatus {
     } else {
         SyncStatus::Idle
     }
+}
+
+fn progress(status: &Status) -> Option<SyncProgress> {
+    let totals = status.progress.as_ref()?;
+    Some(SyncProgress {
+        files_to_upload: totals.files_to_upload,
+        files_to_download: totals.files_to_download,
+        bytes_done: totals.bytes_done,
+        bytes_total: totals.bytes_total,
+        current: status.folders.iter().find_map(|folder| {
+            Some(FolderPath {
+                space_id: folder.space_id.clone(),
+                path: folder.progress.as_ref()?.current.clone()?,
+            })
+        }),
+    })
 }
 
 fn account(account: &driver::Account) -> Account {
@@ -441,6 +461,7 @@ mod tests {
             local_entries: None,
             questions: 0,
             problem: problem.map(str::to_owned),
+            progress: None,
         }
     }
 
@@ -458,6 +479,7 @@ mod tests {
             version: None,
             update: driver::Update::Unknown,
             folders: states.iter().map(|state| folder_in(*state, None)).collect(),
+            progress: None,
         }
     }
 

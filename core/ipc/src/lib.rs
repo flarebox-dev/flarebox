@@ -828,6 +828,7 @@ mod tests {
                         checked_at_ms: 1_763_000_000_000,
                     },
                     folders: Vec::new(),
+                    progress: None,
                 },
             },
             r#"{"response":"status","status":{"account":{"server":"https://files.example.com","user_id":"u1","user_name":"Ada","device_id":"d1","device_name":"laptop"},"running":true,"paused":true,"version":"0.1.0-alpha.2","update":{"state":"available","latest":"0.1.2","url":"https://github.com/koidrive/koidrive/releases/tag/v0.1.2","checked_at_ms":1763000000000},"folders":[]}}"#,

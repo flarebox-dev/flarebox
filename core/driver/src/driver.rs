@@ -7,7 +7,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use koidrive_engine::commit::{Commits, Lift, LiftError};
 use koidrive_engine::guard::Window;
@@ -297,6 +297,8 @@ struct Inner {
     startup_blocked: AtomicBool,
     startup_pending: AtomicBool,
     changed: Arc<watch::Sender<()>>,
+    progressed: Arc<watch::Sender<()>>,
+    totals: Arc<Mutex<crate::progress::Sum>>,
     #[cfg(test)]
     observe_fault: Option<Arc<crate::folder::ObserveFault>>,
     #[cfg(test)]
@@ -327,6 +329,7 @@ struct Folder {
     /// meanwhile, also after its last task has ended, so the cleanup never leaves a task it does not wait for.
     unlink: Option<Unlink>,
     store: Arc<RwLock<()>>,
+    progress: Arc<Mutex<crate::progress::Tracker>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -395,6 +398,65 @@ impl Running {
 
     fn ended(&self) -> bool {
         self.done.has_changed().is_err()
+    }
+}
+
+/// How often [`Changes::next`] reports a change of progress alone at most.
+pub const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+
+/// What [`Changes::next`] waited for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// [`Driver::watch`] was marked: anything [`Driver::status`], [`Driver::questions`] or [`Driver::restores`]
+    /// return may differ, progress included.
+    State,
+    /// Only the progress of a folder in [`Driver::status`] may differ.
+    Progress,
+}
+
+/// The changes of a driver, from [`Driver::changes`].
+pub struct Changes {
+    changed: watch::Receiver<()>,
+    progressed: watch::Receiver<()>,
+    last: Option<Instant>,
+    pending: bool,
+}
+
+impl Changes {
+    /// Waits for the next change. A [`Change::State`] returns at once. A [`Change::Progress`] returns no sooner than
+    /// [`PROGRESS_INTERVAL`] after the previous change this returned, and a state change meanwhile returns instead.
+    /// Fails once the driver is gone.
+    pub async fn next(&mut self) -> Result<Change, watch::error::RecvError> {
+        if !self.pending {
+            let state = tokio::select! {
+                biased;
+                changed = self.changed.changed() => changed.map(|()| true)?,
+                progressed = self.progressed.changed() => progressed.map(|()| false)?,
+            };
+            if state {
+                return Ok(self.returned(Change::State));
+            }
+            self.pending = true;
+        }
+        if let Some(last) = self.last {
+            let due = last + PROGRESS_INTERVAL;
+            let state = tokio::select! {
+                biased;
+                changed = self.changed.changed() => changed.map(|()| true)?,
+                () = tokio::time::sleep_until(due.into()) => false,
+            };
+            if state {
+                return Ok(self.returned(Change::State));
+            }
+        }
+        Ok(self.returned(Change::Progress))
+    }
+
+    fn returned(&mut self, change: Change) -> Change {
+        self.pending = false;
+        self.progressed.mark_unchanged();
+        self.last = Some(Instant::now());
+        change
     }
 }
 
@@ -510,6 +572,8 @@ impl Driver {
                 startup_blocked: AtomicBool::new(false),
                 startup_pending: AtomicBool::new(false),
                 changed: Arc::new(watch::Sender::new(())),
+                progressed: Arc::new(watch::Sender::new(())),
+                totals: Arc::default(),
                 #[cfg(test)]
                 observe_fault: None,
                 #[cfg(test)]
@@ -530,7 +594,7 @@ impl Driver {
             .unwrap()
             .as_ref()
             .map(Credential::account);
-        let folders = self
+        let folders: Vec<FolderStatus> = self
             .inner
             .folders
             .lock()
@@ -544,6 +608,12 @@ impl Driver {
                         "unlinking the folder did not finish; unlink it again to finish".into(),
                     );
                 }
+                if !matches!(
+                    status.state,
+                    FolderState::Bootstrapping | FolderState::CatchingUp
+                ) {
+                    status.progress = None;
+                }
                 status
             })
             .collect();
@@ -553,15 +623,28 @@ impl Driver {
             paused: self.inner.paused.load(Ordering::SeqCst),
             version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             update: self.inner.updates.notice(),
+            progress: (folders.iter().any(|folder| folder.progress.is_some()))
+                .then(|| self.inner.totals.lock().unwrap().totals())
+                .flatten(),
             folders,
         }
     }
 
     /// A receiver that is marked changed whenever [`Driver::status`], [`Driver::questions`] or [`Driver::restores`]
     /// may have changed, so the app can wait for a change instead of polling. A change may be signalled without a
-    /// visible difference.
+    /// visible difference. A change of a folder's progress alone does not mark it, unless the progress began or ended.
     pub fn watch(&self) -> watch::Receiver<()> {
         self.inner.changed.subscribe()
+    }
+
+    /// The changes [`Driver::watch`] marks and those of every folder's progress, at a bounded rate.
+    pub fn changes(&self) -> Changes {
+        Changes {
+            changed: self.inner.changed.subscribe(),
+            progressed: self.inner.progressed.subscribe(),
+            last: None,
+            pending: false,
+        }
     }
 
     fn changed(&self) {
@@ -848,7 +931,9 @@ impl Driver {
                     error: error.to_string(),
                 }),
             }
-            self.inner.folders.lock().unwrap().remove(&link.space_id);
+            if let Some(folder) = self.inner.folders.lock().unwrap().remove(&link.space_id) {
+                folder.progress.lock().unwrap().clear();
+            }
         }
         if failed.is_empty()
             && let Err(error) = leaving.finish()
@@ -1208,6 +1293,7 @@ impl Driver {
             run: None,
             unlink: None,
             store: Arc::default(),
+            progress: Arc::default(),
         };
         drop(lock);
         if self.syncs() {
@@ -1263,7 +1349,9 @@ impl Driver {
         let mut folders = self.inner.folders.lock().unwrap();
         match forgotten {
             Ok(()) => {
-                folders.remove(&link.space_id);
+                if let Some(folder) = folders.remove(&link.space_id) {
+                    folder.progress.lock().unwrap().clear();
+                }
                 tracing::info!(space_id = link.space_id, path = %koidrive_fs::quoted(&link.root), "unlinked a folder");
             }
             Err(ref error) => {
@@ -1724,6 +1812,7 @@ impl Driver {
             store,
             auth,
             status: folder.status.clone(),
+            progress: folder.progress.clone(),
             matcher: self.inner.matcher.clone(),
             local: self.inner.local.clone(),
             trash_cap: self.inner.trash_cap,
@@ -1736,6 +1825,8 @@ impl Driver {
             },
             observer: Mutex::default(),
             changed: self.inner.changed.clone(),
+            progressed: self.inner.progressed.clone(),
+            totals: self.inner.totals.clone(),
             requests: Arc::default(),
             #[cfg(test)]
             observe_fault: self.inner.observe_fault.clone(),
@@ -1914,6 +2005,7 @@ fn folder_status(
         questions,
         problem: None,
         wait: None,
+        progress: None,
     }
 }
 
@@ -1931,6 +2023,7 @@ fn load_folders(paths: &Paths) -> Result<BTreeMap<String, Folder>, DriverError> 
                     run: None,
                     unlink: None,
                     store: Arc::default(),
+                    progress: Arc::default(),
                 },
             )
         })
@@ -3772,6 +3865,68 @@ mod tests {
         watch.borrow_and_update();
         driver.stop().await;
         assert!(watch.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn progress_alone_wakes_a_watcher_at_most_once_an_interval_and_a_state_change_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Driver::open(Paths::under(dir.path())).unwrap();
+        let mut changes = driver.changes();
+        let idle = tokio::time::timeout(Duration::from_secs(1), changes.next()).await;
+        assert!(idle.is_err(), "an idle driver wakes no watcher");
+
+        let progressed = driver.inner.progressed.clone();
+        let marking = tokio::spawn(async move {
+            let started = Instant::now();
+            let mut marks = 0;
+            while started.elapsed() < Duration::from_secs(1) {
+                progressed.send_replace(());
+                marks += 1;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            marks
+        });
+        let started = Instant::now();
+        let mut wakes: u128 = 0;
+        while started.elapsed() < Duration::from_secs(1) {
+            assert_eq!(changes.next().await.unwrap(), Change::Progress);
+            wakes += 1;
+        }
+        let elapsed = started.elapsed();
+        let marks = marking.await.unwrap();
+        let most = 1 + elapsed.as_millis() / PROGRESS_INTERVAL.as_millis();
+        assert!(marks > 100, "{marks} marks");
+        assert!(
+            (3..=most).contains(&wakes),
+            "{wakes} wakes for {marks} marks in {elapsed:?}"
+        );
+
+        driver.inner.progressed.send_replace(());
+        let changed = driver.inner.changed.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            changed.send_replace(());
+        });
+        let asked = Instant::now();
+        assert_eq!(changes.next().await.unwrap(), Change::State);
+        assert!(asked.elapsed() < PROGRESS_INTERVAL, "{:?}", asked.elapsed());
+        let after = tokio::time::timeout(Duration::from_secs(1), changes.next()).await;
+        assert!(after.is_err(), "the state change took the progress with it");
+    }
+
+    #[tokio::test]
+    async fn a_progress_change_waiting_out_the_interval_survives_a_dropped_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Driver::open(Paths::under(dir.path())).unwrap();
+        let mut changes = driver.changes();
+        driver.inner.progressed.send_replace(());
+        assert_eq!(changes.next().await.unwrap(), Change::Progress);
+
+        driver.inner.progressed.send_replace(());
+        let dropped = tokio::time::timeout(PROGRESS_INTERVAL / 5, changes.next()).await;
+        assert!(dropped.is_err(), "the interval holds the change back");
+        let kept = tokio::time::timeout(PROGRESS_INTERVAL * 2, changes.next()).await;
+        assert_eq!(kept.ok().map(Result::unwrap), Some(Change::Progress));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5693,6 +5848,82 @@ mod tests {
         stop.await.unwrap();
         sign_out.await.unwrap().unwrap();
         signed_out(&driver, &paths, &root);
+    }
+
+    fn uploading(driver: &Driver, size: u64) -> Arc<crate::lifecycle::Lifecycle> {
+        let folders = driver.inner.folders.lock().unwrap();
+        let folder = folders.values().next().unwrap();
+        let item = crate::progress::Item {
+            direction: crate::progress::Direction::Upload,
+            node: "a".into(),
+            digest: b"a".to_vec(),
+        };
+        (folder.progress.lock().unwrap()).track(BTreeMap::from([(item, size)]), |_| false);
+        folder.status.clone()
+    }
+
+    #[tokio::test]
+    async fn a_paused_driver_reports_no_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Koidrive");
+        let paths = Paths::under(&base.join("profile"));
+        let (driver, gate) = paused_driver(&paths, &root).await;
+        let status = uploading(&driver, 100);
+        status.lock().unwrap().state = FolderState::CatchingUp;
+        assert_eq!(
+            driver.status().progress.map(|totals| totals.bytes_total),
+            Some(100)
+        );
+
+        let pause = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.pause().await }
+        });
+        gate.open();
+        assert!(pause.await.unwrap().unwrap());
+        let paused = driver.status();
+        assert_eq!(paused.folders[0].progress, None);
+        assert_eq!(paused.progress, None);
+    }
+
+    #[tokio::test]
+    async fn signing_out_takes_its_folders_out_of_the_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Koidrive");
+        let paths = Paths::under(&base.join("profile"));
+        let (driver, gate) = paused_driver(&paths, &root).await;
+        uploading(&driver, 100);
+        assert!(driver.inner.totals.lock().unwrap().totals().is_some());
+
+        let sign_out = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.sign_out(true).await }
+        });
+        gate.open();
+        sign_out.await.unwrap().unwrap();
+        signed_out(&driver, &paths, &root);
+        assert_eq!(driver.inner.totals.lock().unwrap().totals(), None);
+    }
+
+    #[tokio::test]
+    async fn unlinking_takes_the_folder_out_of_the_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Koidrive");
+        let paths = Paths::under(&base.join("profile"));
+        let (driver, gate) = paused_driver(&paths, &root).await;
+        uploading(&driver, 100);
+
+        let unlink = tokio::spawn({
+            let driver = driver.clone();
+            let root = root.clone();
+            async move { driver.unlink(&root).await }
+        });
+        gate.open();
+        unlink.await.unwrap().unwrap();
+        assert_eq!(driver.inner.totals.lock().unwrap().totals(), None);
     }
 
     #[tokio::test]

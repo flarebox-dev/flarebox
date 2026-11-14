@@ -42,6 +42,16 @@ A bootstrap pages through `ListTree`, and once the folder has synced, through `L
 
 `koi _daemon` opens the driver, binds a socket only its user can reach, starts every folder, and serves one JSON line each way per connection until SIGTERM or SIGINT. It shows a desktop notification when a decision opens. Its logs never carry a refresh credential, an access token or a pairing code. Linux runs it as a systemd user service, and macOS as a launch agent.
 
-## A rewound space halts its folders, and status reports no progress
+## Progress counts the files left to sync
 
-A rewound space halts each folder that syncs it, because the driver does not run the engine's recovery (§6.4) for it. `status()` reports no per-folder progress, so the app's `SyncProgress` is always empty.
+A folder counts each file whose content differs between the folder and the server, unless a rule, a question or a problem keeps it out of sync, until both hold the same content. A file found while others sync counts at once in `files_to_upload` or `files_to_download` and in `bytes_total`. The counts start from zero when the folder has files to sync again after none were left.
+
+Until then the numbers stay true to the work: `bytes_done` never decreases, and `bytes_total` grows only when new work arrives. The fraction falls when a folder finds more to sync, and it never falls because credit for work already done is lost.
+
+`bytes_done` counts the content that both sides hold: each chunk once it is stored or fetched, or once the server reports it present already, and the whole content of a file once it is in sync. A chunk sent again after a cut-off upload or a restart counts once, so `bytes_done` never decreases. A file that leaves without syncing, because it was edited again or removed, takes its bytes not done out of `bytes_total`. `current` is the file whose content moved last.
+
+`status()` reports progress while a folder bootstraps or catches up, and none otherwise. A change of progress alone marks no `watch()` receiver unless progress begins or ends. `changes()` reports it at most once every 250 ms (`PROGRESS_INTERVAL`), so the daemon's `watch` socket, `koi status` and the app's `SessionEvent::Progress` carry the same numbers at a bounded rate, and an idle folder sends nothing. `status()` also sums them over the folders in `Status.progress`, which the app shows, while a folder syncs. A folder that finishes, abandons a file, goes offline or stops keeps the bytes it moved in that sum until no folder has a file left, so a paused driver reports no sum and shows the same one when it syncs again. Unlinking a folder or signing out takes the folder out of the sum. The sum takes each folder's own count of what synced and what left, so it stays exact however the watch snapshots coalesce.
+
+## A rewound space halts its folders
+
+A rewound space halts each folder that syncs it, because the driver does not run the engine's recovery (§6.4) for it.

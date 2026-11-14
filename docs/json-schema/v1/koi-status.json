@@ -607,6 +607,16 @@
             "null"
           ]
         },
+        "progress": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProgressData"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "questions": {
           "format": "uint64",
           "minimum": 0,
@@ -853,6 +863,45 @@
           "type": "string"
         }
       ]
+    },
+    "ProgressData": {
+      "description": "The files the folder still sends to the server or fetches from it, while it syncs. The bytes are those of every\nfile counted since the folder last had none left, the synced ones included, so `bytes_done` never decreases.\n`current` is the file whose content moved last, relative to the folder.",
+      "properties": {
+        "bytes_done": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "bytes_total": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "current": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "files_to_download": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "files_to_upload": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "files_to_upload",
+        "files_to_download",
+        "bytes_done",
+        "bytes_total",
+        "current"
+      ],
+      "type": "object"
     },
     "RecoveryCauseData": {
       "properties": {

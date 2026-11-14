@@ -163,17 +163,19 @@ impl Transfer {
         chunks: &[ChunkRef],
         read: impl FnMut(&ChunkRef) -> R,
     ) -> Result<Vec<UploadReceipt>, ChunkError> {
-        self.upload_observed(session, chunks, read, |_| {}).await
+        self.upload_observed(session, chunks, read, |_| {}, |_| {})
+            .await
     }
 
-    /// [`Transfer::upload`], calling `stored` with each chunk once the server or its storage took it, also when a
-    /// later chunk ends the upload.
+    /// [`Transfer::upload`], calling `stored` with each chunk once the server or its storage took it and `present`
+    /// with each chunk the server already held, also when a later chunk ends the upload.
     pub async fn upload_observed<R: Future<Output = io::Result<Bytes>>>(
         &self,
         session: &Session,
         chunks: &[ChunkRef],
         mut read: impl FnMut(&ChunkRef) -> R,
         mut stored: impl FnMut(&ChunkRef),
+        mut present: impl FnMut(&ChunkRef),
     ) -> Result<Vec<UploadReceipt>, ChunkError> {
         let mut todo = distinct(chunks);
         let mut receipts = Vec::new();
@@ -199,7 +201,7 @@ impl Transfer {
                     };
                     let plan = plans.get(chunk.hash.as_slice()).ok_or_else(no_target)?;
                     match plan.action() {
-                        Action::Present => {}
+                        Action::Present => present(chunk),
                         Action::RetryLater => {
                             wait = wait.max(Duration::from_millis(plan.retry_after_ms));
                             deferred.push(index);

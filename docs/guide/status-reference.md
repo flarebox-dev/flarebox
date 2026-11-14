@@ -9,12 +9,21 @@ This page explains what `koi status` and `koi resolve` show. [Status and problem
 | `Stopped` | The daemon isn't running, or sync is paused. The `Background service` and `Sync` lines say which |
 | `Connecting` | Opening a session with the server |
 | `Bootstrapping` | Reading the space's whole file tree, the first time or after a long time offline |
-| `CatchingUp` | Applying changes from other devices |
+| `Syncing` | Sending this device's changes to the server, or applying changes from other devices. `--json` calls it `catching_up` |
 | `UpToDate` | The folder has the server's latest changes, and new ones arrive as they happen. Items that wait on a problem stay out of sync, and the line below names them |
 | `Offline` | The server can't be reached. The folder keeps trying |
 | `Halted` | A problem stopped the folder. The line below says which |
 
 When a newer release is out, an `Update:` line after `Background service` names it and the command that installs it, `koi update`. [Updates](service.md#updates) describes the check behind it.
+
+While a folder bootstraps or syncs, a line under it shows the files it still sends or fetches and how many bytes are done:
+
+```
+/home/alice/Koidrive  space Koidrive (019a...)  Syncing  seq 1204 of 1204, 3120 remote nodes, 3240 local entries, 0 need you
+  120 files to upload; 310.5 MB of 1.2 GB; now Photos/IMG_0412.HEIC
+```
+
+A file found meanwhile adds to the numbers at once. The bytes done never go backwards, and content the server holds already counts as done without being sent. `--json` returns the same numbers under `progress`.
 
 `seq` counts the changes the space has had: how many this device has applied, and how many the server has. A second line under the folder shows a problem, or the last failure the folder is retrying. Below that come the folder's pending decisions. `--json` returns all of it.
 

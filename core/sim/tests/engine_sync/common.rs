@@ -1372,7 +1372,8 @@ fn run_ignoring(
     );
 
     device.trees.settle();
-    let outside = |id: &str| device.trees.ignored(id) || device.trees.kept_for_excluded(id);
+    let kept_for_excluded = device.trees.kept_for_excluded();
+    let outside = |id: &str| device.trees.ignored(id) || kept_for_excluded(id);
     let unsettled: Vec<String> = (device.trees.work().into_iter())
         .map(|(id, _)| id)
         .filter(|id| !outside(id))

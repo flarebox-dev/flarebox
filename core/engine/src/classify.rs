@@ -2,6 +2,7 @@
 
 //! Classifying a node (docs/design/sync-engine.md section 2.3) and the dirty set the planner reads.
 
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use koidrive_ignore::Status;
@@ -1322,25 +1323,47 @@ impl Trees {
         !self.l.get(id).is_some_and(|node| node.parked) && self.ignored(id)
     }
 
-    /// Whether L no longer holds the node while R holds an excluded node below it. The commit planner sends no
+    /// Whether L no longer holds a node while R holds an excluded node below it. The commit planner sends no
     /// `Delete` for such a folder, which stays on the server with what it holds that this device leaves out
-    /// (section 5.10), and the effects do not create it again, so nothing is left to sync for it.
-    pub fn kept_for_excluded(&self, id: &str) -> bool {
-        if self.l.get(id).is_some() || self.r.live(id).is_none() {
-            return false;
-        }
-        let below = |node: &str| {
-            let mut current = node;
-            for _ in 0..self.r.len() {
-                match self.r.live(current) {
-                    Some(shape) if shape.parent == id => return true,
-                    Some(shape) => current = &shape.parent,
-                    None => return false,
-                }
+    /// (section 5.10), and the effects do not create it again, so nothing is left to sync for it. The returned check
+    /// remembers what it found below each node, so asking it about every node of R reads each node once.
+    pub fn kept_for_excluded(&self) -> impl Fn(&str) -> bool + '_ {
+        let children = OnceCell::new();
+        let below = RefCell::new(HashMap::new());
+        move |id| {
+            if self.l.get(id).is_some() || self.r.live(id).is_none() {
+                return false;
             }
-            false
-        };
-        (self.r.iter()).any(|(node, _)| below(node) && self.excluded(node))
+            let children = children.get_or_init(|| {
+                let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+                for (node, _) in self.r.iter() {
+                    if let Some(shape) = self.r.live(node) {
+                        children
+                            .entry(shape.parent.as_str())
+                            .or_default()
+                            .push(node);
+                    }
+                }
+                children
+            });
+            self.excluded_below(id, children, &mut below.borrow_mut())
+        }
+    }
+
+    fn excluded_below(
+        &self,
+        id: &str,
+        children: &HashMap<&str, Vec<&str>>,
+        below: &mut HashMap<String, bool>,
+    ) -> bool {
+        if let Some(found) = below.get(id) {
+            return *found;
+        }
+        below.insert(id.to_owned(), false);
+        let found = (children.get(id).into_iter().flatten())
+            .any(|child| self.excluded(child) || self.excluded_below(child, children, below));
+        below.insert(id.to_owned(), found);
+        found
     }
 
     /// Whether the node is outside the sync tree on this device, as [`Trees::excluded`] decides

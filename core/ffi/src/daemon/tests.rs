@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::core::SessionListener;
-use crate::types::QuestionKind;
+use crate::types::{FolderPath, QuestionKind, SyncProgress};
 
 const KOI: &str = r#"#!/bin/sh
 dir="$(dirname "$0")"
@@ -784,4 +784,111 @@ fn folders_and_decisions_changed_with_koi_reach_the_app_while_no_daemon_runs() {
     eventually("the decision never shows", || {
         koi.core.state().questions.len() == 1
     });
+}
+
+#[test]
+fn the_session_sends_the_progress_the_daemon_reports_while_it_syncs_and_none_after() {
+    use std::io::{BufRead, BufReader, Write};
+
+    struct Progresses(Arc<Mutex<Vec<Option<SyncProgress>>>>);
+
+    impl SessionListener for Progresses {
+        fn on_event(&self, event: SessionEvent) {
+            if let SessionEvent::Progress { progress } = event {
+                self.0.lock().unwrap().push(progress);
+            }
+        }
+    }
+
+    let folder = |space: &str, state: &str, progress: Value| {
+        json!({
+            "space_id": space,
+            "space_name": space,
+            "path": format!("/Users/ada/{space}"),
+            "state": state,
+            "remote_nodes": 3,
+            "questions": 0,
+            "progress": progress,
+        })
+    };
+    let status = |folders: Vec<Value>, progress: Value| -> Status {
+        let mut status = signed_in(true);
+        status["folders"] = Value::Array(folders);
+        status["progress"] = progress;
+        serde_json::from_value(status).unwrap()
+    };
+    let syncing = status(
+        vec![
+            folder(
+                "s1",
+                "catching_up",
+                json!({"files_to_upload": 2, "files_to_download": 1, "bytes_done": 10, "bytes_total": 100, "current": "a.txt"}),
+            ),
+            folder(
+                "s2",
+                "catching_up",
+                json!({"files_to_upload": 0, "files_to_download": 1, "bytes_done": 5, "bytes_total": 50, "current": "b.txt"}),
+            ),
+        ],
+        json!({"files_to_upload": 2, "files_to_download": 2, "bytes_done": 15, "bytes_total": 150}),
+    );
+    let done = status(
+        vec![
+            folder("s1", "up_to_date", Value::Null),
+            folder("s2", "up_to_date", Value::Null),
+        ],
+        Value::Null,
+    );
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let koi = Koi::with_listener(signed_in(true), Box::new(Progresses(seen.clone())));
+    let socket = koi.core.paths.socket();
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let (send, states) = std::sync::mpsc::channel::<Status>();
+    let daemon = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut request = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap();
+        assert_eq!(request.trim(), r#"{"request":"watch"}"#);
+        let mut stream = stream;
+        for status in states {
+            let line = serde_json::to_string(&Response::State {
+                status,
+                questions: Vec::new(),
+            })
+            .unwrap();
+            writeln!(stream, "{line}").unwrap();
+        }
+    });
+    koi.core.start();
+    send.send(syncing).unwrap();
+    eventually("the session sends the daemon's progress", || {
+        !seen.lock().unwrap().is_empty()
+    });
+    let state = koi.core.state();
+    assert_eq!(state.status, SyncStatus::Syncing);
+    let expected = SyncProgress {
+        files_to_upload: 2,
+        files_to_download: 2,
+        bytes_done: 15,
+        bytes_total: 150,
+        current: Some(FolderPath {
+            space_id: "s1".into(),
+            path: "a.txt".into(),
+        }),
+    };
+    assert_eq!(state.progress, Some(expected.clone()));
+
+    send.send(done).unwrap();
+    eventually("the session ends the progress", || {
+        seen.lock().unwrap().len() == 2
+    });
+    assert_eq!(*seen.lock().unwrap(), [Some(expected), None]);
+    assert_eq!(koi.core.state().status, SyncStatus::Idle);
+    koi.core.stop();
+    drop(send);
+    daemon.join().unwrap();
 }

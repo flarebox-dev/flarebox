@@ -31,18 +31,26 @@ pub enum SyncStatus {
     Halted,
 }
 
-/// How far the current sync has got, across every linked folder.
+/// How far the current sync has got, summed over every linked folder that syncs (docs/design/driver.md,
+/// "Progress counts the files left to sync"). The session sends it with [`SyncStatus::Syncing`], at most four
+/// times a second, and `None` once no file is left to send or fetch.
+///
+/// While the session syncs, `bytes_done` never decreases: a folder that finishes, abandons a file, goes offline or
+/// stops keeps the bytes it moved in the sum until no folder has a file left. `bytes_total` grows only when new work
+/// arrives, so the fraction falls only when a folder finds more to sync.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct SyncProgress {
-    /// Files still to be sent to the server, including the ones being sent.
+    /// Files whose content still goes to the server, including the ones being sent.
     pub files_to_upload: u64,
-    /// Files still to be fetched from the server, including the ones being fetched.
+    /// Files whose content still comes from the server, including the ones being fetched.
     pub files_to_download: u64,
-    /// Bytes transferred so far in this sync, in both directions.
+    /// Bytes that this device and the server both hold, in both directions. A chunk the server holds already counts
+    /// as done without being sent.
     pub bytes_done: u64,
-    /// Bytes this sync transfers in total, in both directions. Grows when new work arrives.
+    /// Bytes of the content of every file counted, the synced ones included, in both directions. A file that leaves
+    /// without syncing, because it was edited again or removed, takes its bytes not done out of it.
     pub bytes_total: u64,
-    /// The file being transferred now, if any.
+    /// The file whose content moved last, if any.
     pub current: Option<FolderPath>,
 }
 
