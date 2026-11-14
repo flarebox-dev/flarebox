@@ -1987,6 +1987,7 @@ mod tests {
             commit,
             deletes: BTreeMap::new(),
             restores: BTreeMap::new(),
+            resent: Default::default(),
             result: None,
         });
         let state = CommitsState {
