@@ -2456,7 +2456,8 @@ impl World {
                 .find(|write| !stored(&self.held, *write) && !self.rewound.contains_key(write));
             if let Some(write) = unheld {
                 return Err(Failure::Broken(format!(
-                    "device {d} is quiet with write {write} on its disk, which the server never                      held: a later write of another device can replace it unseen"
+                    "device {d} is quiet with write {write} on its disk, which the server never \
+                     held: a later write of another device can replace it unseen"
                 )));
             }
             let trees = &engine.trees;
