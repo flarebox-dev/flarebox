@@ -83,6 +83,19 @@ main() {
     printf 'Downloading %s (%s)\n' "$archive" "$version"
     fetch "$archive"
     fetch SHA256SUMS
+    fetch SHA256SUMS.sig || fail 'Could not download SHA256SUMS.sig, so the release cannot be verified; the existing installation has not changed'
+    if command -v ssh-keygen >/dev/null 2>&1 && ssh-keygen -\? 2>&1 | grep -q 'ssh-keygen -Y verify'; then
+        printf '%s\n' 'koidrive namespaces="koidrive-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHrojC3pUxk7xAzY+3xU5cpMnCpa2jPxjMu/xH/xL/+n' > "$tmp/allowed-signers"
+        ssh-keygen -Y verify -f "$tmp/allowed-signers" -I koidrive -n koidrive-release -s "$tmp/SHA256SUMS.sig" < "$tmp/SHA256SUMS" >/dev/null 2>&1 ||
+            fail 'SHA256SUMS is not signed with the Koidrive release key; the existing installation has not changed'
+        printf 'Signature verified for SHA256SUMS\n'
+    else
+        printf 'Warning: ssh-keygen from OpenSSH 8.1 or later was not found, so the release signature was not checked\n' >&2
+    fi
+    if [ "$version" != latest ]; then
+        awk -v name="Koidrive-$version-arm64.dmg" '$2 == name { found = 1 } END { exit !found }' "$tmp/SHA256SUMS" ||
+            fail "SHA256SUMS does not belong to v$version; the existing installation has not changed"
+    fi
     expected=$(awk -v name="$archive" '$2 == name { count++; hash = $1 } END { if (count == 1) print hash; else exit 1 }' "$tmp/SHA256SUMS") || fail 'SHA256SUMS must contain exactly one entry for the tarball'
     [ "${#expected}" -eq 64 ] || fail 'Invalid SHA256SUMS entry'
     case "$expected" in *[!0-9a-f]*) fail 'Invalid SHA256SUMS entry' ;; esac

@@ -26,10 +26,19 @@ class InstallJourney(unittest.TestCase):
     def setUpClass(cls):
         cls.certificates = tempfile.TemporaryDirectory(prefix="koidrive-install-tls-")
         cls.tls = Path(cls.certificates.name)
+        cls.keys = tempfile.TemporaryDirectory(prefix="koidrive-install-keys-")
+        keys = Path(cls.keys.name)
+        for name in ("release", "other"):
+            subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", name, "-f", str(keys / name)], check=True)
+        cls.release_key, cls.other_key = keys / "release", keys / "other"
+        pinned = (ROOT / ".github/release-allowed-signers").read_text().split()[3]
+        cls.installer = keys / "install.sh"
+        cls.installer.write_text((ROOT / "install.sh").read_text().replace(pinned, (keys / "release.pub").read_text().split()[1]))
 
     @classmethod
     def tearDownClass(cls):
         cls.certificates.cleanup()
+        cls.keys.cleanup()
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="koidrive-install-journey-")
@@ -102,8 +111,17 @@ class InstallJourney(unittest.TestCase):
             with tarfile.open(archive, "w:gz") as tar:
                 tar.add(koi, arcname="koi")
             sums.append(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n")
+        sums.append(f"{'0' * 64}  Koidrive-0.0.0-arm64.dmg\n")
         self.sums = release / "SHA256SUMS"
         self.sums.write_text("".join(sums))
+        self.sign()
+
+    def sign(self, key=None, namespace="koidrive-release"):
+        self.sums.with_name("SHA256SUMS.sig").unlink(missing_ok=True)
+        subprocess.run(
+            ["ssh-keygen", "-q", "-Y", "sign", "-f", str(key or self.release_key), "-n", namespace, str(self.sums)],
+            check=True, capture_output=True,
+        )
 
     def tool(self, name, body):
         file = self.bin / name
@@ -112,7 +130,7 @@ class InstallJourney(unittest.TestCase):
 
     def install(self, *args, terminal=True, piped=True, env=None, redirect=None):
         environment = self.env | (env or {})
-        installer = shlex.quote(str(ROOT / "install.sh"))
+        installer = shlex.quote(str(self.installer))
         options = " ".join(shlex.quote(arg) for arg in args)
         command = f"cat {installer} | /bin/sh -s -- {options}" if piped else f"/bin/sh {installer} {options}"
         if redirect:
@@ -180,7 +198,7 @@ class InstallJourney(unittest.TestCase):
         self.assertEqual((self.home / "setup.answer").read_text(), "continue\n")
         profile = self.home / ".zprofile"
         self.assertIn(f"Updated {profile}:\n+ {profile.read_text()}", output)
-        self.assertIn("SHA256 verified", output)
+        self.assertIn("Signature verified for SHA256SUMS\nSHA256 verified", output)
 
     def test_no_app_is_forwarded_to_setup(self):
         self.successful_install("--no-app")
@@ -335,7 +353,7 @@ exec /bin/mv "$@"''')
         master, slave = pty.openpty()
         try:
             result = subprocess.run(
-                ["/bin/sh", str(ROOT / "install.sh")], stdin=subprocess.DEVNULL,
+                ["/bin/sh", str(self.installer)], stdin=subprocess.DEVNULL,
                 stdout=slave, stderr=slave, start_new_session=True, env=self.env, timeout=15,
             )
         finally:
@@ -427,12 +445,53 @@ exec /bin/mv "$@"''')
         installed.parent.mkdir(parents=True)
         installed.write_text("old Koidrive sync client")
         self.sums.write_text(self.sums.read_text().replace(self.sums.read_text()[:64], "0" * 64))
+        self.sign()
         code, output = self.install()
         self.assertNotEqual(code, 0)
         self.assertIn("Checksum mismatch", output)
         self.assertEqual(installed.read_text(), "old Koidrive sync client")
         self.assertFalse((self.home / "setup.args").exists())
         self.assertFalse((self.home / ".zprofile").exists())
+
+    def test_installer_pins_the_published_release_key(self):
+        pinned = (ROOT / ".github/release-allowed-signers").read_text().strip()
+        self.assertEqual((ROOT / "install.sh").read_text().count(f"'{pinned}'"), 1)
+        self.assertNotIn(pinned.split()[3], self.installer.read_text())
+
+    def test_release_signed_with_another_key_is_refused_before_entries_are_read(self):
+        for key, namespace in ((self.other_key, "koidrive-release"), (self.release_key, "file")):
+            with self.subTest(key=key.name, namespace=namespace):
+                self.sums.write_text("not a checksum entry\n")
+                self.sign(key, namespace)
+                output = self.refused_install("SHA256SUMS is not signed with the Koidrive release key")
+                self.assertNotIn("entry", output)
+
+    def test_signed_checksums_of_another_version_are_refused(self):
+        self.sums.write_text(self.sums.read_text().replace("Koidrive-0.0.0-arm64.dmg", "Koidrive-0.0.1-arm64.dmg"))
+        self.sign()
+        self.refused_install("SHA256SUMS does not belong to v0.0.0")
+
+    def test_release_without_signature_is_refused(self):
+        self.sums.with_name("SHA256SUMS.sig").unlink()
+        self.refused_install("Could not download SHA256SUMS.sig, so the release cannot be verified")
+
+    def test_missing_or_old_ssh_keygen_warns_and_still_installs(self):
+        self.sign(self.other_key)
+        system = self.dir / "system"
+        system.mkdir()
+        for directory in ("/usr/bin", "/bin"):
+            for entry in os.scandir(directory):
+                if entry.name != "ssh-keygen" and not os.path.lexists(system / entry.name):
+                    (system / entry.name).symlink_to(entry.path)
+        warning = "Warning: ssh-keygen from OpenSSH 8.1 or later was not found, so the release signature was not checked"
+        with self.subTest(ssh_keygen="missing"):
+            output = self.successful_install("--no-setup", env={"PATH": f"{self.bin}:{system}"})
+            self.assertIn(warning, output)
+        self.tool("ssh-keygen", 'echo "usage: ssh-keygen [-q] [-b bits] [-t dsa | ecdsa | ed25519 | rsa]" >&2\nexit 1')
+        with self.subTest(ssh_keygen="without -Y"):
+            output = self.successful_install("--no-setup")
+            self.assertIn(warning, output)
+            self.assertNotIn("Signature verified", output)
 
     def test_release_base_must_be_https(self):
         plain = self.serve("plain")
@@ -444,7 +503,7 @@ exec /bin/mv "$@"''')
 
     def test_https_to_http_redirect_of_either_download_is_refused(self):
         plain = self.serve("plain")
-        for name in ("koidrive-aarch64-apple-darwin.tar.gz", "SHA256SUMS"):
+        for name in ("koidrive-aarch64-apple-darwin.tar.gz", "SHA256SUMS", "SHA256SUMS.sig"):
             with self.subTest(redirected=name):
                 origin = self.serve(f"redirect-{name}", "--tls", str(self.tls), "--redirect", plain, "--only", name)
                 self.refused_install("curl: (1)", env={"KOIDRIVE_RELEASE_BASE_URL": origin + "/releases"})
@@ -455,7 +514,7 @@ exec /bin/mv "$@"''')
         mirror = self.serve("mirror", "--tls", str(self.tls))
         origin = self.serve("redirect", "--tls", str(self.tls), "--redirect", mirror)
         self.successful_install("--no-setup", env={"KOIDRIVE_RELEASE_BASE_URL": origin + "/releases"})
-        self.assertEqual(sorted(self.requests("mirror")), ["/releases/download/v0.0.0/SHA256SUMS", "/releases/download/v0.0.0/koidrive-aarch64-apple-darwin.tar.gz"])
+        self.assertEqual(sorted(self.requests("mirror")), ["/releases/download/v0.0.0/SHA256SUMS", "/releases/download/v0.0.0/SHA256SUMS.sig", "/releases/download/v0.0.0/koidrive-aarch64-apple-darwin.tar.gz"])
 
     def test_version_must_be_one_whole_version(self):
         for version in ("0.0.0\n../..", "0.0.0\n", "\n0.0.0", "../../bad", "0.0", "0.0.0 ", "0.0.0/../x"):
