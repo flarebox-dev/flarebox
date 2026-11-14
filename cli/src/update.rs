@@ -22,6 +22,8 @@ use crate::report::{Done, UpdateNoticeData, UpdateResult, UpdatedData, Via};
 use crate::service;
 
 const INSTALLER: Duration = Duration::from_secs(5 * 60);
+const TAP_REFRESH: Duration = Duration::from_secs(60);
+const TAP: &str = "koidrive/tap";
 const RECONCILE: Duration = Duration::from_secs(7 * 60);
 const SCAN: Duration = Duration::from_secs(60 * 60);
 const INSTALL_SCRIPT: &str = "https://koidrive.com/install.sh";
@@ -651,26 +653,8 @@ pub async fn run(paths: &Paths, json: bool) -> Result<Done, CliError> {
         )
         .unchanged());
     }
-    if matches!(install.method, Method::Cask { .. } | Method::Formula { .. }) {
-        let command = install.command().ok_or_else(|| {
-            failed("Homebrew's path cannot be represented as a shell command".to_owned())
-        })?;
-        return Ok(Done::ok(
-            UpdatedData {
-                from: env!("CARGO_PKG_VERSION").to_owned(),
-                to: env!("CARGO_PKG_VERSION").to_owned(),
-                via: install.method.via(),
-                app: None,
-                result: UpdateResult::Unchanged,
-                service: None,
-            },
-            format!(
-                "Koidrive is managed by Homebrew. To update, run: {}\n",
-                command_text(&command)
-            ),
-        )
-        .unchanged()
-        .then(&command));
+    if let Method::Cask { brew } | Method::Formula { brew } = &install.method {
+        return homebrew(paths, &install, brew, json).await;
     }
     let release = update::check_now(paths)
         .await
@@ -832,6 +816,114 @@ pub async fn run(paths: &Paths, json: bool) -> Result<Done, CliError> {
         app,
         changed,
     )
+}
+
+async fn homebrew(
+    paths: &Paths,
+    install: &Install,
+    brew: &Path,
+    json: bool,
+) -> Result<Done, CliError> {
+    let command = install.command().ok_or_else(|| {
+        failed("Homebrew's path cannot be represented as a shell command".to_owned())
+    })?;
+    let guidance = format!("To update, run: {}", command_text(&command));
+    let koi = match install.method {
+        Method::Formula { .. } => brew
+            .parent()
+            .and_then(Path::parent)
+            .map(|prefix| prefix.join("opt/koidrive/bin/koi"))
+            .unwrap_or_else(|| install.binary.clone()),
+        _ => install.binary.clone(),
+    };
+    let from = service::version_of(&koi).unwrap_or_else(service::this_version);
+    if !fs::metadata(brew)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    {
+        return Err(failed(format!(
+            "Homebrew is not at {}. {guidance}",
+            brew.display()
+        )));
+    }
+    let mut echo = Echo::open(&log_path(paths), json);
+    refresh_tap(brew, &mut echo).await;
+    let mut upgrade = Command::new(brew);
+    upgrade
+        .args(&command[1..])
+        .env("HOMEBREW_NO_AUTO_UPDATE", "1");
+    let (status, _, _) = (echo.run(upgrade, INSTALLER, Child::Progress).await)
+        .map_err(|error| {
+            failed(format!(
+                "{} did not run: {error}. {guidance}",
+                brew.display()
+            ))
+        })?
+        .ok_or_else(|| {
+            failed(format!(
+                "brew upgrade did not finish within {} minutes. {guidance}",
+                minutes(INSTALLER)
+            ))
+        })?;
+    if !status.success() {
+        return Err(failed(format!(
+            "brew upgrade failed ({}). {guidance}",
+            exit(status)
+        )));
+    }
+    let deadline = tokio::time::Instant::now() + RECONCILE;
+    let reconciled = reconcile_updated(
+        &UpdateBinary::Other(koi),
+        &from,
+        service::system().as_ref(),
+        service::this_service(paths),
+        &mut echo,
+        deadline,
+    )
+    .await;
+    let (actual, report, app) =
+        finish_reconciliation(paths, None, &from, reconciled, deadline).await?;
+    updated(&from, actual, Via::Homebrew, report, app, false)
+}
+
+async fn refresh_tap(brew: &Path, echo: &mut Echo) {
+    let mut repository = Command::new(brew);
+    repository
+        .args(["--repository", TAP])
+        .env("HOMEBREW_NO_AUTO_UPDATE", "1")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let tap = match tokio::time::timeout(TAP_REFRESH, repository.output()).await {
+        Ok(Ok(output))
+            if output.status.success()
+                && Path::new(String::from_utf8_lossy(&output.stdout).trim()).is_absolute() =>
+        {
+            PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+        }
+        _ => {
+            echo.line(&format!("Could not find the {TAP} Homebrew tap."), true);
+            return;
+        }
+    };
+    if !tap.join(".git").exists() {
+        return;
+    }
+    let homebrew_git = brew.with_file_name("git");
+    let git = match homebrew_git.is_file() {
+        true => homebrew_git,
+        false => PathBuf::from("/usr/bin/git"),
+    };
+    let mut pull = Command::new(git);
+    pull.arg("-C")
+        .arg(&tap)
+        .args(["pull", "--ff-only", "--quiet"]);
+    match echo.run(pull, TAP_REFRESH, Child::Progress).await {
+        Ok(Some((status, _, _))) if status.success() => (),
+        _ => echo.line(
+            &format!("Could not refresh the {TAP} Homebrew tap; upgrading from it as it is."),
+            true,
+        ),
+    }
 }
 
 fn updated(
