@@ -482,10 +482,52 @@ pub const RETURNS: [Scenario; 4] = [
     },
 ];
 
+pub const FOLDER_MOVED: [Scenario; 2] = [
+    Scenario {
+        name: "remove_file_folder_moved",
+        paths: SCENARIOS[4].paths,
+        setup: SCENARIOS[4].setup,
+        build: SCENARIOS[4].build,
+        disturb: move_docs,
+        check: |root, outcome| {
+            assert_identity(root, outcome, None);
+            let target = contents(root.join("moved/report.txt"));
+            if matches!(outcome, Outcome::Done { .. }) {
+                assert_eq!(target, None);
+                assert_eq!(trashed(root), [SYNCED]);
+            } else {
+                assert_eq!(target.as_deref(), Some(SYNCED));
+                assert!(trashed(root).is_empty());
+            }
+        },
+        done_from: Some(Step::Quarantined),
+    },
+    Scenario {
+        name: "remove_dir_folder_moved",
+        paths: SCENARIOS[5].paths,
+        setup: SCENARIOS[5].setup,
+        build: folder_removal,
+        disturb: move_docs,
+        check: |root, outcome| {
+            assert_identity(root, outcome, None);
+            let done = matches!(outcome, Outcome::Done { .. });
+            assert_eq!(root.join("moved/empty").is_dir(), !done);
+            let trashed_dirs = private_names(root, TRASH_DIR).len();
+            assert_eq!(trashed_dirs, usize::from(done));
+        },
+        done_from: Some(Step::Quarantined),
+    },
+];
+
+fn move_docs(root: &Path) {
+    fs::rename(root.join("docs"), root.join("moved")).unwrap();
+}
+
 pub fn scenario(name: &str) -> &'static Scenario {
     SCENARIOS
         .iter()
         .chain(&RETURNS)
+        .chain(&FOLDER_MOVED)
         .find(|scenario| scenario.name == name)
         .unwrap()
 }

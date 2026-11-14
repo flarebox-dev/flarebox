@@ -668,11 +668,11 @@ impl Space {
                 Some(Some(stat)) if stat.id == *id => None,
                 _ => return Ok(None),
             },
+            Action::RemoveFile { .. } | Action::RemoveDir { .. } if trashed()? => None,
             Action::RemoveFile {
                 displaced: Displaced { at, .. },
             }
             | Action::RemoveDir { at, .. } => match entry_at(at)? {
-                Some(None) if trashed()? => None,
                 Some(None) => return Ok(Some(failed(Reason::Missing))),
                 _ => return Ok(None),
             },

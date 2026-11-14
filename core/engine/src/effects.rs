@@ -439,10 +439,12 @@ impl Effects {
     /// planned with. An edit the user made while the move was in flight stays the user's.
     /// A change R made while the effect was in flight then stays a remote change and is never
     /// taken for the user's: a file R restored during its removal is downloaded again, and a file
-    /// R moved back during its move is moved back. S stays as it is when L no longer matched it:
-    /// L then holds a change of the user's, such as one that recovery after a crash reports as
-    /// the effect's outcome (a missing file as the removal, the planned bytes as the write), and
-    /// that change stays the user's.
+    /// R moved back during its move is moved back. A finished removal leaves S without the node
+    /// even when L no longer matched S: the effect took the entry off the disk, so a change of the
+    /// user's to it is gone with it, and a node R brings back later is downloaded, never deleted
+    /// as the user's. For any other effect, S stays as it is when L no longer matched it: L then
+    /// holds a change of the user's, such as the planned bytes that recovery after a crash reports
+    /// as a write's outcome, and that change stays the user's.
     /// An outcome L does not take ([`EffectRecord::applies`]) is refused, and the effect stays
     /// in flight.
     /// A removal of a node R no longer holds applied another device's deletion, and is returned
@@ -490,7 +492,7 @@ impl Effects {
             }
             _ => same(local, base),
         };
-        if unchanged {
+        if unchanged || record.after.is_none() {
             let synced = match (&record.effect, &record.after, base) {
                 (Effect::Move { .. }, Some(after), Some(base)) => Some(Shape {
                     parent: after.parent.clone(),
@@ -527,8 +529,10 @@ impl Effects {
 
     /// Whether L confirms what recovery reports after a crash: that the effect in flight is done,
     /// with `identity` for the entry it created (section 5.3). Recovery judges a target by the name
-    /// and the content it finds there. An entry that L holds as another node is that node's, and a
-    /// removal whose node L places elsewhere found its name empty because the node moved.
+    /// and the content it finds there, so an entry that L holds as another node is that node's. A
+    /// removal is done only once its entry is in the local trash under the effect's ID, which the
+    /// effect put there after it matched the entry against what it displaced, so L's position for
+    /// the node does not refute it.
     pub fn confirms(
         &self,
         trees: &Trees,
@@ -538,23 +542,9 @@ impl Effects {
         let Some(record) = self.flight(effect_id) else {
             return false;
         };
-        let local = trees.local();
-        if (identity.into_iter())
+        !(identity.into_iter())
             .flat_map(|identity| trees.locals_with_identity(identity))
             .any(|id| *id != record.node)
-        {
-            return false;
-        }
-        match &record.effect {
-            Effect::RemoveDir { at, .. }
-            | Effect::RemoveFile {
-                displaced: Displaced { at, .. },
-            } => {
-                local.get(&record.node).is_none()
-                    || View::new(trees).location(&record.node).as_ref() == Some(at)
-            }
-            _ => true,
-        }
     }
 
     /// The driver did not do the effect. Its observations of the disk go to L separately; the node

@@ -1,0 +1,1 @@
+cc 6deeb8a7291d4f14dbe117ea8128b7e37d1c21c0151f90038e294b6be6bcaa49 # shrinks to devices = 2, a removal done before a crash is re-sent as a delete after its user renames its folder (GUN-732)

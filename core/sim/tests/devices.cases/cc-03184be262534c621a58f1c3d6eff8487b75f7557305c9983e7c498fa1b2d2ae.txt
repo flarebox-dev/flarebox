@@ -1,0 +1,1 @@
+cc 03184be262534c621a58f1c3d6eff8487b75f7557305c9983e7c498fa1b2d2ae # shrinks to devices = 3, a removal done before a crash is re-sent as a delete after a later removal of its batch quarantines its folder (GUN-731)
