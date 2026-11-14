@@ -1011,6 +1011,7 @@ mod tests {
                     tx.put_synced_node(&koidrive_store::SyncedNode {
                         node_id: node.node_id.clone(),
                         shape: shape.clone(),
+                        pending_for: String::new(),
                     })?;
                     tx.put_local_node(&koidrive_store::LocalNode {
                         node_id: node.node_id.clone(),
