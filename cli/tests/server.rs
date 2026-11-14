@@ -1463,7 +1463,7 @@ async fn a_folder_linked_with_reports_on_before_the_daemon_runs_waits_for_its_fi
     run(&["folder", "link", folder.to_str().unwrap(), "--space", &name]);
 
     let settings: Value = serde_json::from_str(
-        &fs::read_to_string(machine.path("state/koidrive/settings.json")).unwrap(),
+        &fs::read_to_string(machine.path("state/koidrive/telemetry/settings.json")).unwrap(),
     )
     .unwrap();
     let install = settings["install_id"].as_str().unwrap();
