@@ -1009,7 +1009,9 @@ def homebrew_update(evidence, root, ownership, entries):
         evidence.check("koi update through Homebrew", status == 0 and envelope.get("outcome") == "ok"
                        and data.get("via") == "homebrew" and data.get("result") == "updated"
                        and data.get("from") == previous and data.get("to") == current
-                       and (data.get("service") or {}).get("state") == "running", out + err)
+                       and not envelope.get("error")
+                       and (data.get("service") or {}).get("state") == "running"
+                       and not (data.get("service") or {}).get("problem"), out + err)
         version(evidence, link, "updated version")
         _, refreshed, _ = evidence.run(["git", "-C", tap, "rev-parse", "HEAD"])
         evidence.check("koidrive tap refreshed", refreshed == head, refreshed)
