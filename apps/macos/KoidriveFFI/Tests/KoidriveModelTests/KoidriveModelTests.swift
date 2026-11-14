@@ -319,6 +319,42 @@ private final class Fetches {
         #expect(model.iconBadge == .none)
     }
 
+    @Test func syncingArrowsTurnOnlyWhileSyncing() throws {
+        let expected: [(FakeScenario, menuBar: Bool, headline: Bool)] = [
+            (.firstRun, false, false),
+            (.upToDate, false, false),
+            (.syncing, true, true),
+            (.paused, false, false),
+            (.offline, false, false),
+            (.massDelete, false, false),
+            (.problems, false, false),
+        ]
+        for (scenario, menuBar, headline) in expected {
+            let model = AppModel.fake(scenario: scenario)
+            model.start()
+            #expect(model.turnsMenuBarArrows(reduceMotion: false) == menuBar, "\(scenario)")
+            #expect(model.turnsHeadlineArrows(reduceMotion: false) == headline, "\(scenario)")
+            #expect(!model.turnsMenuBarArrows(reduceMotion: true), "\(scenario)")
+            #expect(!model.turnsHeadlineArrows(reduceMotion: true), "\(scenario)")
+        }
+
+        let model = AppModel.fake(scenario: .upToDate)
+        model.start()
+        model.apply(.status(status: .connecting))
+        #expect(model.turnsMenuBarArrows(reduceMotion: false))
+        #expect(model.turnsHeadlineArrows(reduceMotion: false))
+
+        model.apply(.status(status: .syncing))
+        let fake = try #require(model.session.fakeCore())
+        _ = try fake.reportProblem(spaceId: "space-documents", path: "log.txt", kind: .fileBusy)
+        model.apply(.problems(problems: model.session.state().problems))
+        #expect(!model.turnsMenuBarArrows(reduceMotion: false))
+        #expect(model.turnsHeadlineArrows(reduceMotion: false))
+
+        model.apply(.status(status: .idle))
+        #expect(!model.turnsHeadlineArrows(reduceMotion: false))
+    }
+
     @Test func questionsInTheOnlyLinkedFolderShowNoSpace() async throws {
         let model = AppModel.fake(scenario: .massDelete)
         try await model.unlinkFolder(spaceID: "space-photos")

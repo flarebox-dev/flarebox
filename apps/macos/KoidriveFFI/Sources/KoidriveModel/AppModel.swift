@@ -139,6 +139,14 @@ public final class AppModel {
         }
     }
 
+    public func turnsMenuBarArrows(reduceMotion: Bool) -> Bool {
+        !reduceMotion && iconBadge == .syncing
+    }
+
+    public func turnsHeadlineArrows(reduceMotion: Bool) -> Bool {
+        !reduceMotion && (headline == .status(.syncing) || headline == .status(.connecting))
+    }
+
     /// How far the current sync has got, from 0 to 1, or nil when nothing is being transferred.
     public var progressFraction: Double? {
         guard let progress = state.progress, progress.bytesTotal > 0 else { return nil }

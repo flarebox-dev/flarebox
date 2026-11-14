@@ -8,10 +8,18 @@ import SwiftUI
 struct MenuBarLabel: View {
     let model: AppModel
     @Environment(\.openWindow) private var openWindow
+    @State private var reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    @State private var turningArrows = TurningArrows()
 
     var body: some View {
-        Image(model.iconBadge.imageName)
+        Image(turningArrows.isTurning ? "MenuBar/syncing-fish" : model.iconBadge.imageName)
             .accessibilityLabel(Text("Koidrive: \(model.headline == .questions ? String(localized: "Needs you") : model.headlineTitle)"))
+            .onChange(of: model.turnsMenuBarArrows(reduceMotion: reduceMotion), initial: true) { _, turns in
+                turningArrows.turn(turns)
+            }
+            .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification)) { _ in
+                reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            }
             .task {
                 if model.needsSetup {
                     openWindow.show(WindowID.setup)
@@ -22,6 +30,59 @@ struct MenuBarLabel: View {
                     openWindow.show(WindowID.questions)
                 }
             }
+    }
+}
+
+@MainActor
+@Observable
+final class TurningArrows {
+    private(set) var isTurning = false
+    @ObservationIgnored private var arrows: NSImageView?
+
+    func turn(_ on: Bool) {
+        arrows?.removeFromSuperview()
+        arrows = nil
+        if on, let button = NSApp.windows.lazy.compactMap({ $0.contentView?.statusBarButton }).first {
+            arrows = Self.addArrows(to: button)
+        }
+        isTurning = arrows != nil
+    }
+
+    private static func addArrows(to button: NSStatusBarButton) -> NSImageView? {
+        guard let image = NSImage(named: "MenuBar/syncing-arrows") else { return nil }
+        let arrows = NSImageView(image: image)
+        arrows.imageScaling = .scaleNone
+        arrows.wantsLayer = true
+        arrows.translatesAutoresizingMaskIntoConstraints = false
+        button.addSubview(arrows)
+        NSLayoutConstraint.activate([
+            arrows.widthAnchor.constraint(equalToConstant: image.size.width),
+            arrows.heightAnchor.constraint(equalToConstant: image.size.height),
+            arrows.centerXAnchor.constraint(equalTo: button.centerXAnchor),
+            arrows.centerYAnchor.constraint(equalTo: button.centerYAnchor),
+        ])
+        guard let layer = arrows.layer else {
+            arrows.removeFromSuperview()
+            return nil
+        }
+        let center = CGPoint(x: 14.15, y: 14.15)
+        let steps = 72
+        let turn = CAKeyframeAnimation(keyPath: "transform")
+        turn.values = (0...steps).map { step in
+            let turned = CATransform3DRotate(CATransform3DMakeTranslation(center.x, center.y, 0), -2 * .pi * Double(step) / Double(steps), 0, 0, 1)
+            return CATransform3DTranslate(turned, -center.x, -center.y, 0)
+        }
+        turn.duration = 1.6
+        turn.repeatCount = .infinity
+        turn.preferredFrameRateRange = CAFrameRateRange(minimum: 15, maximum: 20, preferred: 20)
+        layer.add(turn, forKey: "turn")
+        return arrows
+    }
+}
+
+private extension NSView {
+    var statusBarButton: NSStatusBarButton? {
+        self as? NSStatusBarButton ?? subviews.lazy.compactMap(\.statusBarButton).first
     }
 }
 
@@ -92,37 +153,53 @@ struct MenuContent: View {
     @Environment(AppModel.self) private var model
     @Environment(\.openWindow) private var openWindow
     @Environment(\.openSettings) private var openSettings
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage(SettingsTab.storageKey) private var settingsTab = SettingsTab.folders
     @State private var error: SessionError?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 4) {
             header
             attention
             notices
             recentChanges
-            Divider()
+            separator
             actions
-            Divider()
+            separator
             MenuButton(title: "Quit Koidrive", systemImage: "power", shortcut: "⌘Q") {
                 NSApplication.shared.terminate(nil)
             }
             .keyboardShortcut("q")
         }
-        .padding(.horizontal, 12)
-        .padding(.top, 16)
-        .padding(.bottom, 12)
+        .padding(.horizontal, 5)
+        .padding(.top, 6)
+        .padding(.bottom, 5)
         .frame(width: 330)
         .tint(.koi)
     }
 
+    private var separator: some View {
+        Divider()
+            .padding(.horizontal, 7)
+            .padding(.vertical, 1)
+    }
+
+    private var headlineIcon: some View {
+        Image(systemName: model.headlineSymbol.name)
+            .font(.system(size: 15, weight: .medium))
+            .foregroundStyle(model.headlineSymbol.color)
+            .frame(width: 18, height: 18)
+    }
+
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                Image(systemName: model.headlineSymbol.name)
-                    .font(.system(size: 15, weight: .medium))
-                    .foregroundStyle(model.headlineSymbol.color)
-                    .frame(width: 18, height: 18)
+            HStack(spacing: 6) {
+                if model.turnsHeadlineArrows(reduceMotion: reduceMotion) {
+                    headlineIcon
+                        .symbolEffect(.rotate.clockwise, options: .repeat(.continuous).speed(1.25))
+                } else {
+                    headlineIcon
+                }
                 Text(model.headlineTitle)
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(Color.text)
@@ -132,6 +209,7 @@ struct MenuContent: View {
                     .font(.callout)
                     .foregroundStyle(Color.text2)
                     .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 24)
             }
             if let progress = model.state.progress, model.headline == .status(.syncing) {
                 HStack(spacing: 10) {
@@ -142,6 +220,7 @@ struct MenuContent: View {
                         .font(.callout)
                         .foregroundStyle(Color.text2)
                 }
+                .padding(.leading, 24)
                 .padding(.top, 4)
                 HStack(spacing: 6) {
                     if progress.filesToUpload > 0 {
@@ -151,12 +230,17 @@ struct MenuContent: View {
                         CountChip(title: String(localized: "\(progress.filesToDownload.formatted()) to download"), systemImage: "arrow.down")
                     }
                 }
+                .padding(.leading, 24)
                 if let current = progress.current {
                     PathText(path: model.displayPath(current.path, spaceID: current.spaceId))
                         .font(.callout)
+                        .padding(.leading, 24)
                 }
             }
         }
+        .padding(.horizontal, 7)
+        .padding(.top, 6)
+        .padding(.bottom, 4)
     }
 
     @ViewBuilder
@@ -210,6 +294,7 @@ struct MenuContent: View {
             }
             .font(.callout)
             .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 7)
         }
     }
 
@@ -226,11 +311,12 @@ struct MenuContent: View {
                     RecentChangeRow(change: change, folder: model.folder(spaceID: change.spaceId))
                 }
             }
+            .padding(.horizontal, 7)
         }
     }
 
     private var actions: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: 0) {
             ForEach(model.state.folders, id: \.spaceId) { folder in
                 MenuButton(title: "Open \(folder.spaceName)", systemImage: "folder") {
                     NSWorkspace.shared.open(URL(filePath: folder.path, directoryHint: .isDirectory))
@@ -346,8 +432,7 @@ private struct AttentionRow: View {
                     CountBadge(count: count, fill: .redFill, text: .white)
                 }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
+            .padding(7)
             .background(RoundedRectangle(cornerRadius: 8).fill(wash))
             .contentShape(Rectangle())
         }
@@ -387,7 +472,8 @@ private struct NoticeRow: View {
             .buttonStyle(.plain)
             .help("Dismiss")
         }
-        .padding(10)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 10)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.fillStrong))
     }
 }
@@ -460,8 +546,8 @@ private struct MenuButton: View {
                         .foregroundStyle(Color.label2)
                 }
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
             .opacity(isEnabled ? 1 : 0.4)
             .background(RoundedRectangle(cornerRadius: 6).fill(hovering && isEnabled ? Color.fillStrong : .clear))
             .contentShape(Rectangle())
