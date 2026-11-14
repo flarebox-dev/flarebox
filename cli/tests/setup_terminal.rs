@@ -438,7 +438,6 @@ fn folder_status(folder: &Path, space: &SpaceInfo) -> FolderStatus {
         problem: None,
         progress: None,
         wait: None,
-        unreachable: None,
         recovery: None,
     }
 }
