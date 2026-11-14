@@ -15,7 +15,7 @@ The manual shell case uses immutable installer commit `2ffddfa8472a87f8586986815
 
 The manual `installer_source` input defaults to `held`, the immutable raw URL. Set it to `live` to download `https://koidrive.com/install.sh` after deployment. Both manual sources must match the same accepted SHA-256 before any installer or bootstrap CLI executes. No custom URL or digest input is accepted.
 
-Automatic release and CLI-distribution checks use the live URL. They resolve the release tag, require the checkout to match its commit, and compare the downloaded script with `install.sh` in that checkout. A ref or digest mismatch fails before installer or bootstrap CLI execution.
+Automatic release and CLI-distribution checks use the live URL. They resolve the release tag and require the checkout to match its commit. The downloaded script must match `install.sh` at that commit or at the head of `main`, which koidrive.com serves, so an installer deployed after the tag still passes. While it matches neither, the check resolves `main` and downloads the live script again every 15 seconds for up to 10 minutes, which lets a deploy in progress finish. A ref mismatch, or a script that still matches neither, fails before installer or bootstrap CLI execution.
 
 Each job uploads sanitized commands, transcripts, assertions, and cleanup results as `release-journeys-*` artifacts. A failed prerequisite, runtime assertion, or cleanup fails the job. Read the formula-conflict artifact first when checking coexistence.
 
