@@ -17,6 +17,7 @@ pub(crate) type Halted = BTreeMap<String, (String, i64)>;
 #[derive(Default)]
 pub(crate) struct Carried {
     last: BTreeMap<String, (u64, u64)>,
+    held: BTreeMap<String, u64>,
     done: u64,
     total: u64,
 }
@@ -85,7 +86,9 @@ fn progress(status: &Status, carried: &mut Carried) -> Option<SyncProgress> {
         let Some(progress) = &folder.progress else {
             continue;
         };
-        if let Some(&(done, _)) = carried.last.get(&folder.space_id)
+        let before = (carried.held.remove(&folder.space_id))
+            .or_else(|| carried.last.get(&folder.space_id).map(|&(done, _)| done));
+        if let Some(done) = before
             && progress.bytes_done < done
         {
             carried.done += done;
@@ -119,13 +122,17 @@ fn progress(status: &Status, carried: &mut Carried) -> Option<SyncProgress> {
         }
         let synced = (status.folders.iter())
             .any(|folder| folder.space_id == space && folder.state == DriverFolderState::UpToDate);
-        let credit = if synced { total } else { done };
-        carried.done += credit;
-        carried.total += credit;
+        if synced {
+            carried.done += total;
+            carried.total += total;
+        } else {
+            carried.held.insert(space, done);
+        }
     }
+    let held: u64 = carried.held.values().sum();
     let mut sum = sum?;
-    sum.bytes_done += carried.done;
-    sum.bytes_total += carried.total;
+    sum.bytes_done += carried.done + held;
+    sum.bytes_total += carried.total + held;
     Some(sum)
 }
 
@@ -787,6 +794,26 @@ mod tests {
         assert_eq!(
             shown([(UpToDate, None), (CatchingUp, progress(60, 100))]),
             Some((160, 200))
+        );
+        assert_eq!(shown([(UpToDate, None), (UpToDate, None)]), None);
+
+        assert_eq!(
+            shown([
+                (CatchingUp, progress(40, 100)),
+                (CatchingUp, progress(1, 100))
+            ]),
+            Some((41, 200))
+        );
+        assert_eq!(
+            shown([(Offline, None), (CatchingUp, progress(1, 100))]),
+            Some((41, 140))
+        );
+        assert_eq!(
+            shown([
+                (CatchingUp, progress(40, 100)),
+                (CatchingUp, progress(2, 100))
+            ]),
+            Some((42, 200))
         );
         assert_eq!(shown([(UpToDate, None), (UpToDate, None)]), None);
 
