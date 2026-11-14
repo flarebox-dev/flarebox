@@ -184,11 +184,22 @@ impl PartialEq for Entry {
 impl Eq for Entry {}
 
 /// An entry a caller of [`Snapshot::reset`] believes exists: its kind and
-/// identity, and nothing about what a file holds.
+/// identity, and for a file whose content the caller read, the version it
+/// read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Known {
     pub kind: EntryKind,
     pub id: FileId,
+    pub version: Option<Version>,
+}
+
+/// The size, modification time and executable bit of a file as a read of its
+/// content found them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Version {
+    pub size: u64,
+    pub mtime_ns: i128,
+    pub executable: bool,
 }
 
 /// A modification time no scan reports, so a file reset to it differs from
@@ -662,10 +673,10 @@ impl Snapshot {
     /// path, with the entries of `known` there. The next rescan of `scope`
     /// then reports an entry of `known` the disk lacks as removed, one found
     /// at another path as renamed, and an entry `known` lacks as created. It
-    /// also reports every file of `known` it finds as modified, changed or
-    /// not: `known` says that a file exists, not what it holds, so the caller
-    /// reads it again. An empty path covers the whole tree. Entries of
-    /// `known` outside `scope` are ignored.
+    /// also reports every file of `known` it finds as modified unless the
+    /// file still has the [`Known::version`] the caller read, so the caller
+    /// reads again only a file it has not read as it is. An empty path covers
+    /// the whole tree. Entries of `known` outside `scope` are ignored.
     pub fn reset(&mut self, scope: &Path, known: BTreeMap<PathBuf, Known>) {
         let held: Vec<PathBuf> = self
             .entries
@@ -681,17 +692,25 @@ impl Snapshot {
             known
                 .into_iter()
                 .filter(|(path, _)| path.starts_with(scope))
-                .map(|(path, Known { kind, id })| {
-                    let mtime_ns = match kind {
-                        EntryKind::File => UNVERIFIED,
-                        EntryKind::Dir => 0,
+                .map(|(path, Known { kind, id, version })| {
+                    let unread = Version {
+                        size: 0,
+                        mtime_ns: UNVERIFIED,
+                        executable: false,
+                    };
+                    let version = match kind {
+                        EntryKind::File => version.unwrap_or(unread),
+                        EntryKind::Dir => Version {
+                            mtime_ns: 0,
+                            ..unread
+                        },
                     };
                     let entry = Entry {
                         kind,
                         id,
-                        size: 0,
-                        mtime_ns,
-                        executable: false,
+                        size: version.size,
+                        mtime_ns: version.mtime_ns,
+                        executable: version.executable,
                         linked: kind == EntryKind::File,
                     };
                     (path, entry)
@@ -1782,6 +1801,9 @@ pub struct Poll {
     /// The folders whose rules the scans of this poll established and that no
     /// later scan of the poll found unreadable; see [`Rescan::read`].
     pub read: Vec<PathBuf>,
+    /// Whether the scan of `changes` covered the whole tree, so that an entry
+    /// it reports gone did not move to a path a later scan reports.
+    pub whole: bool,
 }
 
 /// A source of changes under one root.
@@ -2016,8 +2038,9 @@ impl NativeWatcher {
 impl NativeWatcher {
     /// What a poll returns once it has `changes` from a scan of `root`: the
     /// scopes still dirty, and the folders its scans could not read or read.
-    fn report(&mut self, changes: Vec<Change>, root: Option<FileId>) -> Poll {
+    fn report(&mut self, changes: Vec<Change>, root: Option<FileId>, whole: bool) -> Poll {
         Poll {
+            whole,
             changes,
             pending: self.dirty.iter().cloned().collect(),
             unreadable: std::mem::take(&mut self.unreadable).into_iter().collect(),
@@ -2149,7 +2172,7 @@ impl Watcher for NativeWatcher {
             if self.dirty.is_empty() && self.uncovered.is_none() {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if !self.receive(left)? {
-                    return Ok(self.report(Vec::new(), root));
+                    return Ok(self.report(Vec::new(), root, false));
                 }
             }
             let settle_until = Instant::now() + MAX_SETTLE;
@@ -2159,7 +2182,7 @@ impl Watcher for NativeWatcher {
                 // events can keep coming, so they must not hold the poll
                 // past its deadline.
                 if Instant::now() >= deadline {
-                    return Ok(self.report(Vec::new(), root));
+                    return Ok(self.report(Vec::new(), root, false));
                 }
                 continue;
             }
@@ -2175,6 +2198,7 @@ impl Watcher for NativeWatcher {
                 .chain(uncovered.iter().flatten())
                 .cloned()
                 .collect();
+            let whole = scopes.iter().any(|scope| scope.as_os_str().is_empty());
             let rescan = match self.snapshot.rescan_under(
                 &self.root,
                 scopes.iter().cloned(),
@@ -2185,7 +2209,7 @@ impl Watcher for NativeWatcher {
             ) {
                 Ok(rescan) => rescan,
                 Err(Error::Changed) if Instant::now() < deadline => continue,
-                Err(Error::Changed) => return Ok(self.report(Vec::new(), root)),
+                Err(Error::Changed) => return Ok(self.report(Vec::new(), root, false)),
                 Err(Error::RootReplaced) => {
                     self.uncovered = None;
                     return Err(Error::RootReplaced);
@@ -2203,7 +2227,7 @@ impl Watcher for NativeWatcher {
             #[cfg(target_os = "linux")]
             self.cover(&changes, readable, rescan.root);
             if !changes.is_empty() || !self.changed_rules.is_empty() || Instant::now() >= deadline {
-                return Ok(self.report(changes, root));
+                return Ok(self.report(changes, root, whole));
             }
         }
     }
@@ -2297,6 +2321,7 @@ impl Watcher for RescanWatcher {
                     root: Some(rescan.root),
                     rules: rescan.rules,
                     read: rescan.read,
+                    whole: true,
                 },
                 Err(Error::Changed) => Poll {
                     pending: vec![PathBuf::new()],

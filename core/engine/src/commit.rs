@@ -1268,7 +1268,9 @@ impl Commits {
                         content: None,
                     };
                     let into = &outcome.node_id;
-                    if code == Code::MergedInto && trees.local().get(into).is_some() {
+                    if code == Code::MergedInto
+                        && (trees.local().get(into).is_some() || trees.waits_for_half(into))
+                    {
                         trees.revert(create.node_id.clone());
                         merged.insert(create.node_id.clone(), into.clone());
                         self.aliases.insert(create.node_id.clone(), into.clone());
@@ -2113,7 +2115,9 @@ fn rebase(
             Class::Concurrent => {
                 agreed.extend(take_agreed(trees, id).map(|s| (id.clone(), Some(s))))
             }
-            Class::Same => agreed.push((id.clone(), trees.remote().live(id).cloned())),
+            Class::Same if !trees.waits_for_half(id) => {
+                agreed.push((id.clone(), trees.remote().live(id).cloned()))
+            }
             _ => {}
         }
     }

@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use koidrive_engine::restore::RestoreIntent;
 use koidrive_engine::tree::Content;
-use koidrive_proto::v1::error;
+use koidrive_proto::v1::{NodeStatus, error};
 use koidrive_sim::world::disk::Place;
 use koidrive_sim::world::{Action, Cut, Failure, NAMES, Outcome, Reply, Step, TEXTS, World};
 use proptest::prelude::*;
@@ -67,6 +67,7 @@ fn step(losses: Losses) -> BoxedStrategy<Step> {
         8 => action().prop_map(Step::User),
         12 => any::<usize>().prop_map(Step::Work),
         2 => Just(Step::Scan),
+        1 => Just(Step::ScanLeft),
         4 => outcome.prop_map(Step::Effect),
         4 => reply.prop_map(Step::Commit),
         2 => Just(Step::Connect),
@@ -301,7 +302,7 @@ fn reaches(phases: impl Strategy<Value = Vec<Vec<(usize, Step)>>>, events: &[&st
 }
 
 /// The events of `World::seen` that the sample must reach.
-const EVENTS: [&str; 29] = [
+const EVENTS: [&str; 31] = [
     "effect failed before the disk",
     "a batch of effects ends in one transaction",
     "effect refused by the disk",
@@ -331,6 +332,8 @@ const EVENTS: [&str; 29] = [
     "commit abandoned, its bytes are gone",
     "op renamed by the server",
     "op merged a folder",
+    "a scan of part of the disk holds an entry for the other half of its move",
+    "a full scan finds where a held entry went",
 ];
 
 fn user(kind: u8, target: usize, parent: usize, name: &str) -> Step {
@@ -383,6 +386,46 @@ fn commit(device: usize) -> Vec<(usize, Step)> {
         (device, COMMIT),
         (device, DELIVER),
     ]
+}
+
+#[test]
+fn a_file_moved_out_of_a_folder_removed_in_an_earlier_scan_keeps_its_node() {
+    for crash in [false, true] {
+        let mut world = world(2);
+        let mut made = vec![(0, folder("b")), (0, user(1, 0, 1, "c.txt"))];
+        made.extend(commit(0));
+        world.phase(0, &made).unwrap();
+        let live_files = |world: &World| -> Vec<String> {
+            (world.space().nodes().into_iter())
+                .filter(|node| node.name == "c.txt" && node.status == NodeStatus::Live as i32)
+                .map(|node| node.node_id)
+                .collect()
+        };
+        let before = live_files(&world);
+        assert_eq!(before.len(), 1);
+
+        let mut split = vec![
+            (0, rename(1, 0, "c.txt")),
+            (0, delete(0)),
+            (0, Step::ScanLeft),
+            (0, COMMIT),
+            (0, COMMIT),
+            (0, DELIVER),
+        ];
+        if crash {
+            split.push((0, Step::Crash));
+        }
+        split.extend(commit(0));
+        world.phase(1, &split).unwrap();
+        assert_eq!(live_files(&world), before, "crash: {crash}");
+        assert!(
+            world
+                .space()
+                .nodes()
+                .iter()
+                .all(|node| node.name != "b" || node.status != NodeStatus::Live as i32)
+        );
+    }
 }
 
 #[test]
@@ -5423,4 +5466,198 @@ fn an_edit_whose_commit_a_restore_took_before_its_result_is_sent_again_where_ano
         ],
     ];
     converge(3, &phases).unwrap();
+}
+
+fn act(kind: u8, target: usize, parent: usize, name: usize) -> Step {
+    Step::User(Action {
+        kind,
+        target,
+        parent,
+        name,
+        text: 0,
+    })
+}
+
+#[test]
+fn a_file_another_device_trashes_while_it_waits_for_the_other_half_of_its_move_ends_in_one_copy() {
+    let phases = [
+        vec![(0, act(0, 0, 0, 0)), (0, act(1, 0, 0, 1))],
+        vec![
+            (0, act(0, 0, 0, 1)),
+            (1, act(4, 584834678101174135, 0, 0)),
+            (1, act(0, 0, 0, 0)),
+            (0, act(0, 0, 0, 3)),
+            (0, act(3, 6638324997198329265, 0, 2)),
+            (0, Step::ScanLeft),
+            (1, Step::Work(8617563954)),
+            (1, Step::Work(1554589010441976225)),
+            (2, act(3, 1083115735031930059, 7313569736712612123, 6)),
+            (1, Step::Work(5302495761941245456)),
+            (0, Step::Work(6180590768366766512)),
+        ],
+    ];
+    converge(3, &phases).unwrap();
+}
+
+#[test]
+fn a_folder_renamed_in_a_scan_of_part_of_the_disk_keeps_its_node() {
+    let phases = [
+        vec![(0, act(0, 0, 0, 0)), (0, act(1, 0, 5820039722314657795, 0))],
+        vec![
+            (1, act(3, 5142901821869650166, 1094764058166367650, 1)),
+            (1, Step::ScanLeft),
+        ],
+    ];
+    converge(2, &phases).unwrap();
+}
+
+#[test]
+fn a_file_another_device_moves_while_it_waits_for_the_other_half_of_its_move_takes_that_move() {
+    let mut made = vec![(0, folder("b")), (0, user(1, 0, 1, "c.txt"))];
+    made.extend(commit(0));
+    made.extend([(1, DELIVER); 4]);
+    let mut split = vec![
+        (1, rename(0, 0, "a")),
+        (1, Step::ScanLeft),
+        (0, rename(1, 0, "c.txt")),
+    ];
+    split.extend(commit(0));
+    split.extend([(1, DELIVER); 4]);
+    split.extend(commit(1));
+    let world = converge(2, &[made, split]).unwrap();
+    let nodes = world.space().nodes();
+    let live = |name: &str| {
+        (nodes.iter())
+            .find(|node| node.name == name && node.status == NodeStatus::Live as i32)
+            .unwrap()
+    };
+    assert_ne!(live("c.txt").parent_id, live("a").node_id);
+}
+
+#[test]
+fn a_file_the_server_loses_while_it_waits_for_the_other_half_of_its_move_ends_in_one_copy() {
+    let phases = [
+        vec![(0, Step::Backup), (0, file("A"))],
+        vec![
+            (0, Step::Restore),
+            (1, Step::Connect),
+            (1, rename(0, 0, "a")),
+            (1, Step::ScanLeft),
+            (1, Step::Work(64906245804629516)),
+        ],
+    ];
+    converge(2, &phases).unwrap();
+}
+
+#[test]
+fn a_file_trashed_while_its_renamed_folder_waits_for_its_move_stays_trashed() {
+    let made = vec![(0, folder("b")), (0, user(1, 0, 1, "a"))];
+    let mut split = vec![(1, delete(1))];
+    split.extend(commit(1));
+    split.extend([(0, rename(0, 0, "a")), (0, DELIVER), (0, Step::ScanLeft)]);
+    converge(2, &[made, split]).unwrap();
+}
+
+#[test]
+fn a_file_trashed_while_its_renamed_folder_waits_for_its_move_stays_trashed_through_a_commit() {
+    let made = vec![(0, folder("b")), (0, user(1, 0, 1, "a"))];
+    let mut split = vec![(1, delete(1))];
+    split.extend(commit(1));
+    split.extend([
+        (0, rename(0, 0, "a")),
+        (0, DELIVER),
+        (0, Step::ScanLeft),
+        (0, COMMIT),
+    ]);
+    converge(2, &[made, split]).unwrap();
+}
+
+#[test]
+fn a_create_merged_into_a_waiting_folder_keeps_the_folder_waiting() {
+    let made = vec![(0, folder("b")), (0, user(1, 0, 1, "c.txt"))];
+    let mut split = vec![(0, rename(0, 0, "A")), (0, delete(1))];
+    split.extend(commit(0));
+    split.extend([
+        (1, folder("a")),
+        (1, SCAN),
+        (1, rename(0, 0, "ss")),
+        (1, Step::ScanLeft),
+        (1, COMMIT),
+        (1, COMMIT),
+        (1, DELIVER),
+        (1, DELIVER),
+    ]);
+    converge(2, &[made, split]).unwrap();
+}
+#[test]
+fn a_file_whose_folder_waits_for_its_move_keeps_its_synced_state_and_stays_deleted() {
+    let phases = vec![
+        vec![(0, act(1, 0, 0, 0))],
+        vec![
+            (0, act(0, 0, 0, 1)),
+            (0, act(3, 0, 1, 0)),
+            (0, Step::Work(0)),
+            (0, Step::Work(0)),
+            (0, Step::Work(0)),
+            (0, Step::Work(0)),
+            (0, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, act(4, 1, 0, 0)),
+            (2, Step::Deliver(0)),
+            (0, act(0, 0, 0, 0)),
+            (1, act(2, 0, 0, 0)),
+            (0, Step::Work(143701157526920)),
+            (0, act(0, 0, 7915577750495416137, 0)),
+            (2, Step::Work(3707532753024513298)),
+            (2, Step::Work(0)),
+            (2, Step::Work(0)),
+            (2, Step::Effect(Outcome::Run)),
+            (2, Step::Work(0)),
+            (2, act(4, 0, 0, 0)),
+            (2, Step::ScanLeft),
+        ],
+    ];
+    converge(3, &phases).unwrap();
+}
+
+#[test]
+fn a_file_its_user_moved_while_its_node_waits_for_its_move_counts_as_changed_by_that_user() {
+    let phases = vec![
+        vec![(0, act(1, 0, 0, 0))],
+        vec![
+            (0, act(0, 0, 0, 1)),
+            (0, act(3, 0, 1, 0)),
+            (0, Step::Work(0)),
+            (0, Step::Work(0)),
+            (0, Step::Work(0)),
+            (0, Step::Work(0)),
+            (0, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, Step::Work(0)),
+            (1, act(3, 6641794941499446059, 3892537303969588314, 0)),
+            (0, Step::Work(0)),
+            (2, Step::Work(0)),
+            (1, Step::ScanLeft),
+            (0, act(4, 0, 0, 0)),
+            (1, act(3, 2101935095430557774, 0, 1)),
+            (1, act(4, 1, 0, 0)),
+            (1, Step::Work(4008556074246547561)),
+            (1, act(4, 0, 0, 0)),
+            (1, Step::Work(75556449497822577)),
+        ],
+    ];
+    converge(2, &phases).unwrap();
 }

@@ -691,3 +691,183 @@ fn a_bulk_delete_with_a_file_moved_over_another_keeps_the_file_at_its_path() {
         server_nodes(&remote)
     );
 }
+
+#[test]
+fn a_file_deleted_in_a_scan_of_part_of_the_tree_leaves_the_server_once_the_wait_for_its_move_ends() {
+    for restart in [false, true] {
+        let mut remote = Remote::new();
+        let (site, mut a) = linked(&mut remote, "a");
+        a.create(&mut remote, &site.root.join("notes.txt"), b"written on a");
+        fs::remove_file(site.root.join("notes.txt")).unwrap();
+        eventually("the scan finds the file gone", || {
+            a.scan(Duration::from_millis(100));
+            a.folder.engine.trees.local().is_empty()
+        });
+        assert!(a.folder.engine.trees.halves_due().is_some());
+        assert!(a.work.iter().all(|work| matches!(work, Work::HalvesAfter(_))));
+        assert_eq!(remote.names(), ["notes.txt"]);
+
+        if restart {
+            drop(a);
+            a = site.start();
+            assert!(a.folder.engine.trees.halves_due().is_some());
+            a.connect(&remote);
+            a.scan_until(|a| a.folder.scanned);
+            assert_eq!(a.run(&mut remote), ["subscribe", "send"]);
+        } else {
+            a.work.clear();
+            let step = a.folder.halves_ended();
+            a.take(step).unwrap();
+            assert!(a.folder.engine.trees.halves_due().is_some());
+            assert_eq!(remote.names(), ["notes.txt"]);
+            a.answer_halves();
+            assert_eq!(a.run(&mut remote), ["send"]);
+        }
+        assert!(remote.names().is_empty(), "restart: {restart}");
+        a.settle();
+        assert!(a.run(&mut remote).is_empty());
+        assert_eq!(a.state(), FolderState::UpToDate);
+    }
+}
+
+#[test]
+fn a_file_moved_out_and_back_in_after_the_wait_for_its_move_ended_keeps_its_node() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("notes.txt"), b"written on a");
+    fs::create_dir(site.root.join("e")).unwrap();
+    a.settle();
+    a.run(&mut remote);
+    let node = node_named(&a, "notes.txt");
+    let outside = site.root.with_extension("outside");
+    fs::rename(site.root.join("notes.txt"), &outside).unwrap();
+    eventually("the scan finds the file gone", || {
+        a.scan(Duration::from_millis(100));
+        a.folder.engine.trees.halves_due().is_some()
+    });
+    a.work.clear();
+    let step = a.folder.halves_ended();
+    a.take(step).unwrap();
+
+    fs::rename(&outside, site.root.join("e/notes.txt")).unwrap();
+    a.answer_halves();
+    a.settle();
+    a.run(&mut remote);
+    assert!(a.folder.engine.trees.halves_due().is_none());
+    assert_eq!(node_named(&a, "notes.txt"), node);
+    assert_eq!(remote.names(), ["e", "notes.txt"]);
+    assert_eq!(
+        remote.space.node(&node).map(|state| state.parent_id),
+        Some(node_named(&a, "e"))
+    );
+}
+
+#[test]
+fn a_file_moved_into_a_folder_the_scan_may_not_read_keeps_its_node_until_the_folder_is_read() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("notes.txt"), b"written on a");
+    fs::create_dir(site.root.join("e")).unwrap();
+    a.settle();
+    a.run(&mut remote);
+    let node = node_named(&a, "notes.txt");
+    let outside = site.root.with_extension("outside");
+    fs::rename(site.root.join("notes.txt"), &outside).unwrap();
+    eventually("the scan finds the file gone", || {
+        a.scan(Duration::from_millis(100));
+        a.folder.engine.trees.halves_due().is_some()
+    });
+    fs::rename(&outside, site.root.join("e/notes.txt")).unwrap();
+    fs::set_permissions(site.root.join("e"), fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(site.root.join("e")).is_ok() {
+        assert!(rustix::process::geteuid().is_root());
+        eprintln!("SKIPPED: running as root, so permissions do not block reads");
+        return;
+    }
+    a.work.clear();
+    let step = a.folder.halves_ended();
+    a.take(step).unwrap();
+    a.answer_halves();
+    let held = a.folder.engine.trees.halves_due().is_some();
+    let asks_again = (a.work.iter()).any(|work| matches!(work, Work::HalvesAfter(after) if !after.is_zero()));
+    fs::set_permissions(site.root.join("e"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(held);
+    assert!(asks_again);
+    assert_eq!(remote.names(), ["e", "notes.txt"]);
+
+    a.end_halves();
+    assert!(a.folder.engine.trees.halves_due().is_none());
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(node_named(&a, "notes.txt"), node);
+    assert_eq!(remote.names(), ["e", "notes.txt"]);
+    assert_eq!(
+        remote.space.node(&node).map(|state| state.parent_id),
+        Some(node_named(&a, "e"))
+    );
+}
+
+#[test]
+fn the_rescan_that_ends_a_wait_for_halves_reports_no_file_that_did_not_change() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::create_dir_all(site.root.join("d")).unwrap();
+    fs::create_dir_all(site.root.join("x")).unwrap();
+    for i in 0..20 {
+        fs::write(site.root.join(format!("d/f{i:02}")), format!("file {i}")).unwrap();
+    }
+    fs::write(site.root.join("x/one.txt"), b"one").unwrap();
+    a.rest(&mut remote);
+    fs::remove_file(site.root.join("x/one.txt")).unwrap();
+    eventually("the scan holds the file", || {
+        a.scan(Duration::from_millis(100));
+        !a.folder.engine.trees.halves().is_empty()
+    });
+    a.work.clear();
+    let step = a.folder.halves_ended();
+    a.take(step).unwrap();
+    let mut reported = Vec::new();
+    eventually("the observer answers the end of the wait", || {
+        let sections = a.folder.sections();
+        if let Some(batch) = sections.observe(&mut a.observer, Duration::from_millis(100)).unwrap() {
+            reported.extend(batch.observation.changes.iter().map(|change| format!("{change:?}")));
+            let entries = a.observer.snapshot().entries.len() as u64;
+            let step = a.folder.observed(batch, entries);
+            a.take(step).unwrap();
+        }
+        a.folder.halves_asked.is_none()
+    });
+    assert_eq!(reported, Vec::<String>::new());
+    assert!(a.folder.engine.trees.halves().is_empty());
+    a.settle();
+    a.run(&mut remote);
+    assert!(!remote.names().contains(&"one.txt".to_owned()));
+}
+
+#[test]
+fn a_folder_moved_over_an_empty_folder_takes_its_name() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::create_dir_all(site.root.join("drafts/inner")).unwrap();
+    fs::write(site.root.join("drafts/one.txt"), b"one").unwrap();
+    fs::create_dir(site.root.join("final")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(remote.names(), ["drafts", "final", "inner", "one.txt"]);
+    let drafts = node_named(&a, "drafts");
+
+    fs::rename(site.root.join("drafts"), site.root.join("final")).unwrap();
+    a.scan_until(|a| (a.folder.engine.trees.local().get(&drafts)).is_some_and(|node| node.shape.name == "final"));
+    for _ in 0..4 {
+        a.settle();
+        a.run(&mut remote);
+    }
+    assert_eq!(remote.names(), ["final", "inner", "one.txt"]);
+    assert_eq!(
+        remote.space.node(&drafts).map(|state| state.name),
+        Some("final".into())
+    );
+}

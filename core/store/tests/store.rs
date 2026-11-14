@@ -12,7 +12,9 @@ use koidrive_engine::question::{
     Answer, Held, Limit, Question, QuestionKind, RecoveryGroup, Revisions,
 };
 use koidrive_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
-use koidrive_engine::state::{Agreed, CommitsState, EffectsState, MovedHere, Pending, TreesState};
+use koidrive_engine::state::{
+    Agreed, CommitsState, EffectsState, Half, MovedHere, Pending, TreesState,
+};
 use koidrive_engine::tree::{
     FileIdentity, Kind, LocalNode as EngineLocalNode, RemoteNode, Shape as EngineShape,
 };
@@ -109,6 +111,7 @@ fn migrations_apply_from_empty() {
             "local_changes",
             "local_nodes",
             "migrations",
+            "move_halves",
             "moved_here",
             "node_maps",
             "node_sets",
@@ -1256,6 +1259,13 @@ fn engine_state() -> EngineState {
                     birth_ns: Some(-1),
                 },
             )]),
+            halves: BTreeMap::from([(
+                "displaced".into(),
+                Half {
+                    at_ms: 1_700_000_000_000,
+                    content: Some(content(5)),
+                },
+            )]),
             edited_here: BTreeMap::from([("e".into(), 6)]),
             moved_here: BTreeMap::from([
                 (
@@ -1501,7 +1511,7 @@ fn engine_state_survives_a_reopen() {
 }
 
 /// The tables of the engine state besides the nodes of R, L and S.
-const ENGINE_TABLES: [&str; 36] = [
+const ENGINE_TABLES: [&str; 37] = [
     "node_sets",
     "node_maps",
     "waiting_updates",
@@ -1513,6 +1523,7 @@ const ENGINE_TABLES: [&str; 36] = [
     "watched_contents",
     "trashed_here",
     "recorded_nodes",
+    "move_halves",
     "commit_slots",
     "edited_here",
     "replaced_versions",

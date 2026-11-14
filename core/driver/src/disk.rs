@@ -644,6 +644,7 @@ impl Disk {
                 }
             }
         }
+        let whole = observation.whole && !stale.contains(&true);
         let dropped: BTreeSet<PathBuf> = (observation.changes.iter().zip(&stale))
             .filter(|(_, stale)| **stale)
             .flat_map(|(change, _)| paths(change).map(Path::to_path_buf))
@@ -652,12 +653,15 @@ impl Disk {
             .filter(|(_, stale)| !stale)
             .map(|(change, _)| change)
             .collect();
-        if !changes.is_empty() {
+        if !changes.is_empty() || whole && !engine.trees.halves().is_empty() {
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |since| since.as_millis() as u64);
             store.transaction(|tx| -> Result<(), Stop> {
-                engine.observe(&changes, now_ms);
+                match whole {
+                    true => engine.observe(&changes, now_ms),
+                    false => engine.observe_part(&changes, now_ms),
+                };
                 Ok(engine.checkpoint(tx)?)
             })?;
         }
@@ -691,8 +695,8 @@ impl Disk {
     }
 
     /// Asks the observer to reset `paths` to L and scan them again.
-    pub fn rescan(&self, engine: &Engine, paths: Vec<PathBuf>) {
-        self.sections.request(engine.resets(paths));
+    pub fn rescan(&self, engine: &Engine, paths: Vec<PathBuf>) -> Requests {
+        self.sections.request(engine.resets(paths))
     }
 
     /// The chunks `commit` adds, with where the bytes of each are: for every content the commit creates or

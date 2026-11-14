@@ -281,7 +281,7 @@ fn native_watcher_reports_a_change_below_a_folder_that_a_reset_made_known() {
         .filter(|(path, _)| path.starts_with("made"))
         .map(|(path, entry)| {
             let (kind, id) = (entry.kind, entry.id);
-            (path, Known { kind, id })
+            (path, Known { kind, id, version: None })
         })
         .collect();
     watcher.reset(Path::new("made"), known);

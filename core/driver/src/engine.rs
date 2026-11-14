@@ -8,7 +8,7 @@
 //! tree. [`Engine::observe`] puts an observation batch into L: each change goes to the node with the entry's
 //! identity, or to the node at the change's path, and a change that leaves a node as L has it changes nothing.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::BuildHasher;
 use std::path::{Component, Path, PathBuf};
 
@@ -21,7 +21,7 @@ use koidrive_engine::tree::{
     Content, FileIdentity, Kind, LocalNode, Names, Node, NodeId, RemoteNode, Shape, Tree,
     same_content,
 };
-use koidrive_fs::{Entry, EntryKind, FileId, Known, Snapshot};
+use koidrive_fs::{Entry, EntryKind, FileId, Known, Snapshot, Version};
 use koidrive_proto::v1::{
     CaughtUp, ChangeRecord, CommitRecord, NodeKind, NodeState, TrashPage, TreePage, change_record,
 };
@@ -45,6 +45,7 @@ pub(crate) struct Engine {
     pub asked: bool,
     pub recovery_cause: Option<RecoveryCause>,
     unscanned: Option<BTreeSet<NodeId>>,
+    vanishing: Option<u64>,
 }
 
 /// What applying a batch of the log did.
@@ -113,6 +114,7 @@ impl Engine {
             asked: false,
             recovery_cause: None,
             unscanned: None,
+            vanishing: None,
         })
     }
 
@@ -680,9 +682,10 @@ impl Engine {
     /// it out of L, unless the batch placed that node again. That keeps a child's node when its folder is replaced
     /// around it. Any other created entry is a new node. An entry that another path also links is a hard link, a file
     /// of its own (design §5.6), so its identity never takes a node from another path, except a node L keeps recorded
-    /// outside what this device syncs: no included path holds that node, so a created entry with its identity is that
-    /// node placed again, as when a file with a link in an ignored folder comes back after a scan found it only through
-    /// that link.
+    /// outside what this device syncs or keeps for the other half of a move ([`Trees::vanish_local`]): no included
+    /// path holds that node, so an entry with its identity is that node placed again, whether a scan reports it
+    /// created, renamed or modified, as when a file with a link in an ignored folder comes back after a scan found it
+    /// only through that link.
     ///
     /// A node that held the name a change puts an entry at is gone from there, so it leaves L with everything under
     /// it. A file that arrives over a file keeps the node of the file it replaces when L's own node for the arriving
@@ -693,23 +696,31 @@ impl Engine {
     /// node, so it does not bring back a folder another device deleted. Any other entry that arrives where L keeps a
     /// recorded node has taken its name: the recorded node leaves L with what L holds under it, and each stays
     /// recorded ([`Trees::displace_local`]), so the server keeps it. An entry with the identity of such a node is the
-    /// node placed again. A file whose content could not be read is left out until the observer reports it with its
-    /// content.
+    /// node placed again. A file whose content could not be read takes the node its identity names this way, with the
+    /// content L knew for that node, until the observer reports it with its content. Any other such file is left out
+    /// until then.
     /// A rename to a path the rules exclude is a move out of what this device syncs: the node takes that position
     /// when its folder is in L or arrives in the batch, and keeps its entry otherwise ([`Trees::ignore_local`]); an
     /// entry L never held stays out.
     pub fn observe(&mut self, changes: &[Observed], now_ms: u64) -> BTreeSet<NodeId> {
+        self.observe_scans(changes, now_ms, true)
+    }
+
+    pub fn observe_part(&mut self, changes: &[Observed], now_ms: u64) -> BTreeSet<NodeId> {
+        self.observe_scans(changes, now_ms, false)
+    }
+
+    fn observe_scans(
+        &mut self,
+        changes: &[Observed],
+        now_ms: u64,
+        whole: bool,
+    ) -> BTreeSet<NodeId> {
+        let mut touched = BTreeSet::new();
+        let mut gone = Gone::default();
+        self.take_links(changes, now_ms, &mut touched, &mut gone);
+        self.vanishing = (!whole).then_some(now_ms);
         let unscanned = self.unscanned.take();
-        let mut before: Vec<Option<NodeId>> = changes
-            .iter()
-            .map(|change| match change {
-                Observed::Removed { path, .. } => local_at(&self.trees, path),
-                Observed::Renamed {
-                    from, id, linked, ..
-                } => resolve(&self.trees, from, &file_identity(*id), *linked),
-                Observed::Created { .. } | Observed::Modified { .. } => None,
-            })
-            .collect();
         let left: Vec<&Path> = (changes.iter())
             .filter_map(|change| match change {
                 Observed::Removed { path, .. } | Observed::Renamed { from: path, .. } => {
@@ -735,6 +746,27 @@ impl Engine {
                     && unscanned.as_ref().is_none_or(|set| !set.contains(*node))
             })
             .cloned()
+            .collect();
+        let mut before: Vec<Option<NodeId>> = changes
+            .iter()
+            .map(|change| match change {
+                Observed::Removed { path, .. } => local_at(&self.trees, path),
+                Observed::Renamed {
+                    from, id, linked, ..
+                } => identify(
+                    &self.trees,
+                    from,
+                    &file_identity(*id),
+                    *linked,
+                    &staying,
+                    &gone,
+                )
+                .or_else(|| local_at(&self.trees, from))
+                .filter(|node| {
+                    !touched.contains(node) || self.path_of(node).as_deref() == Some(from.as_path())
+                }),
+                Observed::Created { .. } | Observed::Modified { .. } => None,
+            })
             .collect();
         let moving: BTreeSet<NodeId> = (changes.iter().zip(&before))
             .filter(|(change, _)| matches!(change, Observed::Renamed { .. }))
@@ -813,8 +845,6 @@ impl Engine {
                 self.trees.ignore_local(node);
             }
         }
-        let mut touched = BTreeSet::new();
-        let mut gone = Gone::new();
         let mut parked = Vec::new();
         for at in order {
             let (change, before) = (&changes[at], before[at].take());
@@ -840,13 +870,20 @@ impl Engine {
                         self.remove(&id, &moving, true, &mut touched, &mut gone);
                     }
                 }
-                Observed::Renamed { to, kind, id, .. } => {
+                Observed::Renamed {
+                    from, to, kind, id, ..
+                } => {
                     let node_kind = match kind {
                         EntryKind::File => Kind::File,
                         EntryKind::Dir => Kind::Dir,
                     };
                     if names(to).is_some_and(|to| self.trees.ignores(&to, node_kind)) {
                         let Some(node) = &before else { continue };
+                        if touched.contains(node)
+                            && self.path_of(node).as_deref() != Some(from.as_path())
+                        {
+                            continue;
+                        }
                         if to
                             .parent()
                             .and_then(|dir| local_at(&self.trees, dir))
@@ -880,38 +917,43 @@ impl Engine {
                     linked,
                     content,
                 } => {
-                    if *kind == EntryKind::File && content.is_none() {
-                        continue;
-                    }
                     let identity = file_identity(*id);
-                    let takes = |node: &&NodeId| {
-                        !linked
-                            || self.trees.recorded_local(node)
-                            || self.trees.displaced_local().contains_key(*node)
+                    let node = identify(&self.trees, path, &identity, *linked, &staying, &gone);
+                    let content = match content {
+                        None if *kind == EntryKind::File => {
+                            let known = node.as_ref().and_then(|node| {
+                                (self.trees.local().get(node))
+                                    .and_then(|local| local.shape.content.clone())
+                                    .or_else(|| {
+                                        (self.trees.halves().get(node))
+                                            .and_then(|half| half.content.clone())
+                                    })
+                                    .or_else(|| gone.content.get(node).cloned())
+                            });
+                            match known {
+                                Some(content) => Some(content),
+                                None => continue,
+                            }
+                        }
+                        content => content.clone(),
                     };
-                    let node = (self.trees.locals_with_identity(&identity).rev())
-                        .filter(|node| !staying.contains(*node))
-                        .find(takes)
-                        .or_else(|| self.trees.displaced_with_identity(&identity).filter(takes))
-                        .cloned()
-                        .or_else(|| {
-                            (gone.get(path))
-                                .filter(|(node, held)| {
-                                    *held == identity && self.trees.local().get(node).is_none()
-                                })
-                                .map(|(node, _)| node.clone())
-                        });
+                    let link = node.is_none()
+                        && *kind == EntryKind::File
+                        && links_another(&self.trees, &identity, *linked, whole);
                     self.place(
                         node,
                         path,
                         *kind,
                         identity,
-                        content.clone(),
+                        content,
                         now_ms,
                         &moving,
                         &mut touched,
                         &mut gone,
                     );
+                    if link && let Some(new) = local_at(&self.trees, path) {
+                        self.trees.hold_link(&new, now_ms);
+                    }
                 }
                 Observed::Modified {
                     path,
@@ -921,7 +963,10 @@ impl Engine {
                 } => {
                     let Some(content) = content else { continue };
                     let identity = file_identity(*id);
-                    let node = resolve(&self.trees, path, &identity, *linked);
+                    let node = identify(&self.trees, path, &identity, *linked, &staying, &gone)
+                        .or_else(|| local_at(&self.trees, path));
+                    let link =
+                        node.is_none() && links_another(&self.trees, &identity, *linked, whole);
                     self.place(
                         node,
                         path,
@@ -933,6 +978,9 @@ impl Engine {
                         &mut touched,
                         &mut gone,
                     );
+                    if link && let Some(new) = local_at(&self.trees, path) {
+                        self.trees.hold_link(&new, now_ms);
+                    }
                 }
             }
         }
@@ -950,7 +998,73 @@ impl Engine {
                 self.remove(id, &BTreeSet::new(), false, &mut touched, &mut gone);
             }
         }
+        self.vanishing = None;
+        if whole {
+            self.trees.release_halves();
+        }
         touched
+    }
+
+    fn take_links(
+        &mut self,
+        changes: &[Observed],
+        now_ms: u64,
+        touched: &mut BTreeSet<NodeId>,
+        gone: &mut Gone,
+    ) {
+        for change in changes {
+            let left = match change {
+                Observed::Removed { path, .. } => path,
+                Observed::Renamed {
+                    from,
+                    to,
+                    kind: EntryKind::File,
+                    ..
+                } if names(to).is_some_and(|to| self.trees.ignores(&to, Kind::File)) => from,
+                _ => continue,
+            };
+            let Some(top) = local_at(&self.trees, left) else {
+                continue;
+            };
+            let mut below = vec![top];
+            let mut next = 0;
+            while let Some(current) = below.get(next).cloned() {
+                below.extend(self.trees.local_children(&current).cloned());
+                next += 1;
+            }
+            for file in below {
+                let Some(identity) = (self.trees.local().get(&file))
+                    .filter(|node| node.shape.kind == Kind::File)
+                    .map(|node| node.identity)
+                else {
+                    continue;
+                };
+                let Some(link) = (self.trees.link_with_identity(&identity))
+                    .filter(|link| **link != file)
+                    .cloned()
+                else {
+                    continue;
+                };
+                let Some(path) = self.path_of(&link) else {
+                    continue;
+                };
+                let content =
+                    (self.trees.local().get(&link)).and_then(|node| node.shape.content.clone());
+                self.trees.remove_local(&link);
+                touched.insert(link);
+                self.place(
+                    Some(file),
+                    &path,
+                    EntryKind::File,
+                    identity,
+                    content,
+                    now_ms,
+                    &BTreeSet::new(),
+                    touched,
+                    gone,
+                );
+            }
+        }
     }
 
     fn scanned(&self, id: &str) -> bool {
@@ -982,7 +1096,12 @@ impl Engine {
                             Kind::File => EntryKind::File,
                         };
                         let id = file_id(node.identity);
-                        known.insert(path.clone(), Known { kind, id });
+                        let version = (node.shape.content.as_ref()).map(|content| Version {
+                            size: content.size,
+                            mtime_ns: i128::from(content.mtime_ns),
+                            executable: content.executable,
+                        });
+                        known.insert(path.clone(), Known { kind, id, version });
                     }
                     for child in self.trees.local_children(&id).cloned().collect::<Vec<_>>() {
                         if let Some(node) = (local.get(&child))
@@ -1171,12 +1290,17 @@ impl Engine {
         }
         for id in &doomed {
             if let (Some(path), Some(node)) = (self.path_of(id), self.trees.local().get(id)) {
-                gone.insert(path, (id.clone(), node.identity));
+                gone.insert(path, id.clone(), node);
             }
         }
         for id in doomed {
             match displaced.contains(&id) {
                 true => self.trees.displace_local(&id),
+                false
+                    if outside
+                        && self
+                            .vanishing
+                            .is_some_and(|at| self.trees.vanish_local(&id, at)) => {}
                 false => self.trees.remove_local(&id),
             }
             touched.insert(id);
@@ -1185,7 +1309,22 @@ impl Engine {
 }
 
 /// The nodes a batch took out of L, by the path each had, with the identity it had.
-type Gone = BTreeMap<PathBuf, (NodeId, FileIdentity)>;
+#[derive(Default)]
+struct Gone {
+    at: BTreeMap<PathBuf, (NodeId, FileIdentity)>,
+    by_identity: HashMap<FileIdentity, Vec<NodeId>>,
+    content: HashMap<NodeId, Content>,
+}
+
+impl Gone {
+    fn insert(&mut self, path: PathBuf, id: NodeId, node: &LocalNode) {
+        (self.by_identity.entry(node.identity).or_default()).push(id.clone());
+        if let Some(content) = &node.shape.content {
+            self.content.insert(id.clone(), content.clone());
+        }
+        self.at.insert(path, (id, node.identity));
+    }
+}
 
 /// The path of a node `tree` holds live, relative to the linked folder.
 fn path<N: Node>(tree: &Tree<N>, id: &str) -> String {
@@ -1211,21 +1350,45 @@ fn local_at(trees: &Trees, path: &Path) -> Option<NodeId> {
     Some(current)
 }
 
-/// The node at `path` when it has `identity`, else the node with `identity`, else the node at `path`. The identity of
-/// a file with several links (`linked`) names no single path, so it never takes a node from another path, where the
-/// other link may still be.
-fn resolve(trees: &Trees, path: &Path, identity: &FileIdentity, linked: bool) -> Option<NodeId> {
-    let at = local_at(trees, path);
-    at.clone()
+fn identify(
+    trees: &Trees,
+    path: &Path,
+    identity: &FileIdentity,
+    linked: bool,
+    staying: &BTreeSet<NodeId>,
+    gone: &Gone,
+) -> Option<NodeId> {
+    let claims = |node: &&NodeId| {
+        !linked || trees.recorded_local(node) || trees.displaced_local().contains_key(*node)
+    };
+    let out_of_l = |node: &&NodeId| trees.local().get(node).is_none();
+    (local_at(trees, path))
+        .filter(|id| !staying.contains(id))
         .filter(|id| (trees.local().get(id)).is_some_and(|node| node.identity == *identity))
         .or_else(|| {
-            trees
-                .local_with_identity(identity)
-                .or_else(|| trees.displaced_with_identity(identity))
-                .filter(|_| !linked)
+            (trees.locals_with_identity(identity).rev())
+                .filter(|node| !staying.contains(*node))
+                .find(claims)
+                .or_else(|| trees.displaced_with_identity(identity).filter(claims))
+                .or_else(|| {
+                    (gone.at.get(path))
+                        .filter(|(node, held)| held == identity && out_of_l(&node))
+                        .map(|(node, _)| node)
+                })
+                .or_else(|| {
+                    (gone.by_identity.get(identity).into_iter().flatten())
+                        .filter(|_| !linked)
+                        .find(out_of_l)
+                })
                 .cloned()
         })
-        .or(at)
+}
+
+fn links_another(trees: &Trees, identity: &FileIdentity, linked: bool, whole: bool) -> bool {
+    linked
+        && !whole
+        && identity.birth_ns.is_some()
+        && (trees.locals_with_identity(identity)).any(|other| !trees.recorded_local(other))
 }
 
 /// The names from the root to `path`, or `None` when one of them is not a name L can hold.
@@ -1940,6 +2103,7 @@ mod tests {
             asked: false,
             recovery_cause: None,
             unscanned: None,
+            vanishing: None,
         };
         Case {
             name,
@@ -2480,26 +2644,29 @@ mod tests {
         rules: &mut koidrive_fs::Rules,
         scope: PathBuf,
     ) -> Vec<PathBuf> {
-        let rescan = snapshot.rescan_with_rules(root, [scope], rules).unwrap();
+        let rescan = snapshot
+            .rescan_with_rules(root, [scope.clone()], rules)
+            .unwrap();
+        let whole = scope.as_os_str().is_empty() && rescan.unreadable.is_empty();
         let entry = |path: &Path| snapshot.entries[path];
         let batch: Vec<Observed> = (rescan.changes.into_iter())
             .map(|change| match change {
                 Change::Created { path, kind } => Observed::Created {
                     content: (kind == EntryKind::File).then(|| bytes(entry(&path).size)),
                     id: entry(&path).id,
-                    linked: false,
+                    linked: entry(&path).linked,
                     path,
                     kind,
                 },
                 Change::Modified { path } => Observed::Modified {
                     content: Some(bytes(entry(&path).size)),
                     id: entry(&path).id,
-                    linked: false,
+                    linked: entry(&path).linked,
                     path,
                 },
                 Change::Renamed { from, to, kind } => Observed::Renamed {
                     id: entry(&to).id,
-                    linked: false,
+                    linked: entry(&to).linked,
                     from,
                     to,
                     kind,
@@ -2514,7 +2681,10 @@ mod tests {
                 Change::Removed { path, kind } => Observed::Removed { path, kind },
             })
             .collect();
-        engine.observe(&batch, 0);
+        match whole {
+            true => engine.observe(&batch, 0),
+            false => engine.observe_part(&batch, 0),
+        };
         rescan.unsettled
     }
 
@@ -2603,6 +2773,396 @@ mod tests {
             );
             assert!(holding(&engine, "a/g.txt").is_some());
             assert!(holding(&engine, "a/f.txt").is_none());
+        }
+    }
+
+    fn synced_everywhere(engine: &mut Engine) {
+        let local: Vec<_> = (engine.trees.local().iter())
+            .map(|(id, node)| (id.clone(), node.shape.clone()))
+            .collect();
+        for (id, shape) in local {
+            engine.trees.set_synced(id.clone(), Some(shape.clone()));
+            let node = RemoteNode {
+                shape,
+                trashed: false,
+                content_rev: 1,
+                meta_rev: 1,
+                meta_edit_rev: 1,
+                trash_group: String::new(),
+                version_id: String::new(),
+                edit_rev: 1,
+            };
+            engine.trees.set_remote(id, node);
+        }
+    }
+
+    #[test]
+    fn a_file_moved_out_of_a_folder_removed_in_another_scan_keeps_its_node() {
+        for linked in [false, true] {
+            for order in [["x", "e"], ["e", "x"]] {
+                let case = format!("linked {linked}, scans {order:?}");
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path().to_path_buf();
+                fs::create_dir_all(root.join("x/d")).unwrap();
+                fs::create_dir_all(root.join("e")).unwrap();
+                fs::create_dir_all(root.join("ig")).unwrap();
+                fs::write(root.join(koidrive_fs::RULES_FILE), "ig/\n").unwrap();
+                fs::write(root.join("x/d/g.txt"), "g").unwrap();
+                if linked {
+                    fs::hard_link(root.join("x/d/g.txt"), root.join("ig/g.txt")).unwrap();
+                }
+                let mut rules = search_rules(usize::MAX);
+                let mut snapshot = Snapshot::default();
+                let (_dir, mut engine) = mapper();
+                engine.rules(
+                    vec![RulesChange {
+                        dir: PathBuf::new(),
+                        rules: Some(koidrive_engine::ignore::RuleFile::parse(b"ig/\n")),
+                    }],
+                    true,
+                );
+                observe_rescan(&mut engine, &mut snapshot, &root, &mut rules);
+                synced_everywhere(&mut engine);
+                let (file, identity, _) = holding(&engine, "x/d/g.txt").unwrap();
+                fs::rename(root.join("x/d/g.txt"), root.join("e/moved.txt")).unwrap();
+                fs::remove_dir_all(root.join("x/d")).unwrap();
+                for scope in order {
+                    let mut scans = 0;
+                    while !observe_scoped(
+                        &mut engine,
+                        &mut snapshot,
+                        &root,
+                        &mut rules,
+                        scope.into(),
+                    )
+                    .is_empty()
+                    {
+                        scans += 1;
+                        assert!(scans < 40, "{case}: the scan of {scope} never settled");
+                    }
+                }
+                let moved = holding(&engine, "e/moved.txt").map(|(id, _, _)| id);
+                assert_eq!(moved, Some(file.clone()), "{case}");
+                assert!(!engine.trees.recorded_local(&file), "{case}");
+                assert!(!engine.trees.excluded(&file), "{case}");
+                assert_eq!(
+                    engine.trees.locals_with_identity(&identity).count(),
+                    1,
+                    "{case}"
+                );
+                assert_eq!(holding(&engine, "x/d"), None, "{case}");
+                assert_eq!(engine.trees.check(), Ok(()), "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_file_moved_out_of_a_removed_folder_keeps_its_node_when_the_restart_comes_after_the_wait() {
+        for restart_at in [1_001, 3_001] {
+            let (dir, mut engine, file) = moved_out_of_a_removed_folder(false);
+            let mut local = engine.trees.local().get(&file).unwrap().clone();
+            local.identity.birth_ns = Some(10);
+            engine.trees.set_local(file.clone(), local);
+            engine.observe_part(
+                &[Observed::Removed {
+                    path: "x/d".into(),
+                    kind: EntryKind::Dir,
+                }],
+                1_000,
+            );
+            let path = dir.path().join("restart.db");
+            let mut store = koidrive_store::Store::open(&path).unwrap();
+            store
+                .transaction(|tx| {
+                    for (id, remote) in engine.trees.remote().iter() {
+                        tx.put_remote_node(&NodeState {
+                            node_id: id.clone(),
+                            parent_id: remote.shape.parent.clone(),
+                            name: remote.shape.name.clone(),
+                            kind: match remote.shape.kind {
+                                Kind::File => NodeKind::File,
+                                Kind::Dir => NodeKind::Dir,
+                            } as i32,
+                            status: koidrive_proto::v1::NodeStatus::Live as i32,
+                            content_rev: 1,
+                            meta_rev: 1,
+                            edit_rev: 1,
+                            current: remote.shape.content.clone().map(|content| {
+                                koidrive_proto::v1::VersionInfo {
+                                    content: Some(content),
+                                    ..Default::default()
+                                }
+                            }),
+                            ..Default::default()
+                        })?;
+                    }
+                    engine.checkpoint(tx)
+                })
+                .unwrap();
+            drop(store);
+            let mut store = koidrive_store::Store::open(&path).unwrap();
+            let mut restored = store.transaction(|tx| Engine::load(tx, ROOT)).unwrap();
+            assert!(restored.trees.halves_due().is_some());
+            let identity = FileId {
+                birth_ns: Some(10),
+                ..ino(10)
+            };
+            restored.observe(&[created("e/moved.txt", identity, false, 5)], restart_at);
+            assert_eq!(
+                holding(&restored, "e/moved.txt").map(|(id, _, _)| id),
+                Some(file),
+                "restart at {restart_at}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_held_file_a_whole_scan_finds_before_reading_its_content_keeps_its_node() {
+        for linked in [false, true] {
+            let (_dir, mut engine, file) = moved_out_of_a_removed_folder(linked);
+            let identity = FileId {
+                birth_ns: Some(10),
+                ..ino(10)
+            };
+            let mut local = engine.trees.local().get(&file).unwrap().clone();
+            local.identity.birth_ns = identity.birth_ns;
+            engine.trees.set_local(file.clone(), local);
+            engine.observe_part(
+                &[Observed::Removed {
+                    path: "x/d".into(),
+                    kind: EntryKind::Dir,
+                }],
+                1_000,
+            );
+            engine.observe(
+                &[Observed::Created {
+                    path: "e/moved.txt".into(),
+                    kind: EntryKind::File,
+                    id: identity,
+                    linked,
+                    content: None,
+                }],
+                3_001,
+            );
+            engine.observe_part(
+                &[Observed::Modified {
+                    path: "e/moved.txt".into(),
+                    id: identity,
+                    linked,
+                    content: Some(bytes(5)),
+                }],
+                3_002,
+            );
+            assert_eq!(
+                holding(&engine, "e/moved.txt").map(|(id, _, _)| id),
+                Some(file),
+                "linked: {linked}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_held_file_a_whole_scan_finds_before_reading_its_content_keeps_its_node_before_it_was_synced()
+     {
+        for linked in [false, true] {
+            let (_dir, mut engine) = mapper();
+            let identity = FileId {
+                birth_ns: Some(10),
+                ..ino(10)
+            };
+            let folder = |path: &str, id: u64| Observed::Created {
+                path: path.into(),
+                kind: EntryKind::Dir,
+                id: ino(id),
+                linked: false,
+                content: None,
+            };
+            engine.observe(&[folder("x", 1), folder("x/d", 2), folder("e", 3)], 0);
+            synced_everywhere(&mut engine);
+            engine.observe(&[created("x/d/g.txt", identity, linked, 5)], 1);
+            let (file, _, _) = holding(&engine, "x/d/g.txt").unwrap();
+            engine.observe_part(
+                &[Observed::Removed {
+                    path: "x/d".into(),
+                    kind: EntryKind::Dir,
+                }],
+                1_000,
+            );
+            engine.observe(
+                &[Observed::Created {
+                    path: "e/moved.txt".into(),
+                    kind: EntryKind::File,
+                    id: identity,
+                    linked,
+                    content: None,
+                }],
+                3_001,
+            );
+            engine.observe_part(
+                &[Observed::Modified {
+                    path: "e/moved.txt".into(),
+                    id: identity,
+                    linked,
+                    content: Some(bytes(5)),
+                }],
+                3_002,
+            );
+            assert_eq!(
+                holding(&engine, "e/moved.txt").map(|(id, _, _)| id),
+                Some(file),
+                "linked: {linked}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_linked_file_found_at_its_new_path_before_its_old_one_is_gone_keeps_its_node_through_its_read()
+     {
+        for read_before_removal in [false, true] {
+            let (_dir, mut engine, file) = moved_out_of_a_removed_folder(true);
+            let identity = FileId {
+                birth_ns: Some(10),
+                ..ino(10)
+            };
+            let mut local = engine.trees.local().get(&file).unwrap().clone();
+            local.identity.birth_ns = identity.birth_ns;
+            engine.trees.set_local(file.clone(), local);
+            let found = Observed::Created {
+                path: "e/moved.txt".into(),
+                kind: EntryKind::File,
+                id: identity,
+                linked: true,
+                content: None,
+            };
+            let removed = Observed::Removed {
+                path: "x/d".into(),
+                kind: EntryKind::Dir,
+            };
+            let read = Observed::Modified {
+                path: "e/moved.txt".into(),
+                id: identity,
+                linked: true,
+                content: Some(bytes(5)),
+            };
+            engine.observe_part(&[found], 1_000);
+            let rest = match read_before_removal {
+                true => [read, removed],
+                false => [removed, read],
+            };
+            for (at, change) in rest.into_iter().enumerate() {
+                engine.observe_part(&[change], 1_001 + at as u64);
+            }
+            assert_eq!(
+                holding(&engine, "e/moved.txt").map(|(id, _, _)| id),
+                Some(file),
+                "read before removal: {read_before_removal}"
+            );
+            assert_eq!(engine.trees.check(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn a_file_a_scan_of_the_whole_tree_finds_unread_at_its_new_path_keeps_its_node() {
+        let removed = Observed::Removed {
+            path: "x/d".into(),
+            kind: EntryKind::Dir,
+        };
+        let moved = Observed::Created {
+            path: "e/moved.txt".into(),
+            kind: EntryKind::File,
+            id: ino(10),
+            linked: false,
+            content: None,
+        };
+        for batch in [[removed.clone(), moved.clone()], [moved, removed]] {
+            let (_dir, mut engine, file) = moved_out_of_a_removed_folder(false);
+            engine.observe(&batch, 1);
+            assert_eq!(
+                holding(&engine, "e/moved.txt").map(|(id, _, size)| (id, size)),
+                Some((file.clone(), 5))
+            );
+            let read = Observed::Modified {
+                path: "e/moved.txt".into(),
+                id: ino(10),
+                linked: false,
+                content: Some(bytes(6)),
+            };
+            engine.observe_part(&[read], 2);
+            assert_eq!(
+                holding(&engine, "e/moved.txt").map(|(id, _, size)| (id, size)),
+                Some((file, 6))
+            );
+            assert_eq!(engine.trees.check(), Ok(()));
+        }
+    }
+
+    fn moved_out_of_a_removed_folder(linked: bool) -> (tempfile::TempDir, Engine, NodeId) {
+        let (dir, mut engine) = mapper();
+        engine.rules(
+            vec![RulesChange {
+                dir: PathBuf::new(),
+                rules: Some(koidrive_engine::ignore::RuleFile::parse(b"ig/\n")),
+            }],
+            true,
+        );
+        let folder = |path: &str, id: u64| Observed::Created {
+            path: path.into(),
+            kind: EntryKind::Dir,
+            id: ino(id),
+            linked: false,
+            content: None,
+        };
+        engine.observe(
+            &[
+                folder("x", 1),
+                folder("x/d", 2),
+                folder("e", 3),
+                created("x/d/g.txt", ino(10), linked, 5),
+            ],
+            0,
+        );
+        synced_everywhere(&mut engine);
+        let (file, _, _) = holding(&engine, "x/d/g.txt").unwrap();
+        (dir, engine, file)
+    }
+
+    #[test]
+    fn a_file_moved_out_of_a_folder_removed_in_the_same_batch_keeps_its_node_whichever_comes_first()
+    {
+        let removed = Observed::Removed {
+            path: "x/d".into(),
+            kind: EntryKind::Dir,
+        };
+        let moved = created("e/moved.txt", ino(10), false, 5);
+        for batch in [[removed.clone(), moved.clone()], [moved, removed]] {
+            let (_dir, mut engine, file) = moved_out_of_a_removed_folder(false);
+            engine.observe(&batch, 1);
+            let at = holding(&engine, "e/moved.txt").map(|(id, _, _)| id);
+            assert_eq!(at, Some(file), "{batch:?}");
+            assert_eq!(holding(&engine, "x/d"), None, "{batch:?}");
+            assert_eq!(engine.trees.check(), Ok(()), "{batch:?}");
+        }
+    }
+
+    #[test]
+    fn a_linked_file_placed_again_in_the_batch_that_finds_its_old_link_ignored_is_not_recorded() {
+        let removed = Observed::Removed {
+            path: "x/d".into(),
+            kind: EntryKind::Dir,
+        };
+        let ignored = renamed("x/d/g.txt", "ig/g.txt", ino(10), true);
+        let moved = created("e/moved.txt", ino(10), true, 5);
+        for batch in [
+            [moved.clone(), removed.clone(), ignored.clone()],
+            [removed, ignored, moved],
+        ] {
+            let (_dir, mut engine, file) = moved_out_of_a_removed_folder(true);
+            engine.observe(&batch, 1);
+            let at = holding(&engine, "e/moved.txt").map(|(id, _, _)| id);
+            assert_eq!(at, Some(file.clone()), "{batch:?}");
+            assert!(!engine.trees.recorded_local(&file), "{batch:?}");
+            assert!(!engine.trees.excluded(&file), "{batch:?}");
+            assert_eq!(engine.trees.check(), Ok(()), "{batch:?}");
         }
     }
 
@@ -3319,6 +3879,92 @@ mod tests {
                 prop_assert_eq!(engine.trees.check(), Ok(()), "after {:?}", batch);
                 prop_assert_eq!(in_l(&engine), on_disk(&snapshot), "after {:?}", batch);
             }
+        }
+        #[test]
+        fn a_held_file_keeps_its_node_through_any_order_of_scans_expiries_and_reads(
+            linked in any::<bool>(),
+            synced in any::<bool>(),
+            events in prop::collection::vec((0..6u8, any::<bool>()), 0..12),
+        ) {
+            let (_dir, mut engine, file) = moved_out_of_a_removed_folder(linked);
+            let identity = FileId {
+                birth_ns: Some(10),
+                ..ino(10)
+            };
+            let mut local = engine.trees.local().get(&file).unwrap().clone();
+            local.identity.birth_ns = identity.birth_ns;
+            engine.trees.set_local(file.clone(), local);
+            if !synced {
+                engine.trees.remove_remote(&file);
+                engine.trees.set_synced(file.clone(), None);
+                engine.trees.settle();
+                let commit = engine.commits.build(&mut engine.trees, &mut engine.ids, 999, "h", 1u64);
+                prop_assert!(commit.is_some());
+            }
+            let removal = Observed::Removed {
+                path: "x/d".into(),
+                kind: EntryKind::Dir,
+            };
+            let found = |read: bool| Observed::Created {
+                path: "e/moved.txt".into(),
+                kind: EntryKind::File,
+                id: identity,
+                linked,
+                content: read.then(|| bytes(5)),
+            };
+            let read = Observed::Modified {
+                path: "e/moved.txt".into(),
+                id: identity,
+                linked,
+                content: Some(bytes(5)),
+            };
+            let (mut removed, mut kept) = (false, true);
+            let (mut reported, mut was_read) = (false, false);
+            let mut now_ms = 1_000;
+            for (event, read_now) in events.iter().copied().chain([(5, true), (3, true), (4, true)]) {
+                now_ms += 700;
+                let whole = matches!(event, 2 | 3);
+                let mut changes = Vec::new();
+                if (event == 5 || whole) && !removed {
+                    changes.push(removal.clone());
+                    removed = true;
+                    kept = !(whole && linked);
+                }
+                match event {
+                    1 | 2 if !reported => {
+                        changes.push(found(read_now));
+                        (reported, was_read) = (true, read_now);
+                    }
+                    3 if holding(&engine, "e/moved.txt").is_none() => {
+                        changes.push(found(true));
+                        (reported, was_read) = (true, true);
+                    }
+                    2 | 4 if reported && !was_read => {
+                        changes.push(read.clone());
+                        was_read = true;
+                    }
+                    _ => {}
+                }
+                match whole {
+                    true => engine.observe(&changes, now_ms),
+                    false => engine.observe_part(&changes, now_ms),
+                };
+                prop_assert_eq!(engine.trees.check(), Ok(()), "after {:?} in {:?}", event, events);
+                let held = holding(&engine, "e/moved.txt").map(|(id, _, _)| id);
+                if removed && kept && reported && (was_read || held.is_some()) {
+                    prop_assert_eq!(held, Some(file.clone()), "after {:?} in {:?}", event, events);
+                }
+            }
+            prop_assert!(engine.trees.halves().is_empty());
+            let held = holding(&engine, "e/moved.txt").map(|(id, _, _)| id);
+            prop_assert!(held.is_some());
+            if kept {
+                prop_assert_eq!(held, Some(file));
+            }
+            prop_assert_eq!(
+                engine.trees.locals_with_identity(&file_identity(identity)).count(),
+                1
+            );
         }
     }
 

@@ -20,6 +20,7 @@ use crate::guard::{Counted, GuardState, RemoteDeletion};
 use crate::question::{Held, Limit, Question};
 use crate::restore::{Resolved, RestoreId, RestoreIntent};
 use crate::tree::{FileIdentity, NodeId, Shape, TreeError};
+use koidrive_proto::v1::Content;
 
 /// A position L and R agreed on, with the revision of R's record that held it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,8 +74,12 @@ pub struct TreesState {
     /// The folders of `outside` that the disk lost, which L keeps only for what is recorded below them.
     pub lost: BTreeSet<NodeId>,
     /// The nodes whose local copy is in an ignored folder and whose name in L another entry took, each with the
-    /// identity L held for it. L holds none of them, and R holds each live.
+    /// identity L held for it, and the files of `halves` that left L. L holds none of them, and R holds each live
+    /// unless it waits in `halves`.
     pub displaced: BTreeMap<NodeId, FileIdentity>,
+    /// The files that wait for the other half of a move, each with its wait (section 5.1): one a scan of part of the
+    /// tree found gone, which `displaced` keeps meanwhile, and one L holds as a new link of a file at another path.
+    pub halves: BTreeMap<NodeId, Half>,
     /// The files whose content an edit of this device set, each with the seq of its commit, while
     /// R holds that content.
     pub edited_here: BTreeMap<NodeId, u64>,
@@ -189,6 +194,15 @@ pub type SetChanges<K> = Vec<(K, bool)>;
 /// its value now, or `None` when the map no longer holds the key.
 pub type MapChanges<K, V> = Vec<(K, Option<V>)>;
 
+/// A wait for the other half of a move (section 5.1).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Half {
+    /// When the wait began.
+    pub at_ms: u64,
+    /// The content L held for a file that left L, which a scan that finds the file before it reads its content keeps.
+    pub content: Option<Content>,
+}
+
 /// What changed in [`TreesState`] since the changes were last taken
 /// ([`Trees::take_changes`](crate::classify::Trees::take_changes)), field by field.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -206,6 +220,7 @@ pub struct TreesChanges {
     pub outside: SetChanges<NodeId>,
     pub lost: SetChanges<NodeId>,
     pub displaced: MapChanges<NodeId, FileIdentity>,
+    pub halves: MapChanges<NodeId, Half>,
     pub edited_here: MapChanges<NodeId, u64>,
     pub moved_here: MapChanges<NodeId, MovedHere>,
     pub past_positions: MapChanges<NodeId, Vec<Agreed>>,
@@ -234,6 +249,7 @@ impl TreesChanges {
             outside,
             lost,
             displaced,
+            halves,
             edited_here,
             moved_here,
             past_positions,
@@ -258,6 +274,7 @@ impl TreesChanges {
             outside: set_changes(&before.outside, outside),
             lost: set_changes(&before.lost, lost),
             displaced: map_changes(&before.displaced, displaced),
+            halves: map_changes(&before.halves, halves),
             edited_here: map_changes(&before.edited_here, edited_here),
             moved_here: map_changes(&before.moved_here, moved_here),
             past_positions: map_changes(&before.past_positions, past_positions),
@@ -428,8 +445,10 @@ pub enum StateError {
     /// A node is recorded as moved into an ignored folder, or as a folder the disk lost, but L does not hold it or the
     /// lost folder is not recorded.
     NotIgnoredLocal(NodeId),
-    /// A node is recorded as displaced, but L holds it or R does not hold it live.
+    /// A node is recorded as displaced, but L holds it, or R does not hold it live and it does not wait in `halves`.
     NotDisplaced(NodeId),
+    /// A file waits for the other half of a move, but neither L holds it nor is it displaced.
+    NotHalf(NodeId),
     /// A file is recorded as edited by this device, but R does not hold the content of that
     /// commit.
     NotEditedHere(NodeId),

@@ -74,6 +74,9 @@ pub struct Observation {
     /// platform watcher failed and a rescanning one took over. Rules known from before are stale then, since the new
     /// scans compare with no earlier rules and report no rules file as gone.
     pub all_rules: bool,
+    /// Whether the scans of `changes` covered the whole tree ([`koidrive_fs::Poll::whole`]) and read every folder in
+    /// it, so an entry they did not find is not on the disk.
+    pub whole: bool,
 }
 
 /// The rules of the `.koiignore` file in `dir`, a folder relative to the root and empty for the root, or `None` when
@@ -544,6 +547,7 @@ impl Observer for FsObserver {
         self.first &= !first;
         self.reset &= !answers;
         let root = check_root(&self.root, &self.space_id, self.dev).map(|_| ());
+        let whole = poll.whole && unreadable.is_empty();
         Ok(Some(Observation {
             changes,
             root,
@@ -553,6 +557,7 @@ impl Observer for FsObserver {
             busy: reads.busy,
             rules,
             all_rules: first,
+            whole,
         }))
     }
 
@@ -1518,6 +1523,50 @@ mod tests {
         assert!(settled.unreadable.is_empty());
         assert_eq!(settled.read, [proj]);
         assert!(observer.observe(Duration::ZERO).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_scan_of_the_whole_tree_that_could_not_read_a_folder_is_not_whole() {
+        let dir = marked();
+        let root = dir.path();
+        fs::create_dir(root.join("e")).unwrap();
+        let mut known = observer(root);
+        known.observe(Duration::from_secs(10)).unwrap();
+        let snapshot = known.snapshot().clone();
+        let scanned = known.scanned();
+        let dev = fs::metadata(root).unwrap().dev();
+        let mut observer = FsObserver::start(
+            root,
+            SPACE,
+            dev,
+            snapshot.clone(),
+            Arc::new(Unfiltered),
+            || false,
+        )
+        .unwrap();
+        let e = PathBuf::from("e");
+        observer.watcher = Box::new(Scripted {
+            snapshot,
+            polls: vec![
+                Poll {
+                    root: scanned,
+                    unreadable: vec![e.clone()],
+                    whole: true,
+                    ..Poll::default()
+                },
+                Poll {
+                    root: scanned,
+                    read: vec![e],
+                    whole: true,
+                    ..Poll::default()
+                },
+            ],
+        });
+        let blocked =
+            (observer.observe(Duration::ZERO).unwrap()).expect("the batch that could not read e");
+        assert!(!blocked.whole);
+        let read = (observer.observe(Duration::ZERO).unwrap()).expect("the batch that read e");
+        assert!(read.whole);
     }
 
     /// The platform watcher fails after the user deleted a rules file it had not reported. The rescanning watcher that
