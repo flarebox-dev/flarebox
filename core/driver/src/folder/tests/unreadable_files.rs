@@ -215,3 +215,52 @@ fn a_left_out_file_saved_again_is_sent_without_waiting_for_its_retry() {
     assert!(a.folder.engine.commits.problems().is_empty());
 }
 
+
+
+fn fail_upload_of(a: &mut Device, remote: &mut Remote, size: usize) {
+    eventually("the changed file is uploaded", || {
+        while let Some(work) = a.work.pop_front() {
+            match work {
+                Work::Upload(upload) => {
+                    let Some(chunk) = (upload.chunks.iter()).find(|chunk| chunk.size as usize == size) else {
+                        a.perform(Work::Upload(upload), remote).unwrap();
+                        continue;
+                    };
+                    let error = ChunkError::SourceChanged {
+                        hash: chunk.hash.clone(),
+                    };
+                    let step = a.folder.uploaded(Err(error));
+                    a.take(step).unwrap();
+                    return true;
+                }
+                Work::RetryAfter(_) => {}
+                work => a.perform(work, remote).unwrap(),
+            }
+        }
+        a.scan(Duration::from_millis(100));
+        false
+    });
+}
+
+#[test]
+fn a_left_out_file_that_changes_again_is_left_out_at_its_next_failure() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    let secret = site.root.join("secret.txt");
+    fs::write(&secret, b"first").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.rest(&mut remote);
+
+    for size in 10..10 + LEFT_OUT_AFTER as usize {
+        fs::write(&secret, "c".repeat(size)).unwrap();
+        fail_upload_of(&mut a, &mut remote, size);
+    }
+    let left_out = a.folder.view().problem.unwrap_or_default();
+    assert!(left_out.contains("secret.txt"), "{left_out}");
+
+    fs::write(&secret, "c".repeat(30)).unwrap();
+    fail_upload_of(&mut a, &mut remote, 30);
+    let problem = a.folder.view().problem.unwrap_or_default();
+    assert!(problem.contains("secret.txt"), "the file went back to abandoning commits: {problem:?}");
+}
+

@@ -524,9 +524,6 @@ impl Folder {
                 }
                 Ok(())
             })?;
-            for node in &changed {
-                self.unreadable.remove(node);
-            }
         }
         let mut work = Vec::new();
         self.drive(&mut work)?;
