@@ -15,6 +15,12 @@ version_key() {
 }
 
 own=$(version_key "$tag") || { echo "::error::$tag is not a vX.Y.Z, vX.Y.Z-alpha.N or vX.Y.Z-rc.N tag."; exit 1; }
+case $PRERELEASE_TAGS_PUBLISH_AS in
+    normal-release | prerelease) ;;
+    *) echo "::error::PRERELEASE_TAGS_PUBLISH_AS is $PRERELEASE_TAGS_PUBLISH_AS, expected normal-release or prerelease."; exit 1 ;;
+esac
+if [[ $tag == *-* ]]; then tagged_prerelease=true; else tagged_prerelease=false; fi
+[ "$PRERELEASE" = "$tagged_prerelease" ] || { echo "::error::PRERELEASE is $PRERELEASE, but $tag means $tagged_prerelease."; exit 1; }
 
 dmg="Koidrive-${tag#v}-arm64.dmg"
 sums="$files/SHA256SUMS"

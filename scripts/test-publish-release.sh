@@ -97,7 +97,7 @@ sign_with() {
 publish_staged() {
     local prerelease=false
     if [[ $1 == *-* ]]; then prerelease=true; fi
-    PRERELEASE=$prerelease bash "$root/scripts/publish-release.sh" "$1" "$tmp/dist"
+    PRERELEASE=${PRERELEASE:-$prerelease} bash "$root/scripts/publish-release.sh" "$1" "$tmp/dist"
 }
 publish() {
     stage "$1"
@@ -256,5 +256,13 @@ expect_latest v0.1.0 'a prerelease-mode alpha leaves Latest'
 pass 'a prerelease-mode alpha is a GitHub prerelease'
 publish v0.1.1
 expect_latest v0.1.1 'a GitHub prerelease does not hold back Latest'
+
+fresh
+stage v0.2.0-alpha.1
+PRERELEASE_TAGS_PUBLISH_AS=prerelase expect_refused v0.2.0-alpha.1 'PRERELEASE_TAGS_PUBLISH_AS is prerelase, expected normal-release or prerelease' 'a misspelled prerelease mode is refused'
+expect_latest none 'a misspelled prerelease mode leaves Latest'
+PRERELEASE=false expect_refused v0.2.0-alpha.1 'PRERELEASE is false, but v0.2.0-alpha.1 means true' 'a PRERELEASE that disagrees with the tag is refused'
+stage v0.2.0
+PRERELEASE=True expect_refused v0.2.0 'PRERELEASE is True, but v0.2.0 means false' 'a PRERELEASE other than true or false is refused'
 
 echo "Passed $passed release publishing tests"
