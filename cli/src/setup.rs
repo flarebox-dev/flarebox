@@ -393,96 +393,90 @@ async fn onboard(paths: &Paths, terminal: &Terminal) -> Result<Done, CliError> {
         drop(progress.take());
         shared_folder(terminal, &spaces).await?
     };
-    loop {
-        let SelectedFolder {
-            folder,
-            local,
-            directory,
-        } = local_folder(terminal, &target, &mut progress).await?;
-        let preparing = format!("Preparing {}...", shown_folder(&folder));
-        let linking = match progress.take() {
-            Some(progress) => progress,
-            None if folder == home()?.join(DEFAULT_FOLDER) => {
-                terminal.continue_progress(&preparing)
-            }
-            None => terminal.progress(&preparing),
-        };
-        if local == Local::Missing {
-            create(&folder)?;
+    let named = loop {
+        if progress.is_none() {
+            progress = Some(terminal.continue_progress("Preparing ~/Koidrive..."));
         }
-        let directory = directory
-            .map(Ok)
-            .unwrap_or_else(|| directory_identity(&folder))?;
-        let space = match &target {
-            Target::Existing(space) => space.clone(),
+        match target {
+            Target::Existing(space) => break crate::Named::Existing(space),
             Target::Default => match crate::named_space(&auth, &spaces, DEFAULT_FOLDER).await? {
-                crate::Named::Created(space) => space,
+                crate::Named::Created(space) => break crate::Named::Created(space),
                 crate::Named::Existing(_) => {
-                    drop(linking);
+                    drop(progress.take());
                     terminal.message(&format!(
                         "A shared folder named {DEFAULT_FOLDER} is available. Choose which folder to sync."
                     ));
                     let now = auth.api().list_spaces(&auth).await?;
                     target = shared_folder(terminal, &now.spaces).await?;
-                    continue;
                 }
             },
             Target::New(name) => {
                 let request = CreateSpaceRequest { name: name.clone() };
                 match auth.api().create_space(&auth, &request).await {
-                    Ok(space) => space,
+                    Ok(space) => break crate::Named::Created(space),
                     Err(error) => {
                         let now = auth.api().list_spaces(&auth).await?;
-                        if !now.spaces.iter().any(|space| space.name == *name) {
+                        if !now.spaces.iter().any(|space| space.name == name) {
                             return Err(error.into());
                         }
-                        drop(linking);
+                        drop(progress.take());
                         terminal.message(&format!(
                             "A shared folder named {} already exists. Choose another name.",
-                            printable(name)
+                            printable(&name)
                         ));
                         target = new_shared_folder(terminal, &now.spaces).await?;
-                        continue;
                     }
                 }
             }
-        };
-        let approval = LinkApproval {
-            directory,
-            accept_existing_files: local == Local::Files,
-        };
-        let (status, _) =
-            crate::link(paths, folder.clone(), space.space_id, Some(approval)).await?;
-        linking.finish(&format!(
-            "{} is linked to {}",
-            shown_folder(Path::new(&status.path)),
-            status.space_name
-        ));
-        let data = SetupData {
-            account: AccountData::of(&credential.account()),
-            folder: FolderData::of(&status),
-        };
-        return Ok(Done {
-            note: ending(&folder),
-            ..Done::ok(data, "")
-        });
+        }
+    };
+    let SelectedFolder {
+        folder,
+        local,
+        directory,
+    } = local_folder(terminal, &named, &mut progress).await?;
+    let preparing = format!("Preparing {}...", shown_folder(&folder));
+    let linking = match progress.take() {
+        Some(progress) => progress,
+        None if folder == home()?.join(DEFAULT_FOLDER) => terminal.continue_progress(&preparing),
+        None => terminal.progress(&preparing),
+    };
+    if local == Local::Missing {
+        create(&folder)?;
     }
+    let directory = directory
+        .map(Ok)
+        .unwrap_or_else(|| directory_identity(&folder))?;
+    let approval = LinkApproval {
+        directory,
+        accept_existing_files: local == Local::Files,
+    };
+    let (status, _) = crate::link(
+        paths,
+        folder.clone(),
+        named.space().space_id.clone(),
+        Some(approval),
+    )
+    .await?;
+    linking.finish(&format!(
+        "{} is linked to {}",
+        shown_folder(Path::new(&status.path)),
+        status.space_name
+    ));
+    let data = SetupData {
+        account: AccountData::of(&credential.account()),
+        folder: FolderData::of(&status),
+    };
+    Ok(Done {
+        note: ending(&folder),
+        ..Done::ok(data, "")
+    })
 }
 
 enum Target {
     Existing(SpaceInfo),
     Default,
     New(String),
-}
-
-impl Target {
-    fn name(&self) -> &str {
-        match self {
-            Target::Existing(space) => &space.name,
-            Target::Default => DEFAULT_FOLDER,
-            Target::New(name) => name,
-        }
-    }
 }
 
 async fn shared_folder(terminal: &Terminal, spaces: &[SpaceInfo]) -> Result<Target, CliError> {
@@ -563,7 +557,7 @@ fn directory_identity(folder: &Path) -> Result<DirectoryIdentity, CliError> {
 
 async fn local_folder(
     terminal: &Terminal,
-    target: &Target,
+    named: &crate::Named,
     progress: &mut Option<Progress<'_>>,
 ) -> Result<SelectedFolder, CliError> {
     let mut folder = home()?.join(DEFAULT_FOLDER);
@@ -589,16 +583,16 @@ async fn local_folder(
         }
         drop(progress.take());
         let path = shown_folder(&folder);
-        let name = target.name();
+        let name = &named.space().name;
         terminal.separator();
-        match target {
-            Target::Existing(_) => {
+        match named {
+            crate::Named::Existing(_) => {
                 terminal.message(&format!(
                     "{path} contains files. They will upload to {name}."
                 ));
                 terminal.message(&format!("Files in {name} will download into {path}."));
             }
-            Target::Default | Target::New(_) => terminal.message(&format!(
+            crate::Named::Created(_) => terminal.message(&format!(
                 "{path} contains files. They will upload to a new shared folder named {name}."
             )),
         }

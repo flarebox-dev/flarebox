@@ -742,6 +742,14 @@ fn terminal_run(
     output
 }
 
+fn link_is_waiting(root: &Path) -> bool {
+    match File::open(root) {
+        Ok(file) => koidrive_driver::Flock::take(file).unwrap().is_none(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => panic!("open approval root {}: {error}", root.display()),
+    }
+}
+
 fn shown(output: Output) -> String {
     console::strip_ansi_codes(&String::from_utf8(output.stdout).unwrap()).into_owned()
 }
@@ -1405,20 +1413,21 @@ fn a_default_collision_choice_can_be_cancelled_without_linking_local_files() {
         let folder = home.path().join("Koidrive");
         fs::create_dir(&folder).unwrap();
         fs::write(folder.join("report.docx"), b"draft").unwrap();
-        let steps = [
-            step(FILES, choose(rich, 1)),
-            after(&["A shared folder named Koidrive is available.", SPACE], ""),
-        ];
+        let steps = [after(
+            &["A shared folder named Koidrive is available.", SPACE],
+            "",
+        )];
         let output = home.setup(
             &steps,
             &["--telemetry", "off"],
             &[],
             true,
             rich,
-            Some((1, rustix::process::Signal::INT)),
+            Some((0, rustix::process::Signal::INT)),
         );
         let text = shown(output.clone());
         assert_eq!(output.status.code(), Some(130), "{text}");
+        assert!(!text.contains(FILES), "{text}");
         assert!(home.links().is_empty(), "{text}");
         assert!(!folder.join(".koidrive/device.json").exists());
         assert!(!folder.join(".koidrive/space.json").exists());
@@ -1662,7 +1671,16 @@ fn cancelling_a_folder_question_keeps_the_device_and_links_nothing() {
                 );
                 assert!(home.connected());
                 assert!(home.links().is_empty(), "{:?}", home.requests());
-                assert!(!home.requests().contains(&"POST /v1/spaces".to_owned()));
+                assert_eq!(
+                    home.requests()
+                        .iter()
+                        .filter(|request| *request == "POST /v1/spaces")
+                        .count(),
+                    usize::from(stage >= 2),
+                    "{text}"
+                );
+                assert!(!home.path().join("Koidrive/.koidrive/device.json").exists());
+                assert!(!home.path().join("Koidrive/.koidrive/space.json").exists());
                 assert_eq!(
                     fs::read(home.path().join("Koidrive/report.docx")).unwrap(),
                     b"draft"
@@ -1717,10 +1735,12 @@ fn files_appearing_during_creation_confirmation_are_not_linked_without_consent()
         home.connect();
         let folder = home.path().join("Koidrive");
         let changed = folder.clone();
+        let injected = Arc::new(AtomicBool::new(false));
+        let did_inject = injected.clone();
         *home.request_hook.lock().unwrap() = Some(Box::new(move |request| {
-            if request == "POST /v1/spaces" {
-                fs::create_dir_all(&changed).unwrap();
+            if request == "GET /v1/spaces" && link_is_waiting(&changed) {
                 fs::write(changed.join("private.docx"), "private document").unwrap();
+                did_inject.store(true, Ordering::Relaxed);
             }
         }));
         let output = terminal_run(
@@ -1733,6 +1753,7 @@ fn files_appearing_during_creation_confirmation_are_not_linked_without_consent()
             TerminalInput::Direct,
         );
         let text = shown(output.clone());
+        assert!(injected.load(Ordering::Relaxed), "{text}");
         assert!(!output.status.success(), "{text}");
         let driver = koidrive_driver::Driver::open(home.paths()).unwrap();
         assert!(driver.status().folders.is_empty(), "{text}");
@@ -1751,13 +1772,12 @@ fn files_appearing_during_the_link_server_call_still_need_consent() {
         let folder = home.path().join("Koidrive");
         fs::create_dir(&folder).unwrap();
         let changed = folder.clone();
-        let mut lists = 0;
+        let injected = Arc::new(AtomicBool::new(false));
+        let did_inject = injected.clone();
         *home.request_hook.lock().unwrap() = Some(Box::new(move |request| {
-            if request == "GET /v1/spaces" {
-                lists += 1;
-                if lists == 2 {
-                    fs::write(changed.join("private.docx"), "private document").unwrap();
-                }
+            if request == "GET /v1/spaces" && link_is_waiting(&changed) {
+                fs::write(changed.join("private.docx"), "private document").unwrap();
+                did_inject.store(true, Ordering::Relaxed);
             }
         }));
         let steps = [step(SPACE, choose(rich, 0))];
@@ -1771,6 +1791,7 @@ fn files_appearing_during_the_link_server_call_still_need_consent() {
             TerminalInput::Direct,
         );
         let text = shown(output.clone());
+        assert!(injected.load(Ordering::Relaxed), "{text}");
         assert!(!output.status.success(), "{text}");
         let driver = koidrive_driver::Driver::open(home.paths()).unwrap();
         assert!(driver.status().folders.is_empty(), "{text}");
@@ -1816,15 +1837,14 @@ fn replacing_an_approved_directory_during_the_link_server_call_is_refused() {
         let changed = folder.clone();
         let saved = home.path().join("Saved");
         let old = saved.clone();
-        let mut lists = 0;
+        let injected = Arc::new(AtomicBool::new(false));
+        let did_inject = injected.clone();
         *home.request_hook.lock().unwrap() = Some(Box::new(move |request| {
-            if request == "GET /v1/spaces" {
-                lists += 1;
-                if lists == 2 {
-                    fs::rename(&changed, &old).unwrap();
-                    fs::create_dir(&changed).unwrap();
-                    fs::write(changed.join("private.docx"), "private document").unwrap();
-                }
+            if request == "GET /v1/spaces" && link_is_waiting(&changed) {
+                fs::rename(&changed, &old).unwrap();
+                fs::create_dir(&changed).unwrap();
+                fs::write(changed.join("private.docx"), "private document").unwrap();
+                did_inject.store(true, Ordering::Relaxed);
             }
         }));
         let steps = [step(SPACE, choose(rich, 0)), step(FILES, choose(rich, 1))];
@@ -1838,6 +1858,7 @@ fn replacing_an_approved_directory_during_the_link_server_call_is_refused() {
             TerminalInput::Direct,
         );
         let text = shown(output.clone());
+        assert!(injected.load(Ordering::Relaxed), "{text}");
         assert!(!output.status.success(), "{text}");
         let driver = koidrive_driver::Driver::open(home.paths()).unwrap();
         assert!(driver.status().folders.is_empty(), "{text}");

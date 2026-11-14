@@ -1269,6 +1269,43 @@ fn golden_existing_files_new_space() {
 }
 
 #[test]
+fn golden_default_collision() {
+    for rich in [true, false] {
+        let home = Home::new(&[], &[]);
+        home.state.lock().unwrap().collide_create = true;
+        fs::create_dir(home.path().join("Koidrive")).unwrap();
+        fs::write(home.path().join("Koidrive/report.docx"), b"draft").unwrap();
+        home.run_steps(
+            rich,
+            Browser::Opens,
+            &[
+                (ROUTE, pick(rich, 1)),
+                ("Pairing code", typed(rich, "CODE@files.example.com")),
+                (SPACES, pick(rich, 0)),
+                ("What should Koidrive do?", pick(rich, 1)),
+                (CONSENT, consent(rich)),
+            ],
+        );
+        golden(&home, "default-collision", rich);
+        let screen = rendered(&fs::read(home.path().join("terminal.ansi")).unwrap());
+        assert_eq!(
+            screen.matches("What should Koidrive do?").count(),
+            1,
+            "{screen}"
+        );
+        assert!(
+            !screen.contains("new shared folder named Koidrive"),
+            "{screen}"
+        );
+        let state = home.state.lock().unwrap();
+        assert!(state.created.is_empty());
+        assert_eq!(state.spaces.len(), 1);
+        assert_eq!(state.links.len(), 1);
+        assert_eq!(state.links[0].1, state.spaces[0].space_id);
+    }
+}
+
+#[test]
 fn golden_create_shared_folder() {
     for rich in [true, false] {
         let home = Home::new(&["koidrive"], &["Koidrive"]);
@@ -1299,6 +1336,10 @@ fn creating_a_shared_folder_reprompts_for_an_existing_name() {
                     ("Pairing code", typed(rich, "CODE@files.example.com")),
                     (SPACES, pick(rich, spaces.len())),
                     ("Shared folder name", typed(rich, "Work")),
+                    (
+                        "A shared folder named Work already exists. Choose another name.",
+                        String::new(),
+                    ),
                     ("Shared folder name", typed(rich, "Photos")),
                     (CONSENT, consent(rich)),
                 ],
@@ -1341,7 +1382,10 @@ fn a_concurrent_creation_collision_never_links_the_existing_shared_folder() {
                 ("Pairing code", typed(rich, "CODE@files.example.com")),
                 (SPACES, pick(rich, 1)),
                 ("Shared folder name", typed(rich, "Photos")),
-                ("What should Koidrive do?", pick(rich, 1)),
+                (
+                    "A shared folder named Photos already exists. Choose another name.",
+                    String::new(),
+                ),
                 ("Shared folder name", typed(rich, "Travel")),
                 ("What should Koidrive do?", pick(rich, 1)),
                 (CONSENT, consent(rich)),
@@ -1362,12 +1406,22 @@ fn a_concurrent_creation_collision_never_links_the_existing_shared_folder() {
             "{screen}"
         );
         assert!(
-            text.contains("They will upload to a new shared folder named Photos."),
+            !text.contains("They will upload to a new shared folder named Photos."),
             "{text}"
         );
         assert!(
             text.contains("They will upload to a new shared folder named Travel."),
             "{text}"
+        );
+        assert_eq!(
+            screen.matches("What should Koidrive do?").count(),
+            1,
+            "{screen}"
+        );
+        assert!(
+            screen.find("already exists").unwrap()
+                < screen.find("What should Koidrive do?").unwrap(),
+            "{screen}"
         );
         let state = home.state.lock().unwrap();
         assert_eq!(state.created.len(), 1);
@@ -1425,7 +1479,6 @@ fn a_default_creation_collision_requires_a_choice_and_fresh_file_consent() {
                 command.arg("--plain");
             }
             let mut steps = vec![
-                ("What should Koidrive do?", pick(rich, 1)),
                 (SPACES, pick(rich, 0)),
                 (
                     "What should Koidrive do?",
@@ -1436,9 +1489,7 @@ fn a_default_creation_collision_requires_a_choice_and_fresh_file_consent() {
                 steps.push(("Folder to sync", typed(rich, "~/Empty")));
             }
             let text = home.finish_run(rich, command, &steps);
-            let initial = text
-                .find("They will upload to a new shared folder named Koidrive.")
-                .unwrap();
+            assert!(!text.contains("new shared folder named Koidrive"), "{text}");
             let collision = text
                 .find("A shared folder named Koidrive is available.")
                 .unwrap();
@@ -1446,11 +1497,13 @@ fn a_default_creation_collision_requires_a_choice_and_fresh_file_consent() {
             let existing = text
                 .find("Files in Koidrive will download into ~/Koidrive.")
                 .unwrap();
-            assert!(
-                initial < collision && collision < choice && choice < existing,
-                "{text}"
-            );
+            assert!(collision < choice && choice < existing, "{text}");
             let screen = rendered(&fs::read(home.path().join("terminal.ansi")).unwrap());
+            assert_eq!(
+                screen.matches("What should Koidrive do?").count(),
+                1,
+                "{screen}"
+            );
             assert!(screen.contains(SPACES), "{screen}");
             assert!(
                 screen.contains("A shared folder named Koidrive is available."),

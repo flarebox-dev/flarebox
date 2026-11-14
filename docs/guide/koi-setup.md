@@ -20,7 +20,7 @@ Setup uses `~/Koidrive` for your files:
 - If `~/Koidrive` is missing or empty, setup creates or links it without another question. Files excluded by the built-in rules, such as `.DS_Store`, do not make a folder nonempty.
 - If the folder holds files, **What should Koidrive do?** offers **Use another folder** first and **Sync these files** second. Syncing uploads the local files and downloads the shared folder's files. To keep those local files out of sync, select **Use another folder** and enter a path at **Folder to sync**. A path to a file, an unreadable path, or an unwritable folder also leads to this path question.
 
-If setup finds an existing shared folder while creating `Koidrive`, select which shared folder to sync. If your local folder has files, setup asks for consent again.
+Setup resolves the shared folder before asking about local files. If it finds an existing shared folder while creating `Koidrive`, select which shared folder to sync. The file question names that folder and asks for consent once.
 
 Setup links the folder and starts background sync. If you cancel a folder question, this device stays connected and no folder is linked.
 
