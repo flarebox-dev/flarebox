@@ -180,10 +180,15 @@ enum Snapshots {
         if let fake = folders.session.fakeCore(), let folder = folders.state.folders.last {
             _ = try? fake.setFolderState(spaceId: folder.spaceId, folderState: .halted)
         }
+        let syncing = AppModel.preview(.upToDate)
+        if let fake = syncing.session.fakeCore(), let folder = syncing.state.folders.first {
+            _ = try? fake.setFolderState(spaceId: folder.spaceId, folderState: .syncing)
+        }
         let pairing = PairingCode(code: "K7Q4-M2XD", expiresAtMs: Int64(Date.now.addingTimeInterval(600).timeIntervalSince1970 * 1000))
         return [
             ("1-folders", AnyView(FoldersSettings().environment(folders))),
             ("1b-folders-empty", AnyView(FoldersSettings().environment(AppModel.preview(.firstRun)))),
+            ("1c-folders-syncing", AnyView(FoldersSettings().environment(syncing))),
             ("2-account", AnyView(AccountSettings(pairing: pairing).environment(AppModel.preview(.upToDate)))),
             ("3-problems", AnyView(ProblemsSettings().environment(AppModel.preview(.problems)))),
             ("4-general", AnyView(GeneralSettings().environment(AppModel.preview(.upToDate)))),
