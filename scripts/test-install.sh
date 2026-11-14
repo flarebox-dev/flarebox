@@ -76,6 +76,20 @@ if command -v sha256sum >/dev/null 2>&1; then
 else
     (cd "$release" && shasum -a 256 "$archive") > "$release/SHA256SUMS"
 fi
+printf '%064d  Koidrive-0.0.0-arm64.dmg\n' 0 >> "$release/SHA256SUMS"
+sign() {
+    rm -f "$release/SHA256SUMS.sig"
+    ssh-keygen -q -Y sign -f "$tmp/release-key" -n koidrive-release "$release/SHA256SUMS"
+}
+ssh-keygen -q -t ed25519 -N '' -C test-release -f "$tmp/release-key"
+pinned=$(cut -d' ' -f4 "$root/.github/release-allowed-signers")
+sed "s|$pinned|$(cut -d' ' -f2 "$tmp/release-key.pub")|" "$root/install.sh" > "$tmp/install.sh"
+if cmp -s "$root/install.sh" "$tmp/install.sh"; then
+    printf 'install.sh does not pin the key in .github/release-allowed-signers\n' >&2
+    exit 1
+fi
+installer=$tmp/install.sh
+sign
 cp "$release/SHA256SUMS" "$tmp/good-sums"
 ln -s ../download/v0.0.0 "$tmp/releases/latest/download"
 python3 "$root/scripts/release-fixture-server.py" "$tmp/releases" "$tmp/server" --tls "$tmp/tls" &
@@ -95,7 +109,7 @@ export KOIDRIVE_RELEASE_BASE_URL CURL_CA_BUNDLE="$tmp/tls/cert.pem"
 passed=0
 pass() { printf 'PASS %s\n' "$1"; passed=$((passed + 1)); }
 reject() {
-    if sh "$root/install.sh" > "$tmp/rejected.log" 2>&1; then
+    if sh "$installer" > "$tmp/rejected.log" 2>&1; then
         cat "$tmp/rejected.log"
         printf 'Expected installation to fail\n' >&2
         exit 1
@@ -106,31 +120,31 @@ reject() {
     pass "$1"
 }
 
-sed '$d' "$root/install.sh" | HOME="$tmp/truncated" sh
+sed '$d' "$installer" | HOME="$tmp/truncated" sh
 [ ! -e "$tmp/truncated" ]
-if head -n 60 "$root/install.sh" | HOME="$tmp/truncated" sh > "$tmp/truncated.log" 2>&1; then
+if head -n 60 "$installer" | HOME="$tmp/truncated" sh > "$tmp/truncated.log" 2>&1; then
     printf 'Expected a truncated function body to fail parsing\n' >&2
     exit 1
 fi
 [ ! -e "$tmp/truncated" ]
 pass 'truncated download does not install anything'
 
-cat "$root/install.sh" | sh > "$tmp/install.log" 2>&1
+cat "$installer" | sh > "$tmp/install.log" 2>&1
 cat "$tmp/install.log"
 grep -q 'not on PATH' "$tmp/install.log"
 cmp "$binary" "$HOME/.local/bin/koi"
 "$HOME/.local/bin/koi" --version
 pass 'piped install, checksum, executable, and PATH warning'
-sh "$root/install.sh"
+sh "$installer"
 cmp "$binary" "$HOME/.local/bin/koi"
 pass 'repeat installation'
 printf 'old Koidrive sync client\n' > "$HOME/.local/bin/koi"
-sh "$root/install.sh"
+sh "$installer"
 cmp "$binary" "$HOME/.local/bin/koi"
 pass 'upgrade replaces the old binary'
 printf '#!/bin/sh\n' > "$HOME/.local/bin/koi"
 cp "$HOME/.local/bin/koi" "$tmp/unrelated"
-if sh "$root/install.sh" > "$tmp/unrelated.log" 2>&1; then
+if sh "$installer" > "$tmp/unrelated.log" 2>&1; then
     cat "$tmp/unrelated.log"
     printf 'Expected installation over another koi to fail\n' >&2
     exit 1
@@ -141,44 +155,50 @@ cmp "$tmp/unrelated" "$HOME/.local/bin/koi"
 cp "$binary" "$HOME/.local/bin/koi"
 pass 'another program named koi in the install directory is kept'
 unset KOIDRIVE_VERSION
-KOIDRIVE_INSTALL_DIR="$HOME/custom bin" sh "$root/install.sh"
+KOIDRIVE_INSTALL_DIR="$HOME/custom bin" sh "$installer"
 cmp "$binary" "$HOME/custom bin/koi"
 pass 'latest release and custom install directory'
 mkdir -p "$tmp/other"
 printf '#!/bin/sh\n' > "$tmp/other/koi"
 chmod +x "$tmp/other/koi"
-PATH="$tmp/other:$PATH" sh "$root/install.sh" > "$tmp/other.log" 2>&1
+PATH="$tmp/other:$PATH" sh "$installer" > "$tmp/other.log" 2>&1
 cat "$tmp/other.log"
 grep -F "koi on PATH runs $tmp/other/koi, another program" "$tmp/other.log"
-PATH="$HOME/.local/bin:$tmp/other:$PATH" sh "$root/install.sh" > "$tmp/first.log" 2>&1
+PATH="$HOME/.local/bin:$tmp/other:$PATH" sh "$installer" > "$tmp/first.log" 2>&1
 if grep -q 'another program' "$tmp/first.log"; then exit 1; fi
 pass 'another koi on PATH is reported'
-PATH="$HOME/.local/bin:$PATH" KOIDRIVE_INSTALL_DIR="$HOME/.local/bin/" sh "$root/install.sh" > "$tmp/slash.log" 2>&1
+PATH="$HOME/.local/bin:$PATH" KOIDRIVE_INSTALL_DIR="$HOME/.local/bin/" sh "$installer" > "$tmp/slash.log" 2>&1
 cat "$tmp/slash.log"
 if grep -q -e 'Warning' "$tmp/slash.log"; then exit 1; fi
 cmp "$binary" "$HOME/.local/bin/koi"
 pass 'trailing slash in the install directory is the same directory'
 ln -s "$HOME/.local/bin" "$tmp/linked"
-PATH="$tmp/linked:$PATH" sh "$root/install.sh" > "$tmp/linked.log" 2>&1
+PATH="$tmp/linked:$PATH" sh "$installer" > "$tmp/linked.log" 2>&1
 cat "$tmp/linked.log"
 if grep -q -e 'Warning' "$tmp/linked.log"; then exit 1; fi
 pass 'install directory reached through a symlink on PATH'
 mkdir -p "$tmp/older"
 printf '#!/bin/sh\n# Koidrive sync client\n' > "$tmp/older/koi"
 chmod +x "$tmp/older/koi"
-PATH="$tmp/older:$HOME/.local/bin:$PATH" sh "$root/install.sh" > "$tmp/older.log" 2>&1
+PATH="$tmp/older:$HOME/.local/bin:$PATH" sh "$installer" > "$tmp/older.log" 2>&1
 cat "$tmp/older.log"
 grep -F "koi on PATH runs $tmp/older/koi, another Koidrive install" "$tmp/older.log"
 if grep -q 'another program' "$tmp/older.log"; then exit 1; fi
 pass 'an older Koidrive koi on PATH is named as one'
 export KOIDRIVE_VERSION=0.0.0
 printf '%064d  %s\n' 0 "$archive" > "$release/SHA256SUMS"
+printf '%064d  Koidrive-0.0.0-arm64.dmg\n' 0 >> "$release/SHA256SUMS"
+sign
 reject 'checksum mismatch preserves the installed binary' 'Checksum mismatch'
 printf '%064d  other.tar.gz\n' 0 > "$release/SHA256SUMS"
+printf '%064d  Koidrive-0.0.0-arm64.dmg\n' 0 >> "$release/SHA256SUMS"
+sign
 reject 'missing checksum entry' 'exactly one entry'
 cat "$tmp/good-sums" "$tmp/good-sums" > "$release/SHA256SUMS"
+sign
 reject 'duplicate checksum entries' 'exactly one entry'
 cp "$tmp/good-sums" "$release/SHA256SUMS"
+sign
 mv "$release/$archive" "$tmp/saved.tar.gz"
 reject 'missing tarball' 'curl:'
 mv "$tmp/saved.tar.gz" "$release/$archive"
@@ -199,7 +219,7 @@ dev.koidrive.koi.1a2b3c4d'
 kickstart -k gui/$(id -u)/dev.koidrive.koi.1a2b3c4d"
 fi
 rm -f "$HOME/services.log"
-sh "$root/install.sh"
+sh "$installer"
 if grep -E -e '--user restart|kickstart' "$HOME/services.log"; then
     printf 'Expected an upgrade to leave services that are not running alone\n' >&2
     exit 1
@@ -207,7 +227,7 @@ fi
 pass 'an upgrade leaves services that are not running alone'
 printf '%s\n' "$services" > "$HOME/running"
 rm -f "$HOME/services.log"
-sh "$root/install.sh" > "$tmp/restart.log"
+sh "$installer" > "$tmp/restart.log"
 grep -E -e '--user restart|kickstart' "$HOME/services.log" > "$tmp/restarted"
 if [ "$(cat "$tmp/restarted")" != "$restarts" ] || [ "$(grep -c -F 'Restarted the background service' "$tmp/restart.log")" != 2 ]; then
     cat "$HOME/services.log" "$tmp/restart.log"
@@ -221,7 +241,7 @@ if [ "$(uname -s)" = Linux ]; then
     perl -e '$0 = "/opt/custom bin/koi _daemon"; sleep 300' &
     daemon=$!
     touch "$HOME/unreachable"
-    COLUMNS=20 sh "$root/install.sh" 2> "$tmp/nobus.log"
+    COLUMNS=20 sh "$installer" 2> "$tmp/nobus.log"
     if ! grep -F "the koi daemon with process ID $daemon still runs the old koi" "$tmp/nobus.log"; then
         cat "$tmp/nobus.log"
         printf 'Expected an upgrade without a systemd user manager to name the daemon that still runs the old koi\n' >&2
@@ -229,7 +249,7 @@ if [ "$(uname -s)" = Linux ]; then
     fi
     pass 'an upgrade without a systemd user manager names the daemon that still runs the old koi'
     printf '0::/user.slice/user-%s.slice/user@%s.service/app.slice/koidrive-1a2b3c4d.service\n' "$(id -u)" "$(id -u)" > "$HOME/cgroup"
-    sh "$root/install.sh" 2> "$tmp/nobus.log"
+    sh "$installer" 2> "$tmp/nobus.log"
     rm "$HOME/unreachable" "$HOME/cgroup"
     kill "$daemon"
     if ! grep -F "Log in as $(id -un) and run: systemctl --user restart koidrive-1a2b3c4d.service" "$tmp/nobus.log"; then
@@ -263,11 +283,13 @@ for platform in aarch64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-l
     fi
     printf '%s  %s\n' "$hash" "$selected"
 done > "$release/SHA256SUMS"
+printf '%064d  Koidrive-0.0.0-arm64.dmg\n' 0 >> "$release/SHA256SUMS"
+sign
 for platform in 'Darwin arm64 1 aarch64-apple-darwin' 'Darwin x86_64 1 aarch64-apple-darwin' 'Linux x86_64 0 x86_64-unknown-linux-musl' 'Linux aarch64 0 aarch64-unknown-linux-musl'; do
     read -r os arch arm64 selected <<EOF
 $platform
 EOF
-    PATH="$tmp/bin:$PATH" KOIDRIVE_TEST_OS=$os KOIDRIVE_TEST_ARCH=$arch KOIDRIVE_TEST_ARM64=$arm64 sh "$root/install.sh" > "$tmp/arch.log" 2>&1
+    PATH="$tmp/bin:$PATH" KOIDRIVE_TEST_OS=$os KOIDRIVE_TEST_ARCH=$arch KOIDRIVE_TEST_ARM64=$arm64 sh "$installer" > "$tmp/arch.log" 2>&1
     cat "$tmp/arch.log"
     grep -F "Downloading koidrive-$selected.tar.gz" "$tmp/arch.log"
     cmp "$binary" "$HOME/.local/bin/koi"
