@@ -301,6 +301,7 @@ private struct RestoreRow: View {
                 Text(verbatim: request.state.text(folder: folder.spaceName))
                     .foregroundStyle(request.state.isPending ? Color.text2 : Color.text)
                     .lineLimit(1)
+                    .help(request.state.text(folder: folder.spaceName))
             }
             .frame(width: 380, alignment: .leading)
         }

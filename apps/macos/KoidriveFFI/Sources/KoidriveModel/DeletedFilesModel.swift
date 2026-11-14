@@ -22,6 +22,9 @@ public final class DeletedFilesModel {
     public private(set) var isRestoring = false
     public private(set) var restoreError: SessionError?
     private var kinds: [String: NodeKind] = [:]
+    private var unlisted: [String: DeletedEntry.ID] = [:]
+    private var staleTrash: Set<String> = []
+    private var work: Task<Void, Never>?
     private let app: AppModel
     private let clock: HistoryClock
 
@@ -82,40 +85,47 @@ public final class DeletedFilesModel {
         scopedFolders.reduce(0) { $0 + $1.requests.count(where: \.state.isPending) }
     }
 
-    public var hasPendingRestores: Bool { pendingRestoreCount > 0 }
+    public var hasPendingRestores: Bool { pendingRestoreCount > 0 || !unlisted.isEmpty || !staleTrash.isEmpty }
 
     /// Reads every linked folder's trash and restores. A load over loaded content keeps showing it until the answer.
     public func load() async {
-        if case .loaded = content {} else { content = .loading }
-        do {
-            var histories: [FolderHistory] = []
-            for folder in app.state.folders {
-                let trash = try await app.trash(in: folder.url)
-                let requests = try await app.restoreRequests(in: folder.url)
-                histories.append(FolderHistory(folder: folder, trash: trash, requests: requests))
+        await inTurn { [self] in
+            if case .loaded = content {} else { content = .loading }
+            do {
+                var histories: [FolderHistory] = []
+                for folder in app.state.folders {
+                    let requests = try await app.restoreRequests(in: folder.url)
+                    let trash = try await app.trash(in: folder.url)
+                    histories.append(FolderHistory(folder: folder, trash: trash, requests: requests))
+                }
+                remember(histories)
+                content = .loaded(histories)
+            } catch {
+                content = .failed(sessionError(error))
             }
-            remember(histories)
-            content = .loaded(histories)
-        } catch {
-            content = .failed(sessionError(error))
         }
     }
 
     /// Reads the restores again. A folder whose restore ended reads its trash again too, since a restored item leaves it.
     public func refreshRequests() async {
-        guard case .loaded(var histories) = content else { return }
-        for index in histories.indices {
-            let history = histories[index]
-            guard let requests = try? await app.restoreRequests(in: history.folder.url) else { continue }
-            let waited = Set(history.requests.filter(\.state.isPending).map(\.id))
-            if requests.contains(where: { waited.contains($0.id) && !$0.state.isPending }),
-               let trash = try? await app.trash(in: history.folder.url) {
-                histories[index].trash = trash
+        await inTurn { [self] in
+            guard case .loaded(var histories) = content else { return }
+            for index in histories.indices {
+                let history = histories[index]
+                guard let requests = try? await app.restoreRequests(in: history.folder.url) else { continue }
+                let waited = Set(history.requests.filter(\.state.isPending).map(\.id)).union(unlisted.keys)
+                if requests.contains(where: { waited.contains($0.id) && !$0.state.isPending }) {
+                    staleTrash.insert(history.folder.spaceId)
+                }
+                if staleTrash.contains(history.folder.spaceId), let trash = try? await app.trash(in: history.folder.url) {
+                    histories[index].trash = trash
+                    staleTrash.remove(history.folder.spaceId)
+                }
+                histories[index].requests = requests
             }
-            histories[index].requests = requests
+            remember(histories)
+            content = .loaded(histories)
         }
-        remember(histories)
-        content = .loaded(histories)
     }
 
     /// Reads the restores again every `interval` while one in scope waits.
@@ -143,7 +153,8 @@ public final class DeletedFilesModel {
         restoreError = nil
         defer { isRestoring = false }
         do {
-            _ = try await app.restore(entry.item, from: history.trash)
+            let asked = try await app.restore(entry.item, from: history.trash)
+            unlisted[asked.requestId] = entry.id
             await refreshRequests()
         } catch {
             restoreError = sessionError(error)
@@ -163,14 +174,28 @@ public final class DeletedFilesModel {
         }
     }
 
+    private func inTurn(_ operation: @escaping @MainActor () async -> Void) async {
+        let previous = work
+        let turn = Task { @MainActor in
+            await previous?.value
+            await operation()
+        }
+        work = turn
+        await turn.value
+    }
+
     private func remember(_ histories: [FolderHistory]) {
         for item in histories.flatMap(\.trash.items) {
             kinds[item.nodeId] = item.kind
         }
+        for request in histories.flatMap(\.requests) {
+            unlisted[request.id] = nil
+        }
     }
 
     private func entry(for item: DeletedItem, in history: FolderHistory) -> DeletedEntry {
-        let requested = history.requests.contains { request in
+        let id = DeletedEntry.ID(spaceID: history.folder.spaceId, nodeID: item.nodeId)
+        let requested = unlisted.values.contains(id) || history.requests.contains { request in
             request.state.isPending && request.target == .deleted(nodeId: item.nodeId)
         }
         let deletion = item.deletedAtMs.map { ms in

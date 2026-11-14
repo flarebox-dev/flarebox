@@ -24,6 +24,7 @@ public final class VersionHistoryModel {
     public private(set) var content: LoadState<FileVersions> = .loading
     public var selection: FileVersion.ID?
     public private(set) var restore: Restore = .idle
+    private var loads = 0
     private let app: AppModel
     private let clock: HistoryClock
 
@@ -94,11 +95,15 @@ public final class VersionHistoryModel {
 
     public func load() async {
         if case .loaded = content {} else { content = .loading }
+        loads += 1
+        let load = loads
+        let answer: LoadState<FileVersions>
         do {
-            content = .loaded(try await app.versions(of: file))
+            answer = .loaded(try await app.versions(of: file))
         } catch {
-            content = .failed(sessionError(error))
+            answer = .failed(sessionError(error))
         }
+        if load == loads { content = answer }
     }
 
     /// Asks to make the selected version the file's content again.
@@ -117,6 +122,7 @@ public final class VersionHistoryModel {
     public func refreshRestore() async {
         guard case .requested(let version, let id) = restore, let folder,
               let requests = try? await app.restoreRequests(in: folder.url),
+              case .requested(_, id) = restore,
               let request = requests.first(where: { $0.id == id }) else { return }
         switch request.state {
         case .pending:
