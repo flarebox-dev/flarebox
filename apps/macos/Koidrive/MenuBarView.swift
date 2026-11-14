@@ -157,24 +157,30 @@ struct MenuContent: View {
     @State private var error: SessionError?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 4) {
             header
             attention
             notices
             recentChanges
-            Divider()
+            separator
             actions
-            Divider()
+            separator
             MenuButton(title: "Quit Koidrive", systemImage: "power", shortcut: "⌘Q") {
                 NSApplication.shared.terminate(nil)
             }
             .keyboardShortcut("q")
         }
-        .padding(.horizontal, 12)
-        .padding(.top, 16)
-        .padding(.bottom, 12)
+        .padding(.horizontal, 5)
+        .padding(.top, 6)
+        .padding(.bottom, 5)
         .frame(width: 330)
         .tint(.koi)
+    }
+
+    private var separator: some View {
+        Divider()
+            .padding(.horizontal, 7)
+            .padding(.vertical, 1)
     }
 
     private var headlineIcon: some View {
@@ -186,7 +192,7 @@ struct MenuContent: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 if model.turnsHeadlineArrows(reduceMotion: reduceMotion) {
                     headlineIcon
                         .symbolEffect(.rotate.clockwise, options: .repeat(.continuous).speed(1.25))
@@ -202,6 +208,7 @@ struct MenuContent: View {
                     .font(.callout)
                     .foregroundStyle(Color.text2)
                     .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 24)
             }
             if let progress = model.state.progress, model.headline == .status(.syncing) {
                 HStack(spacing: 10) {
@@ -212,6 +219,7 @@ struct MenuContent: View {
                         .font(.callout)
                         .foregroundStyle(Color.text2)
                 }
+                .padding(.leading, 24)
                 .padding(.top, 4)
                 HStack(spacing: 6) {
                     if progress.filesToUpload > 0 {
@@ -221,12 +229,17 @@ struct MenuContent: View {
                         CountChip(title: String(localized: "\(progress.filesToDownload.formatted()) to download"), systemImage: "arrow.down")
                     }
                 }
+                .padding(.leading, 24)
                 if let current = progress.current {
                     PathText(path: model.displayPath(current.path, spaceID: current.spaceId))
                         .font(.callout)
+                        .padding(.leading, 24)
                 }
             }
         }
+        .padding(.horizontal, 7)
+        .padding(.top, 6)
+        .padding(.bottom, 4)
     }
 
     @ViewBuilder
@@ -280,6 +293,7 @@ struct MenuContent: View {
             }
             .font(.callout)
             .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 7)
         }
     }
 
@@ -296,11 +310,12 @@ struct MenuContent: View {
                     RecentChangeRow(change: change, folder: model.folder(spaceID: change.spaceId))
                 }
             }
+            .padding(.horizontal, 7)
         }
     }
 
     private var actions: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: 0) {
             ForEach(model.state.folders, id: \.spaceId) { folder in
                 MenuButton(title: "Open \(folder.spaceName)", systemImage: "folder") {
                     NSWorkspace.shared.open(URL(filePath: folder.path, directoryHint: .isDirectory))
@@ -416,8 +431,7 @@ private struct AttentionRow: View {
                     CountBadge(count: count, fill: .redFill, text: .white)
                 }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
+            .padding(7)
             .background(RoundedRectangle(cornerRadius: 8).fill(wash))
             .contentShape(Rectangle())
         }
@@ -457,7 +471,8 @@ private struct NoticeRow: View {
             .buttonStyle(.plain)
             .help("Dismiss")
         }
-        .padding(10)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 10)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.fillStrong))
     }
 }
@@ -530,8 +545,8 @@ private struct MenuButton: View {
                         .foregroundStyle(Color.label2)
                 }
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
             .opacity(isEnabled ? 1 : 0.4)
             .background(RoundedRectangle(cornerRadius: 6).fill(hovering && isEnabled ? Color.fillStrong : .clear))
             .contentShape(Rectangle())
