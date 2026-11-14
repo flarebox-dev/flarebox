@@ -36,6 +36,15 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Records that the server lost commits of this device, with the edits of the commit in flight
+    /// and `dropped`, those of one the loss already dropped.
+    pub fn server_behind(&mut self, dropped: Vec<NodeId>) {
+        let in_flight = self.commits.edited_in_flight();
+        self.trees
+            .record_dropped_edits(dropped.into_iter().chain(in_flight));
+        self.behind = true;
+    }
+
     pub fn new(root: &str, history: &str, seed: u64) -> Self {
         Self {
             trees: Trees::new(root),

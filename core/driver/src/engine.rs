@@ -461,10 +461,12 @@ impl Engine {
     /// Records that the server's log ends below the cursor (`AHEAD_OF_SERVER`, design §4.4). The store keeps this
     /// with the cursor until a bootstrap replaces R, also when the server's head catches up first or the task
     /// restarts.
-    pub fn server_behind(&mut self, tx: &Tx<'_>) -> Result<(), Stop> {
+    pub fn server_behind(&mut self, tx: &Tx<'_>, dropped: Vec<NodeId>) -> Result<(), Stop> {
         let Some(cursor) = &mut self.cursor else {
             return Ok(());
         };
+        (self.trees)
+            .record_dropped_edits(dropped.into_iter().chain(self.commits.edited_in_flight()));
         if !cursor.ahead_of_server {
             cursor.ahead_of_server = true;
             tx.set_cursor(cursor)?;
@@ -512,7 +514,6 @@ impl Engine {
             }
         }
         if behind {
-            (self.trees).keep_unsent_edits(self.commits.edited_in_flight());
             (self.trees).forget_lost(
                 trashed,
                 edited,

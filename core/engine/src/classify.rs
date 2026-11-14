@@ -219,6 +219,8 @@ pub struct Trees {
     past_positions: TrackedMap<NodeId, Vec<Agreed>>,
     /// See [`TreesState::unsent_edits`].
     unsent_edits: TrackedSet<NodeId>,
+    /// See [`TreesState::dropped_edits`].
+    dropped_edits: TrackedSet<NodeId>,
     replaced_versions: TrackedMap<NodeId, Vec<String>>,
     resends: TrackedSet<NodeId>,
     local_changes: TrackedSet<NodeId>,
@@ -295,6 +297,7 @@ impl Trees {
             moved_here: TrackedMap::default(),
             past_positions: TrackedMap::default(),
             unsent_edits: TrackedSet::default(),
+            dropped_edits: TrackedSet::default(),
             replaced_versions: TrackedMap::default(),
             resends: TrackedSet::default(),
             local_changes: TrackedSet::default(),
@@ -1632,7 +1635,7 @@ impl Trees {
     ///
     /// `edited` lists the files whose content an edit of this device set before the bootstrap
     /// ([`Trees::edited_here`]), each with the seq of that edit's commit, and the files of
-    /// [`Trees::unsent_edits`] whose content in L differs from S's. A file of it that R now holds,
+    /// [`TreesState::dropped_edits`] whose content in L differs from S's. A file of it that R now holds,
     /// live or in the trash, with content of no revision above `held_through` or at a version the
     /// log replaced for it before ([`TreesState::replaced_versions`]), lost the edit. S takes R's
     /// content for it at the position S holds, so the content L holds is sent again as an edit
@@ -1746,11 +1749,12 @@ impl Trees {
         };
         let edited: Vec<(NodeId, u64)> = (edited.into_iter())
             .chain(
-                (self.unsent_edits.iter())
+                (self.dropped_edits.iter())
                     .filter(|id| self.local_content_differs(id))
                     .map(|id| (id.clone(), u64::MAX)),
             )
             .collect();
+        self.dropped_edits.clear();
         let lost_here = (moved.iter().map(|(id, moved)| (id, moved.seq)))
             .chain(edited.iter().map(|(id, seq)| (id, *seq)))
             .filter(|(id, seq)| *seq > held_through && self.l.get(id).is_some())
@@ -2096,15 +2100,10 @@ impl Trees {
         &self.unsent_edits
     }
 
-    /// Records each file of `ids` whose content in L differs from S's as an unsent edit
-    /// ([`Trees::unsent_edits`]).
-    pub fn keep_unsent_edits(&mut self, ids: impl IntoIterator<Item = NodeId>) {
-        for id in ids {
-            if self.local_content_differs(&id) {
-                self.unsent_edits.insert(id.clone());
-                self.mark(&id);
-            }
-        }
+    /// Records `ids` as files the commit in flight edited when the server lost commits of this
+    /// device ([`TreesState::dropped_edits`]).
+    pub fn record_dropped_edits(&mut self, ids: impl IntoIterator<Item = NodeId>) {
+        self.dropped_edits.extend(ids);
     }
 
     fn local_content_differs(&self, id: &str) -> bool {
@@ -2660,6 +2659,7 @@ impl Trees {
             moved_here: (*self.moved_here).clone(),
             past_positions: (*self.past_positions).clone(),
             unsent_edits: (*self.unsent_edits).clone(),
+            dropped_edits: (*self.dropped_edits).clone(),
             replaced_versions: (*self.replaced_versions).clone(),
             resends: (*self.resends).clone(),
             local_changes: (*self.local_changes).clone(),
@@ -2689,6 +2689,7 @@ impl Trees {
             moved_here,
             past_positions,
             unsent_edits,
+            dropped_edits,
             replaced_versions,
             resends,
             local_changes,
@@ -2726,6 +2727,7 @@ impl Trees {
             moved_here: moved_here.take_changes(),
             past_positions: past_positions.take_changes(),
             unsent_edits: unsent_edits.take_changes(),
+            dropped_edits: dropped_edits.take_changes(),
             replaced_versions: replaced_versions.take_changes(),
             resends: resends.take_changes(),
             local_changes: local_changes.take_changes(),
@@ -2831,6 +2833,7 @@ impl Trees {
             moved_here,
             past_positions,
             unsent_edits,
+            dropped_edits,
             replaced_versions,
             resends,
             local_changes,
@@ -2855,6 +2858,7 @@ impl Trees {
         self.moved_here = moved_here.into();
         self.past_positions = past_positions.into();
         self.unsent_edits = unsent_edits.into();
+        self.dropped_edits = dropped_edits.into();
         self.replaced_versions = replaced_versions.into();
         self.resends = resends.into();
         self.local_changes = local_changes.into();

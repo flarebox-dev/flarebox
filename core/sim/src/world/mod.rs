@@ -1373,7 +1373,7 @@ impl World {
             Ok(backlog) => Ok(Message::Records(backlog)),
             Err(resync) if resync.reason() == resync_required::Reason::AheadOfServer => {
                 note(&mut self.seen, "resume finds the server behind");
-                engine.behind = true;
+                engine.server_behind(Vec::new());
                 Ok(listing(&self.space))
             }
             Err(resync) if resync.reason() == resync_required::Reason::LogTruncated => {
@@ -1412,8 +1412,7 @@ impl World {
             }
             Reconnect::AheadOfServer => {
                 note(&mut self.seen, "reconnect finds the server lost commits");
-                self.devices[d].engine.trees.keep_unsent_edits(in_flight);
-                self.devices[d].engine.behind = true;
+                self.devices[d].engine.server_behind(in_flight);
             }
             Reconnect::Resend if welcome.device_seq > self.devices[d].engine.commits.accepted() => {
                 note(
@@ -1496,7 +1495,6 @@ impl World {
                     }
                 }
                 if *behind {
-                    trees.keep_unsent_edits(commits.edited_in_flight());
                     trees.forget_lost(
                         trashed,
                         edited,
@@ -1590,9 +1588,6 @@ impl World {
                         }
                         commit::Failure::Abandoned => {
                             note(&mut self.seen, "commit refused, planned again");
-                            if device.engine.behind {
-                                device.engine.trees.keep_unsent_edits(in_flight);
-                            }
                         }
                         commit::Failure::Split => note(
                             &mut self.seen,
@@ -1605,8 +1600,7 @@ impl World {
                         ),
                         commit::Failure::Resync => {
                             note(&mut self.seen, "commit ahead of the server, R listed again");
-                            device.engine.trees.keep_unsent_edits(in_flight);
-                            device.engine.behind = true;
+                            device.engine.server_behind(in_flight);
                             let listed = listing(&self.space);
                             (device.link.as_mut()).expect("answered").inbox.push(listed);
                         }
@@ -2622,6 +2616,74 @@ mod tests {
         world.restore(false);
         assert!(world.exposed[&1].nodes == exposed);
         assert_eq!(world.exposed[&1].loose, 0);
+    }
+
+    #[test]
+    fn an_edit_in_flight_when_the_server_reports_a_loss_stays_an_edit_of_its_file_after_any_refusal()
+     {
+        for code in [error::Code::UnsupportedVersion, error::Code::LimitExceeded] {
+            let u = |kind, target, name, text| {
+                Step::User(Action {
+                    kind,
+                    target,
+                    parent: 0,
+                    name,
+                    text,
+                })
+            };
+            let mut world = World::new(2);
+            world
+                .phase(0, &[(0, u(1, 0, 0, 0)), (0, u(1, 0, 2, 1))])
+                .unwrap();
+            world.run(1, &[(0, Step::Backup)]).unwrap();
+            world
+                .phase(1, &[(1, u(2, 0, 0, 2)), (1, u(2, 1, 0, 3))])
+                .unwrap();
+            world
+                .run(
+                    2,
+                    &[
+                        (0, u(2, 0, 0, 3)),
+                        (0, u(2, 1, 0, 2)),
+                        (0, Step::Scan),
+                        (0, Step::Commit(Reply::Refused(code))),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(world.devices[0].engine.commits.edited_in_flight().len(), 2);
+            let link = world.devices[0].link.take();
+            world.restore(false);
+            world.devices[0].link = link;
+            world.devices[0].engine.server_behind(Vec::new());
+            world.devices[0].persist().unwrap();
+            let answer = world.devices[0]
+                .link
+                .as_ref()
+                .unwrap()
+                .inbox
+                .iter()
+                .position(|m| matches!(m, Message::Answer { .. }))
+                .unwrap();
+            world.deliver(0, answer).unwrap();
+            assert!(world.devices[0].engine.commits.in_flight().is_none());
+            let listed = listing(&world.space);
+            world.devices[0].link.as_mut().unwrap().inbox.push(listed);
+            let at = world.devices[0].link.as_ref().unwrap().inbox.len() - 1;
+            world.deliver(0, at).unwrap();
+            world.commit(0, Reply::Served).unwrap();
+            let ops = &world.devices[0]
+                .engine
+                .commits
+                .in_flight()
+                .unwrap()
+                .commit
+                .ops;
+            assert!(
+                ops.iter()
+                    .all(|op| matches!(op.op, Some(op::Op::UpdateContent(_)))),
+                "{code:?}: {ops:?}"
+            );
+        }
     }
 
     #[test]

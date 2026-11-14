@@ -223,7 +223,7 @@ fn an_edit_in_flight_that_a_reconnect_drops_after_a_loss_is_sent_again_where_ano
     let in_flight = commits.edited_in_flight();
     assert_eq!(commits.connected(&welcome(0)), Reconnect::AheadOfServer);
     assert!(commits.in_flight().is_none());
-    trees.keep_unsent_edits(in_flight);
+    trees.record_dropped_edits(in_flight);
     list_a_at_its_old_place_after_a_loss(&mut trees, &commits);
     let ops = ops(&build(&mut commits, &mut trees, &mut ids).unwrap());
     assert!(ops.contains(&update("a", 3)), "{ops:?}");
@@ -236,7 +236,7 @@ fn an_edit_in_flight_that_a_reconnect_drops_after_a_loss_is_sent_again_where_ano
 #[test]
 fn an_edit_still_in_flight_when_the_listing_after_a_loss_arrives_is_sent_again_where_another_device_moved_the_file() {
     let (mut commits, mut trees, mut ids) = an_edit_in_flight_of_a_file_another_device_moved();
-    trees.keep_unsent_edits(commits.edited_in_flight());
+    trees.record_dropped_edits(commits.edited_in_flight());
     list_a_at_its_old_place_after_a_loss(&mut trees, &commits);
     let refused = commits.failed(&refusal(error::Code::AheadOfServer, 0)).unwrap();
     assert_eq!(refused, Failure::Resync);
@@ -245,5 +245,29 @@ fn an_edit_still_in_flight_when_the_listing_after_a_loss_arrives_is_sent_again_w
     assert!(
         !ops.iter().any(|op| matches!(op, op::Op::CreateFile(create) if create.content == Some(content(3)))),
         "{ops:?}"
+    );
+}
+
+#[test]
+fn an_edit_dropped_in_flight_is_sent_again_over_a_delete_made_after_the_restore() {
+    let (_, _, built) = after_an_edit_dropped_in_flight(false, deleted_after_the_restore());
+    assert!(built.contains(&update("a", 3)), "{built:?}");
+}
+
+#[test]
+fn an_edit_dropped_in_flight_and_undone_before_the_listing_leaves_a_delete_made_after_the_restore() {
+    let (class, effects, built) = after_an_edit_dropped_in_flight(true, deleted_after_the_restore());
+    assert_eq!(class, Class::Remote);
+    assert!(matches!(&effects[..], [Effect::RemoveFile { .. }]), "{effects:?}");
+    assert!(!uploads(&built, 1), "{built:?}");
+}
+
+#[test]
+fn an_edit_dropped_in_flight_and_undone_before_the_listing_is_not_sent_over_an_edit_made_after_the_restore() {
+    let (class, _, built) = after_an_edit_dropped_in_flight(true, edited_after_the_restore());
+    assert_eq!(class, Class::Concurrent);
+    assert!(
+        !built.iter().any(|op| matches!(op, op::Op::UpdateContent(update) if update.node_id == "a")),
+        "{built:?}"
     );
 }
