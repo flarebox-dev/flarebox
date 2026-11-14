@@ -3,6 +3,8 @@
 import json
 import os
 from pathlib import Path
+import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -17,6 +19,42 @@ REASON = "Test failed: complete failure reason " + "detail " * 30
 LEGACY_CC = "cc " + "b" * 64 + " # generated legacy case"
 CASE_CC = "cc " + "c" * 64 + " # generated case file"
 TRACKED_CC = "cc " + "d" * 64 + " # appended tracked case"
+
+
+class EngineMutations(unittest.TestCase):
+    def test_renamed_revert_disables_both_rename_paths_and_preserves_follows(self):
+        root = RUNNER.parent.parent
+        result = subprocess.run([
+            "bash", "-c",
+            'mutation() { if [ "$1" = renamed-revert ]; then printf "%s\\0%s\\0" "$2" "$3"; fi; }; source scripts/engine-mutations.sh',
+        ], cwd=root, capture_output=True, text=True, check=True)
+        file, expression, end = result.stdout.split("\0")
+        self.assertEqual(end, "")
+        source = (root / file).read_text()
+        immediate = "(renamed && !left && !kept)"
+        deferred = "else if renamed && !left"
+        self.assertEqual(source.count(immediate), 1)
+        self.assertEqual(source.count(deferred), 1)
+        expected = source.replace(immediate, "(false && renamed && !left && !kept)", 1)
+        expected = expected.replace(deferred, "else if false && renamed && !left", 1)
+        transformed = subprocess.run(["perl", "-0pe", expression], input=source, capture_output=True, text=True, check=True).stdout
+        self.assertEqual(transformed, expected)
+        self.assertIn("let mut unreverted: BTreeSet<NodeId> = BTreeSet::new();", transformed)
+        self.assertEqual(transformed.count("unreverted.insert("), 1)
+        self.assertIn("if (false && renamed && !left && !kept) || (done && follows) {\n                trees.revert(node.clone());", transformed)
+        self.assertIn("else if false && renamed && !left {\n                unreverted.insert(node.clone());", transformed)
+        self.assertIn("for id in unreverted.iter().filter(|id| !taken.contains(*id)) {\n            trees.revert(id.clone());", transformed)
+
+    def test_renamed_revert_targets_the_existing_renamed_result_unit_test(self):
+        root = RUNNER.parent.parent
+        helper = (root / "scripts/test-engine-mutations.sh").read_text()
+        tests = shlex.split(re.search(r"^tests=\((.*?)\)", helper, re.MULTILINE | re.DOTALL).group(1))
+        mutants = shlex.split(re.search(r"^mutants=\((.*?)\)", helper, re.MULTILINE | re.DOTALL).group(1))
+        self.assertEqual(len(tests), len(mutants))
+        test = tests[mutants.index("renamed-revert")]
+        self.assertEqual(test, "a_renamed_result_reverts_the_local_name_to_the_server_one")
+        existing = (root / "core/engine/tests/commit/commit_moves_and_conflicts.rs").read_text()
+        self.assertIn(f"fn {test}()", existing)
 
 
 class MutationRunner(unittest.TestCase):

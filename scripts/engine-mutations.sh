@@ -12,7 +12,7 @@ L=core/engine/src/classify.rs
 mutation agreed-batch $C 's/    \(needed, agreed\)\n\}/    let _ = agreed;\n    (needed, Vec::new())\n}/' prop
 mutation merge-delete-wait $C 's/scratch\.protected\.extend\(targets\.iter\(\)\.cloned\(\)\);/let _ = \&targets;/' both
 mutation pending-name $C 's/&& \(scratch\.holders\(&shape\.parent, &shape\.name\)\)\.any\(\|other\| moving\.contains\(other\)\)/\&\& false/' both
-mutation renamed-revert $C 's/if \(renamed && !left && !kept\) \|\| \(done && follows\)/if done \&\& follows/' both
+mutation renamed-revert $C 's/\(renamed && !left && !kept\)/(false \&\& renamed \&\& !left \&\& !kept)/; s/else if renamed && !left/else if false \&\& renamed \&\& !left/' both
 mutation merged-revert $C 's/trees\.revert\(create\.node_id\.clone\(\)\);\n//' both
 mutation cycle-revert $C 's/        for id in reverts \{\n            trees\.revert\(id\);/        for id in reverts {\n            let _ = id;/' both
 mutation split-halves $C 's/self\.cap\.set\(Some\(ops\.len\(\) \/ 2\)\);/self.cap.set(Some(ops.len()));/' both

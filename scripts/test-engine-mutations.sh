@@ -57,8 +57,9 @@ export PROPTEST_CASES=8
 tests=(
   a_policy_halt_takes_a_server_loss_once
   a_policy_refusal_keeps_the_commit_and_outlasts_any_welcome
+  a_renamed_result_reverts_the_local_name_to_the_server_one
 )
-mutants=(refused-reconnect unknown-resend)
+mutants=(refused-reconnect unknown-resend renamed-revert)
 for test in "${tests[@]}"; do
   nice -n 10 cargo test --locked -p koidrive-engine --test commit "$test" -- --exact
 done
