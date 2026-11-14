@@ -281,6 +281,11 @@ impl Tx<'_> {
         while let Some(row) = rows.next()? {
             state.trees.resends.insert(row.get(0)?);
         }
+        let mut stmt = self.0.prepare_cached("SELECT node_id FROM resent_edits")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            state.trees.resent_edits.insert(row.get(0)?);
+        }
         let mut stmt = self.0.prepare_cached("SELECT node_id FROM local_changes")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
@@ -376,6 +381,7 @@ impl Tx<'_> {
             "commit_in_flight_deletes",
             "commit_in_flight_delete_members",
             "commit_in_flight_restore_members",
+            "commit_in_flight_resends",
             "watched_contents",
             "watched_positions",
             "trashed_here",
@@ -391,6 +397,7 @@ impl Tx<'_> {
             "dropped_edits",
             "replaced_versions",
             "resends",
+            "resent_edits",
             "local_changes",
             "kept_originals",
             "effect_state",
@@ -450,6 +457,7 @@ impl Tx<'_> {
             dropped_edits,
             replaced_versions,
             resends,
+            resent_edits,
             local_changes,
             kept_originals,
         } = trees;
@@ -640,6 +648,11 @@ impl Tx<'_> {
             "INSERT OR IGNORE INTO resends (node_id) VALUES (?1)",
         )?;
         self.write_set(
+            resent_edits,
+            "DELETE FROM resent_edits WHERE node_id = ?1",
+            "INSERT OR IGNORE INTO resent_edits (node_id) VALUES (?1)",
+        )?;
+        self.write_set(
             local_changes,
             "DELETE FROM local_changes WHERE node_id = ?1",
             "INSERT OR IGNORE INTO local_changes (node_id) VALUES (?1)",
@@ -689,6 +702,7 @@ impl Tx<'_> {
                 "commit_in_flight_deletes",
                 "commit_in_flight_delete_members",
                 "commit_in_flight_restore_members",
+                "commit_in_flight_resends",
             ] {
                 self.0.execute(&format!("DELETE FROM {table}"), [])?;
             }
@@ -719,6 +733,12 @@ impl Tx<'_> {
                     for (position, node) in nodes.iter().enumerate() {
                         restored.execute(params![index, position, node])?;
                     }
+                }
+                let mut resent = self
+                    .0
+                    .prepare_cached("INSERT INTO commit_in_flight_resends (node_id) VALUES (?1)")?;
+                for node in &flight.resent {
+                    resent.execute([node])?;
                 }
             }
         }
@@ -905,10 +925,16 @@ impl Tx<'_> {
         while let Some(row) = rows.next()? {
             restores.entry(row.get(0)?).or_default().push(row.get(1)?);
         }
+        let resent = self
+            .0
+            .prepare_cached("SELECT node_id FROM commit_in_flight_resends")?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
         Ok(Some(InFlight {
             commit: Commit::decode(commit.as_slice())?,
             deletes,
             restores,
+            resent,
             result: decode(result)?,
         }))
     }

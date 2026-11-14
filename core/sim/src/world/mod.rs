@@ -1908,19 +1908,31 @@ impl World {
                 let inos: BTreeMap<u128, NodeId> = (trees.local().iter())
                     .map(|(id, node)| (node.identity.ino, id.clone()))
                     .collect();
+                let cap = commits.state().cap;
                 commits.build(trees, ids, NOW as u64, &history, cursor.clone());
                 self.built[d] = self.scanned[d];
+                if (commits.in_flight().zip(cap))
+                    .is_some_and(|(flight, cap)| flight.commit.ops.len() == cap)
+                {
+                    note(&mut self.seen, "commit holds as many ops as its cap");
+                }
                 let bound = self.held_commits[d].last().copied().unwrap_or(0);
                 let ops = commits.in_flight().map(|flight| &flight.commit.ops);
                 for op in ops.into_iter().flatten() {
                     let Some(op::Op::CreateFile(create)) = &op.op else {
                         continue;
                     };
-                    self.planned_copies[d].remove(&create.node_id);
+                    let planned = (self.planned_copies[d].remove(&create.node_id)).filter(|copy| {
+                        (create.content.as_ref())
+                            .is_some_and(|content| content.mtime_ns == copy.write)
+                    });
                     let source = (trees.local().get(&create.node_id))
                         .and_then(|node| inos.get(&node.identity.ino))
                         .filter(|source| **source != create.node_id);
                     let (Some(source), Some(content)) = (source, &create.content) else {
+                        if let Some(copy) = planned {
+                            self.planned_copies[d].insert(create.node_id.clone(), copy);
+                        }
                         continue;
                     };
                     let versions = self.space.list_versions(&ListVersions {
