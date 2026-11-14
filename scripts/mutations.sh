@@ -1,21 +1,5 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-#
-# Runs the mutation set in scripts/engine-mutations.sh. Each mutation is applied
-# to the source, the tests that should catch it run, and the file is restored.
-# The run fails when a mutation survives, no longer matches the source, or does
-# not compile. See docs/testing.md.
-#
-# Usage: scripts/mutations.sh [--count] [--shard K/N]
-#   --count       print the number of mutations and exit
-#   --shard K/N   run only the mutations whose index i has i % N == K
-#
-# MUTATION_CASES sets PROPTEST_CASES for the property runs (default 4096).
-# MUTATION_SEED makes them deterministic: run a (0 to 2) of mutation i uses
-# PROPTEST_RNG_SEED = MUTATION_SEED + 3i + a. Without it, proptest picks seeds.
-#
-# It edits files in place and restores them with git, so it refuses to start
-# on a checkout with uncommitted changes.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -61,6 +45,8 @@ if [ -n "$(git status --porcelain --untracked-files=no)" ] || [ -n "$(git ls-fil
   echo "The checkout has uncommitted changes or untracked .proptest-regressions files. Commit or move them first: this script restores files with git." >&2
   exit 2
 fi
+
+bash scripts/test-engine-mutations.sh
 
 restore() {
   git checkout -q -- .
