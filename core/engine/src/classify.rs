@@ -2307,6 +2307,10 @@ impl Trees {
             }
         }
         self.unsearched.clear();
+        let seen: BTreeMap<NodeId, Shape> = (pending.iter())
+            .filter(|id| self.l.get(id).is_none())
+            .filter_map(|id| Some((id.clone(), self.s.get(id)?.clone())))
+            .collect();
         let mut taken = Vec::new();
         loop {
             let before = pending.len();
@@ -2334,6 +2338,12 @@ impl Trees {
         for id in taken {
             if self.l.get(&id).is_none()
                 && let Some(remote) = self.r.get(&id).filter(|remote| remote.trashed)
+                && seen
+                    .get(&id)
+                    .is_some_and(|seen| match (&seen.content, &remote.shape.content) {
+                        (Some(seen), Some(held)) => same_content(seen, held),
+                        (seen, held) => seen.is_none() && held.is_none(),
+                    })
             {
                 self.removed_here.insert(id.clone(), remote.meta_rev);
             }

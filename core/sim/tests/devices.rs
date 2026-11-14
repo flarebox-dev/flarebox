@@ -4343,6 +4343,53 @@ fn an_edit_made_before_a_rename_out_of_the_trash_brings_its_file_back_survives_t
 }
 
 #[test]
+fn an_edit_that_reaches_a_device_after_its_user_removed_the_file_survives_a_rename_out_of_the_trash()
+ {
+    let mut world = World::new(3);
+    world
+        .phase(0, &[(0, folder("a")), (0, user(1, 0, 1, "b"))])
+        .unwrap();
+    world
+        .run(1, &[(1, rename(0, 0, "A")), (1, delete(1)), (1, SCAN)])
+        .unwrap();
+    world
+        .run(
+            2,
+            &[
+                (2, user(2, 1, 0, "a")),
+                (2, SCAN),
+                (2, COMMIT),
+                (2, COMMIT),
+                (2, DELIVER),
+            ],
+        )
+        .unwrap();
+    for _ in 0..20 {
+        world.run(3, &[(0, DELIVER), (0, Step::Work(1))]).unwrap();
+    }
+    world
+        .run(
+            4,
+            &[
+                (0, delete(0)),
+                (0, SCAN),
+                (0, COMMIT),
+                (0, COMMIT),
+                (0, DELIVER),
+            ],
+        )
+        .unwrap();
+    for _ in 0..20 {
+        world.run(5, &[(1, DELIVER)]).unwrap();
+    }
+    world.phase(6, &[]).unwrap();
+    let b = (world.space().nodes().into_iter())
+        .find(|node| node.name == "b")
+        .unwrap();
+    assert_eq!(b.status, koidrive_proto::v1::NodeStatus::Live as i32);
+}
+
+#[test]
 fn a_file_replaced_in_a_folder_moved_out_of_the_trash_keeps_its_name() {
     let synced = vec![
         (0, folder("c.txt")),
