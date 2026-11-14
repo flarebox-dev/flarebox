@@ -8,10 +8,15 @@ import SwiftUI
 struct MenuBarLabel: View {
     let model: AppModel
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var turningArrows = TurningArrows()
 
     var body: some View {
-        Image(model.iconBadge.imageName)
+        Image(turningArrows.isTurning ? "MenuBar/syncing-fish" : model.iconBadge.imageName)
             .accessibilityLabel(Text("Koidrive: \(model.headline == .questions ? String(localized: "Needs you") : model.headlineTitle)"))
+            .onChange(of: model.turnsMenuBarArrows(reduceMotion: reduceMotion), initial: true) { _, turns in
+                turningArrows.turn(turns)
+            }
             .task {
                 if model.needsSetup {
                     openWindow.show(WindowID.setup)
@@ -22,6 +27,61 @@ struct MenuBarLabel: View {
                     openWindow.show(WindowID.questions)
                 }
             }
+    }
+}
+
+/// MenuBarExtra draws its label as a still image, so the turning arrows are a layer-backed image view on the status
+/// item's button, animated by Core Animation outside the app process.
+@MainActor
+@Observable
+final class TurningArrows {
+    private(set) var isTurning = false
+    @ObservationIgnored private var arrows: NSImageView?
+
+    func turn(_ on: Bool) {
+        arrows?.removeFromSuperview()
+        arrows = nil
+        if on, let button = NSApp.windows.lazy.compactMap({ $0.contentView?.statusBarButton }).first {
+            arrows = Self.addArrows(to: button)
+        }
+        isTurning = arrows != nil
+    }
+
+    private static func addArrows(to button: NSStatusBarButton) -> NSImageView? {
+        guard let image = NSImage(named: "MenuBar/syncing-arrows") else { return nil }
+        let arrows = NSImageView(image: image)
+        arrows.imageScaling = .scaleNone
+        arrows.wantsLayer = true
+        arrows.translatesAutoresizingMaskIntoConstraints = false
+        button.addSubview(arrows)
+        NSLayoutConstraint.activate([
+            arrows.widthAnchor.constraint(equalToConstant: image.size.width),
+            arrows.heightAnchor.constraint(equalToConstant: image.size.height),
+            arrows.centerXAnchor.constraint(equalTo: button.centerXAnchor),
+            arrows.centerYAnchor.constraint(equalTo: button.centerYAnchor),
+        ])
+        guard let layer = arrows.layer else {
+            arrows.removeFromSuperview()
+            return nil
+        }
+        let center = CGPoint(x: 14.15, y: 14.15)
+        let steps = 72
+        let turn = CAKeyframeAnimation(keyPath: "transform")
+        turn.values = (0...steps).map { step in
+            let turned = CATransform3DRotate(CATransform3DMakeTranslation(center.x, center.y, 0), -2 * .pi * Double(step) / Double(steps), 0, 0, 1)
+            return CATransform3DTranslate(turned, -center.x, -center.y, 0)
+        }
+        turn.duration = 1.6
+        turn.repeatCount = .infinity
+        turn.preferredFrameRateRange = CAFrameRateRange(minimum: 20, maximum: 30, preferred: 30)
+        layer.add(turn, forKey: "turn")
+        return arrows
+    }
+}
+
+private extension NSView {
+    var statusBarButton: NSStatusBarButton? {
+        self as? NSStatusBarButton ?? subviews.lazy.compactMap(\.statusBarButton).first
     }
 }
 
@@ -92,6 +152,7 @@ struct MenuContent: View {
     @Environment(AppModel.self) private var model
     @Environment(\.openWindow) private var openWindow
     @Environment(\.openSettings) private var openSettings
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage(SettingsTab.storageKey) private var settingsTab = SettingsTab.folders
     @State private var error: SessionError?
 
@@ -116,13 +177,22 @@ struct MenuContent: View {
         .tint(.koi)
     }
 
+    private var headlineIcon: some View {
+        Image(systemName: model.headlineSymbol.name)
+            .font(.system(size: 15, weight: .medium))
+            .foregroundStyle(model.headlineSymbol.color)
+            .frame(width: 18, height: 18)
+    }
+
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                Image(systemName: model.headlineSymbol.name)
-                    .font(.system(size: 15, weight: .medium))
-                    .foregroundStyle(model.headlineSymbol.color)
-                    .frame(width: 18, height: 18)
+                if model.turnsHeadlineArrows(reduceMotion: reduceMotion) {
+                    headlineIcon
+                        .symbolEffect(.rotate.clockwise, options: .repeat(.continuous).speed(1.25))
+                } else {
+                    headlineIcon
+                }
                 Text(model.headlineTitle)
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(Color.text)
