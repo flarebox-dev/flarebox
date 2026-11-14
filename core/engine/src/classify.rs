@@ -531,11 +531,20 @@ impl Trees {
             && !node.trashed
             && self.l.get(&id).is_none()
             && self.removed_here.contains_key(&id);
+        let sent = (self.acknowledged(&id).filter(|_| edited_here)).map(|synced| Shape {
+            content: node.shape.content.clone(),
+            ..synced.clone()
+        });
         let shape = node.shape.clone();
         if edited_here {
             self.edited_here.insert(id.clone(), node.edit_rev);
         }
         self.place_remote(id.clone(), node);
+        if let Some(sent) = sent
+            && !self.set_synced_if_valid(id.clone(), Some(sent.clone()))
+        {
+            self.wait(id.clone(), Some(sent), Origin::Other);
+        }
         if removed_again && !self.set_synced_if_valid(id.clone(), Some(shape.clone())) {
             self.wait(id.clone(), Some(shape.clone()), Origin::Other);
         }
