@@ -2077,7 +2077,10 @@ impl Trees {
             }
         }
         for (id, _) in edited {
-            if let Some(content) = self.s.live(&id).and_then(|synced| synced.content.clone()) {
+            if let Some(content) = (self.s.live(&id))
+                .filter(|_| !self.unsent_edits.contains(&id))
+                .and_then(|synced| synced.content.clone())
+            {
                 self.hold_content(&id, content.manifest_digest);
             }
             let replaced = self.replaced_versions.get(&id);

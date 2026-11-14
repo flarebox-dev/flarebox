@@ -1134,3 +1134,34 @@ fn content_held_again_stays_among_the_newest_held() {
     assert!(held.contains(&vec![1; 32]), "{held:?}");
     assert!(!held.contains(&vec![2; 32]), "{held:?}");
 }
+
+#[test]
+fn a_delete_after_a_second_loss_downloads_restored_content_this_device_never_held() {
+    let at = |digest: u8, revision: u64| RemoteNode {
+        content_rev: revision,
+        edit_rev: revision,
+        version_id: format!("v{digest}"),
+        ..remote(file(ROOT, "f", digest))
+    };
+    let mut trees = Trees::new(ROOT);
+    trees.set_remote("f".into(), at(1, 1));
+    trees.set_local("f".into(), local(file(ROOT, "f", 66), 1));
+    trees.set_synced("f".into(), Some(file(ROOT, "f", 66)));
+    let records = std::collections::BTreeMap::from([("f".into(), at(66, 70))]);
+    trees.forget_lost(
+        vec![],
+        vec![("f".into(), 70)],
+        vec![],
+        vec![],
+        vec![],
+        records,
+        5,
+        1,
+    );
+    assert!(trees.unsent_edits().contains("f"));
+    trees.record_dropped_edits(["f".into()]);
+    let records = trees.remote_records();
+    trees.forget_lost(vec![], vec![], vec![], vec![], vec![], records, 5, 1);
+    trees.remove_local("f");
+    assert_eq!(trees.class("f"), Class::Remote);
+}
