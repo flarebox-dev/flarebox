@@ -62,7 +62,7 @@ jobs:
             for pair in "rust_macos:rust (macos)" "server_macos:server (macos)" "spec_macos:spec (macos)" "macos_app:macos app" "runner_hook:runner hook"; do
               covered=true
               if [ "${pair%%:*}" = rust_macos ]; then
-                for suite in driver engine; do
+                for suite in driver engine sim; do
                   if ! grep -Fxq "rust tests (macos, $suite)" <<<"$passed"; then covered=false; fi
                 done
               fi
@@ -172,6 +172,7 @@ jobs:
       rust: ${{ steps.pick.outputs.rust }}
       rust_driver: ${{ steps.pick.outputs.rust_driver }}
       rust_engine: ${{ steps.pick.outputs.rust_engine }}
+      rust_sim: ${{ steps.pick.outputs.rust_sim }}
       server: ${{ steps.pick.outputs.server }}
       spec: ${{ steps.pick.outputs.spec }}
       runner_hook: ${{ steps.pick.outputs.runner_hook }}
@@ -181,6 +182,8 @@ jobs:
           persist-credentials: false
       - name: Test the macOS runner picker
         run: python3 scripts/test-pick-macos.py -v
+      - name: Test Rust partition coverage
+        run: python3 scripts/test-ci-rust-partitions.py RustPartitions -v
       - name: Pick a runner for each macOS job
         id: pick
         env:
@@ -190,7 +193,7 @@ jobs:
           RUNS_ON: ${{ vars.MACOS_RUNS_ON || '["self-hosted","flarebox-mini"]' }}
           RUNNER_STATUS_TOKEN: ${{ secrets.RUNNER_STATUS_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
-          WANTED: macos_app=${{ needs.changes.outputs.macos_app }} rust=${{ needs.changes.outputs.rust_macos }} rust_driver=${{ needs.changes.outputs.rust_macos }} rust_engine=${{ needs.changes.outputs.rust_macos }} server=${{ needs.changes.outputs.server_macos }} spec=${{ needs.changes.outputs.spec_macos }} runner_hook=${{ needs.changes.outputs.runner_hook }}
+          WANTED: macos_app=${{ needs.changes.outputs.macos_app }} rust=${{ needs.changes.outputs.rust_macos }} rust_driver=${{ needs.changes.outputs.rust_macos }} rust_engine=${{ needs.changes.outputs.rust_macos }} rust_sim=${{ needs.changes.outputs.rust_macos }} server=${{ needs.changes.outputs.server_macos }} spec=${{ needs.changes.outputs.spec_macos }} runner_hook=${{ needs.changes.outputs.runner_hook }}
         run: |
           hosted='["macos-15"]'
           api() {
@@ -260,7 +263,7 @@ jobs:
           fi
           RUNS_ON="$(jq -c . <<<"$RUNS_ON")"
           wanted_jobs=0
-          for job in macos_app rust rust_driver rust_engine server spec runner_hook; do
+          for job in macos_app rust rust_driver rust_engine rust_sim server spec runner_hook; do
             case " $WANTED " in *" $job=true "*) wanted_jobs=$((wanted_jobs + 1)) ;; esac
           done
           hosted_cap=5
@@ -286,7 +289,7 @@ jobs:
           to_hosted=0
           idle_left=$idle
           hosted_busy=$hosted_load
-          for job in macos_app rust rust_driver rust_engine server spec runner_hook; do
+          for job in macos_app rust rust_driver rust_engine rust_sim server spec runner_hook; do
             case " $WANTED " in
               *" $job=true "*) wanted=true ;;
               *) wanted=false ;;
@@ -347,19 +350,20 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: runner.environment != 'self-hosted'
-      - name: List the workspace and remaining test inventories
+      - name: Verify Rust workspace feature parity
+        run: python3 scripts/test-ci-rust-partitions.py FeatureParity -v
+      - name: List the remaining test inventory
         run: |
           out="$RUNNER_TEMP/test-inventory"
           mkdir -p "$out"
-          cargo test --workspace --locked --features koidrive-cli/test-install-inventory -- --list --format terse > "$out/workspace.txt"
-          cargo test --workspace --exclude koidrive-driver --exclude koidrive-engine --locked --features koidrive-cli/test-install-inventory -- --list --format terse > "$out/remainder.txt"
+          cargo test --workspace --exclude koidrive-driver --exclude koidrive-engine --exclude koidrive-sim --locked --features koidrive-cli/test-install-inventory -- --list --format terse > "$out/remainder.txt"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: rust-test-inventory-${{ matrix.os }}
           path: ${{ runner.temp }}/test-inventory
           if-no-files-found: error
           retention-days: 7
-      - run: cargo test --workspace --exclude koidrive-driver --exclude koidrive-engine --locked --features koidrive-cli/test-install-inventory
+      - run: cargo test --workspace --exclude koidrive-driver --exclude koidrive-engine --exclude koidrive-sim --locked --features koidrive-cli/test-install-inventory
       - name: Test the regression-case splitter
         run: |
           python3 scripts/test-split-proptest-regressions.py -v
@@ -368,7 +372,6 @@ jobs:
         env:
           PROPTEST_CASES: '0'
         run: |
-          cargo test --locked -p koidrive-sim --test devices --test engine_sync --test space_properties -- --show-output
           cargo test --locked -p koidrive-chunk --test chunking -- --show-output
           cargo test --locked -p koidrive-ignore --test properties --test git_oracle -- --show-output
           cargo test --locked -p koidrive-net --lib -- --show-output
@@ -381,7 +384,7 @@ jobs:
       fail-fast: false
       matrix:
         os: ${{ fromJSON(needs.changes.outputs.rust_macos == 'true' && '["ubuntu-latest","macos"]' || '["ubuntu-latest"]') }}
-        suite: [driver, engine]
+        suite: [driver, engine, sim]
     runs-on: ${{ matrix.os == 'macos' && fromJSON(needs.pick-macos.outputs[format('rust_{0}', matrix.suite)]).runs_on || matrix.os }}
     timeout-minutes: 30
     env:
@@ -423,7 +426,7 @@ jobs:
       - name: List the package test inventory
         env:
           SUITE: ${{ matrix.suite }}
-          FEATURES: ${{ matrix.suite == 'engine' && 'serde' || '' }}
+          FEATURES: ${{ matrix.suite == 'engine' && 'serde' || matrix.suite == 'sim' && 'koidrive-engine/serde' || '' }}
         run: cargo test --locked -p "koidrive-$SUITE" --features "$FEATURES" -- --list --format terse > "$RUNNER_TEMP/inventory.txt"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
@@ -434,7 +437,7 @@ jobs:
       - name: Run the package tests and doctests
         env:
           SUITE: ${{ matrix.suite }}
-          FEATURES: ${{ matrix.suite == 'engine' && 'serde' || '' }}
+          FEATURES: ${{ matrix.suite == 'engine' && 'serde' || matrix.suite == 'sim' && 'koidrive-engine/serde' || '' }}
         run: cargo test --locked -p "koidrive-$SUITE" --features "$FEATURES"
       - name: Replay saved engine property regressions without random cases
         if: matrix.suite == 'engine'
@@ -446,6 +449,11 @@ jobs:
         env:
           PROPTEST_CASES: '0'
         run: cargo test --locked -p koidrive-driver --lib batches_leave_l_a_tree_that_holds_the_disk -- --show-output
+      - name: Replay saved sim property regressions without random cases
+        if: matrix.suite == 'sim'
+        env:
+          PROPTEST_CASES: '0'
+        run: cargo test --locked -p koidrive-sim --test devices --test engine_sync --test space_properties -- --show-output
       - name: Test that the app installer refuses an app signed by a forged Developer ID
         if: matrix.os == 'macos' && matrix.suite == 'driver'
         run: |
@@ -457,32 +465,6 @@ jobs:
         run: |
           python3 scripts/stamp-release-version.py v0.1.0-alpha.1
           nice -n 10 cargo test --locked -p koidrive-cli --test update --features koidrive-cli/test-install-inventory
-
-  rust-inventory:
-    needs: [changes, rust, rust-tests]
-    if: needs.changes.outputs.site_only != 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
-        with:
-          pattern: rust-test-inventory-*
-          path: inventories
-      - name: Compare workspace and partitioned inventories
-        shell: bash
-        env:
-          RUST_MACOS: ${{ needs.changes.outputs.rust_macos }}
-        run: |
-          platforms=(ubuntu-latest)
-          if [ "$RUST_MACOS" = true ]; then platforms+=(macos); fi
-          for os in "${platforms[@]}"; do
-            root="inventories/rust-test-inventory-$os"
-            cat "$root/remainder.txt" "$root-driver/inventory.txt" "$root-engine/inventory.txt" | LC_ALL=C sort > partitioned.txt
-            LC_ALL=C sort "$root/workspace.txt" > workspace.txt
-            diff -u workspace.txt partitioned.txt
-            count=$(awk '/: (test|benchmark)$/ { n++ } END { print n+0 }' "$root/workspace.txt")
-            echo "$os: identical inventories, $count listed tests and benchmarks." >> "$GITHUB_STEP_SUMMARY"
-          done
 
   server:
     name: server (${{ matrix.os }})
@@ -835,7 +817,7 @@ jobs:
   ci-report:
     name: ci-report
     if: always()
-    needs: [changes, pick-macos, rust, rust-tests, rust-inventory, server, server-deploy, net-integration, driver-integration, cli-integration, ffi-integration, spec, macos-app, runner-hook, installer, comments]
+    needs: [changes, pick-macos, rust, rust-tests, server, server-deploy, net-integration, driver-integration, cli-integration, ffi-integration, spec, macos-app, runner-hook, installer, comments]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any CI job failed or was cancelled
@@ -845,7 +827,6 @@ jobs:
           SITE_ONLY: ${{ needs.changes.outputs.site_only }}
           RUST: ${{ needs.rust.result }}
           RUST_TESTS: ${{ needs.rust-tests.result }}
-          RUST_INVENTORY: ${{ needs.rust-inventory.result }}
           SERVER: ${{ needs.server.result }}
           SERVER_DEPLOY: ${{ needs.server-deploy.result }}
           NET_INTEGRATION: ${{ needs.net-integration.result }}
@@ -860,15 +841,15 @@ jobs:
           FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
         run: |
           echo "site-only change: ${SITE_ONLY:-unknown}. Build and test jobs that skip for a site-only change report skipped."
-          echo "changes: $CHANGES, pick-macos: $PICK_MACOS, rust: $RUST, rust-tests: $RUST_TESTS, rust-inventory: $RUST_INVENTORY, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, driver-integration: $DRIVER_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP, runner-hook: $RUNNER_HOOK, installer: $INSTALLER, comments: $COMMENTS"
+          echo "changes: $CHANGES, pick-macos: $PICK_MACOS, rust: $RUST, rust-tests: $RUST_TESTS, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, driver-integration: $DRIVER_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP, runner-hook: $RUNNER_HOOK, installer: $INSTALLER, comments: $COMMENTS"
           if [ "$FAILED" = "true" ]; then
-            echo "::error::At least one CI job failed or was cancelled (changes: $CHANGES, pick-macos: $PICK_MACOS, rust: $RUST, rust-tests: $RUST_TESTS, rust-inventory: $RUST_INVENTORY, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, driver-integration: $DRIVER_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP, runner-hook: $RUNNER_HOOK, installer: $INSTALLER, comments: $COMMENTS). Open that job's log for the cause."
+            echo "::error::At least one CI job failed or was cancelled (changes: $CHANGES, pick-macos: $PICK_MACOS, rust: $RUST, rust-tests: $RUST_TESTS, server: $SERVER, server-deploy: $SERVER_DEPLOY, net-integration: $NET_INTEGRATION, driver-integration: $DRIVER_INTEGRATION, cli-integration: $CLI_INTEGRATION, ffi-integration: $FFI_INTEGRATION, spec: $SPEC, macos-app: $MACOS_APP, runner-hook: $RUNNER_HOOK, installer: $INSTALLER, comments: $COMMENTS). Open that job's log for the cause."
             exit 1
           fi
       - name: Fail unless the build and test jobs ran for a change outside site/
         if: needs.changes.outputs.site_only != 'true'
         env:
-          RESULTS: rust=${{ needs.rust.result }} rust-tests=${{ needs.rust-tests.result }} rust-inventory=${{ needs.rust-inventory.result }} server=${{ needs.server.result }} server-deploy=${{ needs.server-deploy.result }} net-integration=${{ needs.net-integration.result }} driver-integration=${{ needs.driver-integration.result }} cli-integration=${{ needs.cli-integration.result }} ffi-integration=${{ needs.ffi-integration.result }} spec=${{ needs.spec.result }} runner-hook=${{ needs.changes.outputs.runner_hook == 'true' && needs.runner-hook.result || 'not-needed' }} installer=${{ needs.installer.result }}
+          RESULTS: rust=${{ needs.rust.result }} rust-tests=${{ needs.rust-tests.result }} server=${{ needs.server.result }} server-deploy=${{ needs.server-deploy.result }} net-integration=${{ needs.net-integration.result }} driver-integration=${{ needs.driver-integration.result }} cli-integration=${{ needs.cli-integration.result }} ffi-integration=${{ needs.ffi-integration.result }} spec=${{ needs.spec.result }} runner-hook=${{ needs.changes.outputs.runner_hook == 'true' && needs.runner-hook.result || 'not-needed' }} installer=${{ needs.installer.result }}
         run: |
           echo "Build and test jobs for a change outside site/: $RESULTS"
           for r in $RESULTS; do
