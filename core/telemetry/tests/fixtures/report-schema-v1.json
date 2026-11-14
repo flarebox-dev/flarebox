@@ -1,0 +1,369 @@
+{
+  "minimal": {
+    "api_key": "schema-test-token",
+    "batch": [
+      {
+        "event": "daily_report",
+        "properties": {
+          "$geoip_disable": true,
+          "$process_person_profile": false,
+          "arch": "arm64",
+          "build": "release",
+          "client": "cli_daemon",
+          "distinct_id": "00000000000000000000000000000000",
+          "koi_version": "0.1.0",
+          "os": "linux",
+          "schema": 1
+        },
+        "timestamp": "1970-01-02T00:00:00Z"
+      }
+    ],
+    "historical_migration": false
+  },
+  "populated": {
+    "api_key": "schema-test-token",
+    "batch": [
+      {
+        "event": "daily_report",
+        "properties": {
+          "$geoip_disable": true,
+          "$process_person_profile": false,
+          "arch": "arm64",
+          "build": "release",
+          "c.asked.ambiguous_disappearance": 3,
+          "c.asked.conflict": 3,
+          "c.asked.mass_delete": 3,
+          "c.asked.recovery": 3,
+          "c.asked.remote_mass_delete": 3,
+          "c.command.daemon": 3,
+          "c.command.device": 3,
+          "c.command.diagnose": 3,
+          "c.command.folder": 3,
+          "c.command.history": 3,
+          "c.command.join": 3,
+          "c.command.pause": 3,
+          "c.command.resolve": 3,
+          "c.command.resume": 3,
+          "c.command.server": 3,
+          "c.command.service": 3,
+          "c.command.setup": 3,
+          "c.command.share": 3,
+          "c.command.space": 3,
+          "c.command.status": 3,
+          "c.command.telemetry": 3,
+          "c.command.update": 3,
+          "c.daemon_start_failed.busy": 3,
+          "c.daemon_start_failed.profile": 3,
+          "c.daemon_start_failed.signals": 3,
+          "c.daemon_start_failed.socket": 3,
+          "c.download_failed.call": 3,
+          "c.download_failed.corrupt": 3,
+          "c.download_failed.io": 3,
+          "c.download_failed.no_target": 3,
+          "c.download_failed.refused": 3,
+          "c.download_failed.source_changed": 3,
+          "c.download_failed.unavailable": 3,
+          "c.halted.claim": 3,
+          "c.halted.connection_refused": 3,
+          "c.halted.credentials_refused": 3,
+          "c.halted.device_revoked": 3,
+          "c.halted.disk_behind": 3,
+          "c.halted.io": 3,
+          "c.halted.no_replace": 3,
+          "c.halted.not_a_member": 3,
+          "c.halted.other_root": 3,
+          "c.halted.placement": 3,
+          "c.halted.protocol": 3,
+          "c.halted.record": 3,
+          "c.halted.recovery": 3,
+          "c.halted.refused": 3,
+          "c.halted.replaced": 3,
+          "c.halted.root": 3,
+          "c.halted.session_closed": 3,
+          "c.halted.session_start": 3,
+          "c.halted.signed_out": 3,
+          "c.halted.space_not_found": 3,
+          "c.halted.start": 3,
+          "c.halted.store": 3,
+          "c.halted.store_behind": 3,
+          "c.halted.unlink": 3,
+          "c.halted.unsupported_version": 3,
+          "c.halted.withdrawn": 3,
+          "c.problem_node.ahead_of_server": 3,
+          "c.problem_node.confirmation_required": 3,
+          "c.problem_node.forbidden": 3,
+          "c.problem_node.head_moved": 3,
+          "c.problem_node.history_mismatch": 3,
+          "c.problem_node.internal": 3,
+          "c.problem_node.invalid_argument": 3,
+          "c.problem_node.limit_exceeded": 3,
+          "c.problem_node.missing_chunks": 3,
+          "c.problem_node.not_found": 3,
+          "c.problem_node.quota_exceeded": 3,
+          "c.problem_node.read_only": 3,
+          "c.problem_node.retry_later": 3,
+          "c.problem_node.stale_device_state": 3,
+          "c.problem_node.unauthenticated": 3,
+          "c.problem_node.unknown": 3,
+          "c.problem_node.unsupported_version": 3,
+          "c.process.cpu_ms": 3,
+          "c.refused.ahead_of_server": 3,
+          "c.refused.confirmation_required": 3,
+          "c.refused.forbidden": 3,
+          "c.refused.head_moved": 3,
+          "c.refused.history_mismatch": 3,
+          "c.refused.internal": 3,
+          "c.refused.invalid_argument": 3,
+          "c.refused.limit_exceeded": 3,
+          "c.refused.missing_chunks": 3,
+          "c.refused.not_found": 3,
+          "c.refused.quota_exceeded": 3,
+          "c.refused.read_only": 3,
+          "c.refused.retry_later": 3,
+          "c.refused.stale_device_state": 3,
+          "c.refused.unauthenticated": 3,
+          "c.refused.unknown": 3,
+          "c.refused.unsupported_version": 3,
+          "c.sync.bytes_downloaded": 3,
+          "c.sync.bytes_uploaded": 3,
+          "c.sync.commits_received": 3,
+          "c.sync.commits_sent": 3,
+          "c.too_large.commit": 3,
+          "c.too_large.problem_node": 3,
+          "c.upload_failed.call": 3,
+          "c.upload_failed.corrupt": 3,
+          "c.upload_failed.io": 3,
+          "c.upload_failed.no_target": 3,
+          "c.upload_failed.refused": 3,
+          "c.upload_failed.source_changed": 3,
+          "c.upload_failed.unavailable": 3,
+          "client": "cli_daemon",
+          "distinct_id": "00000000000000000000000000000000",
+          "distro": "debian",
+          "h.download_per_second.bytes": {
+            "buckets": [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 15,
+            "sum": 65536
+          },
+          "h.download_per_second.files": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            "count": 1,
+            "shift": 0,
+            "sum": 65536
+          },
+          "h.first_sync_ms.0": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 10
+          },
+          "h.first_sync_ms.1": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 10
+          },
+          "h.first_sync_ms.1024_2047": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 10
+          },
+          "h.first_sync_ms.1048576_plus": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 10
+          },
+          "h.first_sync_ms.128_255": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 10
+          },
+          "h.first_sync_ms.131072_262143": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 10
+          },
+          "h.first_sync_ms.16384_32767": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 10
+          },
+          "h.first_sync_ms.16_31": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 10
+          },
+          "h.first_sync_ms.2048_4095": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 10
+          },
+          "h.first_sync_ms.256_511": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 10
+          },
+          "h.first_sync_ms.262144_524287": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 10
+          },
+          "h.first_sync_ms.2_3": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 10
+          },
+          "h.first_sync_ms.32768_65535": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 10
+          },
+          "h.first_sync_ms.32_63": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 10
+          },
+          "h.first_sync_ms.4096_8191": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 10
+          },
+          "h.first_sync_ms.4_7": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 10
+          },
+          "h.first_sync_ms.512_1023": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 10
+          },
+          "h.first_sync_ms.524288_1048575": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 10
+          },
+          "h.first_sync_ms.64_127": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 10
+          },
+          "h.first_sync_ms.65536_131071": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 10
+          },
+          "h.first_sync_ms.8192_16383": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 10
+          },
+          "h.first_sync_ms.8_15": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 10
+          },
+          "h.remote_apply_ms.effect": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 10
+          },
+          "h.syncing_ms.completed": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 10
+          },
+          "h.upload_per_second.bytes": {
+            "buckets": [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            "count": 1,
+            "shift": 15,
+            "sum": 65536
+          },
+          "h.upload_per_second.files": {
+            "buckets": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            "count": 1,
+            "shift": 0,
+            "sum": 65536
+          },
+          "koi_version": "0.1.0",
+          "l.sync.nodes": 5,
+          "l.sync.spaces": 5,
+          "os": "linux",
+          "os_major": 6,
+          "os_minor": 8,
+          "schema": 1
+        },
+        "timestamp": "1970-01-01T00:00:00Z",
+        "uuid": "00000000-0000-4000-8000-000000000000"
+      },
+      {
+        "event": "setup_step",
+        "properties": {
+          "$geoip_disable": true,
+          "$process_person_profile": false,
+          "arch": "arm64",
+          "build": "release",
+          "client": "cli_daemon",
+          "cloudflare_code": 10042,
+          "distinct_id": "00000000000000000000000000000000",
+          "distro": "debian",
+          "flow": "cloudflare",
+          "koi_version": "0.1.0",
+          "os": "linux",
+          "os_major": 6,
+          "os_minor": 8,
+          "outcome": "failed",
+          "schema": 1,
+          "seconds_magnitude": 7,
+          "step": "r2_checkout"
+        },
+        "timestamp": "1970-01-01T00:00:00Z",
+        "uuid": "00000000-0000-4000-8000-000000000001"
+      },
+      {
+        "event": "setup_step",
+        "properties": {
+          "$geoip_disable": true,
+          "$process_person_profile": false,
+          "arch": "arm64",
+          "build": "release",
+          "client": "cli_daemon",
+          "distinct_id": "00000000000000000000000000000000",
+          "distro": "debian",
+          "flow": "cloudflare",
+          "koi_version": "0.1.0",
+          "os": "linux",
+          "os_major": 6,
+          "os_minor": 8,
+          "outcome": "failed",
+          "schema": 1,
+          "seconds_magnitude": 7,
+          "step": "r2_checkout"
+        },
+        "timestamp": "1970-01-01T00:00:00Z",
+        "uuid": "00000000-0000-4000-8000-000000000002"
+      },
+      {
+        "event": "panic",
+        "properties": {
+          "$geoip_disable": true,
+          "$process_person_profile": false,
+          "arch": "arm64",
+          "build": "release",
+          "client": "cli_daemon",
+          "distinct_id": "00000000000000000000000000000000",
+          "distro": "debian",
+          "file": "core/driver/src/folder.rs",
+          "koi_version": "0.1.0",
+          "line": 42,
+          "os": "linux",
+          "os_major": 6,
+          "os_minor": 8,
+          "schema": 1
+        },
+        "timestamp": "1970-01-01T00:00:00Z",
+        "uuid": "00000000-0000-4000-8000-000000000003"
+      }
+    ],
+    "historical_migration": false
+  }
+}

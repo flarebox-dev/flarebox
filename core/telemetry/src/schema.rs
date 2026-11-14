@@ -8,7 +8,6 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-/// The layout version of the properties a report sends. It changes when a property changes meaning.
 pub const SCHEMA: u16 = 1;
 
 /// What one install recorded on one UTC day. Its keys are always those of a [`Counter`], a [`Level`] or a [`Measure`]: only a
@@ -18,18 +17,14 @@ pub const SCHEMA: u16 = 1;
 pub struct DailyReport {
     /// Days since 1970-01-01.
     pub day: u32,
-    /// Sums, by metric and then by label.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) counters: BTreeMap<String, BTreeMap<String, u64>>,
-    /// The day's highest readings, by metric and then by label.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) levels: BTreeMap<String, BTreeMap<String, u64>>,
-    /// Distributions, by metric and then by label.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) histograms: BTreeMap<String, BTreeMap<String, Histogram>>,
 }
 
-/// A [`DailyReport`] as a file holds it, before its keys are checked.
 #[derive(Deserialize)]
 struct StoredReport {
     day: u32,
@@ -41,8 +36,6 @@ struct StoredReport {
     histograms: BTreeMap<String, BTreeMap<String, Histogram>>,
 }
 
-/// Rebuilds the report from the closed set of counters, levels and measures, so a key that is not one of theirs, or a
-/// histogram with another shift, is dropped.
 impl From<StoredReport> for DailyReport {
     fn from(stored: StoredReport) -> Self {
         let mut report = DailyReport {
@@ -116,9 +109,6 @@ impl DailyReport {
     }
 }
 
-/// Values in 16 power-of-two buckets. Bucket 0 holds values below `2^shift`; bucket `i` from 1 to 14 holds values
-/// from `2^(shift + i - 1)` up to `2^(shift + i)`; bucket 15 holds everything above. Histograms with the same shift
-/// add bucket by bucket, so they merge across days and installs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Histogram {
     pub shift: u8,
@@ -146,7 +136,6 @@ impl Histogram {
         self.sum = self.sum.map(|sum| sum.saturating_add(value));
     }
 
-    /// Adds `other` when it has the same shift. One with another shift comes from a different layout and is dropped.
     pub fn merge(&mut self, other: &Histogram) {
         if other.shift != self.shift {
             return;
@@ -261,7 +250,6 @@ pub enum Counter {
 }
 
 impl Counter {
-    /// Every counter, for checking the keys of a stored report.
     pub fn all() -> impl Iterator<Item = Counter> {
         (Command::ALL.into_iter().map(Counter::Command))
             .chain(Synced::ALL.map(Counter::Sync))
@@ -621,7 +609,6 @@ impl Measure {
             ])
     }
 
-    /// The metric, the label and the histogram's shift.
     pub(crate) fn key(self) -> (&'static str, &'static str, u8) {
         match self {
             Measure::FirstSync(files) => ("first_sync_ms", files.name(), 10),

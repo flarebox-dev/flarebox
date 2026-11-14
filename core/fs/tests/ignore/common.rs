@@ -62,7 +62,6 @@ impl Ignore for Matched {
     }
 }
 
-/// Rules that know no rules file yet, as after a start.
 fn rules() -> Rules {
     Rules::new(Box::new(Matched(Matcher::new(LocalRules::default()))))
 }
@@ -95,7 +94,6 @@ fn removed(path: &str, kind: EntryKind) -> Change {
     }
 }
 
-/// The change of rules a scan reports for the folder `dir`.
 fn rule(dir: &str, rules: Option<&str>) -> (PathBuf, Option<Vec<u8>>) {
     (dir.into(), rules.map(|rules| rules.as_bytes().to_vec()))
 }
@@ -104,8 +102,6 @@ fn whole() -> [PathBuf; 1] {
     [PathBuf::new()]
 }
 
-/// A tree with entries the rule `*.tmp` or `cache/` matches at the root and
-/// two folders below it, scanned before any rules file exists.
 fn tree_without_rules() -> (tempfile::TempDir, Snapshot, Rules) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -130,7 +126,6 @@ fn tree_without_rules() -> (tempfile::TempDir, Snapshot, Rules) {
     (dir, snapshot, rules)
 }
 
-/// A tree whose root rules leave out the folder `ig`, scanned.
 fn tree_with_an_ignored_folder() -> (tempfile::TempDir, Snapshot, Rules) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -510,8 +505,6 @@ fn small_tree() -> tempfile::TempDir {
     dir
 }
 
-/// Polls until every change of `expected` and every rules change of `rules`
-/// was seen, and returns the polls.
 fn expect(
     watcher: &mut dyn Watcher,
     expected: &[Change],
@@ -535,7 +528,6 @@ fn expect(
     }
 }
 
-/// The inodes this process watches with inotify, from `/proc`.
 #[cfg(target_os = "linux")]
 fn watched_inodes() -> std::collections::BTreeSet<u64> {
     let mut inodes = std::collections::BTreeSet::new();

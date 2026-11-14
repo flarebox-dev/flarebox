@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-/// The other device creates a and b before this one does, so the server renames this device's
-/// files and both are reverted. Right after that commit, the other device moves its own files away
-/// and gives each renamed file the other's local name, so the two reverted files block each other.
 #[test]
 fn two_reverted_files_that_swap_names_converge() {
     let act = |kind, target, name, text| Action {
@@ -24,10 +21,6 @@ fn two_reverted_files_that_swap_names_converge() {
     assert!(parked > 0, "no reverted file was parked");
 }
 
-/// A minimal interleaving the property found: the other device deletes a folder holding a parked
-/// node with a folder the user created under it, so the effects clear the folders above it, and
-/// the create then brings them back on the server. S cannot drop them while the parked node hangs
-/// from them, so they must be brought back on disk.
 #[test]
 fn folders_revived_above_a_parked_node_are_brought_back() {
     let seed = vec![
@@ -273,9 +266,6 @@ fn an_edited_reverted_file_parked_under_a_folder_deleted_remotely_is_kept() {
     run(&seed, &local, &remote, fits, fresh_dir_names, &during).unwrap();
 }
 
-/// A folder created here is merged into one the other device created, and its S update waits
-/// because S still has a parked folder at that name. The user then renames it onto the name the
-/// parked folder needs, so it blocks that folder and is parked too (GUN-285).
 #[test]
 fn a_folder_renamed_onto_the_name_a_parked_folder_needs_is_parked_too() {
     let seed = vec![Action {

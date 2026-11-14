@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Resolving effect locations from the root descriptor (design §5.2), on the
-//! file system the tests run on.
-
 mod common;
 
 use std::ffi::OsString;
@@ -153,7 +150,6 @@ fn parent_moved_out_of_the_root_fails_the_recheck() {
         Err(Unresolved::Missing(path)) if path == Path::new("a")
     ));
 
-    // Moved back under another name, the route no longer leads to it either.
     fs::rename(outside.path().join("a"), root.join("c")).unwrap();
     assert!(matches!(
         space.recheck(&folder),

@@ -276,8 +276,6 @@ fn a_file_moved_into_an_ignored_folder_before_a_folder_above_it_was_renamed_is_i
     assert_eq!(found, 1, "{:?}", rescan.changes);
 }
 
-/// As above, with the folder that held the file moved into the ignored folder: it is ignored once, and the file
-/// it holds goes with it.
 #[test]
 fn a_folder_moved_into_an_ignored_folder_before_a_folder_above_it_was_renamed_is_ignored_once() {
     let dir = tempfile::tempdir().unwrap();
@@ -337,8 +335,6 @@ fn a_file_renamed_to_a_name_a_rule_leaves_out_is_ignored_not_removed() {
     );
 }
 
-/// The search misses a file whose identity changed after the move: an editor
-/// saved it by writing a new file and renaming it over the moved one.
 #[test]
 fn a_file_moved_into_an_ignored_folder_and_saved_under_a_new_identity_is_removed() {
     let (dir, mut snapshot, mut rules) = tree_with_an_ignored_folder();
@@ -435,9 +431,6 @@ fn a_rules_file_renamed_only_in_case_keeps_its_rules() {
     assert_eq!(known(&snapshot), [".KOIIGNORE", "x"]);
 }
 
-/// A file swapped through a third name with a file the rules leave out by
-/// name: the file that took its path is created, and the file itself is
-/// ignored, not modified into the other file.
 #[test]
 fn a_file_swapped_with_an_ignored_file_is_ignored_and_the_other_created() {
     let dir = tempfile::tempdir().unwrap();
@@ -469,8 +462,6 @@ fn a_file_swapped_with_an_ignored_file_is_ignored_and_the_other_created() {
     );
 }
 
-/// Each file moved out of the removed folder is carried by its own rename, so none of them is looked for in the
-/// ignored folder. Comparing every held entry with every rename made this scan take seconds.
 #[test]
 #[ignore = "timing probe; run with --release -- --ignored"]
 fn many_files_moved_out_of_a_removed_folder_are_renamed_in_less_than_a_second() {

@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The rules that leave paths out of scans (design §5.10): the matcher scans
-//! ask, the rules files they read for it, and the search that tells a move
-//! into a left-out path from a removal.
-
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
@@ -20,7 +16,6 @@ use crate::{
 /// The name of a rules file.
 pub const RULES_FILE: &str = ".koiignore";
 
-/// The largest rules file a scan reads.
 const MAX_RULES: u64 = 1 << 20;
 
 /// Why a path is left out of scans.
@@ -51,8 +46,6 @@ pub trait Ignore {
     fn key(&self, name: &OsStr) -> OsString;
 }
 
-/// A folder's rules file as a scan read it: the path the folder was listed at,
-/// and the bytes.
 type Held = (PathBuf, Vec<u8>);
 
 /// The rules of one root and what its scans have seen of them.
@@ -61,16 +54,8 @@ type Held = (PathBuf, Vec<u8>);
 /// folder it lists, so scan the whole tree before any part of it.
 pub struct Rules {
     ignore: Box<dyn Ignore + Send>,
-    /// The key of [`RULES_FILE`].
     rules_file: OsString,
-    /// Each folder's rules file as last read, by the keys of the folder's path
-    /// ([`Ignore::key`]). The matcher holds the rules under the same keys, so
-    /// two paths it takes for one folder never hold two entries here, and
-    /// dropping the entry of a path that is gone cannot take the rules from a
-    /// folder that is still there under another spelling.
     files: BTreeMap<PathBuf, Held>,
-    /// The names each listed folder holds that a rule leaves out
-    /// ([`Ignored::Rule`] only).
     ignored: BTreeMap<PathBuf, BTreeSet<OsString>>,
     budget: usize,
     search: Search,
@@ -179,13 +164,10 @@ impl Rules {
         search.reseeded = crate::outermost(std::mem::take(&mut search.reseeded));
     }
 
-    /// The keys of `path`, under which the rules of the folder there are held.
     fn key(&self, path: &Path) -> PathBuf {
         path.iter().map(|name| self.ignore.key(name)).collect()
     }
 
-    /// Whether the entry at `path`, relative to the root, is left out. The
-    /// root itself never is.
     pub fn status(&self, path: &Path, kind: EntryKind) -> Ignored {
         if path.as_os_str().is_empty() {
             return Ignored::No;
@@ -193,8 +175,6 @@ impl Rules {
         self.ignore.status(path, kind)
     }
 
-    /// Gives the folder at `dir` the rules file `rules`, or none, and returns
-    /// what the folder with those keys had.
     fn set(&mut self, dir: &Path, rules: Option<Vec<u8>>) -> Option<Held> {
         self.ignore.set_rules(dir, rules.as_deref());
         let key = self.key(dir);
@@ -205,23 +185,14 @@ impl Rules {
     }
 }
 
-/// The entries a search looks for, by identity and kind, and where it found
-/// each one.
 pub(crate) type Wanted = HashMap<Key, Option<PathBuf>>;
 
 pub(crate) type Key = (FileId, EntryKind);
 
-/// The rules during one scan. Until the scan is published, [`Pending::undo`]
-/// takes back everything it changed in them.
 pub(crate) struct Pending<'r> {
     rules: &'r mut Rules,
-    /// What each folder had before this scan changed its rules file or the
-    /// path it is listed at, by the keys of its path.
     before: BTreeMap<PathBuf, Option<Held>>,
-    /// The names a rule leaves out in each folder this scan listed.
     listed: BTreeMap<PathBuf, BTreeSet<OsString>>,
-    /// The folders whose rules this scan established, by their paths as
-    /// listed.
     read: BTreeSet<PathBuf>,
 }
 
@@ -239,12 +210,6 @@ impl<'r> Pending<'r> {
         self.rules.status(path, kind)
     }
 
-    /// Reads the rules file of the folder `dir` at `rel`, which lists
-    /// `names`: the regular file among the names the matcher takes for
-    /// `.koiignore`, such as `.KOIIGNORE`. A folder or a link of such a name is
-    /// not one. A rules file that cannot be read keeps the rules the folder
-    /// last had. When the folder had none, its rules are [`RulesRead::Unknown`],
-    /// and so are they when it holds two rules files.
     pub(crate) fn read(
         &mut self,
         dir: BorrowedFd<'_>,
@@ -287,8 +252,6 @@ impl<'r> Pending<'r> {
         }
     }
 
-    /// Whether the rules leave out the listed entry at `rel`. A name a rule
-    /// leaves out is recorded for its folder.
     pub(crate) fn leaves_out(&mut self, rel: &Path, kind: EntryKind) -> bool {
         match self.rules.status(rel, kind) {
             Ignored::No => false,
@@ -305,7 +268,6 @@ impl<'r> Pending<'r> {
         }
     }
 
-    /// Restores every rules file the scan changed.
     pub(crate) fn undo(self) {
         for (key, before) in self.before {
             let now = self.rules.files.get(&key).map(|(dir, _)| dir.clone());
@@ -317,7 +279,6 @@ impl<'r> Pending<'r> {
         }
     }
 
-    /// Replaces the left-out names of every folder the scan listed.
     pub(crate) fn settle(&mut self) {
         for (folder, names) in std::mem::take(&mut self.listed) {
             if let Some(Walk { listings: walk, .. }) = &mut self.rules.search.walk {
@@ -373,10 +334,6 @@ impl<'r> Pending<'r> {
         });
     }
 
-    /// Where the file `old` recorded now is, when the system names its
-    /// identity at or below a name the rules leave out and the entry there
-    /// still matches the record, so a file that reused the identity is not
-    /// taken for it.
     #[cfg(target_os = "macos")]
     pub(crate) fn locate(&self, root: BorrowedFd<'_>, old: &Entry) -> Option<PathBuf> {
         unsafe extern "C" {
@@ -757,9 +714,6 @@ impl<'r> Pending<'r> {
         seeded
     }
 
-    /// Drops the rules of every folder for which `is_folder` is false, and
-    /// returns the folders whose rules file this scan changed, with what each
-    /// one holds now, and the folders whose rules this scan established.
     pub(crate) fn finish(
         self,
         is_folder: impl Fn(&Path) -> bool,
@@ -795,25 +749,15 @@ impl<'r> Pending<'r> {
     }
 }
 
-/// A folder whose rules file a scan found changed, with the bytes it holds
-/// now, or `None` for a folder that has none any more.
 pub(crate) type RulesFile = (PathBuf, Option<Vec<u8>>);
 
-/// What [`Pending::read`] found of a folder's rules.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RulesRead {
-    /// The rules the folder had.
     Same,
     Changed,
-    /// The folder holds a rules file that cannot be read, and no earlier
-    /// scan read one for it, or two rules files whose names differ only in
-    /// case, so what the folder leaves out is not known.
     Unknown,
 }
 
-/// Reads the rules file `name` of the folder `dir`, or returns `None` when the
-/// folder holds no regular file of that name. Fails when the file cannot be
-/// read or is larger than [`MAX_RULES`].
 fn read_rules(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<Option<Vec<u8>>> {
     let regular = |stat: &Stat| stat.file_type == FileType::RegularFile;
     match stat_at(dir, name) {
