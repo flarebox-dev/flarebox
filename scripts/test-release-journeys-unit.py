@@ -118,6 +118,50 @@ class ReleaseJourneys(unittest.TestCase):
             with self.subTest(tag=tag), self.assertRaises(argparse.ArgumentTypeError):
                 DRIVER.tag_value(tag)
 
+    def test_fixed_installer_sources_share_the_accepted_digest_and_held_default(self):
+        payload = b"set -eu\n"
+        digest = DRIVER.hashlib.sha256(payload).hexdigest()
+        self.assertEqual(DRIVER.INSTALLER_SOURCES, {"held": DRIVER.HELD_URL, "live": "https://koidrive.com/install.sh"})
+        for selected in (None, "held", "live"):
+            evidence = self.evidence()
+            source = selected or "held"
+            with self.subTest(source=selected), patch.object(DRIVER, "HELD_SHA", digest), \
+                    patch.object(DRIVER, "download", side_effect=lambda _, url, path: path.write_bytes(payload)) as download:
+                script = DRIVER.verified_installer(evidence, self.root, *([] if selected is None else [selected]))
+            download.assert_called_once_with(evidence, DRIVER.INSTALLER_SOURCES[source], self.root / "install.sh")
+            self.assertEqual(script.read_bytes(), payload)
+            self.assertEqual(evidence.report["inputs"]["held-installer"]["source"], source)
+            self.assertEqual(evidence.report["inputs"]["held-installer"]["sha256"], digest)
+            evidence.directory.rename(self.root / ("evidence-" + str(selected)))
+
+    def test_both_installer_sources_refuse_changed_bytes_before_execution(self):
+        for source in DRIVER.INSTALLER_SOURCES:
+            evidence = self.evidence()
+            with self.subTest(source=source), patch.object(DRIVER, "download", side_effect=lambda _, url, path: path.write_bytes(b"changed")), \
+                    patch.object(evidence, "run") as run:
+                with self.assertRaises(RuntimeError):
+                    DRIVER.verified_installer(evidence, self.root, source)
+            run.assert_not_called()
+            self.assertFalse(evidence.report["assertions"][-1]["passed"])
+            evidence.directory.rename(self.root / ("evidence-" + source))
+
+    def test_installer_source_rejects_arbitrary_urls_before_creating_evidence(self):
+        for source in ("https://example.com/install.sh", "file:///tmp/install.sh", "LIVE", "held;exit 0"):
+            with self.subTest(source=source), patch.object(DRIVER, "Evidence") as evidence, patch("sys.stderr"):
+                with self.assertRaises(SystemExit) as error:
+                    DRIVER.main(["--tag", "v0.1.0-alpha.3", "--scenario", "installer", "--evidence", str(self.root), "--installer-source", source])
+            self.assertEqual(error.exception.code, 2)
+            evidence.assert_not_called()
+
+    def test_installer_source_is_wired_through_both_dispatch_routes(self):
+        installer = (DRIVER.REPO / ".github/workflows/installer.yml").read_text()
+        journeys = (DRIVER.REPO / ".github/workflows/release-journeys.yml").read_text()
+        self.assertIn("installer_source: ${{ inputs.installer_source }}", installer)
+        for workflow in (installer, journeys):
+            self.assertRegex(workflow, r"(?s)installer_source:\n.*?default: held\n.*?options: \[held, live\]")
+        self.assertIn("INSTALLER_SOURCE: ${{ inputs.installer_source || 'held' }}", journeys)
+        self.assertIn('--installer-source "$INSTALLER_SOURCE"', journeys)
+
     def test_checksums_allow_standard_text_and_binary_markers(self):
         result = DRIVER.checksums("a" * 64 + "  koi.tar.gz\n" + "b" * 64 + " *Koidrive.dmg\n")
         self.assertEqual(result, {"koi.tar.gz": "a" * 64, "Koidrive.dmg": "b" * 64})

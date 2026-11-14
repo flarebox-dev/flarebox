@@ -30,6 +30,7 @@ RELEASE = "https://github.com/koidrive/koidrive/releases/download"
 HELD_COMMIT = "b31c0c0232e1083c8b13210c59893c9eecd057f2"
 HELD_SHA = "ccc71c1fcd8381391ab57109d9d365afeea662c142dbbbda6bc4fe700460c276"
 HELD_URL = f"https://raw.githubusercontent.com/koidrive/koidrive/{HELD_COMMIT}/install.sh"
+INSTALLER_SOURCES = {"held": HELD_URL, "live": "https://koidrive.com/install.sh"}
 APP = Path("/Applications/Koidrive.app")
 TAP = "koidrive/tap/koidrive"
 SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
@@ -784,7 +785,17 @@ def stop_app(evidence, app):
         raise RuntimeError("Owned installed app did not terminate")
 
 
-def installer(evidence, root, ownership, assets):
+def verified_installer(evidence, root, source="held"):
+    url = INSTALLER_SOURCES[source]
+    script = root / "install.sh"
+    download(evidence, url, script)
+    evidence.report["inputs"]["held-installer"] = {"source": source, "url": url, "commit": HELD_COMMIT,
+                                                 "sha256": sha256(script), "transport": "https"}
+    evidence.check("held script verified", evidence.report["inputs"]["held-installer"]["sha256"] == HELD_SHA)
+    return script
+
+
+def installer(evidence, root, ownership, assets, source="held"):
     home = Path.home()
     binary = home / ".local/bin/koi"
     profile = home / ".zprofile"
@@ -792,6 +803,7 @@ def installer(evidence, root, ownership, assets):
         raise RuntimeError("Refusing symlinked shell profile")
     original = profile.read_bytes() if profile.exists() else None
     mode = profile.stat().st_mode & 0o777 if profile.exists() else 0o600
+    script = verified_installer(evidence, root, source)
     bootstrap = root / "bootstrap"
     bootstrap.mkdir()
     with tarfile.open(assets["koidrive-aarch64-apple-darwin.tar.gz"], "r:gz") as archive:
@@ -803,11 +815,6 @@ def installer(evidence, root, ownership, assets):
     (bootstrap / "koi").chmod(0o755)
     evidence.report["inputs"]["released-cli"] = {"archive": "koidrive-aarch64-apple-darwin.tar.gz", "sha256": sha256(bootstrap / "koi")}
     quarantine(evidence, bootstrap / "koi", required=False)
-    script = root / "install.sh"
-    download(evidence, HELD_URL, script)
-    evidence.report["inputs"]["held-installer"] = {"url": HELD_URL, "commit": HELD_COMMIT,
-                                                     "sha256": sha256(script), "transport": "https"}
-    evidence.check("held script verified", evidence.report["inputs"]["held-installer"]["sha256"] == HELD_SHA)
     version(evidence, bootstrap / "koi", "bootstrap version")
     peer_env = {**evidence.env, "XDG_CONFIG_HOME": str(root / "peer/config"),
                 "XDG_STATE_HOME": str(root / "peer/state"), "XDG_RUNTIME_DIR": str(root / "peer/runtime")}
@@ -904,6 +911,7 @@ def main(argv=None):
     parser.add_argument("--tag", required=True, type=tag_value)
     parser.add_argument("--scenario", required=True, choices=SCENARIOS)
     parser.add_argument("--evidence", required=True, type=Path)
+    parser.add_argument("--installer-source", choices=INSTALLER_SOURCES, default="held")
     args = parser.parse_args(argv)
     evidence = Evidence(args.evidence, args.tag, args.scenario)
     root = None
@@ -922,7 +930,7 @@ def main(argv=None):
             ownership = Ownership()
             clean_account(evidence, ownership)
             if args.scenario == "installer":
-                installer(evidence, root, ownership, assets)
+                installer(evidence, root, ownership, assets, args.installer_source)
             else:
                 brew_scenario(evidence, root, ownership, entries, args.scenario == "formula-conflict")
     except (Exception, KeyboardInterrupt) as error:

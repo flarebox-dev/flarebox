@@ -21,6 +21,11 @@ on:
         description: Run hosted release journeys for this tag instead of the served-script check
         required: false
         type: string
+      installer_source:
+        description: Fixed installer source, verified against the accepted SHA-256
+        type: choice
+        default: held
+        options: [held, live]
 
 permissions:
   contents: read
@@ -94,3 +99,4 @@ jobs:
     uses: ./.github/workflows/release-journeys.yml
     with:
       tag: ${{ inputs.release_tag }}
+      installer_source: ${{ inputs.installer_source }}

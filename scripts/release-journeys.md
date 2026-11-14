@@ -13,6 +13,8 @@ Each runtime case gets a separate [GitHub-hosted macOS 26 runner](https://docs.g
 
 The shell case uses immutable installer commit `b31c0c0232e1083c8b13210c59893c9eecd057f2`, checked against SHA-256 `ccc71c1fcd8381391ab57109d9d365afeea662c142dbbbda6bc4fe700460c276`. It exercises the installer before publication without deploying it. A local Worker and public CLI commands supply test authentication and a shared folder. They do not substitute for the installer or pre-link its folder.
 
+The `installer_source` input defaults to `held`, the immutable raw URL. Set it to `live` to download `https://koidrive.com/install.sh` after deployment. Both sources must match the same accepted SHA-256 before any installer or bootstrap CLI executes. No custom URL or digest input is accepted.
+
 Each job uploads sanitized commands, transcripts, assertions, and cleanup results as `release-journeys-*` artifacts. A failed prerequisite, runtime assertion, or cleanup fails the job. Read the formula-conflict artifact first when checking coexistence.
 
 Cleanup checks the native unregister hook and absence of owned launchd jobs. It does not independently inspect the macOS background-task database or assert menu attachment.
@@ -22,6 +24,8 @@ Release publication starts this workflow. The CLI distribution workflow also cal
 CLI distribution runs the Homebrew cases only when both tap entries select the published tag. If the tap retains another release, distribution still checks the published assets and shell installer.
 
 Before the workflow is on the default branch, run the existing **Installer** workflow from the proposed branch with `release_tag` set. That invokes the same reusable workflow without redeploying the site.
+
+For post-deploy acceptance, use **Installer** with `release_tag=v0.1.0-alpha.3` and `installer_source=live`, after confirming that the merged and served script match the accepted digest. The source and downloaded hash are retained in the installer artifact.
 
 Run the non-mutating unit tests locally:
 
