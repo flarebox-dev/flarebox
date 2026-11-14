@@ -118,6 +118,47 @@ class OwnedProcess(subprocess.Popen):
         kwargs["start_new_session"] = True
         super().__init__(*args, **kwargs)
         self.group_closed = False
+        self.group_uid = os.getuid()
+        self.group_observations = []
+
+
+def group_census(process, phase, error):
+    observation = {"phase": phase, "errno": error.errno, "members": []}
+    process.group_observations.append(observation)
+    try:
+        if error.errno != errno.EPERM:
+            raise RuntimeError("Unexpected owned-group permission error")
+        result = subprocess.run(["/bin/ps", "-axo", "pid=,pgid=,uid=,stat="],
+                                capture_output=True, text=True, timeout=3)
+        observation.update(status=result.returncode, stderr=result.stderr)
+        if result.returncode != 0 or result.stderr.strip() or not result.stdout.strip():
+            raise RuntimeError("Process-table census did not complete successfully")
+        seen = set()
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if (len(fields) != 4 or not all(re.fullmatch(r"[0-9]+", value) for value in fields[:3])
+                    or not re.fullmatch(r"[RSDTtXZWIU?][+<>=ANLSEVWXsl]*", fields[3])):
+                raise RuntimeError("Malformed process-table census")
+            pid, pgid, uid = map(int, fields[:3])
+            if pid in seen:
+                raise RuntimeError("Duplicate process in process-table census")
+            seen.add(pid)
+            if pgid == process.pid:
+                observation["members"].append({"pid": pid, "pgid": pgid, "uid": uid, "stat": fields[3]})
+        observation["rows"] = len(seen)
+        if any(member["uid"] != process.group_uid for member in observation["members"]):
+            raise RuntimeError("Foreign process in owned group census")
+        if any(not member["stat"].startswith("Z") for member in observation["members"]):
+            raise RuntimeError("Live process remains in owned group census")
+        if phase != "signal-zero":
+            raise RuntimeError("Permission failure in owned-group " + phase)
+    except Exception as failure:
+        observation.update(decision="rejected", reason=str(failure))
+        raise RuntimeError("Could not verify owned process group " + str(process.pid) + ": " + str(failure)) from failure
+    observation["decision"] = "no-live-members"
+    process.group_closed = True
+    process.poll()
+    return False
 
 
 def group_present(process):
@@ -126,9 +167,14 @@ def group_present(process):
     if process.group_closed:
         return False
     exited = process.poll() is not None
+    phase = "getpgid"
     try:
         pgid = os.getpgid(process.pid)
+        phase = "getsid"
         sid = os.getsid(process.pid)
+    except PermissionError as error:
+        group_census(process, phase, error)
+        raise
     except ProcessLookupError:
         if not exited and process.poll() is None:
             raise RuntimeError("Could not verify the owned session leader")
@@ -137,6 +183,8 @@ def group_present(process):
             raise RuntimeError("Refusing to signal a changed or reused session leader")
     try:
         os.killpg(process.pid, 0)
+    except PermissionError as error:
+        return group_census(process, "signal-zero", error)
     except ProcessLookupError:
         process.group_closed = True
         process.poll()
@@ -150,6 +198,9 @@ def stop_group(process, term_timeout=8, kill_timeout=8):
             return
         try:
             os.killpg(process.pid, signum)
+        except PermissionError as error:
+            group_census(process, signal.Signals(signum).name, error)
+            raise
         except ProcessLookupError:
             process.group_closed = True
             process.poll()
@@ -218,6 +269,7 @@ class Evidence:
         process = OwnedProcess(argv, env=self.env if env is None else env, cwd=REPO,
                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE)
+        record["group"] = {"pgid": process.pid, "uid": process.group_uid, "observations": process.group_observations}
         out = Capture(process.stdout, self.directory / record["stdout"], self.secrets)
         err = Capture(process.stderr, self.directory / record["stderr"], self.secrets)
         self.processes.append((process, record, out, err))
@@ -244,22 +296,23 @@ class Evidence:
             raise RuntimeError(f"Command {len(self.report['commands'])} exited {status}; see sanitized evidence")
         return status, out, err
 
-    def cleanup(self, name, action):
+    def cleanup(self, name, action, group=None):
         try:
             action()
         except Exception as error:
-            self.report["cleanup"].append({"name": name, "passed": False,
-                                            "detail": sanitized(str(error), self.secrets)})
-            return False
+            outcome = {"name": name, "passed": False, "detail": sanitized(str(error), self.secrets)}
         else:
-            self.report["cleanup"].append({"name": name, "passed": True})
-            return True
+            outcome = {"name": name, "passed": True}
+        if group is not None:
+            outcome["group"] = group
+        self.report["cleanup"].append(outcome)
+        return outcome["passed"]
 
     def close(self):
         for item in reversed(self.processes):
             process, record, _, _ = item
             if not process.group_closed:
-                self.cleanup("owned process group", lambda p=process: stop_group(p))
+                self.cleanup("owned process group", lambda p=process: stop_group(p), group=record["group"])
             if record["status"] is None:
                 self.cleanup("owned process logs", lambda i=item: self.finish(i, 10))
         self.report["passed"] = passed(self.report)
@@ -633,6 +686,7 @@ def attended(evidence, command, folder, timeout=360):
     try:
         process = OwnedProcess([sys.executable, "-c", bootstrap, command], env=env, cwd=REPO,
                                stdin=slave, stdout=slave, stderr=slave)
+        record["group"] = {"pgid": process.pid, "uid": process.group_uid, "observations": process.group_observations}
         os.close(slave)
         slave = None
         deadline = time.monotonic() + timeout
@@ -874,9 +928,9 @@ def main(argv=None):
     except (Exception, KeyboardInterrupt) as error:
         evidence.report["errors"].append(sanitized(str(error), evidence.secrets))
     finally:
-        for process, _, _, _ in evidence.processes:
+        for process, record, _, _ in evidence.processes:
             if not process.group_closed:
-                evidence.cleanup("stop owned process group", lambda p=process: stop_group(p))
+                evidence.cleanup("stop owned process group", lambda p=process: stop_group(p), group=record["group"])
         if root is not None:
             if all(item["passed"] for item in evidence.report["cleanup"]):
                 evidence.cleanup("owned temporary directory", lambda: shutil.rmtree(root))

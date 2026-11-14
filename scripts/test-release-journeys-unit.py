@@ -3,6 +3,7 @@
 
 import argparse
 import copy
+import errno
 import importlib.util
 import json
 import os
@@ -100,6 +101,13 @@ class ReleaseJourneys(unittest.TestCase):
         except PermissionError:
             return True
         return True
+
+    def census_process(self):
+        process = unittest.mock.Mock(pid=12345)
+        process.group_uid = 501
+        process.group_closed = False
+        process.group_observations = []
+        return process
 
     def test_strict_tags(self):
         for tag in ("v0.1.0-alpha.3", "v1.2.3", "v10.20.30-rc.0"):
@@ -666,6 +674,110 @@ class ReleaseJourneys(unittest.TestCase):
             self.assertFalse(evidence.cleanup("owned group", lambda: DRIVER.stop_group(process, term_timeout=0, kill_timeout=0)))
         self.assertEqual(killpg.call_args_list, [unittest.mock.call(12345, signal.SIGTERM), unittest.mock.call(12345, signal.SIGKILL)])
         self.assertIn("survived SIGKILL", evidence.report["cleanup"][0]["detail"])
+
+    def test_eperm_census_accepts_only_empty_or_owned_zombie_groups(self):
+        for rows in ("1 1 0 S\n", "1 1 0 ?Es\n", "1 1 0 S\n12346 12345 501 ZN\n12347 12345 501 Z\n"):
+            process = self.census_process()
+            result = subprocess.CompletedProcess([], 0, rows, "")
+            with self.subTest(rows=rows), patch.object(DRIVER.subprocess, "run", return_value=result) as run:
+                self.assertFalse(DRIVER.group_census(process, "signal-zero", PermissionError(errno.EPERM, "probe denied")))
+            run.assert_called_once_with(["/bin/ps", "-axo", "pid=,pgid=,uid=,stat="], capture_output=True, text=True, timeout=3)
+            self.assertTrue(process.group_closed)
+            self.assertEqual(process.group_observations[0]["decision"], "no-live-members")
+            self.assertTrue(all(set(member) == {"pid", "pgid", "uid", "stat"}
+                                for member in process.group_observations[0]["members"]))
+
+    def test_eperm_census_rejects_live_foreign_and_malformed_members(self):
+        rows = ("1 1 0 S\n12346 12345 501 S\n", "1 1 0 S\n12346 12345 0 Z\n",
+                "1 1 0 S\n12346 12345 501 ?Es\n",
+                "1 1 0 S\n12346 12345 0 R\n", "PID PGID UID STAT\n", "\n", "",
+                "1 1 0 S\n12346 12345 501 Z extra-secret-argv\n", "1 1 0 S\n12346 12345 user Z\n",
+                "1 1 0 S\n12346 12345 501 Zinvalid\n", "1 1 0 S\n1 1 0 S\n",
+                "1 1 0 S\n12346 -12345 501 Z\n")
+        for text in rows:
+            process = self.census_process()
+            with self.subTest(rows=text), patch.object(DRIVER.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, text, "")):
+                with self.assertRaisesRegex(RuntimeError, "Could not verify owned process group"):
+                    DRIVER.group_census(process, "signal-zero", PermissionError(errno.EPERM, "probe denied"))
+            self.assertFalse(process.group_closed)
+            self.assertEqual(process.group_observations[0]["decision"], "rejected")
+            self.assertNotIn("extra-secret-argv", json.dumps(process.group_observations))
+
+    def test_eperm_census_failure_or_timeout_never_confirms_absence(self):
+        failures = [subprocess.CompletedProcess([], 1, "1 1 0 S\n", ""),
+                    subprocess.CompletedProcess([], 0, "1 1 0 S\n", "permission denied"),
+                    PermissionError(errno.EPERM, "census denied"),
+                    subprocess.TimeoutExpired("ps", 3)]
+        for failure in failures:
+            process = self.census_process()
+            behavior = {"side_effect": failure} if isinstance(failure, Exception) else {"return_value": failure}
+            with self.subTest(failure=str(failure)), patch.object(DRIVER.subprocess, "run", **behavior):
+                with self.assertRaisesRegex(RuntimeError, "Could not verify owned process group"):
+                    DRIVER.group_census(process, "signal-zero", PermissionError(errno.EPERM, "probe denied"))
+            self.assertFalse(process.group_closed)
+            self.assertEqual(process.group_observations[0]["decision"], "rejected")
+
+    def test_only_eperm_can_use_the_process_table_fallback(self):
+        for failure in (PermissionError(errno.EACCES, "access denied"), PermissionError("unknown denial")):
+            process = self.census_process()
+            with self.subTest(error=str(failure)), patch.object(DRIVER.subprocess, "run") as run:
+                with self.assertRaisesRegex(RuntimeError, "Unexpected owned-group permission error"):
+                    DRIVER.group_census(process, "signal-zero", failure)
+            run.assert_not_called()
+            self.assertFalse(process.group_closed)
+
+    def test_non_probe_eperm_is_not_permission_to_close_a_group(self):
+        result = subprocess.CompletedProcess([], 0, "1 1 0 S\n", "")
+        for phase in ("getpgid", "getsid", "SIGTERM", "SIGKILL"):
+            process = self.census_process()
+            with self.subTest(phase=phase), patch.object(DRIVER.subprocess, "run", return_value=result):
+                with self.assertRaisesRegex(RuntimeError, "Permission failure in owned-group " + phase):
+                    DRIVER.group_census(process, phase, PermissionError(errno.EPERM, "denied"))
+            self.assertFalse(process.group_closed)
+            self.assertEqual(process.group_observations[0]["phase"], phase)
+            self.assertEqual(process.group_observations[0]["status"], 0)
+
+    @unittest.skipUnless(os.name == "posix", "Process groups require POSIX")
+    def test_eperm_census_is_persisted_in_command_and_cleanup_evidence(self):
+        evidence = self.evidence()
+        item = evidence.start([sys.executable, "-c", "pass"])
+        item[0].wait(timeout=3)
+        item[1]["status"] = 0
+        result = subprocess.CompletedProcess([], 0, "1 1 0 S\n", "")
+        with patch.object(DRIVER.os, "killpg", side_effect=PermissionError(errno.EPERM, "probe denied")), \
+                patch.object(DRIVER.subprocess, "run", return_value=result), patch("builtins.print"):
+            evidence.close()
+        report = json.loads((evidence.directory / "report.json").read_text())
+        command = report["commands"][0]["group"]
+        cleanup = report["cleanup"][0]["group"]
+        self.assertEqual(command, cleanup)
+        self.assertEqual(command["pgid"], item[0].pid)
+        self.assertEqual(command["observations"][0]["phase"], "signal-zero")
+        self.assertEqual(command["observations"][0]["decision"], "no-live-members")
+        self.assertTrue(report["cleanup"][0]["passed"])
+
+    @unittest.skipUnless(DRIVER.platform.system() == "Darwin", "Darwin zombie-only EPERM reproduction")
+    def test_real_darwin_zombie_group_requires_successful_census_before_closing(self):
+        process = DRIVER.OwnedProcess(["/usr/bin/true"], stdin=subprocess.DEVNULL,
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(process.wait, timeout=3)
+
+        def zombie_ready():
+            result = subprocess.run(["/bin/ps", "-p", str(process.pid), "-o", "stat="],
+                                    capture_output=True, text=True, timeout=3)
+            return result.returncode == 0 and result.stdout.strip().startswith("Z")
+
+        self.assertTrue(DRIVER.until(zombie_ready, 3))
+        with self.assertRaises(PermissionError) as caught:
+            os.killpg(process.pid, 0)
+        self.assertEqual(caught.exception.errno, errno.EPERM)
+        self.assertFalse(DRIVER.group_census(process, "signal-zero", caught.exception))
+        self.assertTrue(process.group_closed)
+        members = process.group_observations[0]["members"]
+        self.assertEqual([member["pid"] for member in members], [process.pid])
+        self.assertTrue(members[0]["stat"].startswith("Z"))
+        self.assertEqual(members[0]["uid"], os.getuid())
+        self.assertTrue(DRIVER.until(lambda: not self.group_exists(process.pid), 3))
 
     @unittest.skipUnless(os.name == "posix", "Workflow shell selection requires POSIX")
     def test_release_tap_selection_runs_actual_workflow_shell_on_final_tap_state(self):
