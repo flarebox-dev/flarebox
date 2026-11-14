@@ -6233,3 +6233,42 @@ fn a_removal_done_before_a_crash_stays_the_engines_when_the_user_renamed_its_fol
     ];
     converge(3, &phases).unwrap();
 }
+
+#[test]
+fn a_lost_write_resent_over_a_restore_to_an_earlier_write_of_the_same_bytes_converges() {
+    use Step::*;
+    let phases = vec![
+        vec![
+            (2, drawn(1, 0, 0, 0)),
+            (0, Work(0)),
+            (1, drawn(1, 0, 0, 3)),
+            (1, drawn(0, 0, 0, 4)),
+            (0, drawn(1, 0, 0, 0)),
+            (0, drawn(2, 0, 0, 0)),
+            (0, Work(0)),
+            (0, drawn(0, 0, 0, 0)),
+        ],
+        vec![
+            (0, drawn(0, 0, 6327704831422908187, 0)),
+            (0, Work(0)),
+            (0, drawn(2, 1788996128876694462, 0, 0)),
+            (1, drawn(3, 14504563550781249349, 2489372962679366448, 1)),
+            (0, drawn(2, 753924341053216599, 0, 0)),
+            (0, Backup),
+            (1, drawn(0, 0, 0, 2)),
+            (0, drawn(0, 0, 0, 5)),
+        ],
+        vec![
+            (1, drawn(2, 4655060049021631170, 0, 0)),
+            (1, Work(0)),
+            (1, Work(0)),
+            (1, Work(0)),
+            (0, Work(0)),
+            (0, Restore),
+            (1, Connect),
+            (1, Work(0)),
+            (1, Work(2136170869829380609)),
+        ],
+    ];
+    converge(3, &phases).unwrap();
+}
