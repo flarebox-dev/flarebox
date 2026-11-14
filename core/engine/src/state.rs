@@ -107,8 +107,9 @@ pub struct TreesState {
     /// of a folder L holds it under, beats the resend unless L holds a change of this device's user
     /// below it: S then takes L's shape, so the delete reaches L. So does R taking the node again,
     /// live with the content L holds, after R lacked it. The record also ends when S takes L's shape
-    /// or L changes the node. A folder S holds and R lacks that L holds such a change under is sent
-    /// again as a resend.
+    /// or L changes the node. A file whose resend ends with a change of this device's user holds an
+    /// edit the server does not have ([`TreesState::unsent_edits`]). A folder S holds and R lacks
+    /// that L holds such a change under is sent again as a resend.
     pub resends: BTreeSet<NodeId>,
     /// The nodes L holds a change of this device's user in: a scan found L's shape changed, a
     /// rekey made L's copy, L holds a shape other than the one the server took from a commit of
