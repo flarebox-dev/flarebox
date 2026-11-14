@@ -719,6 +719,25 @@ class ReleaseJourneys(unittest.TestCase):
         self.assertEqual(killpg.call_args_list, [unittest.mock.call(12345, signal.SIGTERM), unittest.mock.call(12345, signal.SIGKILL)])
         self.assertIn("survived SIGKILL", evidence.report["cleanup"][0]["detail"])
 
+    def test_missing_leader_waits_for_confirmed_exit_before_probing_descendants(self):
+        process = unittest.mock.Mock(spec=DRIVER.OwnedProcess, pid=12345, group_closed=False)
+        process.poll.return_value = None
+        with patch.object(DRIVER.os, "getpgid", side_effect=ProcessLookupError), patch.object(DRIVER.os, "killpg") as killpg:
+            self.assertTrue(DRIVER.group_present(process))
+        process.wait.assert_called_once_with(timeout=1)
+        killpg.assert_called_once_with(process.pid, 0)
+        self.assertFalse(process.group_closed)
+
+    def test_missing_leader_without_confirmed_exit_cannot_signal_or_close_group(self):
+        process = unittest.mock.Mock(spec=DRIVER.OwnedProcess, pid=12345, group_closed=False)
+        process.poll.return_value = None
+        process.wait.side_effect = subprocess.TimeoutExpired("owned", 1)
+        with patch.object(DRIVER.os, "getpgid", side_effect=ProcessLookupError), patch.object(DRIVER.os, "killpg") as killpg:
+            with self.assertRaisesRegex(RuntimeError, "Could not verify the owned session leader"):
+                DRIVER.group_present(process)
+        killpg.assert_not_called()
+        self.assertFalse(process.group_closed)
+
     def test_eperm_census_accepts_only_empty_or_owned_zombie_groups(self):
         for rows in ("1 1 0 S\n", "1 1 0 ?Es\n", "1 1 0 S\n12346 12345 501 ZN\n12347 12345 501 Z\n"):
             process = self.census_process()

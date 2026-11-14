@@ -177,8 +177,11 @@ def group_present(process):
         group_census(process, phase, error)
         raise
     except ProcessLookupError:
-        if not exited and process.poll() is None:
-            raise RuntimeError("Could not verify the owned session leader")
+        if not exited:
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired as error:
+                raise RuntimeError("Could not verify the owned session leader") from error
     else:
         if exited or pgid != process.pid or sid != process.pid:
             raise RuntimeError("Refusing to signal a changed or reused session leader")
