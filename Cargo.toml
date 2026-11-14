@@ -18,6 +18,7 @@ members = [
     "core/store",
     "core/telemetry",
     "core/test-support",
+    "tools/uniffi-bindgen-swift",
 ]
 
 [workspace.package]

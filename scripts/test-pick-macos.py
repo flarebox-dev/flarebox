@@ -12,7 +12,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = ROOT / ".github/workflows/ci.yml"
-JOBS = ("macos_app", "rust", "server", "spec", "runner_hook")
+JOBS = ("macos_app", "rust", "rust_driver", "rust_engine", "server", "spec", "runner_hook")
 SELF_HOSTED = ["self-hosted", "custom-mac", "ARM64"]
 XCODE = "/Applications/Xcode_27.2.app/Contents/Developer"
 SELF_XCODE = "/Applications/Xcode.app/Contents/Developer"
@@ -142,7 +142,7 @@ class Picker(unittest.TestCase):
         self.assertIn("to_self_hosted=1 to_hosted=2", self.log)
 
     def test_enough_idle_runners_avoid_hosted_api(self):
-        self.assert_routes(self.pick(labels=SELF_HOSTED, runners=[runner()] * 5), JOBS)
+        self.assert_routes(self.pick(labels=SELF_HOSTED, runners=[runner()] * 7), JOBS)
         self.assertEqual(self.requests, ["runners?per_page=100"])
 
     def test_shared_cap_counts_both_labels_once_and_ignores_self_hosted_and_completed(self):
@@ -151,8 +151,8 @@ class Picker(unittest.TestCase):
                 hosted_job("SELF-HOSTED", "xcode-27"), hosted_job("macos-15", status="completed"),
                 hosted_job("xcode-27", status="completed"), hosted_job("ubuntu-latest")]
         outputs = self.pick(labels=SELF_HOSTED, runners=[runner(busy=True)], jobs=jobs)
-        self.assert_routes(outputs, ("rust", "server", "spec", "runner_hook"))
-        self.assertIn("hosted_load=4 hosted_cap=5 to_self_hosted=4 to_hosted=1", self.log)
+        self.assert_routes(outputs, ("rust", "rust_driver", "rust_engine", "server", "spec", "runner_hook"))
+        self.assertIn("hosted_load=4 hosted_cap=5 to_self_hosted=6 to_hosted=1", self.log)
         self.assertEqual(self.requests.count("runs/1/jobs?filter=latest&per_page=100&page=1"), 1)
 
     def test_full_shared_cap_queues_for_self_hosted(self):
@@ -163,7 +163,32 @@ class Picker(unittest.TestCase):
     def test_hosted_cap_preserves_priority_after_idle_assignment(self):
         jobs = [hosted_job("xcode-27")] * 4
         outputs = self.pick(labels=SELF_HOSTED, runners=[runner()], jobs=jobs)
-        self.assert_routes(outputs, ("macos_app", "server", "spec", "runner_hook"))
+        self.assert_routes(outputs, ("macos_app", "rust_driver", "rust_engine", "server", "spec", "runner_hook"))
+
+    def test_rust_shards_consume_separate_slots(self):
+        outputs = self.pick(labels=SELF_HOSTED, wanted=("rust", "rust_driver", "rust_engine"),
+                            runners=[runner()], jobs=[hosted_job("macos-15")] * 4)
+        self.assert_routes(outputs, ("rust", "rust_engine"))
+        self.assertIn("hosted_load=4 hosted_cap=5 to_self_hosted=2 to_hosted=1", self.log)
+
+    def test_push_reuses_rust_only_when_all_macos_shards_pass(self):
+        names = ("rust (macos)", "rust tests (macos, driver)", "rust tests (macos, engine)")
+        for missing in (None, *names):
+            with self.subTest(missing=missing):
+                fixtures = {
+                    "workflows/ci.yml/runs?event=merge_group&head_sha=fixture-sha&status=success&per_page=1": {
+                        "workflow_runs": [{"id": 1, "html_url": "https://fixture.invalid/run"}]},
+                    "runs/1/jobs?filter=latest&per_page=100": {
+                        "jobs": [{"name": name, "conclusion": "success"} for name in names if name != missing]},
+                }
+                (self.dir / "fixtures").write_text(json.dumps(fixtures))
+                (self.dir / "requests").write_text("")
+                result, outputs = self.run_script(inline_script("changes"), {
+                    "EVENT": "push", "GITHUB_SHA": "fixture-sha", "GITHUB_REPOSITORY": "koidrive/koidrive",
+                    "REQUESTS": str(self.dir / "requests"), "FIXTURES": str(self.dir / "fixtures"),
+                })
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(outputs["rust_macos"], "covered" if missing is None else "true")
 
     def test_missing_status_token_falls_back_without_api(self):
         self.assert_routes(self.pick(labels=SELF_HOSTED, env={"RUNNER_STATUS_TOKEN": ""}))
