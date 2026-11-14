@@ -667,12 +667,10 @@ def pipeline(script):
     return "curl -fsSL -- " + shlex.quote(Path(script).resolve().as_uri()) + " | sh"
 
 
-def attended(evidence, command, folder, timeout=360):
+def attended(evidence, command, timeout=360):
     import pty
 
-    expected = [(r"Which shared folder should sync here\?\r?\n  1\. Journey\r?\n  2\. Create a shared folder\r?\nChoose 1 to 2: ", "1\n"),
-                (re.escape("Press Enter to use this folder, or type another path: "), str(folder) + "\n"),
-                (re.escape(f"Create {folder}? [Y/n] "), "y\n")]
+    expected = [(r"Which shared folder should sync here\?\r?\n  1\. Journey\r?\n  2\. Create a shared folder\r?\nChoose 1 to 2: ", "1\n")]
     master, slave = pty.openpty()
     process = None
     transcript = ""
@@ -864,16 +862,16 @@ def installer(evidence, root, ownership, assets, source="held", reference="accep
                 "XDG_STATE_HOME": str(root / "peer/state"), "XDG_RUNTIME_DIR": str(root / "peer/runtime")}
     profiles = {str(home / ".local/state"), peer_env["XDG_STATE_HOME"]}
     owned_labels = {"dev.koidrive.koi"}
+    folder = ownership.claim(home / "Koidrive")
     try:
         url, claim = worker(evidence, root)
         koi_json(evidence, bootstrap / "koi", "server", "claim", url, claim, "--user", "Journey", "--name", "Journey")
         space = koi_json(evidence, bootstrap / "koi", "space", "create", "Journey")
         status = koi_json(evidence, bootstrap / "koi", "status")
         evidence.check("unlinked before setup", bool(space.get("space_id")) and not status.get("folders"))
-        folder = root / "Sync"
-        code, transcript, answers = attended(evidence, pipeline(script), folder)
-        evidence.check("attended setup", code == 0 and answers == 3
-                       and f"Done. Linked {folder} to Journey." in transcript,
+        code, transcript, answers = attended(evidence, pipeline(script))
+        evidence.check("attended setup", code == 0 and answers == 1
+                       and "~/Koidrive is linked to Journey." in transcript and "Setup complete." in transcript,
                        f"status={code}, answered={answers}")
         version(evidence, binary, "installed version")
         evidence.check("installed CLI matches released bytes", sha256(binary) == sha256(bootstrap / "koi"))
@@ -925,7 +923,7 @@ def installer(evidence, root, ownership, assets, source="held", reference="accep
         binaries = [binary, APP / "Contents/Helpers/koi", home / "Applications/Koidrive.app/Contents/Helpers/koi"]
         safe &= evidence.cleanup("owned native services", lambda: owned_labels.update(service_cleanup(evidence, profiles, binaries)))
         if safe:
-            for path in state_paths(home):
+            for path in [*state_paths(home), folder]:
                 evidence.cleanup("owned state " + str(path), lambda p=path: ownership.remove(p))
 
         def restore_profile():

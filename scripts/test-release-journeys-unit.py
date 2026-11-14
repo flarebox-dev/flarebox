@@ -710,7 +710,6 @@ class ReleaseJourneys(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "Controlling PTYs require POSIX")
     def test_pty_keeps_installer_stdin_a_pipe_and_answers_real_tty(self):
         evidence = self.evidence("installer")
-        folder = self.root / "Sync"
         probe = self.root / "harmless-probe.sh"
         python = "\n".join([
             "import os,stat,sys",
@@ -723,25 +722,22 @@ class ReleaseJourneys(unittest.TestCase):
             "assert os.tcgetpgrp(tty.fileno())==os.getpgrp()",
             "print('Which shared folder should sync here?\\n  1. Journey\\n  2. Create a shared folder\\nChoose 1 to 2: ',end='',flush=True)",
             "assert tty.readline().strip()=='1'",
-            "print('Press Enter to use this folder, or type another path: ',end='',flush=True)",
-            "assert tty.readline().strip()==" + repr(str(folder)),
-            "print(" + repr(f"Create {folder}? [Y/n] ") + ",end='',flush=True)",
-            "assert tty.readline().strip()=='y'",
-            "print(" + repr(f"Done. Linked {folder} to Journey.") + ")",
+            "print('~/Koidrive is linked to Journey.')",
+            "print('Setup complete. Add files to ~/Koidrive.')",
         ])
         probe.write_text("exec " + shlex.quote(sys.executable) + " -c " + shlex.quote(python) + "\n")
-        code, transcript, answers = DRIVER.attended(evidence, DRIVER.pipeline(probe), folder, timeout=10)
+        code, transcript, answers = DRIVER.attended(evidence, DRIVER.pipeline(probe), timeout=10)
         self.assertEqual(code, 0, transcript)
-        self.assertEqual(answers, 3)
-        self.assertIn(f"Done. Linked {folder} to Journey.", transcript)
+        self.assertEqual(answers, 1)
+        self.assertIn("~/Koidrive is linked to Journey.", transcript)
 
     @unittest.skipUnless(os.name == "posix", "Controlling PTYs require POSIX")
     def test_pty_without_prompts_does_not_synthesize_completion(self):
         evidence = self.evidence("installer")
-        code, transcript, answers = DRIVER.attended(evidence, "printf 'no setup happened\\n'", self.root / "Sync", timeout=5)
+        code, transcript, answers = DRIVER.attended(evidence, "printf 'no setup happened\\n'", timeout=5)
         self.assertEqual(code, 0)
         self.assertEqual(answers, 0)
-        self.assertNotIn("Done. Linked", transcript)
+        self.assertNotIn("is linked to", transcript)
 
     def test_pipeline_quotes_file_url_without_options_or_setup_bypass(self):
         command = DRIVER.pipeline(self.root / "a 'b; c.sh")
