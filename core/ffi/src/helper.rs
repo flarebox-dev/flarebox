@@ -329,6 +329,7 @@ pub(crate) struct FolderData {
 impl FolderData {
     fn driver(self) -> driver::FolderStatus {
         driver::FolderStatus {
+            recovery: None,
             space_id: self.space_id,
             space_name: self.space_name,
             path: self.path,
@@ -438,7 +439,11 @@ impl DecisionData {
                 kind @ driver::QuestionKind::Conflict { .. } => kind.clone(),
                 _ => return None,
             },
-            DecisionKind::Recovery => driver::QuestionKind::Recovery { group: self.group? },
+            DecisionKind::Recovery => driver::QuestionKind::Recovery {
+                group: self.group?,
+                sent_in: None,
+                cause: None,
+            },
             DecisionKind::Other => return None,
         };
         Some(driver::Question {

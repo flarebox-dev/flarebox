@@ -125,6 +125,8 @@ pub enum RestoreRejection {
     Root,
     /// The server takes no writes from this device.
     ReadOnly,
+    /// The person cancelled it during recovery (design §6.4).
+    Cancelled,
     /// A reason this build does not know, as the server spells it.
     Other(String),
 }
@@ -147,6 +149,7 @@ impl From<&Outcome> for RestoreState {
                     Rejection::Cycle => RestoreRejection::Cycle,
                     Rejection::Root => RestoreRejection::Root,
                     Rejection::ReadOnly => RestoreRejection::ReadOnly,
+                    Rejection::Cancelled => RestoreRejection::Cancelled,
                     Rejection::Other(reason) => RestoreRejection::Other(reason.clone()),
                 },
             },

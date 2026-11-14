@@ -18,8 +18,6 @@ use koidrive_engine::ignore::RuleFile;
 
 use koidrive_engine::names::{MAX_NAME_BYTES, nfc, normalize_name};
 
-use koidrive_engine::question::Answer;
-
 use koidrive_engine::state::{CommitsState, MovedHere, Pending, TreesState};
 
 use koidrive_engine::tree::{Content, FileIdentity, Kind, LocalNode, RemoteNode, Shape};
@@ -1199,6 +1197,7 @@ fn reparent_a_folder_at_its_pending_name(answer_first: bool) {
         Some(("x", "A (pending)"))
     );
 }
+use koidrive_engine::question::{Answer, RecoveryCause, RecoveryTrigger};
 
 fn owed_mv(node: &str, parent: &str, name: &str, from: &str) -> op::Op {
     op::Op::Move(proto::Move {

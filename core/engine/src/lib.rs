@@ -16,6 +16,7 @@ pub mod ids;
 pub mod ignore;
 pub mod names;
 pub mod question;
+mod recovery;
 pub mod restore;
 pub mod state;
 pub mod tracked;

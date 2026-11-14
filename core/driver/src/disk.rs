@@ -32,7 +32,7 @@
 //! through the locked descriptor.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
@@ -49,7 +49,8 @@ use koidrive_engine::effects::{
     EffectRecord, Location as EngineLocation, location_of,
 };
 use koidrive_engine::ignore::is_rules_file;
-use koidrive_engine::tree::{Content, Kind};
+use koidrive_engine::question::{RecoveryCause, RecoveryTrigger};
+use koidrive_engine::tree::{Content, Kind, LocalNode};
 use koidrive_fs::{
     Action, Base, Contents, Dir, Displaced, Effect, Entry, EntryKind, FileId, Location, Marker,
     Outcome, Reason, Reclaimed, RootProblem, Space, Step,
@@ -89,11 +90,6 @@ pub(crate) enum Stop {
     #[error("the folder's file system has no rename that refuses to replace its target")]
     NoReplace,
     #[error(
-        "the root marker counts {marker} effects, more than the {upper} the store accounts for: the store is older \
-         than the folder"
-    )]
-    StoreBehind { marker: u64, upper: u64 },
-    #[error(
         "the root marker counts {marker} effects, fewer than the {cleared} the store cleared: the folder was restored \
          from an older state"
     )]
@@ -108,9 +104,6 @@ pub(crate) enum Stop {
     Io(#[from] io::Error),
     #[error("{0}")]
     Session(StopReason),
-    /// The store and the server disagree in a way only recovery (design §6.4) resolves, and this build has none.
-    #[error("{0}; this build cannot recover the folder yet")]
-    Recovery(String),
     /// The server refused a call for good.
     #[error("{0}")]
     Refused(String),
@@ -336,8 +329,9 @@ impl Disk {
     /// 1. The root check of design §6.2 through that descriptor: the linked path still names it, it is on the linked
     ///    device, and its marker names the space. Nothing is written when it fails.
     /// 2. The counters: with *e* the store's effect counter and *upper* that plus the number of effects in flight, a
-    ///    marker above *upper* is [`Stop::StoreBehind`] and one below *e* is [`Stop::DiskBehind`]. Both leave the
-    ///    marker, staging and quarantine as they are, for recovery (§6.4).
+    ///    marker above *upper* means the store is older than the folder. The disk carried out every effect the
+    ///    marker counts, so the store continues from it, and the folder recovers (§6.4). A marker below *e* is
+    ///    [`Stop::DiskBehind`], which leaves the marker, staging and quarantine as they are.
     /// 3. The no-replace probe.
     /// 4. The effects in flight are recovered in one section without staging anything again, and acknowledged in one
     ///    transaction. An interrupted one is planned again; one that met another state on disk stays blocked, and so
@@ -387,10 +381,39 @@ impl Disk {
         }
         let marker = disk.marker()?;
         let cleared = engine.effects.cleared();
-        let records = engine.effects.in_flight().to_vec();
-        let upper = cleared + records.len() as u64;
+        let upper = cleared + engine.effects.in_flight().len() as u64;
         if marker > upper {
-            return Err(Stop::StoreBehind { marker, upper });
+            tracing::warn!(
+                space_id = link.space_id,
+                marker,
+                upper,
+                "the store is older than the folder; recovering"
+            );
+            let trees = &engine.trees;
+            let name = |held: &OsStr, found: FileId| {
+                let id = held.to_string_lossy();
+                let same = |node: &&LocalNode| {
+                    let identity = &node.identity;
+                    (identity.dev, identity.ino, identity.birth_ns)
+                        == (found.dev, found.ino, found.birth_ns)
+                };
+                (trees.local().iter().map(|(_, node)| node))
+                    .find(same)
+                    .or_else(|| trees.local().get(&id))
+                    .map(|node| node.shape.name.clone())
+                    .or_else(|| trees.synced().live(&id).map(|shape| shape.name.clone()))
+                    .or_else(|| trees.remote().get(&id).map(|node| node.shape.name.clone()))
+                    .map_or_else(|| held.to_owned(), OsString::from)
+            };
+            disk.space.bring_back_all(name, SystemTime::now())?;
+            store.transaction(|tx| -> Result<_, Stop> {
+                engine.effects.catch_up(marker);
+                engine
+                    .commits
+                    .enter_recovery(RecoveryCause::of(RecoveryTrigger::StoreOlderThanDisk));
+                engine.checkpoint(tx)?;
+                Ok(())
+            })?;
         }
         if marker < cleared {
             return Err(Stop::DiskBehind { marker, cleared });
@@ -398,6 +421,7 @@ impl Disk {
         if !disk.space.probe_no_replace()? {
             return Err(Stop::NoReplace);
         }
+        let records = engine.effects.in_flight().to_vec();
         if let Some(first) = records.first() {
             let mut translated = (records.iter().map(translate)).collect::<Result<Vec<_>, _>>()?;
             let marker = disk.counter(first.counter);

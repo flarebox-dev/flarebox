@@ -200,7 +200,7 @@ fn question(question: driver::Question) -> Option<Question> {
             exceeded: exceeded.into_iter().map(mass_delete_limit).collect(),
         },
         driver::QuestionKind::AmbiguousDisappearance => QuestionKind::AmbiguousDisappearance,
-        driver::QuestionKind::Recovery { group } => QuestionKind::Recovery {
+        driver::QuestionKind::Recovery { group, .. } => QuestionKind::Recovery {
             cause: recovery_cause(question.recovery_cause),
             group: match group {
                 driver::RecoveryGroup::CreatedAfterRestorePoint => {
@@ -428,6 +428,7 @@ mod tests {
 
     fn folder_in(state: DriverFolderState, problem: Option<&str>) -> driver::FolderStatus {
         driver::FolderStatus {
+            recovery: None,
             space_id: "0190a5b0-0000-7000-8000-000000000001".into(),
             space_name: "Documents".into(),
             path: "/Users/ada/Documents".into(),
@@ -580,6 +581,8 @@ mod tests {
                 "q2",
                 driver::QuestionKind::Recovery {
                     group: driver::RecoveryGroup::RequestedBeforeReset,
+                    sent_in: None,
+                    cause: None,
                 },
             ),
             asked(

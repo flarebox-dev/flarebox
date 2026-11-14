@@ -817,6 +817,7 @@ fn rejection(reason: &RestoreRejection) -> String {
         RestoreRejection::Cycle => "the folder to restore into is inside it".into(),
         RestoreRejection::Root => "it is the root of the space".into(),
         RestoreRejection::ReadOnly => "the server takes no writes from this device".into(),
+        RestoreRejection::Cancelled => "it was cancelled during recovery".into(),
         RestoreRejection::Other(reason) => reason.clone(),
     }
 }
@@ -1244,6 +1245,7 @@ mod tests {
             ]
         );
         let linked = FolderStatus {
+            recovery: None,
             path: "/home/ada/Koidrive".into(),
             ..serde_json::from_value(serde_json::json!({
                 "space_id": SPACE, "space_name": "Home", "path": "", "state": "up_to_date",
@@ -1261,6 +1263,7 @@ mod tests {
             "Nothing from /home/ada/Koidrive is in the trash.\n"
         );
         let forged = FolderStatus {
+            recovery: None,
             path: "/home/ada/Docs\u{1b}[31m\nFORGED".into(),
             ..linked
         };
@@ -1333,6 +1336,7 @@ mod tests {
 
     fn linked() -> FolderStatus {
         FolderStatus {
+            recovery: None,
             path: "/home/ada/Koidrive".into(),
             ..serde_json::from_value(serde_json::json!({
                 "space_id": SPACE, "space_name": "Home", "path": "", "state": "up_to_date",
@@ -1367,6 +1371,7 @@ mod tests {
             },
         ];
         let folder = FolderStatus {
+            recovery: None,
             state: FolderState::Stopped,
             questions: 1,
             problem: Some("the root is missing".into()),
@@ -1387,6 +1392,7 @@ mod tests {
             )
         );
         let two = FolderStatus {
+            recovery: None,
             questions: 2,
             ..linked()
         };

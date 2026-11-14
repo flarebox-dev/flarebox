@@ -34,6 +34,14 @@ impl Question {
     pub fn holds(&self) -> impl Iterator<Item = &NodeId> {
         self.held.values().flat_map(|held| held.members.keys())
     }
+
+    /// What started the recovery that asked this question.
+    pub fn cause(&self) -> Option<&RecoveryCause> {
+        match &self.kind {
+            QuestionKind::Recovery { cause, .. } => cause.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 /// One item a question holds: its topmost node and the nodes below it that the answer applies to,
@@ -77,7 +85,22 @@ pub enum QuestionKind {
     /// (design §5.10).
     AmbiguousDisappearance,
     /// One group of files a recovery holds (design §6.4).
-    Recovery { group: RecoveryGroup },
+    Recovery {
+        group: RecoveryGroup,
+        /// The ID of the commit that carries the answer's ops, while it is in flight. A commit
+        /// refused or abandoned asks the question again.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        sent_in: Option<String>,
+        /// What started the recovery; none for a first link.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        cause: Option<RecoveryCause>,
+    },
     /// The server gave a write of this device a node of its own (design §2.7): an edit became the
     /// conflict copy `copy` of `original`, or a file this device created or moved took a
     /// conflict name because `original` held the name. A create that a first link's
@@ -117,7 +140,57 @@ pub enum Limit {
     Share,
 }
 
+/// What started a recovery (section 6.4), with the seq a rewind restored and the time the owner
+/// asked for when the server names them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct RecoveryCause {
+    pub trigger: RecoveryTrigger,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub restore_seq: Option<u64>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub restore_point_ms: Option<i64>,
+}
+
+impl RecoveryCause {
+    /// A rewind to `restore_seq` that the owner asked for at `restore_point_ms`, as `Welcome` and
+    /// `ResyncRequired` carry them: a time of 0 or less is unknown.
+    pub fn rewind(restore_seq: u64, restore_point_ms: i64) -> RecoveryCause {
+        RecoveryCause {
+            trigger: RecoveryTrigger::SpaceRewound,
+            restore_seq: Some(restore_seq),
+            restore_point_ms: (restore_point_ms > 0).then_some(restore_point_ms),
+        }
+    }
+
+    pub fn of(trigger: RecoveryTrigger) -> RecoveryCause {
+        RecoveryCause {
+            trigger,
+            restore_seq: None,
+            restore_point_ms: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum RecoveryTrigger {
+    /// The owner rewound the space, or its server state was restored (`HISTORY_CHANGED`).
+    SpaceRewound,
+    /// The server's count of this device's commits does not match the folder's sync state.
+    StoreRolledBack,
+    /// The folder's sync state is older than the files on disk.
+    StoreOlderThanDisk,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum RecoveryGroup {
@@ -165,7 +238,7 @@ impl QuestionKind {
                 &[Answer::Delete, Answer::Restore]
             }
             QuestionKind::RemoteMassDelete { .. } => &[Answer::Dismiss],
-            QuestionKind::Recovery { group } => match group {
+            QuestionKind::Recovery { group, .. } => match group {
                 RecoveryGroup::CreatedAfterRestorePoint => &[Answer::Keep, Answer::Discard],
                 RecoveryGroup::ChangedOnThisDevice | RecoveryGroup::CreatedOnThisDevice => {
                     &[Answer::Publish, Answer::Discard]

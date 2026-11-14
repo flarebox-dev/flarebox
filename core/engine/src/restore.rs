@@ -174,6 +174,9 @@ pub enum Rejection {
     Root,
     /// The server takes no writes from this device, so the restore was not sent.
     ReadOnly,
+    /// The person cancelled a restore they had asked for before recovery began (design section
+    /// 6.4).
+    Cancelled,
     /// A reason this build does not know. Build it with [`Rejection::from_reason`].
     Other(String),
 }
@@ -188,6 +191,7 @@ impl Rejection {
             "CYCLE" => Self::Cycle,
             "ROOT" => Self::Root,
             "READ_ONLY" => Self::ReadOnly,
+            "CANCELLED" => Self::Cancelled,
             other => Self::Other(other.to_owned()),
         }
     }
@@ -203,6 +207,7 @@ impl Rejection {
             Self::Cycle => "CYCLE",
             Self::Root => "ROOT",
             Self::ReadOnly => "READ_ONLY",
+            Self::Cancelled => "CANCELLED",
             Self::Other(reason) => reason,
         }
     }

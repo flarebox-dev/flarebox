@@ -460,6 +460,10 @@ impl Device {
             }
             Work::ResendAfter(_) => self.folder.resend(),
             Work::RetryAfter(_) => self.folder.retry(),
+            Work::Reconnect => {
+                let welcome = remote.space.welcome(&self.caller);
+                self.folder.event(Event::Connected(welcome))
+            }
         };
         self.take(step)
     }
@@ -483,6 +487,7 @@ impl Device {
                 Work::Send(_) => "send",
                 Work::ResendAfter(_) => "wait",
                 Work::RetryAfter(_) => "retry",
+                Work::Reconnect => "reconnect",
             });
             self.perform(work, remote)?;
         }
@@ -1437,3 +1442,7 @@ fn keep_original_lost_after_the_original_was_deleted(deleted_on_b: bool) -> (Rem
     }
     (restored, site_b)
 }
+
+use crate::status::describe;
+
+use koidrive_engine::question::{RecoveryCause, RecoveryTrigger};

@@ -405,6 +405,7 @@ fn folder_status(folder: &Path, space: &SpaceInfo) -> FolderStatus {
         questions: 0,
         problem: None,
         wait: None,
+        recovery: None,
     }
 }
 

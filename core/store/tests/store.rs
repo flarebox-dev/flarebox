@@ -9,7 +9,8 @@ use koidrive_engine::effects::{Base, BatchLimit, Dir, Displaced, Effect, EffectR
 use koidrive_engine::guard::{Counted, GuardState, RemoteDeletion, Trash};
 use koidrive_engine::ids::{IdGen, uuid_v7};
 use koidrive_engine::question::{
-    Answer, Held, Limit, Question, QuestionKind, RecoveryGroup, Revisions,
+    Answer, Held, Limit, Question, QuestionKind, RecoveryCause, RecoveryGroup, RecoveryTrigger,
+    Revisions,
 };
 use koidrive_engine::restore::{Outcome, Rejection, Resolved, RestoreIntent};
 use koidrive_engine::state::{Agreed, CommitsState, EffectsState, MovedHere, Pending, TreesState};
@@ -1361,6 +1362,8 @@ fn engine_state() -> EngineState {
                     asked_at_ms: 8,
                     kind: QuestionKind::Recovery {
                         group: RecoveryGroup::CreatedOnThisDevice,
+                        sent_in: None,
+                        cause: None,
                     },
                     held: BTreeMap::from([(
                         "local".into(),
@@ -1735,7 +1738,10 @@ fn a_halt_survives_a_reopen_with_its_commit() {
     for halted in [
         None,
         Some(Halt::ReadOnly),
-        Some(Halt::Recovery),
+        Some(Halt::Recovery(RecoveryCause::rewind(4, 1_700_000_000_000))),
+        Some(Halt::Recovery(RecoveryCause::of(
+            RecoveryTrigger::StoreOlderThanDisk,
+        ))),
         Some(Halt::Policy { code: 7 }),
     ] {
         let mut state = engine_state();
@@ -2711,6 +2717,26 @@ fn an_inode_wider_than_64_bits_survives_a_reopen() {
 }
 
 #[test]
+fn a_recovery_stored_before_its_cause_was_opens_as_a_rolled_back_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let mut state = engine_state();
+    state.commits.halted = Some(Halt::Recovery(RecoveryCause::rewind(4, 1_700_000_000_000)));
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| tx.set_engine_state(&state))
+        .unwrap();
+    store_before(&path, "recovery_cause");
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(applied(&path), all_migrations());
+    state.commits.halted = Some(Halt::Recovery(RecoveryCause::of(
+        RecoveryTrigger::StoreRolledBack,
+    )));
+    assert_eq!(store.transaction(|tx| tx.engine_state()).unwrap(), state);
+}
+
+#[test]
 fn a_store_from_before_pending_names_were_recorded_opens_with_none_recorded() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
@@ -2818,7 +2844,9 @@ fn a_store_from_before_discarded_shapes_were_recorded_takes_them_from_the_waitin
         (asked.kind, asked.answer),
         (
             QuestionKind::Recovery {
-                group: RecoveryGroup::CreatedOnThisDevice
+                group: RecoveryGroup::CreatedOnThisDevice,
+                sent_in: None,
+                cause: None,
             },
             None
         )

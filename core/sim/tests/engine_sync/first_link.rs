@@ -31,3 +31,31 @@ fn a_first_link_holds_a_file_whose_name_the_space_holds_until_the_person_answers
         );
     }
 }
+
+#[test]
+fn a_discarded_folder_the_user_moved_a_synced_file_into_before_the_answer_converges() {
+    let seed = [
+        act(1, 0, 0, 2, 0),
+        act(0, 0, 0, 0, 0),
+        act(0, 0, 0, 2, 0),
+        act(1, 0, 5494772186727268893, 0, 0),
+    ];
+    let local = [act(0, 0, 0, 1, 0)];
+    let during = [(
+        true,
+        vec![act(3, 3247345582551114674, 732025268020294025, 0, 0)],
+    )];
+    run_ignoring(
+        &seed,
+        &local,
+        &[],
+        MAX_OPS,
+        false,
+        &during,
+        Cut::None,
+        &[],
+        Answer::Discard,
+        true,
+    )
+    .unwrap();
+}

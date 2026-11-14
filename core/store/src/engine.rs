@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use koidrive_engine::classify::{Origin, Waiting};
 use koidrive_engine::commit::{Halt, InFlight};
 use koidrive_engine::effects::{Base, Dir, Displaced, Effect, EffectRecord, Location};
+use koidrive_engine::question::{RecoveryCause, RecoveryTrigger};
 use koidrive_engine::state::{
     Agreed, CommitsChanges, CommitsState, EffectsChanges, EffectsState, MapChanges, MovedHere,
     Pending, SetChanges, TreesChanges, TreesState,
@@ -293,24 +294,28 @@ impl Tx<'_> {
             state.trees.kept_originals.insert(row.get(0)?, row.get(1)?);
         }
 
-        if let Some((accepted, halt, code, cap)) = self
+        if let Some((accepted, halt, cap)) = self
             .0
             .query_row(
-                "SELECT accepted, halt, policy_code, cap FROM commit_state WHERE id = 1",
+                "SELECT accepted, halt, policy_code, recovery_trigger, restore_seq, restore_point_ms,
+                        cap
+                 FROM commit_state WHERE id = 1",
                 [],
                 |row| {
-                    Ok((
-                        row.get::<_, u64>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<i32>>(2)?,
-                        row.get::<_, Option<usize>>(3)?,
-                    ))
+                    let halt = HaltRow {
+                        halt: row.get(1)?,
+                        policy_code: row.get(2)?,
+                        recovery_trigger: row.get(3)?,
+                        restore_seq: row.get(4)?,
+                        restore_point_ms: row.get(5)?,
+                    };
+                    Ok((row.get::<_, u64>(0)?, halt, row.get::<_, Option<usize>>(6)?))
                 },
             )
             .optional()?
         {
             state.commits.accepted = accepted;
-            state.commits.halted = halt_from_row(halt, code)?;
+            state.commits.halted = halt.halt()?;
             state.commits.cap = cap;
         }
         state.commits.in_flight = self.in_flight()?;
@@ -659,10 +664,19 @@ impl Tx<'_> {
             )?;
         }
         if let Some(halted) = halted {
-            let (halt, code) = halt_row(*halted);
+            let halt = HaltRow::of(*halted);
             self.0.execute(
-                "UPDATE commit_state SET halt = ?1, policy_code = ?2 WHERE id = 1",
-                params![halt, code],
+                "UPDATE commit_state
+                 SET halt = ?1, policy_code = ?2, recovery_trigger = ?3, restore_seq = ?4,
+                     restore_point_ms = ?5
+                 WHERE id = 1",
+                params![
+                    halt.halt,
+                    halt.policy_code,
+                    halt.recovery_trigger,
+                    halt.restore_seq,
+                    halt.restore_point_ms
+                ],
             )?;
         }
         if let Some(cap) = cap {
@@ -904,23 +918,74 @@ fn invalid(what: String) -> Error {
     Error::InvalidEngineState(what)
 }
 
-fn halt_row(halt: Option<Halt>) -> (Option<&'static str>, Option<i32>) {
-    match halt {
-        None => (None, None),
-        Some(Halt::ReadOnly) => (Some("read_only"), None),
-        Some(Halt::Recovery) => (Some("recovery"), None),
-        Some(Halt::Policy { code }) => (Some("policy"), Some(code)),
-    }
+#[derive(Default)]
+struct HaltRow {
+    halt: Option<String>,
+    policy_code: Option<i32>,
+    recovery_trigger: Option<String>,
+    restore_seq: Option<u64>,
+    restore_point_ms: Option<i64>,
 }
 
-fn halt_from_row(halt: Option<String>, code: Option<i32>) -> Result<Option<Halt>> {
-    Ok(match (halt.as_deref(), code) {
-        (None, None) => None,
-        (Some("read_only"), None) => Some(Halt::ReadOnly),
-        (Some("recovery"), None) => Some(Halt::Recovery),
-        (Some("policy"), Some(code)) => Some(Halt::Policy { code }),
-        _ => return Err(invalid(format!("halt {halt:?} with code {code:?}"))),
-    })
+impl HaltRow {
+    fn of(halt: Option<Halt>) -> HaltRow {
+        let named = |name: &str| Some(name.to_owned());
+        match halt {
+            None => HaltRow::default(),
+            Some(Halt::ReadOnly) => HaltRow {
+                halt: named("read_only"),
+                ..HaltRow::default()
+            },
+            Some(Halt::Policy { code }) => HaltRow {
+                halt: named("policy"),
+                policy_code: Some(code),
+                ..HaltRow::default()
+            },
+            Some(Halt::Recovery(cause)) => HaltRow {
+                halt: named("recovery"),
+                recovery_trigger: named(match cause.trigger {
+                    RecoveryTrigger::SpaceRewound => "space_rewound",
+                    RecoveryTrigger::StoreRolledBack => "store_rolled_back",
+                    RecoveryTrigger::StoreOlderThanDisk => "store_older_than_disk",
+                }),
+                restore_seq: cause.restore_seq,
+                restore_point_ms: cause.restore_point_ms,
+                ..HaltRow::default()
+            },
+        }
+    }
+
+    fn halt(self) -> Result<Option<Halt>> {
+        let HaltRow {
+            halt,
+            policy_code,
+            recovery_trigger,
+            restore_seq,
+            restore_point_ms,
+        } = self;
+        let trigger = match recovery_trigger.as_deref() {
+            None => None,
+            Some("space_rewound") => Some(RecoveryTrigger::SpaceRewound),
+            Some("store_rolled_back") => Some(RecoveryTrigger::StoreRolledBack),
+            Some("store_older_than_disk") => Some(RecoveryTrigger::StoreOlderThanDisk),
+            Some(other) => return Err(invalid(format!("recovery trigger {other:?}"))),
+        };
+        Ok(match (halt.as_deref(), policy_code, trigger) {
+            (None, None, None) => None,
+            (Some("read_only"), None, None) => Some(Halt::ReadOnly),
+            (Some("recovery"), None, Some(trigger)) => Some(Halt::Recovery(RecoveryCause {
+                trigger,
+                restore_seq,
+                restore_point_ms,
+            })),
+            (Some("policy"), Some(code), None) => Some(Halt::Policy { code }),
+            _ => {
+                return Err(invalid(format!(
+                    "halt {halt:?} with code {policy_code:?} and trigger {trigger:?}"
+                )));
+            }
+        })
+    }
 }
 
 pub(crate) fn node_kind(kind: Kind) -> i32 {

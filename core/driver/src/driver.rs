@@ -1906,6 +1906,7 @@ fn folder_status(
     questions: u64,
 ) -> FolderStatus {
     FolderStatus {
+        recovery: None,
         space_id: link.space_id.clone(),
         space_name: link.space_name.clone(),
         path: link.root.to_string_lossy().into_owned(),

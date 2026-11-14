@@ -95,7 +95,7 @@ pub struct Disk {
     /// The effects in flight whose download is staged and has no name in the folder yet.
     pub(super) staged: BTreeSet<String>,
     /// The entries that effects in flight displaced and have not sent to the local trash yet.
-    pub(super) quarantine: BTreeMap<String, Entry>,
+    pub(super) quarantine: BTreeMap<String, (u128, Entry)>,
     /// The effects whose displaced entry is in the local trash.
     trash: BTreeSet<String>,
     binned: BTreeSet<i64>,
@@ -140,6 +140,44 @@ impl Disk {
         Some(names)
     }
 
+    /// Moves every entry of the parked directory and of quarantine to the root under a recovered
+    /// name, as `Space::bring_back_all` does, and drops what is staged: `name` gives a parked
+    /// entry's name, and an entry in quarantine keeps its own.
+    pub fn bring_back_all(&mut self, name: impl Fn(&str) -> String) {
+        self.staged.clear();
+        let parked: Vec<(u128, String)> = (self.entries.iter())
+            .filter_map(|(ino, entry)| match &entry.place {
+                Place::Parked(parked) => Some((*ino, parked.clone())),
+                _ => None,
+            })
+            .collect();
+        for (ino, parked) in parked {
+            let free = self.recovered(&name(&parked));
+            let entry = self.entries.get_mut(&ino).expect("listed");
+            entry.place = Place::Root;
+            entry.name = free;
+        }
+        for (ino, entry) in std::mem::take(&mut self.quarantine).into_values() {
+            let name = self.recovered(&entry.name);
+            let entry = Entry {
+                place: Place::Root,
+                name,
+                ..entry
+            };
+            self.entries.insert(ino, entry);
+        }
+    }
+
+    fn recovered(&self, original: &str) -> String {
+        (1..)
+            .map(|n| match n {
+                1 => format!("{original} (recovered)"),
+                n => format!("{original} (recovered {n})"),
+            })
+            .find(|candidate| self.child(&Place::Root, candidate).is_none())
+            .expect("a free name")
+    }
+
     /// The entries the user sees, which leaves out the parked directory, in inode order.
     pub fn visible(&self) -> Vec<u128> {
         self.entries
@@ -173,7 +211,7 @@ impl Disk {
     /// True when some file, parked, in quarantine or neither, holds the write with this tag.
     pub fn holds(&self, write: i64) -> bool {
         (self.entries.values())
-            .chain(self.quarantine.values())
+            .chain(self.quarantine.values().map(|(_, entry)| entry))
             .any(|entry| entry.content.as_ref().is_some_and(|c| c.mtime_ns == write))
     }
 
@@ -294,8 +332,10 @@ impl Disk {
                 self.staged.insert(id.clone());
                 let displaced = replaces.as_ref().map(|d| self.displaced(d)).transpose()?;
                 let (place, name) = self.locate(at)?;
-                if let Some(entry) = displaced.and_then(|ino| self.entries.remove(&ino)) {
-                    self.quarantine.insert(id.clone(), entry);
+                if let Some(ino) = displaced
+                    && let Some(entry) = self.entries.remove(&ino)
+                {
+                    self.quarantine.insert(id.clone(), (ino, entry));
                 }
                 if until == Cut::Quarantined {
                     return Ok(None);
@@ -305,7 +345,10 @@ impl Disk {
                     self.staged.remove(id);
                 }
                 if until == Cut::Done {
-                    *trashed = self.quarantine.remove(id).and_then(|entry| entry.content);
+                    *trashed = self
+                        .quarantine
+                        .remove(id)
+                        .and_then(|(_, entry)| entry.content);
                 }
                 let refused = match displaced {
                     Some(_) if until == Cut::Done => Refused::Overtaken,
@@ -330,10 +373,13 @@ impl Disk {
             Effect::RemoveFile { displaced } => {
                 let ino = self.displaced(displaced)?;
                 if let Some(entry) = self.entries.remove(&ino) {
-                    self.quarantine.insert(id.clone(), entry);
+                    self.quarantine.insert(id.clone(), (ino, entry));
                 }
                 if until == Cut::Done {
-                    *trashed = self.quarantine.remove(id).and_then(|entry| entry.content);
+                    *trashed = self
+                        .quarantine
+                        .remove(id)
+                        .and_then(|(_, entry)| entry.content);
                 }
                 Ok(None)
             }
@@ -348,7 +394,7 @@ impl Disk {
                 }
                 let entry = self.entries.remove(&ino);
                 if let Some(entry) = entry.filter(|_| until != Cut::Done) {
-                    self.quarantine.insert(id.clone(), entry);
+                    self.quarantine.insert(id.clone(), (ino, entry));
                 }
                 Ok(None)
             }
@@ -367,7 +413,7 @@ impl Disk {
     pub fn recover(&mut self, record: &EffectRecord) -> Applied {
         self.marker = record.counter;
         let staged = self.staged.remove(&record.effect_id);
-        let Some(entry) = self.quarantine.remove(&record.effect_id) else {
+        let Some((_, entry)) = self.quarantine.remove(&record.effect_id) else {
             let outcome = match staged {
                 false => self.finished(record),
                 true => Err(Refused::Interrupted),

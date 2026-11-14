@@ -50,8 +50,9 @@ use crate::failures::{self, Halted};
 use crate::ignore::Matcher;
 use crate::observe::{FsObserver, Observer};
 use crate::policy::{self, Disposition};
-use crate::status::{FolderState, Wait, WaitKind};
+use crate::status::{FolderState, Wait, WaitKind, describe};
 use crate::timing::{Time, Timing};
+use koidrive_engine::question::{RecoveryCause, RecoveryTrigger};
 
 /// The highest space format this build reads (spec v0 section 9.2).
 pub const MAX_FORMAT: u32 = 1;
@@ -107,6 +108,8 @@ pub(crate) struct Folder {
     offline: bool,
     /// The history the server reported in its last `Welcome`.
     history_id: String,
+    /// The server's count of this device's commits in that history, from the same `Welcome`.
+    device_seq: u64,
     head_seq: Option<u64>,
     local_entries: Option<u64>,
     remote_nodes: u64,
@@ -182,9 +185,12 @@ pub(crate) enum Work {
     Subscribe(Resume),
     /// Read every page of the tree, then every page of the trash when `trash` is set. Answered with
     /// [`Folder::listed`].
-    List { trash: bool },
+    List {
+        trash: bool,
+    },
     /// Read on from `Listing` after a wait.
     ListAfter(Duration, Listing),
+    Reconnect,
     /// [`Pending::stage`]. Answered with [`Folder::staged`].
     Stage(Pending),
     /// The same after a wait.
@@ -263,6 +269,7 @@ pub(crate) struct View {
     pub problem: Option<String>,
     pub wait: Option<Wait>,
     pub questions: u64,
+    pub recovery: Option<RecoveryCause>,
 }
 
 impl Folder {
@@ -308,6 +315,7 @@ impl Folder {
             scanned: false,
             offline: false,
             history_id: String::new(),
+            device_seq: 0,
             head_seq: None,
             local_entries: None,
             remote_nodes,
@@ -387,10 +395,20 @@ impl Folder {
                     self.list_again(&mut work);
                 }
                 Ok(Reason::HistoryChanged) => {
-                    return Err(Stop::Recovery(rewound(
-                        resync.restore_seq,
-                        resync.restore_point_ms,
-                    )));
+                    let recovery =
+                        RecoveryCause::rewind(resync.restore_seq, resync.restore_point_ms);
+                    tracing::warn!(
+                        space_id = self.link.space_id,
+                        why = describe(&recovery),
+                        "recovering from the Welcome of a new connection"
+                    );
+                    self.step(|engine, _| {
+                        engine.commits.enter_recovery(recovery);
+                        Ok(())
+                    })?;
+                    self.flight = Flight::Idle;
+                    self.stream = Stream::Connecting;
+                    work.push(Work::Reconnect);
                 }
                 Ok(Reason::Unspecified) | Err(_) => {
                     return Err(Stop::Protocol(format!(
@@ -623,8 +641,12 @@ impl Folder {
         receipts: Result<Vec<UploadReceipt>, ChunkError>,
     ) -> Result<Vec<Work>, Stop> {
         let mut work = Vec::new();
-        let Flight::Uploading(paths) = std::mem::replace(&mut self.flight, Flight::Idle) else {
-            return Ok(work);
+        let paths = match std::mem::replace(&mut self.flight, Flight::Idle) {
+            Flight::Uploading(paths) => paths,
+            other => {
+                self.flight = other;
+                return Ok(work);
+            }
         };
         let error = match receipts {
             Ok(receipts) => {
@@ -733,9 +755,13 @@ impl Folder {
                 return Ok(work);
             }
             Err(CallError::NotResent(why)) => {
-                return Err(Stop::Recovery(format!(
-                    "a commit was not sent again after reconnecting: {why}"
-                )));
+                tracing::warn!(space_id = self.link.space_id, %why, "a commit was not sent again after reconnecting");
+                let trigger = match why {
+                    NotResent::HistoryChanged { .. } => RecoveryTrigger::SpaceRewound,
+                    _ => RecoveryTrigger::StoreRolledBack,
+                };
+                self.recover(RecoveryCause::of(trigger), &mut work)?;
+                return Ok(work);
             }
             Err(CallError::TooLarge { bytes }) => {
                 self.refused(commit, NotTaken::TooLarge { bytes }, &mut work)?
@@ -903,9 +929,7 @@ impl Folder {
                 "the server refused this device's changes (code {code}); nothing more is sent{}",
                 lift_hint(code)
             )),
-            Some(CommitHalt::Recovery) => {
-                Some("the folder's sync state does not match the server".into())
-            }
+            Some(CommitHalt::Recovery(cause)) => Some(describe(&cause)),
             None if !stuck.is_empty() => {
                 let (count, fixed) = match stuck.len() {
                     1 => ("1 item".to_owned(), "it is"),
@@ -925,7 +949,14 @@ impl Folder {
             None => None,
         };
         let last_seq = self.engine.cursor.as_ref().map(|c| c.last_seq);
+        let recovery = match self.engine.commits.halted() {
+            Some(CommitHalt::Recovery(cause)) => Some(cause),
+            _ => (self.engine.commits.questions().iter())
+                .find_map(koidrive_engine::question::Question::cause)
+                .cloned(),
+        };
         View {
+            recovery,
             state,
             history_id: self.engine.cursor.as_ref().map(|c| c.history_id.clone()),
             last_seq,
@@ -1041,13 +1072,12 @@ impl Folder {
         self.note = None;
         self.head_seq = Some(welcome.head_seq);
         self.history_id.clone_from(&welcome.history_id);
+        self.device_seq = welcome.device_seq;
         if let Some(cursor) = &self.engine.cursor
             && cursor.history_id != welcome.history_id
         {
-            return Err(Stop::Recovery(rewound(
-                welcome.restore_seq,
-                welcome.restore_point_ms,
-            )));
+            let recovery = RecoveryCause::rewind(welcome.restore_seq, welcome.restore_point_ms);
+            return self.recover(recovery, work);
         }
         let commits = &self.engine.commits;
         let never_synced = self.engine.cursor.is_none()
@@ -1075,10 +1105,10 @@ impl Folder {
         })?;
         match reconnect {
             Reconnect::Recovery => {
-                return Err(Stop::Recovery(
-                    "the server's count of this device's commits does not match the folder's sync state"
-                        .into(),
-                ));
+                let Some(CommitHalt::Recovery(cause)) = self.engine.commits.halted() else {
+                    unreachable!("connected halts for a recovery");
+                };
+                self.recover(cause, work)?;
             }
             Reconnect::AheadOfServer => {
                 tracing::info!(
@@ -1266,7 +1296,8 @@ impl Folder {
             return Ok(());
         }
         let first_link = self.engine.cursor.is_none();
-        if first_link && !self.scanned {
+        let recovering = matches!(self.engine.commits.halted(), Some(CommitHalt::Recovery(_)));
+        if (first_link || recovering) && !self.scanned {
             return Ok(());
         }
         let head = Some(staging.last_seq());
@@ -1277,9 +1308,22 @@ impl Folder {
         };
         let now_ms = (SystemTime::now().duration_since(UNIX_EPOCH))
             .map_or(0, |since| since.as_millis() as u64);
+        let cause = match self.engine.commits.halted() {
+            Some(CommitHalt::Recovery(cause)) => cause,
+            _ => RecoveryCause::of(RecoveryTrigger::StoreRolledBack),
+        };
+        let device_seq = self.device_seq;
         self.remote_nodes = self.step(|engine, tx| {
             engine.replace_remote(tx, staging)?;
-            if first_link {
+            if recovering {
+                (engine.commits).recover(
+                    &mut engine.trees,
+                    device_seq,
+                    &cause,
+                    &mut engine.ids,
+                    now_ms,
+                );
+            } else if first_link {
                 (engine.commits).first_link(&mut engine.trees, &mut engine.ids, now_ms);
                 engine.recovery_cause = Some(crate::RecoveryCause {
                     trigger: crate::RecoveryTrigger::NoSyncState,
@@ -1368,7 +1412,17 @@ impl Folder {
                 self.commit_ended();
                 self.list_again(work);
             }
-            Failure::Halted(CommitHalt::Recovery) => return Err(Stop::Recovery(described)),
+            Failure::Halted(CommitHalt::Recovery(cause)) => {
+                tracing::warn!(
+                    space_id = self.link.space_id,
+                    described,
+                    why = describe(&cause),
+                    "a commit was refused; recovering through a new connection"
+                );
+                self.flight = Flight::Idle;
+                self.stream = Stream::Connecting;
+                work.push(Work::Reconnect);
+            }
             Failure::Halted(CommitHalt::Policy { code }) => {
                 return Err(Stop::Refused(format!(
                     "the server refused this device's changes: {described}{}",
@@ -1376,6 +1430,25 @@ impl Folder {
                 )));
             }
         }
+        Ok(())
+    }
+
+    /// Starts a recovery (design §6.4) for `why`: nothing is committed and the commit in flight is never sent again,
+    /// and the tree of the server's current history is listed. Once it has replaced R and the folder is scanned, the
+    /// engine classifies every node against S ([`Folder::publish_remote`]).
+    fn recover(&mut self, recovery: RecoveryCause, work: &mut Vec<Work>) -> Result<(), Stop> {
+        tracing::warn!(
+            space_id = self.link.space_id,
+            why = describe(&recovery),
+            "recovering the folder"
+        );
+        self.step(|engine, _| {
+            engine.commits.enter_recovery(recovery);
+            Ok(())
+        })?;
+        self.flight = Flight::Idle;
+        self.commit_ended();
+        self.list_again(work);
         Ok(())
     }
 
@@ -1574,6 +1647,8 @@ enum Halt {
     /// Only a person can fix it. The task waits for a restart.
     #[error("{1}")]
     Person(Halted, String),
+    #[error("reconnecting")]
+    Reconnect,
 }
 
 impl From<Stop> for Halt {
@@ -1714,6 +1789,10 @@ impl FolderTask {
                 self.join_observer().await;
                 return;
             };
+            if let Halt::Reconnect = halted {
+                self.join_observer().await;
+                continue;
+            }
             tracing::warn!(space_id, reason = %halted, "sync of a folder halted");
             let (why, problem, recovery) = match &halted {
                 Halt::Root(why, problem) => (
@@ -1724,6 +1803,7 @@ impl FolderTask {
                 Halt::Person(why, problem) => {
                     (*why, problem.clone(), crate::lifecycle::Recovery::Restart)
                 }
+                Halt::Reconnect => unreachable!("handled above"),
             };
             self.status.halt(why, problem, recovery);
             self.changed.send_replace(());
@@ -1810,7 +1890,7 @@ impl FolderTask {
             let mut recheck = tokio::time::interval(CLAIM_RECHECK);
             let mut reclaim = tokio::time::interval(RECLAIM_TRASH);
             reclaim.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
+            'session: loop {
                 let step = tokio::select! {
                     event = events.next() => match event {
                         Some(event) => folder.event(event),
@@ -1899,6 +1979,7 @@ impl FolderTask {
                         Work::RetryAfter(after) => {
                             retry = Some(Box::pin(tokio::time::sleep(after)))
                         }
+                        Work::Reconnect => break 'session Halt::Reconnect,
                     }
                 }
                 self.publish(&mut folder);
@@ -2064,6 +2145,7 @@ impl FolderTask {
             problem: status.problem.clone(),
             wait: status.wait,
             questions: status.questions,
+            recovery: status.recovery,
         };
         if shown == view && !asked {
             return;
@@ -2077,6 +2159,7 @@ impl FolderTask {
         status.problem = view.problem;
         status.wait = view.wait;
         status.questions = view.questions;
+        status.recovery = view.recovery;
         drop(status);
         self.changed.send_replace(());
     }
@@ -2157,18 +2240,6 @@ fn later(
             _ => None,
         }),
     })
-}
-
-fn rewound(restore_seq: u64, restore_point_ms: i64) -> String {
-    let Ok(requested @ 1..) = u64::try_from(restore_point_ms) else {
-        return "the space was rewound or restored on the server".into();
-    };
-    let at = UNIX_EPOCH + Duration::from_millis(requested);
-    format!(
-        "the space was rewound on the server to seq {restore_seq} (requested {} {})",
-        koidrive_fs::utc_date(at),
-        utc(at)
-    )
 }
 
 /// The time of day of `at` in UTC, such as `00:00 UTC`.

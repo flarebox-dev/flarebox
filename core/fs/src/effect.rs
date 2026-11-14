@@ -11,7 +11,7 @@ use koidrive_ignore::PLATFORM_FILES;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
-use crate::resolve::{Folder, Location, Space, Unresolved, check_name};
+use crate::resolve::{Folder, Location, PARKED_DIR, Space, Unresolved, check_name};
 use crate::root::{Flush, Marker, flush, remove_if_present, rename_no_replace, write_marker_at};
 use crate::trash::TRASH_DIR;
 use crate::{Entry, EntryKind, FileId, Stat, list, stat_at, stat_fd};
@@ -291,6 +291,32 @@ impl Space {
             cleared.push(name);
         }
         Ok(cleared)
+    }
+
+    /// Moves every entry of the parked directory and of quarantine to the root under a recovered
+    /// name made from `name` of its private name and identity, and returns the paths they took. A
+    /// store older than the disk does not know what the disk parked, or what the last effect the
+    /// root marker counts left in quarantine when it stopped between its steps, and scans read
+    /// neither directory (design §6.4).
+    pub fn bring_back_all(
+        &self,
+        name: impl Fn(&OsStr, FileId) -> OsString,
+        now: SystemTime,
+    ) -> io::Result<Vec<PathBuf>> {
+        let root = self.root_folder()?;
+        let mut moved = Vec::new();
+        for dir in [PARKED_DIR, QUARANTINE_DIR] {
+            let private = self.private(&[dir])?;
+            for entry in list(private.fd())? {
+                let stat = stat_at(private.fd(), &entry)?;
+                let original = name(&entry, stat.id);
+                let folder = stat.file_type == FileType::Directory;
+                moved.push(
+                    self.move_to_recovered_name(&private, &entry, &root, &original, folder, now)?,
+                );
+            }
+        }
+        Ok(moved)
     }
 
     /// Begins an effect section after checking that the root is held. It

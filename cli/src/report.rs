@@ -360,7 +360,7 @@ impl Decision {
                 (DecisionKind::AmbiguousDisappearance, None, None)
             }
             QuestionKind::Conflict { .. } => (DecisionKind::Conflict, None, None),
-            QuestionKind::Recovery { group } => (
+            QuestionKind::Recovery { group, .. } => (
                 DecisionKind::Recovery,
                 Some(match group {
                     RecoveryGroup::CreatedAfterRestorePoint => {
@@ -1088,6 +1088,7 @@ impl RequestData {
                         RestoreRejection::Cycle => "cycle".into(),
                         RestoreRejection::Root => "root".into(),
                         RestoreRejection::ReadOnly => "read_only".into(),
+                        RestoreRejection::Cancelled => "cancelled".into(),
                         RestoreRejection::Other(reason) => reason.clone(),
                     },
                 },
@@ -1266,6 +1267,7 @@ mod tests {
 
     fn folder(path: &str, state: FolderState) -> FolderStatus {
         FolderStatus {
+            recovery: None,
             space_id: format!("space-{path}"),
             space_name: path.to_owned(),
             path: format!("/home/ada/{path}"),
@@ -1466,6 +1468,8 @@ mod tests {
             "q2",
             QuestionKind::Recovery {
                 group: RecoveryGroup::RequestedBeforeReset,
+                sent_in: None,
+                cause: None,
             },
         ));
         assert_eq!(
@@ -1496,6 +1500,8 @@ mod tests {
                     "q1",
                     QuestionKind::Recovery {
                         group: RecoveryGroup::CreatedAfterRestorePoint,
+                        sent_in: None,
+                        cause: None,
                     },
                 );
                 question.recovery_cause = Some(koidrive_driver::RecoveryCause {
@@ -1529,6 +1535,8 @@ mod tests {
             "q1",
             QuestionKind::Recovery {
                 group: RecoveryGroup::CreatedAfterRestorePoint,
+                sent_in: None,
+                cause: None,
             },
         );
         let mut stored = serde_json::to_value(&question).unwrap();
@@ -1705,6 +1713,7 @@ mod tests {
     #[test]
     fn a_quota_or_retry_wait_exits_unavailable_from_the_typed_field_alone() {
         let waiting = |kind| FolderStatus {
+            recovery: None,
             problem: Some("no words here decide the exit".into()),
             wait: Some(Wait {
                 kind,

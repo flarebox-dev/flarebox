@@ -213,6 +213,7 @@ pub struct Trees {
     removed_here: TrackedMap<NodeId, u64>,
     /// See [`TreesState::discarded`].
     discarded: TrackedMap<NodeId, Shape>,
+    adopted: BTreeSet<NodeId>,
     /// The files whose content an edit of this device set, each with the seq of its commit, while
     /// R holds that content.
     edited_here: TrackedMap<NodeId, u64>,
@@ -295,6 +296,7 @@ impl Trees {
             trashed_here: TrackedMap::default(),
             removed_here: TrackedMap::default(),
             discarded: TrackedMap::default(),
+            adopted: BTreeSet::new(),
             edited_here: TrackedMap::default(),
             moved_here: TrackedMap::default(),
             past_positions: TrackedMap::default(),
@@ -607,6 +609,7 @@ impl Trees {
         if node.trashed {
             self.displaced.remove(&id);
         }
+        self.discarded.remove(&id);
         if (self.edited_here.get(&id)).is_some_and(|&seq| node.trashed || node.edit_rev != seq) {
             self.edited_here.remove(&id);
         }
@@ -709,12 +712,17 @@ impl Trees {
 
     pub(crate) fn resend_folders_of_changes(&mut self) {
         let lacking = |id: &NodeId| self.r.get(id).is_none() && self.acknowledged(id).is_some();
-        let changed: Vec<NodeId> = (self.changes().into_iter())
-            .filter(|id| lacking(id))
+        let released: Vec<NodeId> = (self.changes().into_iter())
+            .filter(|id| !self.held(id))
             .cloned()
             .collect();
-        let mut folders: Vec<NodeId> = (self.holding_changes().into_iter())
-            .filter(|id| lacking(id) && !changed.contains(id))
+        let changed: Vec<NodeId> = released.iter().filter(|id| lacking(id)).cloned().collect();
+        let holding: BTreeSet<NodeId> = (released.iter())
+            .flat_map(|id| self.local_chain(id).skip(1))
+            .map(str::to_owned)
+            .collect();
+        let mut folders: Vec<NodeId> = (holding.into_iter())
+            .filter(|id| lacking(id) && !self.held(id) && !changed.contains(id))
             .collect();
         folders.sort_by_key(|id| std::cmp::Reverse(self.local_chain(id).count()));
         for id in changed.into_iter().chain(folders.iter().cloned()) {
@@ -978,6 +986,30 @@ impl Trees {
         }
     }
 
+    pub(crate) fn adopt_pending(&mut self, id: NodeId) {
+        self.adopted.insert(id);
+    }
+
+    pub(crate) fn adopted(&self, id: &str) -> bool {
+        self.adopted.contains(id)
+    }
+
+    pub(crate) fn rewound(&mut self) {
+        self.adopted.clear();
+        self.watched.clear();
+        self.watched_positions.clear();
+        self.trashed_here.clear();
+        self.edited_here.clear();
+        let r = &self.r;
+        self.reverted.retain(|id| r.get(id).is_some());
+        let waiting: Vec<NodeId> = self.waiting.keys().cloned().collect();
+        for id in waiting {
+            if let Some(waiting) = self.waiting.get_mut(&id) {
+                waiting.origin = Origin::Other;
+            }
+        }
+    }
+
     pub(crate) fn is_discarded(&self, id: &str) -> bool {
         self.discarded.contains_key(id) && !self.reclaimed(id)
     }
@@ -997,13 +1029,32 @@ impl Trees {
         }
     }
 
-    pub(crate) fn discard(&mut self, shapes: impl IntoIterator<Item = (NodeId, Shape)>) {
-        self.discarded.extend(shapes);
+    pub(crate) fn discard(
+        &mut self,
+        ids: impl IntoIterator<Item = NodeId>,
+        shown: &BTreeMap<NodeId, Shape>,
+    ) {
+        for id in ids {
+            if self.unsent_edits.remove(&id) {
+                self.mark(&id);
+            }
+            if let (None, Some(shape)) = (self.r.get(&id), shown.get(&id)) {
+                self.discarded.insert(id, shape.clone());
+            }
+        }
     }
 
-    pub(crate) fn reclaim(&mut self) {
+    pub(crate) fn approve(&mut self, ids: impl IntoIterator<Item = NodeId>) {
+        for id in ids {
+            if self.reverted.remove(&id) {
+                self.mark(&id);
+            }
+        }
+    }
+
+    pub(crate) fn reclaim(&mut self, among: impl Fn(&str) -> bool) -> Vec<NodeId> {
         let reclaimed: BTreeSet<NodeId> = (self.discarded.keys())
-            .filter(|id| self.reclaimed(id))
+            .filter(|id| among(id) && self.reclaimed(id))
             .cloned()
             .collect();
         let below_reclaimed = |id: &str| {
@@ -1022,12 +1073,22 @@ impl Trees {
             .cloned()
             .collect();
         let mut left: Vec<NodeId> = reclaimed.iter().cloned().chain(excluded_below).collect();
+        let mut dropped = Vec::new();
         loop {
             let before = left.len();
-            left.retain(|id| !self.set_synced_if_valid(id.clone(), None));
+            left.retain(|id| {
+                let done = self.set_synced_if_valid(id.clone(), None);
+                if done {
+                    dropped.push(id.clone());
+                }
+                !done
+            });
             if left.len() == before {
                 break;
             }
+        }
+        if !left.is_empty() && self.drop_together(&left) {
+            dropped.append(&mut left);
         }
         for id in reclaimed.iter().filter(|id| !left.contains(id)) {
             self.discarded.remove(id);
@@ -1035,6 +1096,69 @@ impl Trees {
         let (l, s, waiting) = (&self.l, &self.s, &self.waiting);
         (self.discarded)
             .retain(|id, _| l.get(id).is_some() || s.get(id).is_some() || waiting.contains_key(id));
+        dropped
+    }
+
+    fn drop_together(&mut self, ids: &[NodeId]) -> bool {
+        let mut offered: BTreeMap<NodeId, Option<Shape>> = (self.waiting.iter())
+            .map(|(id, waiting)| (id.clone(), waiting.shape.clone()))
+            .chain((self.same.iter()).map(|id| (id.clone(), self.r.live(id).cloned())))
+            .filter(|(id, _)| !ids.contains(id))
+            .collect();
+        let mut updates: BTreeMap<NodeId, Option<Shape>> =
+            ids.iter().map(|id| (id.clone(), None)).collect();
+        loop {
+            let mut s = self.s.clone();
+            for (id, shape) in &updates {
+                match shape {
+                    Some(shape) => {
+                        s.insert(id.clone(), shape.clone());
+                    }
+                    None => {
+                        s.remove(id);
+                    }
+                }
+            }
+            let involved: Vec<NodeId> = match s.check(Names::ByKey) {
+                Ok(()) => break,
+                Err(TreeError::NameTaken { parent, name }) => (s.iter())
+                    .filter(|(_, shape)| {
+                        shape.parent == parent && name_key(&shape.name) == name_key(&name)
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect(),
+                Err(
+                    TreeError::MissingParent(id)
+                    | TreeError::ParentNotDir(id)
+                    | TreeError::Cycle(id),
+                ) => {
+                    let mut chain = vec![id];
+                    for _ in 0..s.len() {
+                        match s.get(chain.last().expect("the chain starts with a node")) {
+                            Some(shape) if !chain.contains(&shape.parent) => {
+                                chain.push(shape.parent.clone())
+                            }
+                            _ => break,
+                        }
+                    }
+                    chain
+                }
+                Err(TreeError::RootStored) => return false,
+            };
+            let needed: Vec<(NodeId, Option<Shape>)> = (involved.iter())
+                .filter_map(|id| offered.remove_entry(id))
+                .collect();
+            if needed.is_empty() {
+                return false;
+            }
+            updates.extend(needed);
+        }
+        for (id, shape) in updates {
+            self.set_synced_unmarked(&id, shape);
+            self.same.remove(&id);
+            self.mark(&id);
+        }
+        true
     }
 
     /// The caller has passed the rules files of a full scan made since the last restore, and the
@@ -2780,6 +2904,7 @@ impl Trees {
             trashed_here,
             removed_here,
             discarded,
+            adopted: _,
             edited_here,
             moved_here,
             past_positions,
@@ -2992,3 +3117,6 @@ enum Discard {
     Kept,
     Pending,
 }
+
+#[cfg(test)]
+mod tests;
