@@ -120,13 +120,11 @@ The [user guide](docs/guide/README.md) covers conflicts, the trash, devices, lim
 
 Koidrive for macOS is a menu bar app for macOS 26 or later on Apple silicon. It shows each folder's sync status, asks before a large delete reaches your other machines, links folders, adds devices and pauses sync.
 
-Download `Koidrive-<version>-arm64.dmg` from the [latest release](https://github.com/koidrive/koidrive/releases/latest), open it and drag Koidrive to Applications. With [Homebrew](https://brew.sh), one command installs the app and puts its `koi` on your `PATH`:
+Download `Koidrive-<version>-arm64.dmg` from the [latest release](https://github.com/koidrive/koidrive/releases/latest), open it and drag Koidrive to Applications. With [Homebrew](https://brew.sh), one command installs the app and puts its `koi` on your `PATH`. If the `koidrive` formula is installed, first run `brew uninstall --formula koidrive/tap/koidrive`, as [Install with Homebrew](docs/guide/install.md#install-with-homebrew) explains. Install the cask with:
 
 ```sh
 brew install --cask koidrive/tap/koidrive
 ```
-
-If the `koidrive` formula is installed, run `brew uninstall --formula koidrive/tap/koidrive` first, as [Install with Homebrew](docs/guide/install.md#install-with-homebrew) explains.
 
 Then open Koidrive. On a Mac where `koi` isn't set up, the Set Up Koidrive window asks for your server, signs in this Mac and links a folder.
 
