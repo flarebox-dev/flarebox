@@ -139,4 +139,16 @@ message ListTrash {
 message TrashPage {
   repeated NodeState nodes = 1;
   string next_cursor = 2;
+  // One entry for each node in nodes that the server knows the deletion of (RFC 0023). A server before RFC 0023
+  // sends none.
+  repeated Trashed trashed = 3;
+}
+
+// The deletion that put a node in the trash (RFC 0023).
+message Trashed {
+  string node_id = 1;
+  // committed_at_ms of the commit whose Delete trashed the node.
+  int64 trashed_at_ms = 2;
+  // The device that sent that commit.
+  string device_id = 3;
 }

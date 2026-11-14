@@ -48,6 +48,7 @@ import {
   type PrepareUpload,
   PrepareUploadResultSchema,
   TargetSchema,
+  TrashedSchema,
   TrashPageSchema,
   TreePageSchema,
   VersionChunksSchema,
@@ -1086,16 +1087,28 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
       const found = rows<NodeRow>(
         this.sql.exec("SELECT * FROM nodes WHERE status = ? AND node_id > ? ORDER BY node_id LIMIT ?", status, cursor, limit + 1),
       );
-      const nodes = fitPage(found.slice(0, limit), (node) => nodeState(this.sql, node), (state) => toBinary(NodeStateSchema, state).length);
-      const more = nodes.length < found.length;
-      return { nodes, nextCursor: more ? nodes.at(-1)!.nodeId : "" };
+      const entries = fitPage(
+        found.slice(0, limit),
+        (node) => ({
+          state: nodeState(this.sql, node),
+          trashed:
+            node.trashed_at_ms === null
+              ? undefined
+              : create(TrashedSchema, { nodeId: node.node_id, trashedAtMs: BigInt(node.trashed_at_ms), deviceId: node.meta_dev }),
+        }),
+        ({ state, trashed }) => toBinary(NodeStateSchema, state).length + (trashed ? toBinary(TrashedSchema, trashed).length + 6 : 0),
+      );
+      const more = entries.length < found.length;
+      return { entries, nextCursor: more ? entries.at(-1)!.state.nodeId : "" };
     }
 
     private listTree(request: ListTree) {
       const head = this.headSeq;
       const token = this.tokenAt(head);
+      const { entries, nextCursor } = this.nodePage(1, request.cursor, request.limit);
       return create(TreePageSchema, {
-        ...this.nodePage(1, request.cursor, request.limit),
+        nodes: entries.map((entry) => entry.state),
+        nextCursor,
         headSeq: BigInt(head),
         headCommitId: token.commitId,
         headCommittedAtMs: token.committedAtMs,
@@ -1103,7 +1116,12 @@ export function spaceLogic<B extends abstract new (...args: any[]) => object>(Ba
     }
 
     private listTrash(request: ListTrash) {
-      return create(TrashPageSchema, this.nodePage(2, request.cursor, request.limit));
+      const { entries, nextCursor } = this.nodePage(2, request.cursor, request.limit);
+      return create(TrashPageSchema, {
+        nodes: entries.map((entry) => entry.state),
+        trashed: entries.flatMap((entry) => entry.trashed ?? []),
+        nextCursor,
+      });
     }
 
     private dropVersion(version: VersionRow, nowMs: number): void {

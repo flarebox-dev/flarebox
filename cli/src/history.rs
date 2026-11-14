@@ -1011,7 +1011,7 @@ mod tests {
         };
         let trash_page = TrashPage {
             nodes: vec![node("old", "docs", "old.txt", NodeKind::File, 12, "g")],
-            next_cursor: String::new(),
+            ..TrashPage::default()
         };
         let refusal = Error {
             message: "not a member of this space".into(),
