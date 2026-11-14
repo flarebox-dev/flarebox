@@ -2,13 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Publishes the GitHub release for a version tag with the files in a directory, then checks the result.
-# The directory holds the CLI tarballs, the app's disk image Koidrive-<version>-arm64.dmg and SHA256SUMS,
-# which lists each of them; the script refuses to publish anything else.
+# The directory holds the CLI tarballs, the app's disk image Koidrive-<version>-arm64.dmg, SHA256SUMS,
+# which lists each of them, and SHA256SUMS.sig; the script refuses to publish anything else.
 # The release becomes Latest only when no published release that can be Latest (not a draft and not a
 # prerelease) has a higher version, so a rerun or an older tag leaves Latest where it is.
 # Usage: publish-release.sh <tag> <directory>
 # Environment:
 #   GH_REPO                     owner/name of the repository
+#   RELEASE_ALLOWED_SIGNERS     ssh-keygen allowed-signers file with the release key that signs SHA256SUMS
 #   PRERELEASE                  true for an -alpha.N or -rc.N tag, false for vX.Y.Z
 #   PRERELEASE_TAGS_PUBLISH_AS  latest: an -alpha.N or -rc.N tag is published as a normal release;
 #                               prerelease: it is published as a GitHub prerelease
@@ -16,7 +17,7 @@ set -euo pipefail
 
 tag=${1:?usage: publish-release.sh <tag> <directory>}
 files=${2:?usage: publish-release.sh <tag> <directory>}
-: "${GH_REPO:?is not set}" "${PRERELEASE:?is not set}" "${PRERELEASE_TAGS_PUBLISH_AS:?is not set}"
+: "${GH_REPO:?is not set}" "${PRERELEASE:?is not set}" "${PRERELEASE_TAGS_PUBLISH_AS:?is not set}" "${RELEASE_ALLOWED_SIGNERS:?is not set}"
 
 # version_key prints a key for vX.Y.Z[-alpha.N|-rc.N] that sorts as text in version order, with
 # alpha before rc before the release itself. It fails for any other tag.
@@ -34,10 +35,11 @@ dmg="Koidrive-${tag#v}-arm64.dmg"
 sums="$files/SHA256SUMS"
 [ -f "$files/$dmg" ] || { echo "::error::$files has no $dmg, and a release needs the signed app."; exit 1; }
 [ -f "$sums" ] || { echo "::error::$files has no SHA256SUMS."; exit 1; }
+[ -f "$sums.sig" ] || { echo "::error::$files has no SHA256SUMS.sig."; exit 1; }
 assets=0
 for path in "$files"/*; do
     name=${path##*/}
-    [ "$name" != SHA256SUMS ] || continue
+    case $name in SHA256SUMS | SHA256SUMS.sig) continue ;; esac
     case $name in
         koidrive-*.tar.gz | "$dmg") ;;
         *) echo "::error::$files has $name, which is neither a CLI tarball nor $dmg."; exit 1 ;;
@@ -49,6 +51,8 @@ done
 entries=$(awk 'NF { count++ } END { print count + 0 }' "$sums")
 [ "$entries" = "$assets" ] || { echo "::error::SHA256SUMS has $entries entries, but $files has $assets files to publish."; exit 1; }
 (cd "$files" && sha256sum --strict -c SHA256SUMS) || { echo "::error::A file in $files does not match its SHA256SUMS entry."; exit 1; }
+ssh-keygen -q -Y verify -f "$RELEASE_ALLOWED_SIGNERS" -I koidrive -n koidrive-release -s "$sums.sig" < "$sums" > /dev/null \
+    || { echo "::error::SHA256SUMS.sig is not a signature of SHA256SUMS by the release key pinned in $RELEASE_ALLOWED_SIGNERS."; exit 1; }
 
 before=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name 2>/dev/null) || before=none
 

@@ -74,7 +74,12 @@ case "$1 $2" in
 esac
 EOF
 chmod +x "$tmp/bin/gh"
+ssh-keygen -q -t ed25519 -N '' -C koidrive-release -f "$tmp/release-key"
+ssh-keygen -q -t ed25519 -N '' -C other -f "$tmp/other-key"
+printf 'koidrive namespaces="koidrive-release" %s\n' "$(cut -d' ' -f1,2 "$tmp/release-key.pub")" > "$tmp/allowed-signers"
+RELEASE_SIGNING_KEY=$(cat "$tmp/release-key")
 export PATH="$tmp/bin:$PATH" GH_REPO=koidrive/koidrive GH_STUB_DIR="$tmp/db" PRERELEASE_TAGS_PUBLISH_AS=latest
+export RELEASE_ALLOWED_SIGNERS="$tmp/allowed-signers" RELEASE_SIGNING_KEY
 passed=0
 
 stage() {
@@ -84,6 +89,14 @@ stage() {
     echo cli > "$tmp/dist/koidrive-aarch64-apple-darwin.tar.gz"
     echo app > "$tmp/dist/Koidrive-${1#v}-arm64.dmg"
     (cd "$tmp/dist" && sha256sum koidrive-*.tar.gz Koidrive-*.dmg > SHA256SUMS)
+    sign
+}
+sign() {
+    bash "$root/scripts/sign-checksums.sh" "$tmp/dist" > /dev/null
+}
+sign_with() {
+    rm -f "$tmp/dist/SHA256SUMS.sig"
+    ssh-keygen -q -Y sign -f "$1" -n "$2" "$tmp/dist/SHA256SUMS"
 }
 publish_staged() {
     local prerelease=false
@@ -121,9 +134,9 @@ expect_refused() {
 
 fresh
 publish v0.1.0-alpha.2
-[ "$(sort "$tmp/db/assets-v0.1.0-alpha.2")" = "$(printf '%s\n' Koidrive-0.1.0-alpha.2-arm64.dmg SHA256SUMS koidrive-aarch64-apple-darwin.tar.gz koidrive-x86_64-unknown-linux-musl.tar.gz | sort)" ] \
-    || { echo 'FAIL the release does not have the tarballs, the dmg and SHA256SUMS' >&2; cat "$tmp/db/assets-v0.1.0-alpha.2" >&2; exit 1; }
-pass 'a prerelease tag attaches the tarballs, its dmg and SHA256SUMS'
+[ "$(sort "$tmp/db/assets-v0.1.0-alpha.2")" = "$(printf '%s\n' Koidrive-0.1.0-alpha.2-arm64.dmg SHA256SUMS SHA256SUMS.sig koidrive-aarch64-apple-darwin.tar.gz koidrive-x86_64-unknown-linux-musl.tar.gz | sort)" ] \
+    || { echo 'FAIL the release does not have the tarballs, the dmg, SHA256SUMS and its signature' >&2; cat "$tmp/db/assets-v0.1.0-alpha.2" >&2; exit 1; }
+pass 'a prerelease tag attaches the tarballs, its dmg, SHA256SUMS and its signature'
 
 fresh
 stage v0.2.0
@@ -155,16 +168,49 @@ expect_refused v0.2.0 'does not match its SHA256SUMS entry' 'a malformed SHA256S
 stage v0.2.0
 rm "$tmp/dist/SHA256SUMS"
 expect_refused v0.2.0 'has no SHA256SUMS' 'a release without SHA256SUMS is refused'
+stage v0.2.0
+rm "$tmp/dist/SHA256SUMS.sig"
+expect_refused v0.2.0 'has no SHA256SUMS.sig' 'a release without SHA256SUMS.sig is refused'
+stage v0.2.0
+sign_with "$tmp/other-key" koidrive-release
+expect_refused v0.2.0 'is not a signature of SHA256SUMS by the release key' 'SHA256SUMS signed by another key is refused'
+stage v0.2.0
+sign_with "$tmp/release-key" file
+expect_refused v0.2.0 'is not a signature of SHA256SUMS by the release key' 'a release-key signature in another namespace is refused'
+stage v0.2.0
+printf 'other bytes\n' > "$tmp/other-sums"
+ssh-keygen -q -Y sign -f "$tmp/release-key" -n koidrive-release "$tmp/other-sums"
+cp "$tmp/other-sums.sig" "$tmp/dist/SHA256SUMS.sig"
+expect_refused v0.2.0 'is not a signature of SHA256SUMS by the release key' 'a release-key signature of other bytes is refused'
+if output=$(RELEASE_SIGNING_KEY='' bash "$root/scripts/sign-checksums.sh" "$tmp/dist" 2>&1); then
+    echo 'FAIL signing succeeded without RELEASE_SIGNING_KEY' >&2
+    exit 1
+fi
+grep -qF '::error::Signing SHA256SUMS needs the secret RELEASE_SIGNING_KEY in the release-signing environment.' <<< "$output"
+pass 'signing without the secret names the secret and its environment'
+if output=$(RELEASE_SIGNING_KEY=$(cat "$tmp/other-key") bash "$root/scripts/sign-checksums.sh" "$tmp/dist" 2>&1); then
+    echo 'FAIL signing succeeded with a key other than the pinned one' >&2
+    exit 1
+fi
+grep -qF 'RELEASE_SIGNING_KEY does not match the release key pinned in' <<< "$output"
+pass 'a signing key other than the pinned one stops the release'
+pinned="$root/.github/release-allowed-signers"
+if [ "$(grep -c . "$pinned" 2>/dev/null)" != 1 ] || ! grep -Eqx 'koidrive namespaces="koidrive-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5[A-Za-z0-9+/]{48}' "$pinned"; then
+    echo 'FAIL .github/release-allowed-signers must hold one line: koidrive namespaces="koidrive-release" ssh-ed25519 <release public key>' >&2
+    exit 1
+fi
+pass 'the release public key is pinned'
 
 fresh
 publish v0.1.0-alpha.1
 expect_latest v0.1.0-alpha.1 'the first alpha becomes Latest'
 publish v0.1.0-alpha.1
 expect_latest v0.1.0-alpha.1 'a rerun of the highest tag keeps Latest'
-[ "$(wc -l < "$tmp/db/assets-v0.1.0-alpha.1" | tr -d ' ')" = 4 ] || { echo 'FAIL an identical rerun uploaded assets again' >&2; exit 1; }
+[ "$(wc -l < "$tmp/db/assets-v0.1.0-alpha.1" | tr -d ' ')" = 5 ] || { echo 'FAIL an identical rerun uploaded assets again' >&2; exit 1; }
 pass 'an identical rerun leaves published assets untouched'
 echo 'signed again with a different timestamp' > "$tmp/dist/koidrive-aarch64-apple-darwin.tar.gz"
 (cd "$tmp/dist" && sha256sum koidrive-*.tar.gz Koidrive-*.dmg > SHA256SUMS)
+sign
 if output=$(publish_staged v0.1.0-alpha.1 2>&1); then
     echo 'FAIL a rerun replaced a published release with different bytes' >&2
     exit 1

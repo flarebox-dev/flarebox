@@ -76,3 +76,21 @@ If the secret is lost, create a new certificate. A team can have up to five Deve
    ```
 
 6. Delete the `.p8` file. If the secret is lost or leaks, revoke the key on the same page and generate a new one.
+
+## The release checksum key
+
+Each release publishes `SHA256SUMS.sig`, an `ssh-keygen -Y sign` signature of `SHA256SUMS` in the namespace `koidrive-release`. The `sign-checksums` job signs with the secret `RELEASE_SIGNING_KEY` in the `release-signing` environment, and fails when that key does not match the public key in `.github/release-allowed-signers`. `publish-release.sh` refuses a signature that does not verify against the same file.
+
+Create the `release-signing` environment like `macos-release`, with only a **Tag** rule for `v*` under "Deployment branches and tags". It needs no reviewers: the job runs after `checksums`, which waits for the approved `macos-release` jobs.
+
+To create or replace the key:
+
+```sh
+d=$(mktemp -d)
+ssh-keygen -q -t ed25519 -N '' -C koidrive-release -f "$d/key"
+gh secret set RELEASE_SIGNING_KEY --env release-signing < "$d/key"
+cut -d' ' -f1,2 "$d/key.pub" | sed 's/^/koidrive namespaces="koidrive-release" /'
+rm -rf "$d"
+```
+
+The last command prints the line for `.github/release-allowed-signers`. The environment secret is the private key's only copy.
