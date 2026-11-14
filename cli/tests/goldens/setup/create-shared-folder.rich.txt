@@ -1,0 +1,22 @@
+┌  Koidrive <VERSION>
+│
+◇  How do you want to connect?
+│  Log in with Cloudflare
+◇  Signed in to Personal
+◇  Found your server
+◇  This device is connected
+◇  Which shared folder should sync here?
+│  Create a shared folder
+◇  Shared folder name
+│  Photos
+◇  ~/Koidrive is linked to Photos
+◇  Background sync is running
+│
+│  Reports include usage counts, crash locations, daily sync totals, OS, and Koidrive version.
+│  No file names, paths, contents, error messages, server address, or account.
+│  Preview: koi telemetry preview. Turn off: koi telemetry off.
+◇  Send anonymous usage reports?
+│  Yes
+│
+└  Setup complete. Add files to ~/Koidrive.
+   Check sync: koi status

@@ -28,7 +28,7 @@ use crate::credential::{
 };
 use crate::failures::Halted;
 use crate::folder::FolderTask;
-use crate::ignore::{Matcher, local_rules, matcher};
+use crate::ignore::{Matcher, has_sync_entries, local_rules, matcher};
 use crate::leave::{Leaving, Phase};
 use crate::paths::{Paths, PathsError};
 use crate::question::{Answer, Limit, Question, QuestionKind};
@@ -1154,12 +1154,7 @@ impl Driver {
         if let Some(approval) = approval {
             approval.check_directory(&root)?;
             let unapproved_files = !approval.accept_existing_files
-                && fs::read_dir(&root)
-                    .map_err(io_error(&root))?
-                    .try_fold(false, |found, entry| {
-                        entry.map(|entry| found || entry.file_name() != koidrive_fs::PRIVATE_DIR)
-                    })
-                    .map_err(io_error(&root))?;
+                && has_sync_entries(&root).map_err(io_error(&root))?;
             if unapproved_files || !claim::still_locked(&lock, &root) {
                 return Err(DriverError::FolderApprovalChanged(root));
             }
@@ -6370,6 +6365,138 @@ mod tests {
             Err(DriverError::Api(_))
         ));
         assert!(driver.status().folders.is_empty());
+    }
+
+    #[tokio::test]
+    async fn link_approval_rechecks_syncable_files_after_the_server_reply() {
+        for (name, consent, allowed) in [
+            (".DS_Store", false, true),
+            ("THUMBS.DB", false, true),
+            ("report.docx", false, false),
+            ("report.docx", true, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = fs::canonicalize(dir.path()).unwrap();
+            let root = base.join("Koidrive");
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("desktop.ini"), b"metadata").unwrap();
+            let approval = LinkApproval {
+                directory: crate::DirectoryIdentity::of(&fs::metadata(&root).unwrap()),
+                accept_existing_files: consent,
+            };
+            let spaces = prost::Message::encode_to_vec(&koidrive_proto::v1::SpaceList {
+                spaces: vec![SpaceInfo {
+                    space_id: SPACE.into(),
+                    name: "Projects".into(),
+                    format_version: 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            let (server, held) = serve_held(vec![access_token().1, spaces]).await;
+            let paths = Paths::under(&base.join("profile"));
+            Credential {
+                server,
+                ..credential("d1")
+            }
+            .save_new(&paths.credential())
+            .unwrap();
+            let driver = Driver::open(paths.clone()).unwrap();
+            let pending = tokio::spawn({
+                let driver = driver.clone();
+                let root = root.clone();
+                async move { driver.link_approved(&root, SPACE, Some(approval)).await }
+            });
+            held.arrived.await.unwrap();
+            assert!(claim::lock(&root).unwrap().is_none());
+            fs::write(root.join(name), b"arrived after approval").unwrap();
+            held.release.send(()).unwrap();
+            let result = pending.await.unwrap();
+            assert_eq!(held.served.await.unwrap(), ["/v1/token", "/v1/spaces"]);
+            if allowed {
+                assert!(
+                    matches!(result, Ok(Linked::New(_))),
+                    "{name}, consent={consent}: {result:?}"
+                );
+                assert_eq!(read_marker(&root).unwrap().unwrap().space_id, SPACE);
+                assert_eq!(claim::owner(&root).unwrap().unwrap().device_id, "d1");
+                assert_eq!(driver.status().folders.len(), 1);
+            } else {
+                assert!(
+                    matches!(result, Err(DriverError::FolderApprovalChanged(_))),
+                    "{name}: {result:?}"
+                );
+                assert!(read_marker(&root).unwrap().is_none());
+                assert!(claim::owner(&root).unwrap().is_none());
+                assert!(driver.status().folders.is_empty());
+                assert!(!paths.store(SPACE).unwrap().exists());
+            }
+            assert_eq!(
+                fs::read(root.join(name)).unwrap(),
+                b"arrived after approval"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn link_approval_keeps_identity_and_lock_guards_for_metadata_only_folders() {
+        for consent in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = fs::canonicalize(dir.path()).unwrap();
+            let root = base.join("Koidrive");
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join(".DS_Store"), b"metadata").unwrap();
+            let approval = LinkApproval {
+                directory: crate::DirectoryIdentity::of(&fs::metadata(&root).unwrap()),
+                accept_existing_files: consent,
+            };
+            let spaces = prost::Message::encode_to_vec(&koidrive_proto::v1::SpaceList {
+                spaces: vec![SpaceInfo {
+                    space_id: SPACE.into(),
+                    name: "Projects".into(),
+                    format_version: 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            let (server, held) = serve_held(vec![access_token().1, spaces]).await;
+            let paths = Paths::under(&base.join("profile"));
+            Credential {
+                server,
+                ..credential("d1")
+            }
+            .save_new(&paths.credential())
+            .unwrap();
+            let driver = Driver::open(paths.clone()).unwrap();
+            let lock = claim::lock(&root).unwrap().unwrap();
+            assert!(matches!(
+                driver.link_approved(&root, SPACE, Some(approval)).await,
+                Err(DriverError::FolderInUse(_))
+            ));
+            drop(lock);
+            let pending = tokio::spawn({
+                let driver = driver.clone();
+                let root = root.clone();
+                async move { driver.link_approved(&root, SPACE, Some(approval)).await }
+            });
+            held.arrived.await.unwrap();
+            let original = base.join("original");
+            fs::rename(&root, &original).unwrap();
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join(".DS_Store"), b"replacement metadata").unwrap();
+            held.release.send(()).unwrap();
+            assert!(matches!(
+                pending.await.unwrap(),
+                Err(DriverError::FolderApprovalChanged(_))
+            ));
+            assert_eq!(held.served.await.unwrap(), ["/v1/token", "/v1/spaces"]);
+            for folder in [&root, &original] {
+                assert!(!folder.join(".koidrive/space.json").exists());
+                assert!(!folder.join(".koidrive/device.json").exists());
+            }
+            assert!(driver.status().folders.is_empty());
+            assert!(!paths.store(SPACE).unwrap().exists());
+        }
     }
 
     #[tokio::test]

@@ -19,12 +19,13 @@ use prost::Message;
 
 mod schema;
 
-const ROUTE: &str = "How do you want to set up Koidrive on this machine?";
+const ROUTE: &str = "How do you want to connect?";
 const CODE: &str = "Pairing code";
 const SPACE: &str = "Which shared folder should sync here?";
-const NAME: &str = "Name of the new shared folder";
-const PATH: &str = "Press Enter to use this folder, or type another path";
-const TELEMETRY: &str = "Send reports?";
+const NAME: &str = "Shared folder name";
+const PATH: &str = "Folder to sync";
+const FILES: &str = "What should Koidrive do?";
+const TELEMETRY: &str = "Send anonymous usage reports?";
 
 struct Step {
     wait: Vec<&'static str>,
@@ -75,18 +76,35 @@ fn pairing(rich: bool) -> Vec<Step> {
     ]
 }
 
-fn default_folder(rich: bool) -> Vec<Step> {
-    vec![
-        step(PATH, "\n"),
-        step("and its shared folder named Koidrive?", yes(rich, true)),
-    ]
-}
-
 fn full(rich: bool, telemetry: &str) -> Vec<Step> {
     let mut steps = pairing(rich);
-    steps.extend(default_folder(rich));
     steps.push(step(TELEMETRY, telemetry));
     steps
+}
+
+fn folder_choices(rich: bool, telemetry: &str) -> (Home, Vec<Step>) {
+    let home = Home::new(&["Koidrive"]);
+    fs::create_dir(home.path().join("Koidrive")).unwrap();
+    fs::write(home.path().join("Koidrive/report.docx"), "draft").unwrap();
+    let mut steps = pairing(rich);
+    steps.extend([
+        step(SPACE, choose(rich, 1)),
+        step(NAME, line("Photos")),
+        step(FILES, choose(rich, 0)),
+        step(PATH, line("~/Photos")),
+        step(TELEMETRY, telemetry),
+    ]);
+    (home, steps)
+}
+
+fn assert_sync_off(text: &str) {
+    assert!(
+        text.contains("Folder linked. Background sync is off in config.toml."),
+        "{text}"
+    );
+    assert!(text.contains("Start sync: koi service start"), "{text}");
+    assert!(!text.contains("Setup complete"), "{text}");
+    assert!(!text.contains("Background sync is running"), "{text}");
 }
 
 fn no(rich: bool) -> String {
@@ -725,6 +743,14 @@ fn terminal_run(
     output
 }
 
+fn link_is_waiting(root: &Path) -> bool {
+    match File::open(root) {
+        Ok(file) => koidrive_driver::Flock::take(file).unwrap().is_none(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => panic!("open approval root {}: {error}", root.display()),
+    }
+}
+
 fn shown(output: Output) -> String {
     console::strip_ansi_codes(&String::from_utf8(output.stdout).unwrap()).into_owned()
 }
@@ -734,7 +760,8 @@ fn rich_setup_masks_pairing_input() {
     let (_, output) = session(&full(true, "n"), &[], &[], true, true, None);
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(output.status.success(), "{text}");
-    assert!(text.contains("This device is set up"), "{text}");
+    assert!(text.contains("This device is connected"), "{text}");
+    assert_sync_off(&console::strip_ansi_codes(&text));
     assert!(!text.contains("CODE@files.example.com"), "{text}");
 }
 
@@ -876,6 +903,7 @@ fn plain_setup_has_no_terminal_escapes_or_pairing_code_echo() {
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(output.status.success(), "{text}");
     assert!(!text.contains('\u{1b}'), "{text}");
+    assert!(text.is_ascii(), "{text}");
     assert!(!text.contains("CODE@files.example.com"), "{text}");
 }
 
@@ -883,9 +911,9 @@ fn plain_setup_has_no_terminal_escapes_or_pairing_code_echo() {
 fn signals_reap_helpers_and_restore_each_prompt() {
     for rich in [false, true] {
         for signal in [rustix::process::Signal::INT, rustix::process::Signal::TERM] {
-            for stage in 0..5 {
-                let steps = full(rich, if rich { "n" } else { "n\n" });
-                let (home, output) = session(&steps, &[], &[], true, rich, Some((stage, signal)));
+            for stage in 0..7 {
+                let (home, steps) = folder_choices(rich, if rich { "n" } else { "n\n" });
+                let output = home.setup(&steps, &[], &[], true, rich, Some((stage, signal)));
                 assert_eq!(
                     output.status.code(),
                     Some(if signal == rustix::process::Signal::INT {
@@ -897,7 +925,11 @@ fn signals_reap_helpers_and_restore_each_prompt() {
                     String::from_utf8_lossy(&output.stdout)
                 );
                 assert_eq!(home.connected(), stage >= 2);
-                assert_eq!(home.links().len(), usize::from(stage == 4));
+                assert_eq!(home.links().len(), usize::from(stage == 6));
+                assert_eq!(
+                    fs::read(home.path().join("Koidrive/report.docx")).unwrap(),
+                    b"draft"
+                );
             }
         }
     }
@@ -918,23 +950,31 @@ fn raw_ctrl_c_cancels_rich_selection() {
 #[test]
 fn eof_closes_each_plain_and_rich_prompt_without_granting_consent() {
     for rich in [false, true] {
-        for stage in 0..5 {
-            let mut steps = full(rich, "");
+        for stage in 0..7 {
+            let (home, mut steps) = folder_choices(rich, "");
             steps.truncate(stage + 1);
             steps[stage].input = "\u{4}".into();
-            let (home, output) = session(&steps, &[], &[], true, rich, None);
+            let output = home.setup(&steps, &[], &[], true, rich, None);
             let text = String::from_utf8(output.stdout).unwrap();
             assert_eq!(
                 output.status.code(),
-                Some(if stage == 4 { 0 } else { 1 }),
+                Some(if stage == 6 { 0 } else { 1 }),
                 "{text}"
             );
-            assert_eq!(text.contains("This device is set up"), stage >= 2, "{text}");
+            assert_eq!(
+                text.contains("This device is connected"),
+                stage >= 2,
+                "{text}"
+            );
             assert_eq!(home.connected(), stage >= 2);
-            assert_eq!(home.links().len(), usize::from(stage == 4));
+            assert_eq!(home.links().len(), usize::from(stage == 6));
+            assert_eq!(
+                fs::read(home.path().join("Koidrive/report.docx")).unwrap(),
+                b"draft"
+            );
             let state = home.path().join("state/koidrive/telemetry");
             assert!(!state.join("settings.json").exists());
-            assert_eq!(state.join("prompt.json").exists(), stage == 4);
+            assert_eq!(state.join("prompt.json").exists(), stage == 6);
         }
     }
 }
@@ -1030,7 +1070,7 @@ fn cancelled_reporting_returns_after_the_next_successful_interactive_command() {
         }
         let output = terminal_run(
             home.path(),
-            &[step(TELEMETRY, yes(rich, false))],
+            &[step("Send reports?", yes(rich, false))],
             &["status"],
             &[],
             rich,
@@ -1072,7 +1112,7 @@ fn rich_questions_use_the_terminal_color_policy_with_a_private_answer_pipe() {
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
     let question = text.find(ROUTE).unwrap();
-    let pair = text.find("On your connected computer").unwrap();
+    let pair = text.find("On your other device").unwrap();
     assert!(text[question..pair].contains("\u{1b}[32m"), "{text}");
 }
 
@@ -1083,7 +1123,7 @@ fn failed_status_check_preserves_its_exit_and_defers_consent() {
         home.disconnect();
         let output = terminal_run(
             home.path(),
-            &[step(TELEMETRY, if rich { "\u{3}" } else { "n\n" })],
+            &[step("Send reports?", if rich { "\u{3}" } else { "n\n" })],
             &["status", "--check"],
             &[],
             rich,
@@ -1106,7 +1146,7 @@ fn queued_enter_cannot_answer_deferred_consent() {
         home.disconnect();
         let output = terminal_run(
             home.path(),
-            &[step(TELEMETRY, "\u{4}")],
+            &[step("Send reports?", "\u{4}")],
             &["status"],
             &[],
             rich,
@@ -1154,10 +1194,18 @@ fn telemetry_is_asked_after_pairing_succeeds() {
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(output.status.success(), "{text}");
     assert!(
-        text.find("This device is set up").unwrap()
+        text.find("This device is connected").unwrap()
             < text.find("Send anonymous usage reports").unwrap(),
         "{text}"
     );
+    assert!(
+        text.find(TELEMETRY).unwrap()
+            < text
+                .find("Folder linked. Background sync is off in config.toml.")
+                .unwrap(),
+        "{text}"
+    );
+    assert_sync_off(&text);
     let settings: serde_json::Value = serde_json::from_slice(
         &fs::read(home.path().join("state/koidrive/telemetry/settings.json")).unwrap(),
     )
@@ -1197,6 +1245,21 @@ fn opting_in_after_setup_enables_future_reports_without_recording_the_setup() {
 }
 
 #[test]
+fn enter_accepts_the_default_usage_report_choice() {
+    for rich in [false, true] {
+        let (home, output) = session(&full(rich, "\n"), &[], &[], true, rich, None);
+        let text = shown(output.clone());
+        assert!(output.status.success(), "{text}");
+        let settings: serde_json::Value = serde_json::from_slice(
+            &fs::read(home.path().join("state/koidrive/telemetry/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(settings["enabled"], true);
+        assert_sync_off(&text);
+    }
+}
+
+#[test]
 fn explicit_choice_and_environment_do_not_prompt_after_setup() {
     for (args, vars) in [
         (vec!["--telemetry", "off"], vec![]),
@@ -1220,14 +1283,21 @@ fn pairing_with_a_new_server_proposes_and_links_a_koidrive_folder() {
         let folder = home.path().join("Koidrive");
         let text = shown(output.clone());
         assert!(output.status.success(), "{text}");
+        assert!(!text.contains(SPACE), "{text}");
+        assert!(!text.contains(NAME), "{text}");
+        assert!(!text.contains(PATH), "{text}");
+        assert!(!text.contains("Create ~/Koidrive"), "{text}");
+        assert!(text.contains("Enter a pairing code"), "{text}");
+        assert!(text.contains("~/Koidrive is linked to Koidrive"), "{text}");
+        if !rich {
+            assert!(text.contains("~/Koidrive is linked to Koidrive."), "{text}");
+        }
+        assert!(!text.contains(home.path().to_str().unwrap()), "{text}");
         assert!(
-            text.contains("Where should Koidrive sync your files?"),
+            !text.contains("0190a0b0-0000-7000-8000-000000000001"),
             "{text}"
         );
-        assert!(
-            text.contains(&format!("Folder: {}", folder.display())),
-            "{text}"
-        );
+        assert!(!text.contains("credential.json"), "{text}");
         assert!(folder.is_dir());
         let created = (home.requests().iter())
             .filter(|request| *request == "POST /v1/spaces")
@@ -1235,11 +1305,14 @@ fn pairing_with_a_new_server_proposes_and_links_a_koidrive_folder() {
         assert_eq!(created, 1);
         let space = home.space_id("Koidrive");
         assert_eq!(home.links(), [format!("link {} {space}", folder.display())]);
-        let ending = text
-            .find(&format!("Add files to {} to sync them.", folder.display()))
-            .unwrap();
-        assert!(text[ending..].contains("Check sync: koi status"), "{text}");
-        assert!(ending < text.find("Send anonymous usage reports").unwrap());
+        assert_sync_off(&text);
+        assert!(
+            text.find(TELEMETRY).unwrap()
+                < text
+                    .find("Folder linked. Background sync is off in config.toml.")
+                    .unwrap(),
+            "{text}"
+        );
         assert!(!text.contains("koi space list"), "{text}");
     }
 }
@@ -1249,12 +1322,7 @@ fn pairing_with_an_existing_server_selects_a_shared_folder() {
     for rich in [false, true] {
         let home = Home::new(&["Koidrive", "Work"]);
         let mut steps = pairing(rich);
-        steps.extend([
-            step(SPACE, choose(rich, 1)),
-            step(PATH, "\n"),
-            after(&["Create ", "Koidrive?"], yes(rich, true)),
-            step(TELEMETRY, no(rich)),
-        ]);
+        steps.extend([step(SPACE, choose(rich, 1)), step(TELEMETRY, no(rich))]);
         let output = home.setup(&steps, &[], &[], true, rich, None);
         let text = shown(output.clone());
         assert!(output.status.success(), "{text}");
@@ -1269,10 +1337,7 @@ fn pairing_with_an_existing_server_selects_a_shared_folder() {
             )]
         );
         assert!(!home.requests().contains(&"POST /v1/spaces".to_owned()));
-        assert!(
-            text.contains(&format!("Linked {} to Work.", folder.display())),
-            "{text}"
-        );
+        assert!(text.contains("~/Koidrive is linked to Work"), "{text}");
     }
 }
 
@@ -1280,12 +1345,7 @@ fn pairing_with_an_existing_server_selects_a_shared_folder() {
 fn shared_folders_with_one_name_show_a_short_id() {
     let home = Home::new(&["Work", "Work"]);
     home.connect();
-    let steps = [
-        step(SPACE, choose(false, 1)),
-        step(PATH, "\n"),
-        step("Create ", yes(false, true)),
-        step(TELEMETRY, no(false)),
-    ];
+    let steps = [step(SPACE, choose(false, 1)), step(TELEMETRY, no(false))];
     let output = home.setup(&steps, &[], &[], true, false, None);
     let text = shown(output.clone());
     assert!(output.status.success(), "{text}");
@@ -1309,8 +1369,6 @@ fn a_new_shared_folder_takes_the_name_typed() {
         steps.extend([
             step(SPACE, choose(rich, 1)),
             step(NAME, line("Photos")),
-            step(PATH, "\n"),
-            step("and its shared folder named Photos?", yes(rich, true)),
             step(TELEMETRY, no(rich)),
         ]);
         let output = home.setup(&steps, &[], &[], true, rich, None);
@@ -1325,7 +1383,7 @@ fn a_new_shared_folder_takes_the_name_typed() {
                 home.space_id("Photos")
             )]
         );
-        assert!(text.contains("Created the shared folder Photos."), "{text}");
+        assert!(text.contains("~/Koidrive is linked to Photos"), "{text}");
     }
 }
 
@@ -1333,7 +1391,9 @@ fn a_new_shared_folder_takes_the_name_typed() {
 fn a_lost_create_answer_links_the_shared_folder_it_made_once() {
     let home = Home::new(&[]);
     home.lose_create.store(true, Ordering::Relaxed);
-    let output = home.setup(&full(false, "n\n"), &[], &[], true, false, None);
+    let mut steps = pairing(false);
+    steps.extend([step(SPACE, choose(false, 0)), step(TELEMETRY, "n\n")]);
+    let output = home.setup(&steps, &[], &[], true, false, None);
     let text = shown(output.clone());
     assert!(output.status.success(), "{text}");
     let created = (home.requests().iter())
@@ -1346,35 +1406,78 @@ fn a_lost_create_answer_links_the_shared_folder_it_made_once() {
 }
 
 #[test]
+fn a_default_collision_choice_can_be_cancelled_without_linking_local_files() {
+    for rich in [false, true] {
+        let home = Home::new(&[]);
+        home.connect();
+        home.lose_create.store(true, Ordering::Relaxed);
+        let folder = home.path().join("Koidrive");
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("report.docx"), b"draft").unwrap();
+        let steps = [after(
+            &["A shared folder named Koidrive is available.", SPACE],
+            "",
+        )];
+        let output = home.setup(
+            &steps,
+            &["--telemetry", "off"],
+            &[],
+            true,
+            rich,
+            Some((0, rustix::process::Signal::INT)),
+        );
+        let text = shown(output.clone());
+        assert_eq!(output.status.code(), Some(130), "{text}");
+        assert!(!text.contains(FILES), "{text}");
+        assert!(home.links().is_empty(), "{text}");
+        assert!(!folder.join(".koidrive/device.json").exists());
+        assert!(!folder.join(".koidrive/space.json").exists());
+        assert_eq!(fs::read(folder.join("report.docx")).unwrap(), b"draft");
+        assert_eq!(home.spaces.lock().unwrap().len(), 1);
+        assert_eq!(
+            home.requests()
+                .iter()
+                .filter(|request| *request == "POST /v1/spaces")
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
 fn a_folder_with_files_links_only_after_its_owner_agrees() {
     for rich in [false, true] {
         for accept in [true, false] {
             let home = Home::new(&["Koidrive"]);
             home.connect();
-            let files = home.path().join("Files");
+            let files = home.path().join("Koidrive");
             fs::create_dir(&files).unwrap();
             fs::write(files.join("report.docx"), "draft").unwrap();
             let other = home.path().join("My Files é");
             let mut steps = vec![
                 step(SPACE, choose(rich, 0)),
-                step(PATH, line("~/Files")),
-                step(
-                    "will upload to Koidrive, and files in Koidrive will download here.",
-                    no(rich),
-                ),
+                step(FILES, choose(rich, usize::from(accept))),
             ];
-            if accept {
-                steps[2].input = yes(rich, true);
-            } else {
-                steps.extend([
-                    after(&["Folder: ", PATH], line("~/My Files é")),
-                    after(&["Create ", "My Files é?"], yes(rich, true)),
-                ]);
+            if !accept {
+                steps.push(step(PATH, line("~/My Files é")));
             }
             steps.push(step(TELEMETRY, no(rich)));
             let output = home.setup(&steps, &[], &[], true, rich, None);
             let text = shown(output.clone());
             assert!(output.status.success(), "{text}");
+            assert!(
+                text.contains("~/Koidrive contains files. They will upload to Koidrive."),
+                "{text}"
+            );
+            assert!(
+                text.contains("Files in Koidrive will download into ~/Koidrive."),
+                "{text}"
+            );
+            assert!(
+                text.find("Use another folder").unwrap() < text.find("Sync these files").unwrap(),
+                "{text}"
+            );
+            assert_eq!(text.contains(PATH), !accept, "{text}");
             let linked = if accept { &files } else { &other };
             assert_eq!(
                 home.links(),
@@ -1392,23 +1495,66 @@ fn a_folder_with_files_links_only_after_its_owner_agrees() {
 }
 
 #[test]
+fn a_populated_alternate_folder_needs_its_own_consent() {
+    for rich in [false, true] {
+        let home = Home::new(&[]);
+        home.connect();
+        for folder in ["Koidrive", "Other"] {
+            fs::create_dir(home.path().join(folder)).unwrap();
+            fs::write(home.path().join(folder).join("report.docx"), folder).unwrap();
+        }
+        let steps = [
+            step(FILES, choose(rich, 0)),
+            step(PATH, line("~/Other")),
+            after(&["~/Other contains files.", FILES], choose(rich, 1)),
+            step(TELEMETRY, no(rich)),
+        ];
+        let output = home.setup(&steps, &[], &[], true, rich, None);
+        let text = shown(output.clone());
+        assert!(output.status.success(), "{text}");
+        assert!(
+            text.contains("They will upload to a new shared folder named Koidrive."),
+            "{text}"
+        );
+        assert_eq!(
+            home.links(),
+            [format!(
+                "link {} {}",
+                home.path().join("Other").display(),
+                home.space_id("Koidrive")
+            )]
+        );
+        for folder in ["Koidrive", "Other"] {
+            assert_eq!(
+                fs::read(home.path().join(folder).join("report.docx")).unwrap(),
+                folder.as_bytes()
+            );
+        }
+    }
+}
+
+#[test]
 fn a_file_is_refused_and_the_folder_asked_again() {
     for rich in [false, true] {
         let home = Home::new(&["Koidrive"]);
         home.connect();
+        fs::write(home.path().join("Koidrive"), "not a folder").unwrap();
         fs::write(home.path().join("notes.txt"), "notes").unwrap();
         let steps = [
             step(SPACE, choose(rich, 0)),
             step(PATH, line("~/notes.txt")),
-            after(&["is a file, not a folder", PATH], "\n"),
-            after(&["Create ", "Koidrive?"], yes(rich, true)),
+            after(&["is a file, not a folder", PATH], line("~/Documents")),
             step(TELEMETRY, no(rich)),
         ];
         let output = home.setup(&steps, &[], &[], true, rich, None);
         let text = shown(output.clone());
         assert!(output.status.success(), "{text}");
         assert_eq!(fs::read(home.path().join("notes.txt")).unwrap(), b"notes");
-        let folder = home.path().join("Koidrive");
+        assert_eq!(
+            fs::read(home.path().join("Koidrive")).unwrap(),
+            b"not a folder"
+        );
+        let folder = home.path().join("Documents");
         assert_eq!(
             home.links(),
             [format!(
@@ -1431,16 +1577,12 @@ fn a_rerun_with_a_linked_folder_changes_nothing() {
         let output = home.setup(&[step(TELEMETRY, no(rich))], &[], &[], true, rich, None);
         let text = shown(output.clone());
         assert!(output.status.success(), "{text}");
-        assert!(
-            text.contains("This computer is already connected to Koidrive."),
-            "{text}"
-        );
-        assert!(
-            text.contains(&format!("{} syncs with Koidrive.", folder.display())),
-            "{text}"
-        );
+        assert!(text.contains("This device is already connected"), "{text}");
+        assert!(text.contains("~/Koidrive is linked to Koidrive"), "{text}");
         assert!(!text.contains(ROUTE), "{text}");
         assert!(!text.contains(PATH), "{text}");
+        assert!(!text.contains(SPACE), "{text}");
+        assert_sync_off(&text);
         let requests = home.requests();
         assert!(
             !requests
@@ -1452,23 +1594,49 @@ fn a_rerun_with_a_linked_folder_changes_nothing() {
 }
 
 #[test]
+fn background_off_in_config_does_not_claim_the_daemon_has_stopped() {
+    for rich in [false, true] {
+        let home = Home::new(&["Koidrive"]);
+        home.connect();
+        let folder = home.path().join("Koidrive");
+        fs::create_dir(&folder).unwrap();
+        home.link(&folder, &home.space_id("Koidrive"));
+        let daemon = home.daemon(true);
+        let output = koi(home.path())
+            .args(["status", "--json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(status["data"]["running"], true, "{status}");
+        let output = terminal_run(
+            home.path(),
+            &[step(TELEMETRY, no(rich))],
+            &["setup", "--interactive"],
+            &[],
+            rich,
+            None,
+            TerminalInput::Direct,
+        );
+        daemon.finish();
+        let text = shown(output.clone());
+        assert!(output.status.success(), "{text}");
+        assert_sync_off(&text);
+        assert!(!text.contains("Background sync is off."), "{text}");
+        assert!(home.links().is_empty());
+    }
+}
+
+#[test]
 fn a_connected_device_without_a_folder_goes_to_the_folder_step() {
     for rich in [false, true] {
         let home = Home::new(&["Koidrive"]);
         home.connect();
-        let steps = [
-            step(SPACE, choose(rich, 0)),
-            step(PATH, "\n"),
-            after(&["Create ", "Koidrive?"], yes(rich, true)),
-            step(TELEMETRY, no(rich)),
-        ];
+        let steps = [step(SPACE, choose(rich, 0)), step(TELEMETRY, no(rich))];
         let output = home.setup(&steps, &[], &[], true, rich, None);
         let text = shown(output.clone());
         assert!(output.status.success(), "{text}");
-        assert!(
-            text.contains("This computer is already connected to Koidrive."),
-            "{text}"
-        );
+        assert!(text.contains("This device is already connected"), "{text}");
         assert!(!text.contains(ROUTE), "{text}");
         assert!(!home.requests().contains(&"pair".to_owned()));
         assert_eq!(home.links().len(), 1);
@@ -1485,11 +1653,13 @@ fn cancelling_a_folder_question_keeps_the_device_and_links_nothing() {
             for stage in 0..4 {
                 let home = Home::new(&["Koidrive"]);
                 home.connect();
+                fs::create_dir(home.path().join("Koidrive")).unwrap();
+                fs::write(home.path().join("Koidrive/report.docx"), "draft").unwrap();
                 let mut steps = vec![
                     step(SPACE, choose(rich, 1)),
                     step(NAME, line("Photos")),
-                    step(PATH, "\n"),
-                    step("and its shared folder named Photos?", yes(rich, true)),
+                    step(FILES, choose(rich, 0)),
+                    step(PATH, line("~/Photos")),
                 ];
                 steps.truncate(stage + 1);
                 steps[stage].input = key.into();
@@ -1502,8 +1672,21 @@ fn cancelling_a_folder_question_keeps_the_device_and_links_nothing() {
                 );
                 assert!(home.connected());
                 assert!(home.links().is_empty(), "{:?}", home.requests());
-                assert!(!home.requests().contains(&"POST /v1/spaces".to_owned()));
-                assert!(!home.path().join("Koidrive").exists());
+                assert_eq!(
+                    home.requests()
+                        .iter()
+                        .filter(|request| *request == "POST /v1/spaces")
+                        .count(),
+                    usize::from(stage >= 2),
+                    "{text}"
+                );
+                assert!(!home.path().join("Koidrive/.koidrive/device.json").exists());
+                assert!(!home.path().join("Koidrive/.koidrive/space.json").exists());
+                assert_eq!(
+                    fs::read(home.path().join("Koidrive/report.docx")).unwrap(),
+                    b"draft"
+                );
+                assert!(!home.path().join("Photos").exists());
             }
         }
     }
@@ -1549,24 +1732,21 @@ fn scripted_pairing_links_the_folder_without_a_terminal() {
 #[test]
 fn files_appearing_during_creation_confirmation_are_not_linked_without_consent() {
     for rich in [false, true] {
-        let home = Home::new(&["Work"]);
+        let home = Home::new(&[]);
         home.connect();
         let folder = home.path().join("Koidrive");
         let changed = folder.clone();
-        let steps = [
-            step(SPACE, choose(rich, 0)),
-            step(PATH, "\n"),
-            Step {
-                before_answer: Some(Box::new(move || {
-                    fs::create_dir(&changed).unwrap();
-                    fs::write(changed.join("private.docx"), "private document").unwrap();
-                })),
-                ..after(&["Create ", "Koidrive?"], yes(rich, true))
-            },
-        ];
+        let injected = Arc::new(AtomicBool::new(false));
+        let did_inject = injected.clone();
+        *home.request_hook.lock().unwrap() = Some(Box::new(move |request| {
+            if request == "GET /v1/spaces" && link_is_waiting(&changed) {
+                fs::write(changed.join("private.docx"), "private document").unwrap();
+                did_inject.store(true, Ordering::Relaxed);
+            }
+        }));
         let output = terminal_run(
             home.path(),
-            &steps,
+            &[],
             &["setup", "--telemetry", "off"],
             &[],
             rich,
@@ -1574,6 +1754,7 @@ fn files_appearing_during_creation_confirmation_are_not_linked_without_consent()
             TerminalInput::Direct,
         );
         let text = shown(output.clone());
+        assert!(injected.load(Ordering::Relaxed), "{text}");
         assert!(!output.status.success(), "{text}");
         let driver = koidrive_driver::Driver::open(home.paths()).unwrap();
         assert!(driver.status().folders.is_empty(), "{text}");
@@ -1592,16 +1773,15 @@ fn files_appearing_during_the_link_server_call_still_need_consent() {
         let folder = home.path().join("Koidrive");
         fs::create_dir(&folder).unwrap();
         let changed = folder.clone();
-        let mut lists = 0;
+        let injected = Arc::new(AtomicBool::new(false));
+        let did_inject = injected.clone();
         *home.request_hook.lock().unwrap() = Some(Box::new(move |request| {
-            if request == "GET /v1/spaces" {
-                lists += 1;
-                if lists == 2 {
-                    fs::write(changed.join("private.docx"), "private document").unwrap();
-                }
+            if request == "GET /v1/spaces" && link_is_waiting(&changed) {
+                fs::write(changed.join("private.docx"), "private document").unwrap();
+                did_inject.store(true, Ordering::Relaxed);
             }
         }));
-        let steps = [step(SPACE, choose(rich, 0)), step(PATH, "\n")];
+        let steps = [step(SPACE, choose(rich, 0))];
         let output = terminal_run(
             home.path(),
             &steps,
@@ -1612,6 +1792,7 @@ fn files_appearing_during_the_link_server_call_still_need_consent() {
             TerminalInput::Direct,
         );
         let text = shown(output.clone());
+        assert!(injected.load(Ordering::Relaxed), "{text}");
         assert!(!output.status.success(), "{text}");
         let driver = koidrive_driver::Driver::open(home.paths()).unwrap();
         assert!(driver.status().folders.is_empty(), "{text}");
@@ -1630,10 +1811,16 @@ fn creating_a_shared_folder_does_not_choose_between_duplicate_names() {
         let steps = [
             step(SPACE, choose(rich, 2)),
             step(NAME, line("Work")),
-            step(PATH, "\n"),
-            step("Create ", yes(rich, true)),
+            after(&["already exists. Choose another name.", NAME], ""),
         ];
-        let output = home.setup(&steps, &["--telemetry", "off"], &[], true, rich, None);
+        let output = home.setup(
+            &steps,
+            &["--telemetry", "off"],
+            &[],
+            true,
+            rich,
+            Some((2, rustix::process::Signal::INT)),
+        );
         let text = shown(output.clone());
         assert!(!output.status.success(), "{text}");
         assert!(home.links().is_empty(), "{text}");
@@ -1651,22 +1838,17 @@ fn replacing_an_approved_directory_during_the_link_server_call_is_refused() {
         let changed = folder.clone();
         let saved = home.path().join("Saved");
         let old = saved.clone();
-        let mut lists = 0;
+        let injected = Arc::new(AtomicBool::new(false));
+        let did_inject = injected.clone();
         *home.request_hook.lock().unwrap() = Some(Box::new(move |request| {
-            if request == "GET /v1/spaces" {
-                lists += 1;
-                if lists == 2 {
-                    fs::rename(&changed, &old).unwrap();
-                    fs::create_dir(&changed).unwrap();
-                    fs::write(changed.join("private.docx"), "private document").unwrap();
-                }
+            if request == "GET /v1/spaces" && link_is_waiting(&changed) {
+                fs::rename(&changed, &old).unwrap();
+                fs::create_dir(&changed).unwrap();
+                fs::write(changed.join("private.docx"), "private document").unwrap();
+                did_inject.store(true, Ordering::Relaxed);
             }
         }));
-        let steps = [
-            step(SPACE, choose(rich, 0)),
-            step(PATH, "\n"),
-            step("Link this folder?", yes(rich, true)),
-        ];
+        let steps = [step(SPACE, choose(rich, 0)), step(FILES, choose(rich, 1))];
         let output = terminal_run(
             home.path(),
             &steps,
@@ -1677,6 +1859,7 @@ fn replacing_an_approved_directory_during_the_link_server_call_is_refused() {
             TerminalInput::Direct,
         );
         let text = shown(output.clone());
+        assert!(injected.load(Ordering::Relaxed), "{text}");
         assert!(!output.status.success(), "{text}");
         let driver = koidrive_driver::Driver::open(home.paths()).unwrap();
         assert!(driver.status().folders.is_empty(), "{text}");
@@ -1703,14 +1886,7 @@ fn a_lost_create_response_does_not_choose_between_duplicate_names() {
                 spaces.lock().unwrap().push(space(0, "Koidrive"));
             }
         }));
-        let output = home.setup(
-            &default_folder(rich),
-            &["--telemetry", "off"],
-            &[],
-            true,
-            rich,
-            None,
-        );
+        let output = home.setup(&[], &["--telemetry", "off"], &[], true, rich, None);
         let text = shown(output.clone());
         assert!(!output.status.success(), "{text}");
         assert!(text.contains("several spaces are called"), "{text}");
@@ -1724,14 +1900,12 @@ fn a_dangling_path_is_refused_and_the_folder_asked_again() {
     for rich in [false, true] {
         let home = Home::new(&["Work"]);
         home.connect();
-        let dangling = home.path().join("Dangling");
+        let dangling = home.path().join("Koidrive");
         let missing = home.path().join("Missing");
         std::os::unix::fs::symlink(&missing, &dangling).unwrap();
         let steps = [
             step(SPACE, choose(rich, 0)),
-            step(PATH, line(dangling.to_str().unwrap())),
-            after(&["cannot be read", PATH], "\n"),
-            step("Create ", yes(rich, true)),
+            after(&["cannot be read", PATH], line("~/Documents")),
         ];
         let output = home.setup(&steps, &["--telemetry", "off"], &[], true, rich, None);
         let text = shown(output.clone());
@@ -2136,4 +2310,120 @@ esac"#,
     assert!(home.paths().state_dir.join("upgraded").exists());
     assert!(home.paths().paused().exists());
     assert_eq!(home.links().len(), 1);
+}
+
+#[test]
+fn ctrl_c_during_the_service_spawn_poll_exits_promptly_and_keeps_the_folder_link() {
+    for rich in [false, true] {
+        let home = Home::new(&[]);
+        home.connect();
+        fs::write(home.paths().config_file, "[service]\nbackground = true\n").unwrap();
+        let tools = home.path().join("tools");
+        fs::create_dir(&tools).unwrap();
+        for (name, body) in [
+            (
+                "launchctl",
+                r#"case "$1" in
+print)
+    case "$2" in
+    gui/*/*)
+        if [ -f "$HOME/state/koidrive/service-started" ]; then
+            if [ -f "$HOME/state/koidrive/first-state" ]; then
+                /usr/bin/touch "$HOME/state/koidrive/spawn-polled"
+            else
+                /usr/bin/touch "$HOME/state/koidrive/first-state"
+            fi
+        fi
+        ;;
+    esac
+    echo 'state = exited'
+    ;;
+print-disabled) echo '{}' ;;
+bootout) ;;
+bootstrap|kickstart) /usr/bin/touch "$HOME/state/koidrive/service-started" ;;
+*) exit 91 ;;
+esac"#,
+            ),
+            (
+                "systemctl",
+                r#"[ "$1" = '--user' ]
+case "$2" in
+show-environment|enable|daemon-reload) ;;
+is-active)
+    if [ -f "$HOME/state/koidrive/service-started" ]; then
+        if [ -f "$HOME/state/koidrive/first-state" ]; then
+            /usr/bin/touch "$HOME/state/koidrive/spawn-polled"
+        else
+            /usr/bin/touch "$HOME/state/koidrive/first-state"
+        fi
+    fi
+    exit 3
+    ;;
+start|restart) /usr/bin/touch "$HOME/state/koidrive/service-started" ;;
+*) exit 91 ;;
+esac"#,
+            ),
+            ("loginctl", "echo yes"),
+        ] {
+            let tool = tools.join(name);
+            fs::write(&tool, format!("#!/bin/sh\nset -eu\n{body}\n")).unwrap();
+            fs::set_permissions(&tool, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let marker = home.paths().state_dir.join("spawn-polled");
+        let poll = marker.clone();
+        let sent = Arc::new(Mutex::new(None));
+        let sending = sent.clone();
+        let steps = [Step {
+            before_answer: Some(Box::new(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !poll.exists() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                *sending.lock().unwrap() = Some((Instant::now(), poll.exists()));
+            })),
+            ..step("Starting background sync...", "\u{3}")
+        }];
+        let path = std::env::join_paths(
+            std::iter::once(tools).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let output = terminal_run(
+            home.path(),
+            &steps,
+            &["setup", "--interactive", "--telemetry", "off"],
+            &[("PATH", path.to_str().unwrap())],
+            rich,
+            None,
+            TerminalInput::FullProxy,
+        );
+        let interrupted = sent
+            .lock()
+            .unwrap()
+            .map(|(sent, polled)| (sent.elapsed(), polled));
+        let text = shown(output.clone());
+        assert!(
+            matches!(interrupted, Some((_, true))),
+            "the service never entered its spawn poll before Ctrl-C: {text}"
+        );
+        let elapsed = interrupted.unwrap().0;
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "Ctrl-C took {elapsed:?}: {text}"
+        );
+        assert_eq!(output.status.code(), Some(130), "{text}");
+        assert!(home.connected());
+        let folder = home.path().join("Koidrive");
+        assert!(folder.is_dir());
+        let driver = koidrive_driver::Driver::open(home.paths()).unwrap();
+        let linked = driver.status().folders;
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].space_id, home.space_id("Koidrive"));
+        assert_eq!(
+            Path::new(&linked[0].path),
+            fs::canonicalize(&folder).unwrap()
+        );
+        assert!(!text.contains("Setup complete"), "{text}");
+        assert!(!text.contains("Background sync is running"), "{text}");
+        assert!(!text.contains(TELEMETRY), "{text}");
+    }
 }

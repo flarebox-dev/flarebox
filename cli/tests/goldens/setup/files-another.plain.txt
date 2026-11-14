@@ -1,0 +1,36 @@
+Koidrive <VERSION>
+
+How do you want to connect?
+  1. Log in with Cloudflare
+  2. Enter a pairing code
+Choose 1 to 2: 2
+
+On your other device, run koi device invite.
+Pairing code:
+Connecting this device...
+This device is connected.
+Preparing ~/Koidrive...
+Which shared folder should sync here?
+  1. Work
+  2. Create a shared folder
+Choose 1 to 2: 1
+
+~/Koidrive contains files. They will upload to Work.
+Files in Work will download into ~/Koidrive.
+What should Koidrive do?
+  1. Use another folder
+  2. Sync these files
+Choose 1 to 2: 1
+Folder to sync: ~/Work
+Preparing ~/Work...
+~/Work is linked to Work.
+Starting background sync...
+Background sync is running.
+
+Reports include usage counts, crash locations, daily sync totals, OS, and Koidrive version.
+No file names, paths, contents, error messages, server address, or account.
+Preview: koi telemetry preview. Turn off: koi telemetry off.
+Send anonymous usage reports? [Y/n] y
+
+Setup complete. Add files to ~/Work.
+Check sync: koi status

@@ -356,14 +356,14 @@ jobs:
         run: |
           out="$RUNNER_TEMP/test-inventory"
           mkdir -p "$out"
-          cargo test --workspace --exclude koidrive-driver --exclude koidrive-engine --exclude koidrive-sim --locked --features koidrive-cli/test-install-inventory -- --list --format terse > "$out/remainder.txt"
+          cargo test --workspace --exclude koidrive-driver --exclude koidrive-engine --exclude koidrive-sim --locked --features koidrive-cli/test-install-inventory,koidrive-cli/test-setup -- --list --format terse > "$out/remainder.txt"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: rust-test-inventory-${{ matrix.os }}
           path: ${{ runner.temp }}/test-inventory
           if-no-files-found: error
           retention-days: 7
-      - run: cargo test --workspace --exclude koidrive-driver --exclude koidrive-engine --exclude koidrive-sim --locked --features koidrive-cli/test-install-inventory
+      - run: cargo test --workspace --exclude koidrive-driver --exclude koidrive-engine --exclude koidrive-sim --locked --features koidrive-cli/test-install-inventory,koidrive-cli/test-setup
       - name: Test the regression-case splitter
         run: |
           python3 scripts/test-split-proptest-regressions.py -v
@@ -405,7 +405,7 @@ jobs:
       - if: matrix.suite == 'engine'
         run: cargo fmt --all --check
       - if: matrix.suite == 'engine'
-        run: cargo clippy --workspace --all-targets --locked --features koidrive-cli/test-install-inventory -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked --features koidrive-cli/test-install-inventory,koidrive-cli/test-setup -- -D warnings
       - name: Require per-seed persistence for every property test
         if: matrix.suite == 'engine'
         env:

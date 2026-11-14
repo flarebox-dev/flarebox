@@ -105,7 +105,7 @@ def cargo_features(arguments, target, roots_only=False):
 
 def check_features(workflow, target):
     expected = cargo_features(["--locked", "--workspace", "--features",
-                               "koidrive-cli/test-install-inventory"], target, roots_only=True)
+                               "koidrive-cli/test-install-inventory,koidrive-cli/test-setup"], target, roots_only=True)
     for partition, command in check_partitions(workflow).items():
         actual = cargo_features(command[2:], target)
         for package in expected.keys() & actual.keys():

@@ -642,7 +642,7 @@ fn start(manager: &dyn Manager, service: &Service, daemon: &Daemon) -> Result<()
     }
 }
 
-pub fn converge(
+pub async fn converge(
     manager: &dyn Manager,
     service: &Service,
     folders: usize,
@@ -672,7 +672,7 @@ pub fn converge(
                 && after != State::Running
                 && Instant::now() < spawned
             {
-                std::thread::sleep(Duration::from_millis(100));
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 after = manager.state(service).unwrap_or(after);
             }
             let installed = after != State::NotInstalled;
@@ -767,7 +767,7 @@ async fn reconcile_with(
         Ok(off) => off,
         Err(problem) => return unavailable(problem),
     };
-    let mut report = converge(manager, &service, folders, off, asked, &daemon);
+    let mut report = converge(manager, &service, folders, off, asked, &daemon).await;
     drop(lock);
     if report.state != State::Running || folders == 0 {
         return report;
@@ -866,7 +866,7 @@ async fn blocked(paths: &Paths) -> Vec<Blocked> {
     }
 }
 
-pub fn forget(paths: &Paths, deleted: &url::Url) -> Option<Report> {
+pub async fn forget(paths: &Paths, deleted: &url::Url) -> Option<Report> {
     let credential = koidrive_driver::Credential::load(&paths.credential()).ok()??;
     let server = url::Url::parse(&credential.server).ok()?;
     if server.origin() != deleted.origin() {
@@ -874,14 +874,17 @@ pub fn forget(paths: &Paths, deleted: &url::Url) -> Option<Report> {
     }
     let manager = system();
     let service = this_service(paths).ok()?;
-    Some(converge(
-        manager.as_ref(),
-        &service,
-        0,
-        background_off(paths).unwrap_or(false),
-        false,
-        &Daemon::Absent,
-    ))
+    Some(
+        converge(
+            manager.as_ref(),
+            &service,
+            0,
+            background_off(paths).unwrap_or(false),
+            false,
+            &Daemon::Absent,
+        )
+        .await,
+    )
 }
 
 fn write(path: &Path, text: &str) -> Result<bool, String> {
@@ -1469,11 +1472,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn linking_starts_the_service_once_and_unlinking_the_last_folder_removes_it() {
+    #[tokio::test]
+    async fn linking_starts_the_service_once_and_unlinking_the_last_folder_removes_it() {
         let fake = Fake::default();
         let service = service(&[]);
-        let first = converge(&fake, &service, 1, false, false, &Daemon::Absent);
+        let first = converge(&fake, &service, 1, false, false, &Daemon::Absent).await;
         assert_eq!((first.state, first.started), (State::Running, true));
         let text = first.text();
         assert!(
@@ -1481,15 +1484,17 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("log out"), "lingering is unknown: {text}");
-        let second = converge(&fake, &service, 2, false, false, &Daemon::Absent);
+        let second = converge(&fake, &service, 2, false, false, &Daemon::Absent).await;
         assert_eq!((second.state, second.started), (State::Running, false));
         assert_eq!(second.text(), "");
         assert_eq!(fake.restarts.get(), 0);
         assert_eq!(
-            converge(&fake, &service, 1, false, false, &Daemon::Absent).state,
+            converge(&fake, &service, 1, false, false, &Daemon::Absent)
+                .await
+                .state,
             State::Running
         );
-        let removed = converge(&fake, &service, 0, false, false, &Daemon::Absent);
+        let removed = converge(&fake, &service, 0, false, false, &Daemon::Absent).await;
         assert_eq!(
             (removed.state, removed.removed),
             (State::NotInstalled, true)
@@ -1499,30 +1504,50 @@ mod tests {
             "Stopped and removed the background service.\n"
         );
         assert_eq!(*fake.unit.borrow(), None);
-        let again = converge(&fake, &service, 0, false, false, &Daemon::Absent);
+        let again = converge(&fake, &service, 0, false, false, &Daemon::Absent).await;
         assert_eq!((again.state, again.removed), (State::NotInstalled, false));
         assert_eq!(again.text(), "");
     }
 
-    #[test]
-    fn a_service_that_spawns_a_moment_after_it_starts_reads_as_running() {
+    #[tokio::test]
+    async fn a_service_that_spawns_a_moment_after_it_starts_reads_as_running() {
         let fake = Fake {
             spawning: Cell::new(3),
             ..Fake::default()
         };
-        let report = converge(&fake, &service(&[]), 1, false, false, &Daemon::Absent);
+        let report = converge(&fake, &service(&[]), 1, false, false, &Daemon::Absent).await;
         assert_eq!((report.state, report.started), (State::Running, true));
         assert!(!report.text().contains("not running"), "{}", report.text());
     }
 
-    #[test]
-    fn a_link_leaves_an_agent_switched_off_in_login_items_off_and_says_how_to_switch_it_on() {
+    #[tokio::test]
+    async fn a_service_spawn_wait_can_be_cancelled_without_waiting_for_its_deadline() {
+        let fake = Fake {
+            spawning: Cell::new(u32::MAX),
+            ..Fake::default()
+        };
+        let service = service(&[]);
+        let started = Instant::now();
+        let result = tokio::time::timeout(Duration::from_millis(250), async {
+            converge(&fake, &service, 1, false, false, &Daemon::Absent).await
+        })
+        .await;
+        assert!(
+            result.is_err(),
+            "the service must still be waiting to spawn"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(fake.unit.borrow().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_link_leaves_an_agent_switched_off_in_login_items_off_and_says_how_to_switch_it_on() {
         let fake = Fake::default();
         let service = service(&[]);
-        converge(&fake, &service, 1, false, false, &Daemon::Absent);
+        converge(&fake, &service, 1, false, false, &Daemon::Absent).await;
         fake.running.set(false);
         fake.switched_off.set(true);
-        let linked = converge(&fake, &service, 2, false, false, &Daemon::Absent);
+        let linked = converge(&fake, &service, 2, false, false, &Daemon::Absent).await;
         assert_eq!(linked.state, State::SwitchedOff);
         assert!(!fake.running.get());
         let text = linked.text();
@@ -1540,13 +1565,13 @@ mod tests {
             "{line}"
         );
         assert!(linked.failed());
-        let asked = converge(&fake, &service, 2, false, true, &Daemon::Absent);
+        let asked = converge(&fake, &service, 2, false, true, &Daemon::Absent).await;
         assert_eq!((asked.state, asked.started), (State::Running, true));
         assert!(!asked.failed());
     }
 
-    #[test]
-    fn removing_a_disabled_agent_preserves_the_removal_failure() {
+    #[tokio::test]
+    async fn removing_a_disabled_agent_preserves_the_removal_failure() {
         let service = service(&[]);
         let fake = Fake {
             unit: RefCell::new(Some(service.unit())),
@@ -1554,7 +1579,7 @@ mod tests {
             remove_problem: Some("removal refused"),
             ..Fake::default()
         };
-        let report = converge(&fake, &service, 0, false, false, &Daemon::Absent);
+        let report = converge(&fake, &service, 0, false, false, &Daemon::Absent).await;
         assert_eq!(report.state, State::SwitchedOff);
         assert!(report.failed());
         assert_eq!(report.problem.as_deref(), Some("removal refused"));
@@ -1563,14 +1588,14 @@ mod tests {
         assert_eq!(*fake.unit.borrow(), Some(service.unit()));
     }
 
-    #[test]
-    fn a_moved_binary_restarts_the_running_service_with_the_new_unit() {
+    #[tokio::test]
+    async fn a_moved_binary_restarts_the_running_service_with_the_new_unit() {
         let fake = Fake::default();
-        converge(&fake, &service(&[]), 1, false, false, &Daemon::Absent);
+        converge(&fake, &service(&[]), 1, false, false, &Daemon::Absent).await;
         let home = "/home/ada";
         let binary = Path::new("/usr/local/bin/koi");
         let moved = Service::new(&paths(home, &[]), Path::new(home), binary).unwrap();
-        converge(&fake, &moved, 1, false, false, &Daemon::Absent);
+        converge(&fake, &moved, 1, false, false, &Daemon::Absent).await;
         assert_eq!(fake.restarts.get(), 1);
         assert!(
             fake.unit
@@ -1617,26 +1642,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_config_switch_keeps_koi_from_installing_or_removing_the_service() {
+    #[tokio::test]
+    async fn the_config_switch_keeps_koi_from_installing_or_removing_the_service() {
         let fake = Fake::default();
-        let off = converge(&fake, &service(&[]), 1, true, false, &Daemon::Absent);
+        let off = converge(&fake, &service(&[]), 1, true, false, &Daemon::Absent).await;
         assert_eq!(off.state, State::Off);
         assert_eq!(*fake.unit.borrow(), None);
         assert!(off.text().contains("off in config.toml"), "{}", off.text());
         fake.running.set(true);
         *fake.unit.borrow_mut() = Some(String::new());
-        converge(&fake, &service(&[]), 0, true, false, &Daemon::Absent);
+        converge(&fake, &service(&[]), 0, true, false, &Daemon::Absent).await;
         assert!(fake.running.get());
     }
 
-    #[test]
-    fn without_a_service_manager_the_link_says_so_and_what_to_do() {
+    #[tokio::test]
+    async fn without_a_service_manager_the_link_says_so_and_what_to_do() {
         let fake = Fake {
             unavailable: true,
             ..Fake::default()
         };
-        let report = converge(&fake, &service(&[]), 1, false, false, &Daemon::Absent);
+        let report = converge(&fake, &service(&[]), 1, false, false, &Daemon::Absent).await;
         assert_eq!(report.state, State::Unavailable);
         assert_eq!(report.problem.as_deref(), Some("no user bus"));
         let text = report.text();
@@ -1646,16 +1671,18 @@ mod tests {
         );
         assert!(text.contains("koi service start"), "{text}");
         assert_eq!(
-            converge(&fake, &service(&[]), 0, false, false, &Daemon::Absent).text(),
+            converge(&fake, &service(&[]), 0, false, false, &Daemon::Absent)
+                .await
+                .text(),
             ""
         );
     }
 
-    #[test]
-    fn lingering_is_turned_on_or_the_command_to_turn_it_on_is_named() {
+    #[tokio::test]
+    async fn lingering_is_turned_on_or_the_command_to_turn_it_on_is_named() {
         let allowed = Fake::default();
         allowed.lingers.set(Some(false));
-        let report = converge(&allowed, &service(&[]), 1, false, false, &Daemon::Absent);
+        let report = converge(&allowed, &service(&[]), 1, false, false, &Daemon::Absent).await;
         assert_eq!(report.lingers, Some(true));
         let text = report.text();
         assert!(text.contains("keeps running after you log out"), "{text}");
@@ -1664,7 +1691,7 @@ mod tests {
             ..Fake::default()
         };
         refused.lingers.set(Some(false));
-        let report = converge(&refused, &service(&[]), 1, false, false, &Daemon::Absent);
+        let report = converge(&refused, &service(&[]), 1, false, false, &Daemon::Absent).await;
         assert_eq!(report.lingers, Some(false));
         assert!(
             report.text().contains("sudo loginctl enable-linger"),
@@ -1804,14 +1831,15 @@ mod tests {
         assert!(volatile_binary(&alias));
     }
 
-    #[test]
-    fn a_volatile_helper_cannot_install_a_service_or_replace_one_with_another_volatile_path() {
+    #[tokio::test]
+    async fn a_volatile_helper_cannot_install_a_service_or_replace_one_with_another_volatile_path()
+    {
         let caller = Service {
             binary: "/Volumes/Koidrive/Koidrive.app/Contents/Helpers/koi".into(),
             ..service(&[])
         };
         let fake = Fake::default();
-        let report = converge(&fake, &caller, 1, false, true, &Daemon::Absent);
+        let report = converge(&fake, &caller, 1, false, true, &Daemon::Absent).await;
         assert_eq!(report.state, State::NotInstalled);
         assert_eq!(report.problem.as_deref(), Some(MOVE_TO_APPLICATIONS));
         assert!(report.text().contains("Move Koidrive to Applications"));
@@ -1822,14 +1850,15 @@ mod tests {
             Path::new("/Volumes/Older/Koidrive.app/Contents/Helpers/koi"),
         );
         let before = fake.unit.borrow().clone();
-        let report = converge(&fake, &caller, 1, false, true, &Daemon::Absent);
+        let report = converge(&fake, &caller, 1, false, true, &Daemon::Absent).await;
         assert_eq!(report.problem.as_deref(), Some(MOVE_TO_APPLICATIONS));
         assert_eq!(*fake.unit.borrow(), before);
         assert_eq!(fake.restarts.get(), 0);
     }
 
-    #[test]
-    fn a_volatile_helper_keeps_an_older_stable_service_and_can_start_it_without_repointing_it() {
+    #[tokio::test]
+    async fn a_volatile_helper_keeps_an_older_stable_service_and_can_start_it_without_repointing_it()
+     {
         let dir = tempfile::tempdir().unwrap();
         let stable = koi_printing(dir.path(), "koi", "koi 0.0.1\n", 0);
         let fake = Fake::default();
@@ -1845,7 +1874,7 @@ mod tests {
             };
             let daemon = Daemon::Running(Some(version("0.0.1")));
             for _ in 0..2 {
-                let report = converge(&fake, &caller, 1, false, false, &daemon);
+                let report = converge(&fake, &caller, 1, false, false, &daemon).await;
                 assert_eq!(report.state, State::Running);
                 assert!(report.problem.is_none());
                 assert_eq!(*fake.unit.borrow(), before);
@@ -1854,17 +1883,17 @@ mod tests {
 
             fake.running.set(false);
             fake.switched_off.set(true);
-            let left = converge(&fake, &caller, 1, false, false, &Daemon::Absent);
+            let left = converge(&fake, &caller, 1, false, false, &Daemon::Absent).await;
             assert_eq!(left.state, State::SwitchedOff);
-            let started = converge(&fake, &caller, 1, false, true, &Daemon::Absent);
+            let started = converge(&fake, &caller, 1, false, true, &Daemon::Absent).await;
             assert_eq!((started.state, started.started), (State::Running, true));
             assert!(started.problem.is_none());
             assert_eq!(*fake.unit.borrow(), before);
         }
     }
 
-    #[test]
-    fn a_stable_helper_replaces_a_volatile_service_even_when_it_reports_a_newer_version() {
+    #[tokio::test]
+    async fn a_stable_helper_replaces_a_volatile_service_even_when_it_reports_a_newer_version() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("AppTranslocation")).unwrap();
         let volatile = koi_printing(dir.path(), "AppTranslocation/koi", "koi 99.0.0\n", 0);
@@ -1872,15 +1901,16 @@ mod tests {
         running_on(&fake, &volatile);
         let caller = service(&[]);
         assert_eq!(newer_installed(&fake, &caller), None);
-        let report = converge(&fake, &caller, 1, false, false, &Daemon::Absent);
+        let report = converge(&fake, &caller, 1, false, false, &Daemon::Absent).await;
         assert_eq!(report.state, State::Running);
         assert!(report.problem.is_none());
         assert_eq!(runs(&fake), caller.binary);
         assert_eq!(fake.restarts.get(), 1);
     }
 
-    #[test]
-    fn a_service_on_a_newer_koi_keeps_it_and_one_on_an_older_or_broken_koi_moves_to_this_one() {
+    #[tokio::test]
+    async fn a_service_on_a_newer_koi_keeps_it_and_one_on_an_older_or_broken_koi_moves_to_this_one()
+    {
         let dir = tempfile::tempdir().unwrap();
         let caller = service(&[]);
         let this = this_version();
@@ -1896,7 +1926,8 @@ mod tests {
                 false,
                 false,
                 &Daemon::Running(Some(running)),
-            );
+            )
+            .await;
             assert_eq!(report.state, State::Running);
             assert_eq!(runs(&fake), kept.to_str().unwrap());
         }
@@ -1914,7 +1945,7 @@ mod tests {
         ] {
             running_on(&fake, &moved);
             let restarts = fake.restarts.get();
-            converge(&fake, &caller, 1, false, false, &Daemon::Absent);
+            converge(&fake, &caller, 1, false, false, &Daemon::Absent).await;
             assert_eq!(
                 runs(&fake),
                 "/home/ada/.local/bin/koi",
@@ -1925,17 +1956,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_service_whose_daemon_is_older_than_its_binary_restarts_once_and_a_stopped_one_only_starts()
-    {
+    #[tokio::test]
+    async fn a_service_whose_daemon_is_older_than_its_binary_restarts_once_and_a_stopped_one_only_starts()
+     {
         let fake = Fake::default();
         let caller = service(&[]);
         let this = this_version();
-        converge(&fake, &caller, 1, false, false, &Daemon::Absent);
+        converge(&fake, &caller, 1, false, false, &Daemon::Absent).await;
         let older = Daemon::Running(Some(version("0.0.0-0")));
-        converge(&fake, &caller, 1, false, false, &older);
+        converge(&fake, &caller, 1, false, false, &older).await;
         assert_eq!(fake.restarts.get(), 1);
-        converge(&fake, &caller, 1, false, false, &Daemon::Running(None));
+        converge(&fake, &caller, 1, false, false, &Daemon::Running(None)).await;
         assert_eq!(fake.restarts.get(), 2);
         converge(
             &fake,
@@ -1944,16 +1975,17 @@ mod tests {
             false,
             false,
             &Daemon::Running(Some(this)),
-        );
+        )
+        .await;
         assert_eq!(fake.restarts.get(), 2);
         fake.running.set(false);
-        let started = converge(&fake, &caller, 1, false, false, &older);
+        let started = converge(&fake, &caller, 1, false, false, &older).await;
         assert_eq!((started.state, started.started), (State::Running, true));
         assert_eq!(fake.restarts.get(), 2);
     }
 
-    #[test]
-    fn a_daemon_too_old_to_report_a_version_restarts_once_and_then_reports_the_binarys() {
+    #[tokio::test]
+    async fn a_daemon_too_old_to_report_a_version_restarts_once_and_then_reports_the_binarys() {
         let dir = tempfile::tempdir().unwrap();
         let this = this_version();
         let same = koi_printing(dir.path(), "same", &format!("koi {this}\n"), 0);
@@ -1966,10 +1998,11 @@ mod tests {
             false,
             false,
             &Daemon::Running(None),
-        );
+        )
+        .await;
         for _ in 0..3 {
             let restarted = Daemon::Running(Some(this.clone()));
-            converge(&fake, &service(&[]), 1, false, false, &restarted);
+            converge(&fake, &service(&[]), 1, false, false, &restarted).await;
         }
         assert_eq!(runs(&fake), same.to_str().unwrap());
         assert_eq!(fake.restarts.get(), 1);

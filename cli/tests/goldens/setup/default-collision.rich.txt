@@ -1,0 +1,28 @@
+┌  Koidrive <VERSION>
+│
+◇  How do you want to connect?
+│  Enter a pairing code
+│
+│  On your other device, run koi device invite.
+◇  Pairing code
+│  ▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪
+◇  This device is connected
+│  A shared folder named Koidrive is available. Choose which folder to sync.
+◇  Which shared folder should sync here?
+│  Koidrive
+│
+│  ~/Koidrive contains files. They will upload to Koidrive.
+│  Files in Koidrive will download into ~/Koidrive.
+◇  What should Koidrive do?
+│  Sync these files
+◇  ~/Koidrive is linked to Koidrive
+◇  Background sync is running
+│
+│  Reports include usage counts, crash locations, daily sync totals, OS, and Koidrive version.
+│  No file names, paths, contents, error messages, server address, or account.
+│  Preview: koi telemetry preview. Turn off: koi telemetry off.
+◇  Send anonymous usage reports?
+│  Yes
+│
+└  Setup complete. Add files to ~/Koidrive.
+   Check sync: koi status

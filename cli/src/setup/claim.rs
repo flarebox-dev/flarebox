@@ -79,10 +79,12 @@ impl<'a> Claim<'a> {
         }
         file.save(&self.state)?;
         if saved_device(self.paths, &self.server.url).await? {
-            println!(
-                "This device is already set up with {}, so it was not claimed again.",
-                self.server.script.id
-            );
+            if !self.session.terminal.setup_guided() {
+                println!(
+                    "This device is already set up with {}, so it was not claimed again.",
+                    self.server.script.id
+                );
+            }
             if self.state.secret_set {
                 self.delete_key().await?;
             }
@@ -106,7 +108,7 @@ impl<'a> Claim<'a> {
             format!("the server refused {MAX_KEYS} keys as already used; run the command again")
         })?;
         let saved = ipc::run(self.paths, Request::SaveCredential { credential }).await?;
-        report_paired(self.paths, saved)?;
+        report_paired(self.paths, saved, &self.session.terminal)?;
         self.state.setup_attempt = None;
         file.save(&self.state)?;
         self.delete_key().await?;
@@ -150,7 +152,9 @@ impl<'a> Claim<'a> {
             setup_attempt: self.state.setup_attempt.clone().unwrap_or_default(),
         };
         let started = Instant::now();
-        println!("Claiming {} with this device...", self.server.script.id);
+        if !self.session.terminal.setup_guided() {
+            println!("Claiming {} with this device...", self.server.script.id);
+        }
         loop {
             let wait = match api.claim(&request).await {
                 Ok(issued) => {

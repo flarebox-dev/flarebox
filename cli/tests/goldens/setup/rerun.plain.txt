@@ -1,0 +1,9 @@
+Koidrive <VERSION>
+
+This device is already connected.
+~/Koidrive is linked to Koidrive.
+Starting background sync...
+Background sync is running.
+
+Setup is already complete. Your folders have not changed.
+Check sync: koi status

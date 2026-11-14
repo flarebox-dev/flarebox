@@ -395,7 +395,13 @@ fn main() -> ExitCode {
             interactive,
         )
         .is_ok_and(|mode| mode == setup::Mode::Guided);
-    let terminal = Arc::new(terminal::Terminal::new(cli.plain, guided));
+    let terminal = Arc::new(
+        if matches!(command_args, Command::Setup { .. }) && !scripted {
+            terminal::Terminal::setup(cli.plain, guided)
+        } else {
+            terminal::Terminal::new(cli.plain, guided)
+        },
+    );
     let log_format = match &command_args {
         Command::Daemon { .. } if json => Some(LogFormat::Json),
         Command::Daemon { log_format } => Some(*log_format),
@@ -456,7 +462,7 @@ fn main() -> ExitCode {
         tokio::select! {
             done = async move {
                 telemetry::start(&paths, switch, name, flow).await;
-                let outcome = run(paths, command_args, json, work_terminal.clone()).await;
+                let mut outcome = run(paths, command_args, json, work_terminal.clone()).await;
                 telemetry::finish().await;
                 let pending = match reports_pending && (json || shows_banner) {
                     true => pending_questions(&pending_paths).await,
@@ -467,11 +473,19 @@ fn main() -> ExitCode {
                 if json && daemon_run && succeeded {
                     return ExitCode::SUCCESS;
                 }
+                let summary = if work_terminal.setup_guided() {
+                    outcome.as_mut().ok().map(|done| std::mem::take(&mut done.note))
+                } else {
+                    None
+                };
                 let exit = finish(command_name, json, outcome, pending);
                 if ask && prompt_eligible
                     && let Err(error) = telemetry::ask(&telemetry_paths, &work_terminal).await
                 {
                     return finish(command_name, json, Err(error), Vec::new());
+                }
+                if let Some(summary) = summary {
+                    work_terminal.outro(&summary);
                 }
                 exit
             } => done,
@@ -582,8 +596,11 @@ async fn run(
                         | setup::ServerAction::AddDevice { .. }
                 }
         );
-    let done = execute(paths.clone(), command, json, terminal).await?;
+    let done = execute(paths.clone(), command, json, terminal.clone()).await?;
     let service = if reconciles {
+        let _progress = terminal
+            .setup_guided()
+            .then(|| terminal.progress("Starting background sync..."));
         let report = service::reconcile(&paths, asked).await;
         let failed = shows_state
             && report.failed()
@@ -602,6 +619,8 @@ async fn run(
     let app = match app_policy {
         Some(policy) => Some(match policy {
             Ok(launch) => {
+                let _progress = (terminal.setup_guided() && cfg!(target_os = "macos"))
+                    .then(|| terminal.progress("Preparing the Koidrive app..."));
                 let deadline = lifecycle_deadline.unwrap_or_else(|| {
                     tokio::time::Instant::now() + std::time::Duration::from_secs(400)
                 });
@@ -611,7 +630,164 @@ async fn run(
         }),
         None => None,
     };
-    finish_lifecycle(done, service, app, setup_app, shows_state)
+    if terminal.setup_guided() {
+        finish_setup(&paths, done, service, app, &terminal).await
+    } else {
+        finish_lifecycle(done, service, app, setup_app, shows_state)
+    }
+}
+
+async fn finish_setup(
+    paths: &Paths,
+    done: Done,
+    service: Option<service::Report>,
+    app: Option<(app::Report, Option<service::Report>)>,
+    terminal: &terminal::Terminal,
+) -> Result<Done, CliError> {
+    let final_service = app
+        .as_ref()
+        .and_then(|(_, report)| report.as_ref())
+        .or(service.as_ref());
+    let progress = terminal.continue_progress("Starting background sync...");
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ipc::run(paths, Request::Status),
+    )
+    .await;
+    drop(progress);
+    let status = match status {
+        Ok(Ok(Response::Status { status })) => Some(status),
+        Ok(Ok(_)) => None,
+        Ok(Err(error)) => {
+            terminal.message(&error.message);
+            None
+        }
+        Err(_) => None,
+    };
+    let mut summary = done.note.clone();
+    match final_service {
+        Some(report) if report.state == service::State::Off => {
+            terminal.message("Turn on background sync in config.toml, then run koi service start.");
+            summary =
+                "Folder linked. Background sync is off in config.toml.\nStart sync: koi service start\n".into();
+        }
+        Some(report)
+            if report.failed()
+                || !report.blocked.is_empty()
+                || report.state != service::State::Running =>
+        {
+            if report.state == service::State::Running {
+                if let Some(problem) = &report.problem {
+                    terminal.message(problem);
+                }
+                for blocked in &report.blocked {
+                    terminal.message(&format!(
+                        "macOS can't read {} in the background.",
+                        setup::shown_folder(Path::new(&blocked.folder))
+                    ));
+                    if blocked.waiting {
+                        terminal.message("If macOS asks for folder access, click Allow.");
+                    } else {
+                        terminal.message("Allow folder access in System Settings > Privacy & Security > Files & Folders, or add koi under Full Disk Access.");
+                        terminal.message(&format!(
+                            "Then run: koi folder restart {}",
+                            pairing::shell_word(&blocked.folder)
+                        ));
+                    }
+                }
+            } else {
+                let reason = report.text();
+                for line in reason.lines() {
+                    terminal.message(line);
+                }
+            }
+            summary =
+                "Folder linked. Background sync needs attention.\nCheck sync: koi status\n".into();
+        }
+        _ => {
+            match status {
+                Some(status) if status.paused => {
+                    terminal.message("Sync is paused.");
+                    summary = "Folder linked. Sync is paused.\nResume sync: koi resume\n".into();
+                }
+                Some(status)
+                    if final_service.is_some() && status.running && !status.folders.is_empty() =>
+                {
+                    let blocked = status.folders.iter().find(|folder| {
+                        folder.questions > 0
+                            || matches!(
+                                folder.state,
+                                FolderState::Stopped | FolderState::Halted | FolderState::Offline
+                            )
+                    });
+                    if let Some(folder) = blocked {
+                        let state = match folder.state {
+                            FolderState::Stopped => Some("stopped"),
+                            FolderState::Halted => Some("halted"),
+                            FolderState::Offline => Some("offline"),
+                            _ => None,
+                        };
+                        if let Some(state) = state {
+                            terminal.message(&format!(
+                                "Sync is {state} for {}.",
+                                setup::shown_folder(Path::new(&folder.path))
+                            ));
+                        }
+                        if folder.questions > 0 {
+                            terminal.message(&format!(
+                                "Review pending decisions for {}: koi resolve",
+                                setup::shown_folder(Path::new(&folder.path))
+                            ));
+                        }
+                        if let Some(problem) = &folder.problem {
+                            terminal.message(problem);
+                        }
+                        summary =
+                            "Folder linked. Sync needs attention.\nCheck sync: koi status\n".into();
+                    } else {
+                        terminal.complete("Background sync is running");
+                    }
+                }
+                _ => {
+                    summary = "Folder linked. Could not confirm background sync.\nCheck sync: koi status\n".into();
+                }
+            }
+        }
+    }
+    if let Some(report) = final_service
+        && report.manager == service::ServiceManager::Systemd
+        && report.state == service::State::Running
+        && report.lingers == Some(false)
+    {
+        terminal.message("Background sync stops when you log out. To keep it running, run: sudo loginctl enable-linger \"$USER\"");
+    }
+    if let Some((report, _)) = &app {
+        match report {
+            app::Report::Present { .. } if !report.failed() => {
+                terminal.complete("Koidrive app is ready")
+            }
+            _ if report.failed() => {
+                for line in report.text().lines() {
+                    terminal.message(line);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut result = finish_lifecycle(done, service, app, true, false);
+    match &mut result {
+        Ok(done) => {
+            done.text.clear();
+            done.note = summary;
+        }
+        Err(error) => {
+            if let Some(done) = &mut error.partial {
+                done.text.clear();
+                done.note.clear();
+            }
+        }
+    }
+    result
 }
 
 fn with_service(mut done: Done, report: service::Report) -> Done {
@@ -2941,6 +3117,253 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn setup_finish_bounds_a_status_request_that_accepts_but_never_replies() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let listener = koidrive_ipc::bind(&paths.socket()).unwrap();
+        let (accepted, received) = tokio::sync::oneshot::channel();
+        let served = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = koidrive_ipc::read_line(&mut stream).await.unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&request).unwrap(),
+                Request::Status
+            ));
+            accepted.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(stream);
+        });
+        let report: service::Report = serde_json::from_value(serde_json::json!({
+            "manager":"systemd", "name":"fixture", "state":"running", "lingers":true
+        }))
+        .unwrap();
+        let done = Done {
+            note: "Setup complete. Add files to ~/Koidrive.\nCheck sync: koi status\n".into(),
+            ..Done::printed()
+        };
+        let terminal = terminal::Terminal::setup(true, true);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            finish_setup(&paths, done, Some(report), None, &terminal),
+        )
+        .await;
+        served.abort();
+        let _ = served.await;
+        received
+            .await
+            .expect("the daemon must have received the final status request");
+        let done = result
+            .expect("setup must stop waiting for a silent status response")
+            .unwrap();
+        assert_eq!(
+            done.note,
+            "Folder linked. Could not confirm background sync.\nCheck sync: koi status\n"
+        );
+        assert!(!done.note.contains("Setup complete"));
+        assert!(!done.note.contains("Background sync is running"));
+        assert_eq!(done.data["service"]["state"], "running");
+    }
+
+    #[tokio::test]
+    async fn setup_finish_reports_pending_decisions_in_active_folders() {
+        const FIXTURE: &str = "KOIDRIVE_TEST_SETUP_PENDING";
+        let Ok(case) = std::env::var(FIXTURE) else {
+            for case in ["connecting", "bootstrapping", "catching_up", "up_to_date"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::setup_finish_reports_pending_decisions_in_active_folders",
+                        "--nocapture",
+                    ])
+                    .env(FIXTURE, case)
+                    .output()
+                    .unwrap();
+                let text = String::from_utf8(output.stderr).unwrap();
+                assert!(
+                    output.status.success(),
+                    "{case}: {text}\n{}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+                assert!(
+                    text.contains("Review pending decisions for /fixture/Koidrive: koi resolve"),
+                    "{case}: {text}"
+                );
+                assert!(
+                    !text.contains("Background sync is running"),
+                    "{case}: {text}"
+                );
+                assert!(!text.contains("Sync is offline"), "{case}: {text}");
+            }
+            return;
+        };
+        let state = match case.as_str() {
+            "connecting" => FolderState::Connecting,
+            "bootstrapping" => FolderState::Bootstrapping,
+            "catching_up" => FolderState::CatchingUp,
+            "up_to_date" => FolderState::UpToDate,
+            _ => panic!("unknown fixture {case}"),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let listener = koidrive_ipc::bind(&paths.socket()).unwrap();
+        let served = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = koidrive_ipc::read_line(&mut stream).await.unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&request).unwrap(),
+                Request::Status
+            ));
+            let status = Status {
+                running: true,
+                folders: vec![
+                    serde_json::from_value(serde_json::json!({
+                        "space_id": "s1",
+                        "space_name": "Koidrive",
+                        "path": "/fixture/Koidrive",
+                        "state": state,
+                        "history_id": null,
+                        "last_seq": null,
+                        "head_seq": null,
+                        "remote_nodes": 0,
+                        "local_entries": null,
+                        "questions": 1,
+                        "problem": null,
+                        "wait": null
+                    }))
+                    .unwrap(),
+                ],
+                ..Status::default()
+            };
+            koidrive_ipc::write_line(&mut stream, &Response::Status { status })
+                .await
+                .unwrap();
+        });
+        let report: service::Report = serde_json::from_value(serde_json::json!({
+            "manager":"systemd", "name":"fixture", "state":"running", "lingers":true
+        }))
+        .unwrap();
+        let done = finish_setup(
+            &paths,
+            Done {
+                note: "Setup complete. Add files to ~/Koidrive.\nCheck sync: koi status\n".into(),
+                ..Done::printed()
+            },
+            Some(report),
+            None,
+            &terminal::Terminal::setup(true, true),
+        )
+        .await
+        .unwrap();
+        served.await.unwrap();
+        assert_eq!(
+            done.note,
+            "Folder linked. Sync needs attention.\nCheck sync: koi status\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_finish_preserves_the_linux_logout_warning() {
+        const FIXTURE: &str = "KOIDRIVE_TEST_SETUP_LINGER";
+        let Ok(case) = std::env::var(FIXTURE) else {
+            for (case, warns) in [
+                ("systemd-off", true),
+                ("systemd-on", false),
+                ("systemd-unknown", false),
+                ("launchd-off", false),
+            ] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::setup_finish_preserves_the_linux_logout_warning",
+                        "--nocapture",
+                    ])
+                    .env(FIXTURE, case)
+                    .output()
+                    .unwrap();
+                let text = String::from_utf8(output.stderr).unwrap();
+                assert!(
+                    output.status.success(),
+                    "{case}: {text}\n{}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+                assert_eq!(
+                    text.contains("stops when you log out"),
+                    warns,
+                    "{case}: {text}"
+                );
+                assert_eq!(
+                    text.contains("sudo loginctl enable-linger \"$USER\""),
+                    warns,
+                    "{case}: {text}"
+                );
+            }
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let listener = koidrive_ipc::bind(&paths.socket()).unwrap();
+        let served = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = koidrive_ipc::read_line(&mut stream).await.unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&request).unwrap(),
+                Request::Status
+            ));
+            let status = Status {
+                running: true,
+                folders: vec![
+                    serde_json::from_value(serde_json::json!({
+                        "space_id": "s1",
+                        "space_name": "Koidrive",
+                        "path": "/fixture/Koidrive",
+                        "state": FolderState::UpToDate,
+                        "history_id": null,
+                        "last_seq": null,
+                        "head_seq": null,
+                        "remote_nodes": 0,
+                        "local_entries": null,
+                        "questions": 0,
+                        "problem": null,
+                        "wait": null
+                    }))
+                    .unwrap(),
+                ],
+                ..Status::default()
+            };
+            koidrive_ipc::write_line(&mut stream, &Response::Status { status })
+                .await
+                .unwrap();
+        });
+        let (manager, lingers) = match case.as_str() {
+            "systemd-off" => ("systemd", Some(false)),
+            "systemd-on" => ("systemd", Some(true)),
+            "systemd-unknown" => ("systemd", None),
+            "launchd-off" => ("launchd", Some(false)),
+            _ => panic!("unknown fixture {case}"),
+        };
+        let report: service::Report = serde_json::from_value(serde_json::json!({
+            "manager":manager, "name":"fixture", "state":"running", "lingers":lingers
+        }))
+        .unwrap();
+        let note = "Setup complete. Add files to ~/Koidrive.\nCheck sync: koi status\n";
+        let done = finish_setup(
+            &paths,
+            Done {
+                note: note.into(),
+                ..Done::printed()
+            },
+            Some(report),
+            None,
+            &terminal::Terminal::setup(true, true),
+        )
+        .await
+        .unwrap();
+        served.await.unwrap();
+        assert_eq!(done.note, note);
+        assert_eq!(done.data["service"]["manager"], manager);
     }
 
     #[test]
