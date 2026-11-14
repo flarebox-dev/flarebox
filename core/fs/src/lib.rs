@@ -508,6 +508,11 @@ pub enum Change {
         path: PathBuf,
         kind: EntryKind,
     },
+    /// The folder at `path` is another folder on disk that holds the entries the old one held, as after an app
+    /// writes a copy of a folder and swaps it in. It is the same folder, with a new identity.
+    Reidentified {
+        path: PathBuf,
+    },
     /// The entry at `from` now sits at `to`, a path the rules leave out. The
     /// snapshot no longer holds it or anything below it. Nothing was deleted.
     Ignored {
@@ -1354,7 +1359,7 @@ fn find_ignored(
             Change::Removed { path, .. }
             | Change::Renamed { from: path, .. }
             | Change::Ignored { from: path, .. } => *path = unaside(path),
-            Change::Created { .. } | Change::Modified { .. } => {}
+            Change::Created { .. } | Change::Modified { .. } | Change::Reidentified { .. } => {}
         }
     }
     let created: BTreeSet<&PathBuf> = (changes.iter())
@@ -1674,11 +1679,14 @@ fn diff(old: &BTreeMap<PathBuf, Entry>, new: &BTreeMap<PathBuf, Entry>) -> Vec<C
     let mut removed: BTreeMap<&Path, &Entry> = BTreeMap::new();
     let mut created: Vec<(&Path, &Entry)> = Vec::new();
     let mut modified: Vec<&Path> = Vec::new();
+    let mut reidentified: Vec<&Path> = Vec::new();
     for (path, before) in old {
         match new.get(path) {
             Some(after) if !changed.contains(path.as_path()) => {
                 if after.kind == EntryKind::File && after != before {
                     modified.push(path);
+                } else if after.kind == EntryKind::Dir && after.id != before.id {
+                    reidentified.push(path);
                 }
             }
             _ => {
@@ -1755,6 +1763,11 @@ fn diff(old: &BTreeMap<PathBuf, Entry>, new: &BTreeMap<PathBuf, Entry>) -> Vec<C
     }
     for path in modified {
         changes.push(Change::Modified {
+            path: path.to_path_buf(),
+        });
+    }
+    for path in reidentified {
+        changes.push(Change::Reidentified {
             path: path.to_path_buf(),
         });
     }
@@ -1974,7 +1987,8 @@ impl NativeWatcher {
                         to: path,
                         kind: EntryKind::Dir,
                         ..
-                    } => Some(path.clone()),
+                    }
+                    | Change::Reidentified { path } => Some(path.clone()),
                     _ => None,
                 })
                 .chain(readable)

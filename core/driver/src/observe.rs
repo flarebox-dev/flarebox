@@ -113,6 +113,11 @@ pub enum Observed {
         path: PathBuf,
         kind: EntryKind,
     },
+    /// The folder at `path` keeps its entries under a new identity, `id`.
+    Reidentified {
+        path: PathBuf,
+        id: FileId,
+    },
 }
 
 /// What the observer is to believe about one scope, a path relative to the root, before it scans the scope again:
@@ -327,6 +332,10 @@ impl FsObserver {
                 })
             }
             Change::Removed { path, kind } => out.push(Observed::Removed { path, kind }),
+            Change::Reidentified { path } => {
+                let Some(entry) = entry(&path) else { return };
+                out.push(Observed::Reidentified { path, id: entry.id });
+            }
         }
     }
 
@@ -340,7 +349,7 @@ impl FsObserver {
                 Change::Removed { path, .. } | Change::Ignored { from: path, .. } => {
                     moves.insert(path, None);
                 }
-                Change::Created { .. } | Change::Modified { .. } => {}
+                Change::Created { .. } | Change::Modified { .. } | Change::Reidentified { .. } => {}
             }
         }
         for (path, retry) in std::mem::take(&mut self.unread) {
@@ -1437,7 +1446,8 @@ mod tests {
             .map(|change| match change {
                 Observed::Created { path, .. }
                 | Observed::Modified { path, .. }
-                | Observed::Removed { path, .. } => path.as_path(),
+                | Observed::Removed { path, .. }
+                | Observed::Reidentified { path, .. } => path.as_path(),
                 Observed::Renamed { to, .. } => to.as_path(),
             })
             .collect();

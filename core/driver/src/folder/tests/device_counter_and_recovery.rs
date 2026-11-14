@@ -268,7 +268,7 @@ fn an_upload_that_ends_after_a_recovery_leaves_the_next_commit_in_flight() {
         panic!("the new folder is sent");
     };
 
-    let step = a.folder.uploaded(Ok(receipts));
+    let step = a.folder.uploaded(receipts);
     a.take(step).unwrap();
     let step = a
         .folder

@@ -1279,3 +1279,63 @@ fn a_left_out_entry_back_while_its_removal_is_confirmed_stays_left_out_until_inc
         "{rescan:?}"
     );
 }
+
+#[test]
+fn a_folder_swapped_for_one_holding_its_entries_is_reidentified() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("space");
+    fs::create_dir_all(root.join("photos")).unwrap();
+    fs::write(root.join("photos/one.jpeg"), "one").unwrap();
+    let mut snapshot = Snapshot::scan(&root).unwrap();
+    let before = snapshot.entries[Path::new("photos")].id;
+
+    fs::create_dir(root.join("photos.new")).unwrap();
+    fs::rename(
+        root.join("photos/one.jpeg"),
+        root.join("photos.new/one.jpeg"),
+    )
+    .unwrap();
+    fs::remove_dir(root.join("photos")).unwrap();
+    fs::rename(root.join("photos.new"), root.join("photos")).unwrap();
+    let rescan = snapshot.rescan(&root, [PathBuf::new()]).unwrap();
+
+    let after = snapshot.entries[Path::new("photos")].id;
+    assert_ne!(after, before);
+    assert_eq!(
+        rescan.changes,
+        [Change::Reidentified {
+            path: PathBuf::from("photos")
+        }]
+    );
+}
+
+#[test]
+fn a_folder_swapped_for_one_holding_its_entries_is_reidentified_by_a_rescan_of_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("space");
+    fs::create_dir_all(root.join("photos")).unwrap();
+    fs::write(root.join("photos/one.jpeg"), "one").unwrap();
+    let mut snapshot = Snapshot::scan(&root).unwrap();
+
+    fs::create_dir(root.join("photos.new")).unwrap();
+    fs::rename(
+        root.join("photos/one.jpeg"),
+        root.join("photos.new/one.jpeg"),
+    )
+    .unwrap();
+    fs::remove_dir(root.join("photos")).unwrap();
+    fs::rename(root.join("photos.new"), root.join("photos")).unwrap();
+    let rescan = snapshot
+        .rescan(
+            &root,
+            [PathBuf::from("photos"), PathBuf::from("photos.new")],
+        )
+        .unwrap();
+
+    assert_eq!(
+        rescan.changes,
+        [Change::Reidentified {
+            path: PathBuf::from("photos")
+        }]
+    );
+}

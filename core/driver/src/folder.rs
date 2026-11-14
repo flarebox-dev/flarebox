@@ -28,7 +28,7 @@ use koidrive_engine::commit::{Base, Failure, Halt as CommitHalt, Reconnect};
 use koidrive_engine::effects::{self, Effect as EngineEffect, Stuck};
 use koidrive_engine::ignore::LocalRules;
 use koidrive_engine::tree::{Content, Kind, RemoteNode, Shape, Tree, same_content};
-use koidrive_fs::{Snapshot, check_root};
+use koidrive_fs::{Snapshot, Unresolved, check_root};
 use koidrive_net::{
     Auth, Backoff, CallError, ChunkError, Event, NotResent, ServerError, Session, SessionConfig,
     StopReason, Transfer, UploadGate,
@@ -677,6 +677,24 @@ impl Folder {
                     %error,
                     "a file changed while it was uploaded; planning its commit again"
                 );
+                let unresolved = match &error {
+                    ChunkError::Io { source, .. } => {
+                        (source.get_ref()).and_then(|inner| inner.downcast_ref::<Unresolved>())
+                    }
+                    _ => None,
+                };
+                let paths = match unresolved {
+                    Some(Unresolved::RootWithdrawn(_)) => {
+                        return Err(Stop::Withdrawn(self.link.root.clone()));
+                    }
+                    Some(
+                        Unresolved::Missing(folder)
+                        | Unresolved::NotAFolder(folder)
+                        | Unresolved::Replaced { path: folder, .. },
+                    ) => vec![folder.clone()],
+                    _ if paths.is_empty() => vec![PathBuf::new()],
+                    _ => paths,
+                };
                 self.step(|engine, _| Ok(engine.commits.abandon()))?;
                 self.commit_ended();
                 self.disk.rescan(&self.engine, paths);
@@ -1574,6 +1592,7 @@ impl Folder {
             return Ok(());
         }
         let may_build = matches!(self.flight, Flight::Idle)
+            && !self.disk.awaits_rescan()
             && self.engine.commits.in_flight().is_none()
             && self.caught_up()
             && !self.offline
