@@ -16,6 +16,16 @@ on:
       - ".github/workflows/installer.yml"
   merge_group:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Run hosted release journeys for this tag instead of the served-script check
+        required: false
+        type: string
+      installer_source:
+        description: Fixed installer source, verified against the accepted SHA-256
+        type: choice
+        default: held
+        options: [held, live]
 
 permissions:
   contents: read
@@ -27,7 +37,7 @@ concurrency:
 jobs:
   production:
     name: koidrive.com
-    if: github.event_name != 'merge_group'
+    if: github.event_name != 'merge_group' && (github.event_name != 'workflow_dispatch' || inputs.release_tag == '')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -83,3 +93,10 @@ jobs:
           fi
           echo "$URL matches install.sh at $main ($(wc -c <"$expected") bytes, sha256 $(sha256sum "$expected" | cut -d' ' -f1)) and is served as $type."
           tr -d '\r' <"$headers" | grep -i '^cache-control:' || true
+
+  release-journeys:
+    if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+    uses: ./.github/workflows/release-journeys.yml
+    with:
+      tag: ${{ inputs.release_tag }}
+      installer_source: ${{ inputs.installer_source }}

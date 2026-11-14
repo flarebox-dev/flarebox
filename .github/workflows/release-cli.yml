@@ -495,6 +495,8 @@ jobs:
 
   homebrew:
     name: Update the Homebrew formula and cask
+    outputs:
+      selected: ${{ steps.tap.outputs.selected }}
     needs: [publish, homebrew-install]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: xcode-27
@@ -537,6 +539,7 @@ jobs:
           github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
           EOF
       - name: Push the formula and cask to koidrive/homebrew-tap
+        id: tap
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -558,6 +561,13 @@ jobs:
               git -C "$tap" add "$kind/koidrive.rb"
             fi
           done
+          selected=true
+          for kind in Formula Casks; do
+            if ! grep -Fq "/download/$TAG/" "$tap/$kind/koidrive.rb"; then
+              selected=false
+            fi
+          done
+          echo "selected=$selected" >> "$GITHUB_OUTPUT"
           if git -C "$tap" diff --cached --quiet; then
             echo "The formula and cask need no change for $TAG, so there is nothing to push."
             exit 0
@@ -568,3 +578,13 @@ jobs:
       - name: Remove the deploy key
         if: always()
         run: rm -rf "$RUNNER_TEMP/homebrew-tap-ssh"
+
+  release-journeys:
+    name: Verify the published release journeys
+    needs: homebrew
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/release-journeys.yml
+    with:
+      tag: ${{ github.ref_name }}
+      skip_homebrew: ${{ needs.homebrew.outputs.selected != 'true' }}
+      installer_source: live
