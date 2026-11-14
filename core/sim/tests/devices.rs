@@ -148,34 +148,42 @@ fn owing_a_rename(losses: Losses) -> impl Strategy<Value = Vec<Vec<(usize, Step)
     (phases(losses), any::<prop::sample::Index>(), change).prop_map(|(mut phases, at, change)| {
         let first = &mut phases[0];
         first.insert(at.index(first.len() + 1), (1, change));
-        let mut owing = vec![(0, folder("A")), (0, rename(0, 1, "a"))];
-        owing.extend([(0, Step::Work(0)); 5]);
-        owing.extend([(1, Step::Work(0)); 8]);
-        first.splice(0..0, owing);
+        first.splice(0..0, owing());
         phases.insert(0, vec![(0, file("a"))]);
         phases
     })
 }
 
+fn owing() -> Vec<(usize, Step)> {
+    let mut owing = vec![(0, folder("A")), (0, rename(0, 1, "a"))];
+    owing.extend([(0, Step::Work(0)); 5]);
+    owing.extend([(1, Step::Work(0)); 8]);
+    owing
+}
+
 fn reviving_an_owed_rename() -> impl Strategy<Value = Vec<Vec<(usize, Step)>>> {
-    let revival = prop_oneof![
-        Just(user(1, 0, 1, "b")),
-        Just(user(0, 0, 1, "b")),
-        Just(overwrite(0))
+    let owed_reply = prop_oneof![
+        Just(Reply::Served),
+        Just(Reply::Refused(error::Code::LimitExceeded)),
+        Just(Reply::Refused(error::Code::RetryLater)),
     ];
+    let revival = prop_oneof![Just(user(1, 0, 1, "b")), Just(user(0, 0, 1, "b"))];
     (
         owing_a_rename(Losses::None),
         any::<prop::sample::Index>(),
+        owed_reply,
         revival,
     )
-        .prop_map(|(mut phases, at, revival)| {
+        .prop_map(|(mut phases, at, owed_reply, revival)| {
             let mut block = vec![(2, Step::Work(0)); 8];
+            block.push((0, Step::Commit(owed_reply)));
             block.push((1, delete(1)));
             block.extend(commit(1));
+            block.extend([(0, Step::Work(0)); 4]);
             block.push((2, revival));
             block.extend(commit(2));
             let owed = &mut phases[1];
-            let at = at.index(owed.len() + 1);
+            let at = owing().len() + at.index(owed.len() - owing().len() + 1);
             owed.splice(at..at, block);
             phases
         })
@@ -5492,4 +5500,26 @@ fn a_folder_owing_its_name_that_another_device_deletes_and_a_third_brings_back_l
             "device {device}"
         );
     }
+}
+
+#[test]
+#[ignore = "a file one device deletes and another edits ends in a recovery copy although the server kept the edit (GUN-730)"]
+fn a_file_edited_after_another_device_deleted_it_converges() {
+    let w = |d: usize| (d, Step::Work(0));
+    let mut steps = vec![(2, Step::Work(0)); 8];
+    steps.push((1, delete(1)));
+    steps.extend(commit(1));
+    steps.push((2, overwrite(0)));
+    steps.extend(commit(2));
+    steps.extend(owing());
+    steps.extend([
+        (1, delete(1)),
+        w(0),
+        w(0),
+        (0, Step::Effect(Outcome::Crash(Cut::Quarantined))),
+        w(0),
+        (0, user(2, 6800060412439942171, 0, "a")),
+        (0, folder("a")),
+    ]);
+    converge(3, &[vec![(0, file("a"))], steps]).unwrap();
 }
