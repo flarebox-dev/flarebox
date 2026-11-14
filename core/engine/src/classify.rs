@@ -825,9 +825,12 @@ impl Trees {
         }
         self.displaced.remove(&id);
         self.kept_originals.remove(&id);
-        let left = (self.discarded.get(&id)).is_some_and(|shape| !node.shape.same(shape));
-        if left && !node.parked && self.r.get(&id).is_some() {
-            self.discarded.remove(&id);
+        let home = !node.parked
+            && (self.r.live(&id)).is_some_and(|remote| node.shape.same_position(remote));
+        if home
+            && (self.discarded.get(&id)).is_some_and(|shape| self.r.get(&shape.parent).is_none())
+        {
+            self.drop_discarded_copy(&id);
         }
         (self.l_identities.entry(node.identity).or_default()).insert(id.clone());
         self.mark(&id);
@@ -1021,10 +1024,31 @@ impl Trees {
     }
 
     fn left_as_discarded(&self, id: &str) -> bool {
-        self.r.get(id).is_none()
-            || (self.l.get(id)).is_some_and(|local| {
-                (self.discarded.get(id)).is_some_and(|shape| local.shape.same(shape))
-            })
+        if self.r.get(id).is_none() {
+            return true;
+        }
+        let unchanged = (self.l.get(id)).is_some_and(|local| {
+            (self.discarded.get(id)).is_some_and(|shape| local.shape.same(shape))
+        });
+        let gone = |child: &NodeId| self.l.get(child).is_none() && self.r.live(child).is_none();
+        unchanged
+            && (self.discarded.iter())
+                .filter(|(_, shape)| shape.parent == id)
+                .all(|(child, _)| self.left_as_discarded(child) || gone(child))
+            && (self.local_children(id))
+                .all(|child| (self.discarded.get(child)).is_some_and(|shape| shape.parent == id))
+    }
+
+    fn drop_discarded_copy(&mut self, id: &str) {
+        let mut below = vec![id.to_owned()];
+        while let Some(id) = below.pop() {
+            self.discarded.remove(&id);
+            below.extend(
+                (self.discarded.iter())
+                    .filter(|(_, shape)| shape.parent == id)
+                    .map(|(child, _)| child.clone()),
+            );
+        }
     }
 
     pub(crate) fn rekey_discarded(&mut self, from: &str, to: &str) {
