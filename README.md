@@ -126,6 +126,8 @@ Download `Koidrive-<version>-arm64.dmg` from the [latest release](https://github
 brew install --cask koidrive/tap/koidrive
 ```
 
+If the `koidrive` formula is installed, run `brew uninstall --formula koidrive/tap/koidrive` first, as [Install with Homebrew](docs/guide/install.md#install-with-homebrew) explains.
+
 Then open Koidrive. On a Mac where `koi` isn't set up, the Set Up Koidrive window asks for your server, signs in this Mac and links a folder.
 
 The app runs the `koi` command it carries inside it, so the app and `koi` are one device. They share one profile and one background sync service, and a folder you link in either one shows up in both.
