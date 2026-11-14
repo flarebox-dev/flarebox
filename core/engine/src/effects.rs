@@ -417,10 +417,12 @@ impl Effects {
     /// planned with. An edit the user made while the move was in flight stays the user's.
     /// A change R made while the effect was in flight then stays a remote change and is never
     /// taken for the user's: a file R restored during its removal is downloaded again, and a file
-    /// R moved back during its move is moved back. S stays as it is when L no longer matched it:
-    /// L then holds a change of the user's, such as one that recovery after a crash reports as
-    /// the effect's outcome (a missing file as the removal, the planned bytes as the write), and
-    /// that change stays the user's.
+    /// R moved back during its move is moved back. A finished removal leaves S without the node
+    /// even when L no longer matched S: the effect took the entry off the disk, so a change of the
+    /// user's to it is gone with it, and a node R brings back later is downloaded, never deleted
+    /// as the user's. For any other effect, S stays as it is when L no longer matched it: L then
+    /// holds a change of the user's, such as the planned bytes that recovery after a crash reports
+    /// as a write's outcome, and that change stays the user's.
     /// An outcome L does not take ([`EffectRecord::applies`]) is refused, and the effect stays
     /// in flight.
     /// A removal of a node R no longer holds applied another device's deletion, and is returned
