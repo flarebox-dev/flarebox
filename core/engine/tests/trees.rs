@@ -748,6 +748,75 @@ fn a_node_another_device_creates_again_after_a_loss_with_other_content_is_not_ta
     assert_eq!(trees.class("a"), Class::Concurrent);
 }
 
+fn a_folder_resent_after_a_loss_with_a_file_marked_as_nothing() -> Trees {
+    a_folder_resent_after_a_loss_with_a_file_scanned_as(&[])
+}
+
+fn a_folder_resent_after_a_loss_with_a_file_scanned_as(digests: &[u8]) -> Trees {
+    let mut trees = Trees::new(ROOT);
+    for (id, shape, ino) in [
+        ("p", dir(ROOT, "p"), 1),
+        ("f", dir("p", "f"), 2),
+        ("g", file("f", "g", 1), 3),
+    ] {
+        trees.set_local(id.into(), local(shape.clone(), ino));
+        trees.set_synced(id.into(), Some(shape.clone()));
+        trees.set_remote(id.into(), remote(shape));
+    }
+    for &digest in digests {
+        trees.set_local_changed("g".into(), local(file("f", "g", digest), 3));
+    }
+    trees.settle();
+    trees.remove_remote("g");
+    trees.remove_remote("f");
+    trees.forget_lost(
+        Vec::new(),
+        Vec::new(),
+        vec!["f".into()],
+        Vec::new(),
+        Vec::new(),
+        Default::default(),
+        0,
+        0,
+    );
+    assert_eq!(trees.class("g"), Class::Local);
+    trees
+}
+
+fn deleted(shape: Shape) -> RemoteNode {
+    RemoteNode {
+        trashed: true,
+        meta_rev: 2,
+        trash_group: "2:0".into(),
+        ..remote(shape)
+    }
+}
+
+#[test]
+fn a_file_a_loss_left_unmarked_does_not_keep_its_resent_folder_from_a_delete() {
+    let mut trees = a_folder_resent_after_a_loss_with_a_file_marked_as_nothing();
+    trees.set_remote("p".into(), deleted(dir(ROOT, "p")));
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(trees.class("f"), Class::Remote);
+}
+
+#[test]
+fn a_file_whose_edit_the_user_undid_does_not_keep_its_resent_folder_from_a_delete() {
+    let mut trees = a_folder_resent_after_a_loss_with_a_file_scanned_as(&[2, 1]);
+    trees.set_remote("p".into(), deleted(dir(ROOT, "p")));
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(trees.class("f"), Class::Remote);
+}
+
+#[test]
+fn a_file_the_user_makes_in_a_resent_folder_keeps_it_from_a_delete() {
+    let mut trees = a_folder_resent_after_a_loss_with_a_file_marked_as_nothing();
+    trees.set_local_changed("n".into(), local(file("f", "n", 2), 4));
+    trees.set_remote("p".into(), deleted(dir(ROOT, "p")));
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(trees.class("f"), Class::Local);
+}
+
 fn spaces() -> impl Strategy<Value = Vec<(bool, Change, Change)>> {
     proptest::collection::vec((any::<bool>(), changes(), changes()), 1..9)
 }

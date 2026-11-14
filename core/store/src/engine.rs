@@ -268,6 +268,11 @@ impl Tx<'_> {
         while let Some(row) = rows.next()? {
             state.trees.resends.insert(row.get(0)?);
         }
+        let mut stmt = self.0.prepare_cached("SELECT node_id FROM local_changes")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            state.trees.local_changes.insert(row.get(0)?);
+        }
         let mut stmt = self
             .0
             .prepare_cached("SELECT node_id, kept FROM kept_originals")?;
@@ -366,6 +371,7 @@ impl Tx<'_> {
             "unsent_edits",
             "replaced_versions",
             "resends",
+            "local_changes",
             "kept_originals",
             "effect_state",
             "effects_in_flight",
@@ -422,6 +428,7 @@ impl Tx<'_> {
             unsent_edits,
             replaced_versions,
             resends,
+            local_changes,
             kept_originals,
         } = trees;
         let CommitsChanges {
@@ -598,6 +605,11 @@ impl Tx<'_> {
             resends,
             "DELETE FROM resends WHERE node_id = ?1",
             "INSERT OR IGNORE INTO resends (node_id) VALUES (?1)",
+        )?;
+        self.write_set(
+            local_changes,
+            "DELETE FROM local_changes WHERE node_id = ?1",
+            "INSERT OR IGNORE INTO local_changes (node_id) VALUES (?1)",
         )?;
         self.write_map(
             kept_originals,

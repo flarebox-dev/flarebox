@@ -104,6 +104,7 @@ fn migrations_apply_from_empty() {
             "guard_remote_dismissed",
             "kept_originals",
             "link",
+            "local_changes",
             "local_nodes",
             "migrations",
             "moved_here",
@@ -549,6 +550,7 @@ fn differences(steps: &[Step], priorities: &[Vec<usize>]) -> Vec<String> {
         let path = dir.path().join(name);
         std::fs::copy(&base, &path).unwrap();
         let conn = Connection::open(&path).unwrap();
+        koidrive_store::migrations::register_functions(&conn).unwrap();
         conn.pragma_update(None, "synchronous", "OFF").unwrap();
         for step in &order {
             conn.execute_batch(step.sql).unwrap();
@@ -753,6 +755,7 @@ fn rewind(path: &Path, version: usize) {
 fn rebuild(path: &Path, migrate: impl FnOnce(&Connection)) {
     let rebuilt = path.with_extension("rebuilt");
     let conn = Connection::open(&rebuilt).unwrap();
+    koidrive_store::migrations::register_functions(&conn).unwrap();
     conn.pragma_update(None, "foreign_keys", false).unwrap();
     conn.pragma_update(None, "synchronous", "OFF").unwrap();
     migrate(&conn);
@@ -1282,6 +1285,7 @@ fn engine_state() -> EngineState {
             )]),
             unsent_edits: nodes(["u"]),
             resends: nodes(["u"]),
+            local_changes: nodes(["u"]),
             replaced_versions: BTreeMap::from([(
                 "e".into(),
                 vec![
@@ -1490,7 +1494,7 @@ fn engine_state_survives_a_reopen() {
 }
 
 /// The tables of the engine state besides the nodes of R, L and S.
-const ENGINE_TABLES: [&str; 32] = [
+const ENGINE_TABLES: [&str; 33] = [
     "node_sets",
     "node_maps",
     "waiting_updates",
@@ -1505,6 +1509,7 @@ const ENGINE_TABLES: [&str; 32] = [
     "edited_here",
     "replaced_versions",
     "resends",
+    "local_changes",
     "kept_originals",
     "effect_state",
     "effects_in_flight",
@@ -2626,6 +2631,7 @@ fn a_store_from_before_inodes_took_128_bits_keeps_every_identity() {
             assert_eq!(tx.local_nodes()?, local);
             let mut state = state.clone();
             state.trees.lost.clear();
+            state.trees.local_changes = nodes(["a", "b", "c", "d"]);
             assert_eq!(tx.engine_state()?, state);
             Ok::<_, Error>(())
         })
@@ -3492,6 +3498,43 @@ fn a_store_from_before_effects_were_planned_in_batches_keeps_its_effect_in_fligh
 }
 
 #[test]
+fn a_store_from_before_local_changes_were_recorded_records_each_local_node_s_holds_otherwise() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let local = |node_id: &str, shape: Shape, ino: u64| LocalNode {
+        node_id: node_id.into(),
+        shape,
+        identity: FileId {
+            dev: 1,
+            ino: ino.into(),
+            birth_ns: None,
+        },
+        parked: false,
+    };
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| {
+            for (node_id, name) in [("same", "same.txt"), ("moved", "a.txt")] {
+                tx.put_synced_node(&SyncedNode {
+                    node_id: node_id.into(),
+                    shape: file_shape("root", name),
+                })?;
+            }
+            tx.put_local_node(&local("same", file_shape("root", "same.txt"), 1))?;
+            tx.put_local_node(&local("moved", file_shape("root", "b.txt"), 2))?;
+            tx.put_local_node(&local("new", file_shape("root", "new.txt"), 3))?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+    store_before(&path, "local_changes");
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(applied(&path), all_migrations());
+    let state = store.transaction(|tx| tx.engine_state()).unwrap();
+    assert_eq!(state.trees.local_changes, nodes(["moved", "new"]));
+}
+
+#[test]
 fn a_store_from_before_kept_originals_were_recorded_opens_with_none_recorded() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
@@ -3547,4 +3590,49 @@ fn a_store_from_before_edit_revisions_were_stored_reads_each_as_its_content_revi
             ..node
         }]
     );
+}
+
+#[test]
+fn a_store_from_before_local_changes_were_recorded_records_no_node_l_holds_as_s_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let local = |node_id: &str, shape: Shape, ino: u64| LocalNode {
+        node_id: node_id.into(),
+        shape,
+        identity: FileId {
+            dev: 1,
+            ino: ino.into(),
+            birth_ns: None,
+        },
+        parked: false,
+    };
+    let synced = file_shape("root", "m.txt");
+    let mut touched = synced.clone();
+    if let Some(content) = touched.content.as_mut() {
+        content.mtime_ns += 1;
+    }
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| {
+            tx.put_synced_node(&SyncedNode {
+                node_id: "name".into(),
+                shape: file_shape("root", "\u{d55c}.txt"),
+            })?;
+            tx.put_local_node(&local(
+                "name",
+                file_shape("root", "\u{1112}\u{1161}\u{11ab}.txt"),
+                1,
+            ))?;
+            tx.put_synced_node(&SyncedNode {
+                node_id: "mtime".into(),
+                shape: synced,
+            })?;
+            tx.put_local_node(&local("mtime", touched, 2))?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+    store_before(&path, "local_changes");
+    let mut store = Store::open(&path).unwrap();
+    let state = store.transaction(|tx| tx.engine_state()).unwrap();
+    assert_eq!(state.trees.local_changes, nodes::<0>([]));
 }

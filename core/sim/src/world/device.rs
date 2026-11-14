@@ -141,7 +141,7 @@ impl Engine {
                         parked.filter(|node| node.shape.content != entry.content)
                     {
                         node.shape.content = entry.content.clone();
-                        self.trees.set_local(id, node);
+                        self.trees.set_local_changed(id, node);
                     }
                     continue;
                 }
@@ -160,7 +160,7 @@ impl Engine {
                 parked: false,
             };
             if self.trees.local().get(&id) != Some(&node) {
-                self.trees.set_local(id, node);
+                self.trees.set_local_changed(id, node);
             }
         }
         let on_disk: BTreeSet<&NodeId> = nodes.values().collect();

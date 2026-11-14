@@ -27,6 +27,11 @@ pub fn nfc(name: &str) -> String {
     name.nfc().collect()
 }
 
+/// Whether two names are the same name: equal, or equal in NFC (L keeps the spelling on disk).
+pub fn same_name(a: &str, b: &str) -> bool {
+    a == b || nfc(a) == nfc(b)
+}
+
 /// The key under which no two live children of a directory may collide: canonical caseless matching,
 /// `NFD(casefold(NFD(name)))`, so canonically equivalent names that differ only by case share a key.
 pub fn name_key(name: &str) -> String {
