@@ -703,6 +703,7 @@ fn a_pending_name_finished_on_a_server_restored_to_before_the_rename_is_finished
     fs::rename(site_b.root.join("a"), site_b.root.join("x")).unwrap();
     fs::create_dir(site_b.root.join("a")).unwrap();
     fs::rename(site_b.root.join("x"), site_b.root.join("a/f")).unwrap();
+    b.rescan();
     b.scan_until(|b| !b.work.is_empty());
     let Some(Work::Send(commit)) = b.work.pop_front() else {
         panic!("the move goes out as a commit");
