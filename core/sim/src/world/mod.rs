@@ -1863,6 +1863,16 @@ impl World {
                                                 .contains(&node.node_id.as_str())
                                     })
                             });
+                            if (nodes.iter()).any(|node| {
+                                node.status == NodeStatus::Live as i32
+                                    && trashed.contains(&node.node_id)
+                                    && pending_stem(&node.name).is_some()
+                            }) {
+                                note(
+                                    &mut self.seen,
+                                    "a node at a pending name comes back from the trash",
+                                );
+                            }
                             if let Some(node) = revived {
                                 return Err(Failure::Broken(format!(
                                     "a commit of device {d} brought back node {} as {:?}, which a \

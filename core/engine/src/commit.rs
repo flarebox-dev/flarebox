@@ -1203,7 +1203,7 @@ impl Commits {
                 && !revived_here(trees, id)
                 && take_owed_name(trees, id, pending)
             {
-                return false;
+                return at_sent;
             }
             let owed_locally = holds_owed_name(trees, id, pending);
             at_sent

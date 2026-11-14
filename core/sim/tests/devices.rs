@@ -157,6 +157,30 @@ fn owing_a_rename(losses: Losses) -> impl Strategy<Value = Vec<Vec<(usize, Step)
     })
 }
 
+fn reviving_an_owed_rename() -> impl Strategy<Value = Vec<Vec<(usize, Step)>>> {
+    let revival = prop_oneof![
+        Just(user(1, 0, 1, "b")),
+        Just(user(0, 0, 1, "b")),
+        Just(overwrite(0))
+    ];
+    (
+        owing_a_rename(Losses::None),
+        any::<prop::sample::Index>(),
+        revival,
+    )
+        .prop_map(|(mut phases, at, revival)| {
+            let mut block = vec![(2, Step::Work(0)); 8];
+            block.push((1, delete(1)));
+            block.extend(commit(1));
+            block.push((2, revival));
+            block.extend(commit(2));
+            let owed = &mut phases[1];
+            let at = at.index(owed.len() + 1);
+            owed.splice(at..at, block);
+            phases
+        })
+}
+
 /// Devices that print every step with the state it leaves when `KOIDRIVE_SIM_TRACE` is set.
 fn world(devices: usize) -> World {
     let mut world = World::new(devices);
@@ -220,6 +244,11 @@ proptest! {
     }
 
     #[test]
+    fn devices_converge_when_a_folder_owing_its_name_is_deleted_and_brought_back(phases in reviving_an_owed_rename()) {
+        converge(3, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
+    }
+
+    #[test]
     #[ignore = "after a server restore, a device sends its lost creates again under a folder another device deleted (GUN-700)"]
     fn devices_lose_no_write_around_an_owed_rename_across_server_restores(devices in 2..=3usize, phases in owing_a_rename(Losses::Restores)) {
         keep(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
@@ -258,6 +287,14 @@ fn the_owed_rename_schedules_reach_both_answers() {
     reaches(
         owing_a_rename(Losses::None),
         &["move with from applied", "move with from superseded"],
+    );
+}
+
+#[test]
+fn the_revival_schedules_bring_back_a_folder_at_its_pending_name() {
+    reaches(
+        reviving_an_owed_rename(),
+        &["a node at a pending name comes back from the trash"],
     );
 }
 
@@ -5423,4 +5460,36 @@ fn an_edit_whose_commit_a_restore_took_before_its_result_is_sent_again_where_ano
         ],
     ];
     converge(3, &phases).unwrap();
+}
+
+#[test]
+fn a_folder_owing_its_name_that_another_device_deletes_and_a_third_brings_back_leaves_its_pending_name()
+ {
+    let mut steps = vec![(0, folder("A")), (0, rename(0, 1, "a"))];
+    steps.extend([(0, Step::Work(0)); 5]);
+    steps.extend([(1, Step::Work(0)); 8]);
+    steps.extend([
+        (1, delete(1)),
+        (0, Step::Commit(Reply::Refused(error::Code::LimitExceeded))),
+        (2, Step::Work(0)),
+        (0, Step::Work(0)),
+        (2, Step::Effect(Outcome::Crash(Cut::Placed))),
+        (0, user(0, 0, 7021841829139713342, "a")),
+        (1, Step::Work(0)),
+        (1, Step::Work(0)),
+        (1, Step::Work(0)),
+        (2, user(0, 0, 264496735129991995, "a")),
+    ]);
+    let world = converge(3, &[vec![(0, file("a"))], steps]).unwrap();
+    for device in 0..3 {
+        assert_eq!(
+            paths_on(&world, device),
+            [
+                "A (conflict from device-0 2026-11-09)",
+                "A (conflict from device-0 2026-11-09)/a",
+                "a",
+            ],
+            "device {device}"
+        );
+    }
 }

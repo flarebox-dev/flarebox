@@ -1078,3 +1078,25 @@ fn a_superseded_owed_rename_of_a_node_another_device_deleted_keeps_the_debt() {
     );
     assert!(commits.state().pending.contains_key("a"));
 }
+
+#[test]
+fn a_folder_another_device_deletes_and_brings_back_at_its_pending_name_takes_its_own_name() {
+    let (mut commits, mut trees, mut ids) = owing_its_name(&[(
+        "a",
+        Some(dir(ROOT, "a")),
+        Some(dir(ROOT, "a (pending)")),
+        Some(remote(dir(ROOT, "a (pending)"))),
+    )]);
+    trees.set_remote("a".into(), trashed(dir(ROOT, "a (pending)")));
+    commits.acknowledge(&mut trees, 2);
+    trees.settle();
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    effects_for(&mut trees, &mut ids, "a");
+    assert!(trees.local().get("a").is_none());
+    trees.set_remote("a".into(), remote_at(dir(ROOT, "a (pending)"), 3));
+    commits.acknowledge(&mut trees, 3);
+    trees.settle();
+    effects_for(&mut trees, &mut ids, "a");
+    let rename = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&rename), [owed_mv("a", ROOT, "a", "a (pending)")]);
+}
