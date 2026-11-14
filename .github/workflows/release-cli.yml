@@ -563,3 +563,11 @@ jobs:
       - name: Remove the deploy key
         if: always()
         run: rm -rf "$RUNNER_TEMP/homebrew-tap-ssh"
+
+  release-journeys:
+    name: Verify the published release journeys
+    needs: homebrew
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/release-journeys.yml
+    with:
+      tag: ${{ github.ref_name }}
