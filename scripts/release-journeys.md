@@ -11,9 +11,11 @@ Each runtime case gets a separate [GitHub-hosted macOS 26 runner](https://docs.g
 | Formula first | Record whether Homebrew rejects the binary collision or installs the app while skipping its CLI link. The formula's executable and version must remain intact, including after cask removal. Evidence includes the exact warning or error and resulting installation state. |
 | Shell installer | The pinned installer runs through `curl \| sh` in a controlling terminal, completes guided setup with the released CLI, and leaves a usable installation. Cleanup stops the test's app and services. |
 
-The shell case uses immutable installer commit `b31c0c0232e1083c8b13210c59893c9eecd057f2`, checked against SHA-256 `ccc71c1fcd8381391ab57109d9d365afeea662c142dbbbda6bc4fe700460c276`. It exercises the installer before publication without deploying it. A local Worker and public CLI commands supply test authentication and a shared folder. They do not substitute for the installer or pre-link its folder.
+The manual shell case uses immutable installer commit `b31c0c0232e1083c8b13210c59893c9eecd057f2`, checked against SHA-256 `ccc71c1fcd8381391ab57109d9d365afeea662c142dbbbda6bc4fe700460c276`. It exercises the installer before publication without deploying it. A local Worker and public CLI commands supply test authentication and a shared folder. They do not substitute for the installer or pre-link its folder.
 
-The `installer_source` input defaults to `held`, the immutable raw URL. Set it to `live` to download `https://koidrive.com/install.sh` after deployment. Both sources must match the same accepted SHA-256 before any installer or bootstrap CLI executes. No custom URL or digest input is accepted.
+The manual `installer_source` input defaults to `held`, the immutable raw URL. Set it to `live` to download `https://koidrive.com/install.sh` after deployment. Both manual sources must match the same accepted SHA-256 before any installer or bootstrap CLI executes. No custom URL or digest input is accepted.
+
+Automatic release and CLI-distribution checks use the live URL. They resolve the release tag, require the checkout to match its commit, and compare the downloaded script with `install.sh` in that checkout. A ref or digest mismatch fails before installer or bootstrap CLI execution.
 
 Each job uploads sanitized commands, transcripts, assertions, and cleanup results as `release-journeys-*` artifacts. A failed prerequisite, runtime assertion, or cleanup fails the job. Read the formula-conflict artifact first when checking coexistence.
 

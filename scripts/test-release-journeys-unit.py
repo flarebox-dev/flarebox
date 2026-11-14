@@ -159,8 +159,85 @@ class ReleaseJourneys(unittest.TestCase):
         self.assertIn("installer_source: ${{ inputs.installer_source }}", installer)
         for workflow in (installer, journeys):
             self.assertRegex(workflow, r"(?s)installer_source:\n.*?default: held\n.*?options: \[held, live\]")
-        self.assertIn("INSTALLER_SOURCE: ${{ inputs.installer_source || 'held' }}", journeys)
+        self.assertIn("INSTALLER_SOURCE: ${{ inputs.installer_source || 'live' }}", journeys)
         self.assertIn('--installer-source "$INSTALLER_SOURCE"', journeys)
+
+    def test_release_installer_uses_live_bytes_matching_the_release_checkout(self):
+        payload = b"release installer bytes\n"
+        (self.root / "install.sh").write_bytes(payload)
+        work = self.root / "download"
+        work.mkdir()
+        commit = "a" * 40
+        tag_ref = "refs/tags/v0.1.0-alpha.3"
+        for index, listing in enumerate((commit + "\t" + tag_ref + "\n",
+                                        "b" * 40 + "\t" + tag_ref + "\n" + commit + "\t" + tag_ref + "^{}\n")):
+            evidence = DRIVER.Evidence(self.root / str(index), "v0.1.0-alpha.3", "installer")
+            with patch.object(DRIVER, "REPO", self.root), patch.object(evidence, "run", side_effect=[(0, commit + "\n", ""), (0, listing, "")]) as run, \
+                    patch.object(DRIVER, "download", side_effect=lambda _, url, path: path.write_bytes(payload)) as download:
+                DRIVER.verified_installer(evidence, work, "live", "release")
+            download.assert_called_once_with(evidence, "https://koidrive.com/install.sh", work / "install.sh")
+            self.assertEqual(run.call_args_list, [unittest.mock.call(["git", "rev-parse", "HEAD"]),
+                unittest.mock.call(["git", "ls-remote", "--exit-code", "https://github.com/koidrive/koidrive.git", tag_ref, tag_ref + "^{}"])])
+            record = evidence.report["inputs"]["held-installer"]
+            self.assertEqual(record["reference"], "release")
+            self.assertEqual(record["commit"], commit)
+            self.assertEqual(record["expected_sha256"], DRIVER.hashlib.sha256(payload).hexdigest())
+            self.assertNotEqual(record["expected_sha256"], DRIVER.HELD_SHA)
+
+    def test_release_installer_rejects_unbound_or_malformed_release_refs(self):
+        commit = "a" * 40
+        tag_ref = "refs/tags/v0.1.0-alpha.3"
+        cases = (("b" * 40, commit + "\t" + tag_ref + "\n"),
+                 (commit, ""), (commit, "invalid\t" + tag_ref + "\n"),
+                 (commit, commit + "\trefs/heads/main\n"),
+                 (commit, (commit + "\t" + tag_ref + "\n") * 2),
+                 (commit, commit + "\t" + tag_ref + "^{}\n"))
+        for index, (head, listing) in enumerate(cases):
+            evidence = DRIVER.Evidence(self.root / str(index), "v0.1.0-alpha.3", "installer")
+            with self.subTest(head=head, listing=listing), patch.object(evidence, "run", side_effect=[(0, head, ""), (0, listing, "")]), \
+                    patch.object(DRIVER, "download") as download:
+                with self.assertRaises(RuntimeError):
+                    DRIVER.verified_installer(evidence, self.root, "live", "release")
+            download.assert_not_called()
+
+    def test_automatic_release_cannot_select_the_held_script(self):
+        evidence = self.evidence()
+        with patch.object(evidence, "run") as run, patch.object(DRIVER, "download") as download:
+            with self.assertRaisesRegex(RuntimeError, "live release installer"):
+                DRIVER.verified_installer(evidence, self.root, "held", "release")
+        run.assert_not_called()
+        download.assert_not_called()
+
+    def test_release_installer_rejects_live_bytes_different_from_release_checkout(self):
+        (self.root / "install.sh").write_bytes(b"release bytes")
+        work = self.root / "download"
+        work.mkdir()
+        commit = "a" * 40
+        evidence = self.evidence()
+        with patch.object(DRIVER, "REPO", self.root), \
+                patch.object(evidence, "run", side_effect=[(0, commit, ""), (0, commit + "\trefs/tags/v0.1.0-alpha.3\n", "")]), \
+                patch.object(DRIVER, "download", side_effect=lambda _, url, path: path.write_bytes(b"different live bytes")):
+            with self.assertRaisesRegex(RuntimeError, "held script verified"):
+                DRIVER.verified_installer(evidence, work, "live", "release")
+        self.assertFalse(evidence.report["assertions"][-1]["passed"])
+
+    def test_installer_reference_rejects_arbitrary_inputs(self):
+        for reference in ("/tmp/install.sh", "https://example.com/install.sh", DRIVER.HELD_SHA):
+            with self.subTest(reference=reference), patch.object(DRIVER, "Evidence") as evidence, patch("sys.stderr"):
+                with self.assertRaises(SystemExit) as error:
+                    DRIVER.main(["--tag", "v0.1.0-alpha.3", "--scenario", "installer", "--evidence", str(self.root), "--installer-reference", reference])
+            self.assertEqual(error.exception.code, 2)
+            evidence.assert_not_called()
+
+    def test_release_and_distribution_routes_resolve_to_live_with_release_reference(self):
+        journeys = (DRIVER.REPO / ".github/workflows/release-journeys.yml").read_text()
+        release = (DRIVER.REPO / ".github/workflows/release-cli.yml").read_text()
+        reusable = journeys.split("  workflow_call:\n", 1)[1].split("  pull_request:\n", 1)[0]
+        self.assertRegex(reusable, r"(?s)installer_source:\n.*?default: live")
+        self.assertIn("INSTALLER_SOURCE: ${{ inputs.installer_source || 'live' }}", journeys)
+        self.assertIn("INSTALLER_REFERENCE: ${{ github.event_name == 'workflow_dispatch' && 'accepted' || 'release' }}", journeys)
+        self.assertIn('--installer-reference "$INSTALLER_REFERENCE"', journeys)
+        self.assertRegex(release, r"(?s)  release-journeys:\n.*?installer_source: live")
 
     def test_checksums_allow_standard_text_and_binary_markers(self):
         result = DRIVER.checksums("a" * 64 + "  koi.tar.gz\n" + "b" * 64 + " *Koidrive.dmg\n")

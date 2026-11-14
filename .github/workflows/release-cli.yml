@@ -582,3 +582,4 @@ jobs:
     with:
       tag: ${{ github.ref_name }}
       skip_homebrew: ${{ needs.homebrew.outputs.selected != 'true' }}
+      installer_source: live
