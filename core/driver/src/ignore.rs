@@ -75,6 +75,16 @@ pub fn matcher(sync: &SyncRules) -> Result<Arc<dyn Matcher>, LocalRulesError> {
     Ok(Arc::new(Device(Rules::new(local_rules(sync)?))))
 }
 
+/// Whether the root holds entries other than the engine's built-in exclusions, before any user rules apply.
+pub fn has_sync_entries(root: &Path) -> std::io::Result<bool> {
+    let matcher = matcher(&SyncRules::default()).map_err(std::io::Error::other)?;
+    std::fs::read_dir(root)?.try_fold(false, |found, entry| {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        Ok(found || !matcher.is_excluded(Path::new(&entry.file_name()), kind.is_dir()))
+    })
+}
+
 /// What `core/fs` asks while it scans: the device's matcher, and the `.koiignore` files the scan has read so far.
 struct Scanned {
     device: Arc<dyn Matcher>,
@@ -114,6 +124,54 @@ pub(crate) fn scan_rules(device: &Arc<dyn Matcher>) -> koidrive_fs::Rules {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_entries_use_the_engine_built_ins_and_name_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(!has_sync_entries(root).unwrap());
+        for name in [".ds_store", "THUMBS.DB", "Desktop.INI", "Icon\r"] {
+            std::fs::write(root.join(name), b"metadata").unwrap();
+            assert!(!has_sync_entries(root).unwrap(), "{name:?}");
+        }
+        std::fs::create_dir(root.join(".KOIDRIVE")).unwrap();
+        std::fs::write(root.join(".KOIDRIVE/local"), b"state").unwrap();
+        assert!(!has_sync_entries(root).unwrap());
+        std::fs::write(root.join("report.docx"), b"draft").unwrap();
+        assert!(has_sync_entries(root).unwrap());
+        std::fs::remove_file(root.join("report.docx")).unwrap();
+        std::fs::create_dir(root.join("Documents")).unwrap();
+        assert!(has_sync_entries(root).unwrap());
+    }
+
+    #[test]
+    fn sync_entries_do_not_apply_unreviewed_ignore_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".koiignore"), b"*\n").unwrap();
+        std::fs::write(dir.path().join("report.docx"), b"draft").unwrap();
+        assert!(has_sync_entries(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn sync_entries_propagate_directory_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            has_sync_entries(&root.join("missing")).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        std::fs::write(root.join("file"), b"not a directory").unwrap();
+        assert!(has_sync_entries(&root.join("file")).is_err());
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = has_sync_entries(root);
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
 
     fn sync(include: &[&str], exclude: &[&str]) -> SyncRules {
         SyncRules {

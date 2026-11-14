@@ -99,7 +99,7 @@ fn folder_choices(rich: bool, telemetry: &str) -> (Home, Vec<Step>) {
 
 fn assert_sync_off(text: &str) {
     assert!(
-        text.contains("Folder linked. Background sync is off."),
+        text.contains("Folder linked. Background sync is off in config.toml."),
         "{text}"
     );
     assert!(text.contains("Start sync: koi service start"), "{text}");
@@ -1191,7 +1191,9 @@ fn telemetry_is_asked_after_pairing_succeeds() {
     );
     assert!(
         text.find(TELEMETRY).unwrap()
-            < text.find("Folder linked. Background sync is off.").unwrap(),
+            < text
+                .find("Folder linked. Background sync is off in config.toml.")
+                .unwrap(),
         "{text}"
     );
     assert_sync_off(&text);
@@ -1297,7 +1299,9 @@ fn pairing_with_a_new_server_proposes_and_links_a_koidrive_folder() {
         assert_sync_off(&text);
         assert!(
             text.find(TELEMETRY).unwrap()
-                < text.find("Folder linked. Background sync is off.").unwrap(),
+                < text
+                    .find("Folder linked. Background sync is off in config.toml.")
+                    .unwrap(),
             "{text}"
         );
         assert!(!text.contains("koi space list"), "{text}");
@@ -1540,6 +1544,40 @@ fn a_rerun_with_a_linked_folder_changes_nothing() {
 }
 
 #[test]
+fn background_off_in_config_does_not_claim_the_daemon_has_stopped() {
+    for rich in [false, true] {
+        let home = Home::new(&["Koidrive"]);
+        home.connect();
+        let folder = home.path().join("Koidrive");
+        fs::create_dir(&folder).unwrap();
+        home.link(&folder, &home.space_id("Koidrive"));
+        let daemon = home.daemon(true);
+        let output = koi(home.path())
+            .args(["status", "--json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(status["data"]["running"], true, "{status}");
+        let output = terminal_run(
+            home.path(),
+            &[step(TELEMETRY, no(rich))],
+            &["setup", "--interactive"],
+            &[],
+            rich,
+            None,
+            TerminalInput::Direct,
+        );
+        daemon.finish();
+        let text = shown(output.clone());
+        assert!(output.status.success(), "{text}");
+        assert_sync_off(&text);
+        assert!(!text.contains("Background sync is off."), "{text}");
+        assert!(home.links().is_empty());
+    }
+}
+
+#[test]
 fn a_connected_device_without_a_folder_goes_to_the_folder_step() {
     for rich in [false, true] {
         let home = Home::new(&["Koidrive"]);
@@ -1708,8 +1746,19 @@ fn creating_a_shared_folder_does_not_choose_between_duplicate_names() {
     for rich in [false, true] {
         let home = Home::new(&["Work", "Work"]);
         home.connect();
-        let steps = [step(SPACE, choose(rich, 2)), step(NAME, line("Work"))];
-        let output = home.setup(&steps, &["--telemetry", "off"], &[], true, rich, None);
+        let steps = [
+            step(SPACE, choose(rich, 2)),
+            step(NAME, line("Work")),
+            after(&["already exists. Choose another name.", NAME], ""),
+        ];
+        let output = home.setup(
+            &steps,
+            &["--telemetry", "off"],
+            &[],
+            true,
+            rich,
+            Some((2, rustix::process::Signal::INT)),
+        );
         let text = shown(output.clone());
         assert!(!output.status.success(), "{text}");
         assert!(home.links().is_empty(), "{text}");
@@ -2199,4 +2248,120 @@ esac"#,
     assert!(home.paths().state_dir.join("upgraded").exists());
     assert!(home.paths().paused().exists());
     assert_eq!(home.links().len(), 1);
+}
+
+#[test]
+fn ctrl_c_during_the_service_spawn_poll_exits_promptly_and_keeps_the_folder_link() {
+    for rich in [false, true] {
+        let home = Home::new(&[]);
+        home.connect();
+        fs::write(home.paths().config_file, "[service]\nbackground = true\n").unwrap();
+        let tools = home.path().join("tools");
+        fs::create_dir(&tools).unwrap();
+        for (name, body) in [
+            (
+                "launchctl",
+                r#"case "$1" in
+print)
+    case "$2" in
+    gui/*/*)
+        if [ -f "$HOME/state/koidrive/service-started" ]; then
+            if [ -f "$HOME/state/koidrive/first-state" ]; then
+                /usr/bin/touch "$HOME/state/koidrive/spawn-polled"
+            else
+                /usr/bin/touch "$HOME/state/koidrive/first-state"
+            fi
+        fi
+        ;;
+    esac
+    echo 'state = exited'
+    ;;
+print-disabled) echo '{}' ;;
+bootout) ;;
+bootstrap|kickstart) /usr/bin/touch "$HOME/state/koidrive/service-started" ;;
+*) exit 91 ;;
+esac"#,
+            ),
+            (
+                "systemctl",
+                r#"[ "$1" = '--user' ]
+case "$2" in
+show-environment|enable|daemon-reload) ;;
+is-active)
+    if [ -f "$HOME/state/koidrive/service-started" ]; then
+        if [ -f "$HOME/state/koidrive/first-state" ]; then
+            /usr/bin/touch "$HOME/state/koidrive/spawn-polled"
+        else
+            /usr/bin/touch "$HOME/state/koidrive/first-state"
+        fi
+    fi
+    exit 3
+    ;;
+start|restart) /usr/bin/touch "$HOME/state/koidrive/service-started" ;;
+*) exit 91 ;;
+esac"#,
+            ),
+            ("loginctl", "echo yes"),
+        ] {
+            let tool = tools.join(name);
+            fs::write(&tool, format!("#!/bin/sh\nset -eu\n{body}\n")).unwrap();
+            fs::set_permissions(&tool, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let marker = home.paths().state_dir.join("spawn-polled");
+        let poll = marker.clone();
+        let sent = Arc::new(Mutex::new(None));
+        let sending = sent.clone();
+        let steps = [Step {
+            before_answer: Some(Box::new(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !poll.exists() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                *sending.lock().unwrap() = Some((Instant::now(), poll.exists()));
+            })),
+            ..step("Starting background sync...", "\u{3}")
+        }];
+        let path = std::env::join_paths(
+            std::iter::once(tools).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let output = terminal_run(
+            home.path(),
+            &steps,
+            &["setup", "--interactive", "--telemetry", "off"],
+            &[("PATH", path.to_str().unwrap())],
+            rich,
+            None,
+            TerminalInput::FullProxy,
+        );
+        let interrupted = sent
+            .lock()
+            .unwrap()
+            .map(|(sent, polled)| (sent.elapsed(), polled));
+        let text = shown(output.clone());
+        assert!(
+            matches!(interrupted, Some((_, true))),
+            "the service never entered its spawn poll before Ctrl-C: {text}"
+        );
+        let elapsed = interrupted.unwrap().0;
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "Ctrl-C took {elapsed:?}: {text}"
+        );
+        assert_eq!(output.status.code(), Some(130), "{text}");
+        assert!(home.connected());
+        let folder = home.path().join("Koidrive");
+        assert!(folder.is_dir());
+        let driver = koidrive_driver::Driver::open(home.paths()).unwrap();
+        let linked = driver.status().folders;
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].space_id, home.space_id("Koidrive"));
+        assert_eq!(
+            Path::new(&linked[0].path),
+            fs::canonicalize(&folder).unwrap()
+        );
+        assert!(!text.contains("Setup complete"), "{text}");
+        assert!(!text.contains("Background sync is running"), "{text}");
+        assert!(!text.contains(TELEMETRY), "{text}");
+    }
 }

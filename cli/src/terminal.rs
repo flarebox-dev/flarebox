@@ -22,7 +22,10 @@ use crate::error::CliError;
 const READY: &str = "\u{1b}]777;koi-prompt-ready\u{7}";
 
 #[derive(Default)]
-struct ReadyTheme(AtomicBool);
+struct ReadyTheme {
+    ready: AtomicBool,
+    compact: bool,
+}
 
 struct DefaultTheme;
 
@@ -30,12 +33,16 @@ impl cliclack::Theme for DefaultTheme {}
 
 impl cliclack::Theme for ReadyTheme {
     fn format_footer_with_message(&self, state: &cliclack::ThemeState, message: &str) -> String {
-        let mut footer = <DefaultTheme as cliclack::Theme>::format_footer_with_message(
-            &DefaultTheme,
-            state,
-            message,
-        );
-        if !self.0.swap(true, Ordering::Relaxed) {
+        let mut footer = if self.compact && matches!(state, cliclack::ThemeState::Submit) {
+            String::new()
+        } else {
+            <DefaultTheme as cliclack::Theme>::format_footer_with_message(
+                &DefaultTheme,
+                state,
+                message,
+            )
+        };
+        if !self.ready.swap(true, Ordering::Relaxed) {
             footer.push_str(READY);
         }
         footer
@@ -545,10 +552,24 @@ impl Terminal {
             .map(crate::printable)
             .collect::<Vec<_>>()
             .join("\n");
+        self.separator();
         if self.interaction == Interaction::Rich {
             let _ = cliclack::outro(message.replace('\n', "\n   "));
         } else {
-            eprintln!("\n{message}");
+            eprintln!("{message}");
+        }
+    }
+
+    pub fn separator(&self) {
+        if self.interaction == Interaction::Rich {
+            eprintln!(
+                "{}",
+                DefaultTheme
+                    .bar_color(&cliclack::ThemeState::Submit)
+                    .apply_to("│")
+            );
+        } else {
+            eprintln!();
         }
     }
 
@@ -645,7 +666,7 @@ impl Terminal {
         let child = tokio::process::Command::new(std::env::current_exe()?)
             .arg("_prompt")
             .arg(if self.interaction == Interaction::Rich {
-                "rich"
+                if self.setup { "setup-rich" } else { "rich" }
             } else {
                 "plain"
             })
@@ -858,7 +879,7 @@ pub fn helper(args: &[OsString]) -> Option<ExitCode> {
     if args.len() != 4
         || args
             .get(2)
-            .is_none_or(|value| value != "plain" && value != "rich")
+            .is_none_or(|value| value != "plain" && value != "rich" && value != "setup-rich")
     {
         return Some(ExitCode::from(2));
     }
@@ -869,10 +890,13 @@ pub fn helper(args: &[OsString]) -> Option<ExitCode> {
     else {
         return Some(ExitCode::from(2));
     };
-    let rich = args.get(2).is_some_and(|value| value == "rich");
+    let rich = args.get(2).is_some_and(|value| value != "plain");
     colors(!rich);
     if rich {
-        cliclack::set_theme(ReadyTheme::default());
+        cliclack::set_theme(ReadyTheme {
+            compact: args.get(2).is_some_and(|value| value == "setup-rich"),
+            ..Default::default()
+        });
     }
     let result = match tokio::runtime::Builder::new_current_thread()
         .enable_all()

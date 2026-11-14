@@ -31,7 +31,7 @@ use koidrive_cloudflare::{
 use koidrive_driver::{Credential, DirectoryIdentity, DriverError, LinkApproval, Paths};
 use koidrive_ipc::{Code, Next, Request, Response};
 use koidrive_net::{Api, ApiError};
-use koidrive_proto::v1::{ServerInfo, SpaceInfo};
+use koidrive_proto::v1::{CreateSpaceRequest, ServerInfo, SpaceInfo};
 use tokio::signal::unix::{SignalKind, signal};
 use url::Url;
 
@@ -357,6 +357,7 @@ async fn connect(
         }
         1 => {
             crate::telemetry::set_flow(SetupFlow::Pairing);
+            terminal.separator();
             terminal.message("On your other device, run koi device invite.");
             let code = terminal.input("Pairing code", true).await?;
             let progress = terminal.progress("Connecting this device...");
@@ -389,49 +390,78 @@ async fn onboard(paths: &Paths, terminal: &Terminal) -> Result<Done, CliError> {
     if !spaces.is_empty() {
         drop(progress.take());
     }
-    let target = shared_folder(terminal, &spaces).await?;
-    let SelectedFolder {
-        folder,
-        local,
-        directory,
-    } = local_folder(terminal, &target, &mut progress).await?;
-    let progress = progress
-        .unwrap_or_else(|| terminal.progress(&format!("Preparing {}...", shown_folder(&folder))));
-    if local == Local::Missing {
-        create(&folder)?;
+    let mut target = shared_folder(terminal, &spaces).await?;
+    loop {
+        let SelectedFolder {
+            folder,
+            local,
+            directory,
+        } = local_folder(terminal, &target, &mut progress).await?;
+        let preparing = format!("Preparing {}...", shown_folder(&folder));
+        let linking = match progress.take() {
+            Some(progress) => progress,
+            None if folder == home()?.join(DEFAULT_FOLDER) => {
+                terminal.continue_progress(&preparing)
+            }
+            None => terminal.progress(&preparing),
+        };
+        if local == Local::Missing {
+            create(&folder)?;
+        }
+        let directory = directory
+            .map(Ok)
+            .unwrap_or_else(|| directory_identity(&folder))?;
+        let space = match &target {
+            Target::Existing(space) => space.clone(),
+            Target::Default => crate::named_space(&auth, &spaces, DEFAULT_FOLDER)
+                .await?
+                .space()
+                .clone(),
+            Target::New(name) => {
+                let request = CreateSpaceRequest { name: name.clone() };
+                match auth.api().create_space(&auth, &request).await {
+                    Ok(space) => space,
+                    Err(error) => {
+                        let now = auth.api().list_spaces(&auth).await?;
+                        if !now.spaces.iter().any(|space| space.name == *name) {
+                            return Err(error.into());
+                        }
+                        drop(linking);
+                        terminal.message(&format!(
+                            "A shared folder named {} already exists. Choose another name.",
+                            printable(name)
+                        ));
+                        target = new_shared_folder(terminal, &now.spaces).await?;
+                        continue;
+                    }
+                }
+            }
+        };
+        let approval = LinkApproval {
+            directory,
+            accept_existing_files: local == Local::Files,
+        };
+        let (status, _) =
+            crate::link(paths, folder.clone(), space.space_id, Some(approval)).await?;
+        linking.finish(&format!(
+            "{} is linked to {}",
+            shown_folder(Path::new(&status.path)),
+            status.space_name
+        ));
+        let data = SetupData {
+            account: AccountData::of(&credential.account()),
+            folder: FolderData::of(&status),
+        };
+        return Ok(Done {
+            note: ending(&folder),
+            ..Done::ok(data, "")
+        });
     }
-    let directory = directory
-        .map(Ok)
-        .unwrap_or_else(|| directory_identity(&folder))?;
-    let space = match target {
-        Target::Existing(space) => space,
-        Target::New(name) => match crate::named_space(&auth, &spaces, &name).await? {
-            crate::Named::Created(space) => space,
-            crate::Named::Existing(space) => space,
-        },
-    };
-    let approval = LinkApproval {
-        directory,
-        accept_existing_files: local == Local::Files,
-    };
-    let (status, _) = crate::link(paths, folder.clone(), space.space_id, Some(approval)).await?;
-    progress.finish(&format!(
-        "{} is linked to {}",
-        shown_folder(Path::new(&status.path)),
-        status.space_name
-    ));
-    let data = SetupData {
-        account: AccountData::of(&credential.account()),
-        folder: FolderData::of(&status),
-    };
-    Ok(Done {
-        note: ending(&folder),
-        ..Done::ok(data, "")
-    })
 }
 
 enum Target {
     Existing(SpaceInfo),
+    Default,
     New(String),
 }
 
@@ -439,6 +469,7 @@ impl Target {
     fn name(&self) -> &str {
         match self {
             Target::Existing(space) => &space.name,
+            Target::Default => DEFAULT_FOLDER,
             Target::New(name) => name,
         }
     }
@@ -446,7 +477,7 @@ impl Target {
 
 async fn shared_folder(terminal: &Terminal, spaces: &[SpaceInfo]) -> Result<Target, CliError> {
     if spaces.is_empty() {
-        return Ok(Target::New(DEFAULT_FOLDER.to_owned()));
+        return Ok(Target::Default);
     }
     let mut items: Vec<String> = (spaces.iter())
         .map(|space| {
@@ -466,17 +497,21 @@ async fn shared_folder(terminal: &Terminal, spaces: &[SpaceInfo]) -> Result<Targ
     if let Some(space) = spaces.get(index) {
         return Ok(Target::Existing(space.clone()));
     }
+    new_shared_folder(terminal, spaces).await
+}
+
+async fn new_shared_folder(terminal: &Terminal, spaces: &[SpaceInfo]) -> Result<Target, CliError> {
     loop {
         let answer = terminal.input("Shared folder name", false).await?;
         let name = answer.trim();
         match crate::short_name(name) {
             Ok(_) if name.is_empty() => terminal.message("Enter a name for the shared folder."),
+            Ok(_) if spaces.iter().any(|space| space.name == name) => terminal.message(&format!(
+                "A shared folder named {} already exists. Choose another name.",
+                printable(name)
+            )),
             Ok(_) => {
-                let existing = crate::existing_space(spaces, name)?;
-                return Ok(match existing {
-                    Some(space) => Target::Existing(space),
-                    None => Target::New(name.to_owned()),
-                });
+                return Ok(Target::New(name.to_owned()));
             }
             Err(problem) => terminal.message(&problem),
         }
@@ -503,6 +538,11 @@ struct SelectedFolder {
     directory: Option<DirectoryIdentity>,
 }
 
+enum Entries {
+    Syncable,
+    All,
+}
+
 fn directory_identity(folder: &Path) -> Result<DirectoryIdentity, CliError> {
     std::fs::metadata(folder)
         .map(|meta| DirectoryIdentity::of(&meta))
@@ -521,7 +561,7 @@ async fn local_folder(
 ) -> Result<SelectedFolder, CliError> {
     let mut folder = home()?.join(DEFAULT_FOLDER);
     loop {
-        let local = match inspect(&folder) {
+        let local = match inspect(&folder, Entries::Syncable) {
             Ok(local) => local,
             Err(problem) => {
                 drop(progress.take());
@@ -543,6 +583,7 @@ async fn local_folder(
         drop(progress.take());
         let path = shown_folder(&folder);
         let name = target.name();
+        terminal.separator();
         match target {
             Target::Existing(_) => {
                 terminal.message(&format!(
@@ -550,7 +591,7 @@ async fn local_folder(
                 ));
                 terminal.message(&format!("Files in {name} will download into {path}."));
             }
-            Target::New(_) => terminal.message(&format!(
+            Target::Default | Target::New(_) => terminal.message(&format!(
                 "{path} contains files. They will upload to a new shared folder named {name}."
             )),
         }
@@ -583,7 +624,7 @@ async fn read_folder(terminal: &Terminal) -> Result<PathBuf, CliError> {
     }
 }
 
-fn inspect(folder: &Path) -> Result<Local, String> {
+fn inspect(folder: &Path, entries: Entries) -> Result<Local, String> {
     let shown = printable(&folder.display().to_string());
     let unreadable = |error: std::io::Error| format!("{shown} cannot be read: {error}");
     if std::fs::symlink_metadata(folder).is_ok_and(|meta| meta.file_type().is_symlink()) {
@@ -599,11 +640,18 @@ fn inspect(folder: &Path) -> Result<Local, String> {
             {
                 return Err(format!("{shown} is not writable"));
             }
-            let mut entries = std::fs::read_dir(folder).map_err(unreadable)?;
-            Ok(match entries.next() {
-                Some(_) => Local::Files,
-                None => Local::Empty,
-            })
+            let files = match entries {
+                Entries::Syncable => {
+                    koidrive_driver::ignore::has_sync_entries(folder).map_err(unreadable)?
+                }
+                Entries::All => std::fs::read_dir(folder)
+                    .map_err(unreadable)?
+                    .next()
+                    .transpose()
+                    .map_err(unreadable)?
+                    .is_some(),
+            };
+            Ok(if files { Local::Files } else { Local::Empty })
         }
         Ok(_) => Err(format!("{shown} is a file, not a folder")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -710,7 +758,7 @@ async fn scripted(
         return Err(CliError::usage("--space needs the ID or name of a space"));
     }
     let folder = crate::absolute(&expanded(folder)?)?;
-    let local = inspect(&folder).map_err(CliError::usage)?;
+    let local = inspect(&folder, Entries::All).map_err(CliError::usage)?;
     let directory = (local != Local::Missing)
         .then(|| directory_identity(&folder))
         .transpose()?;
@@ -1274,6 +1322,7 @@ impl Session {
                     let opened = open_browser(&page).await;
                     drop(progress);
                     if !opened {
+                        terminal.separator();
                         terminal.message("Couldn't open your browser. Open this page:");
                         terminal.message(page.as_str());
                     }
@@ -1295,6 +1344,9 @@ impl Session {
                     })??
             }
             None => {
+                if terminal.setup_guided() {
+                    terminal.separator();
+                }
                 terminal.message(if terminal.setup_guided() {
                     "Open this page on any device:"
                 } else {
@@ -1472,6 +1524,7 @@ impl Session {
                         .expect("the R2 page is a URL");
                         if self.terminal.setup_guided() {
                             drop(progress.take());
+                            terminal.separator();
                             self.terminal
                                 .message("Complete the R2 checkout in your browser to continue.");
                             let opening = terminal.progress("Opening your browser...");
@@ -2098,7 +2151,7 @@ impl Session {
                 return;
             }
         };
-        if let Some(report) = crate::service::forget(paths, &url) {
+        if let Some(report) = crate::service::forget(paths, &url).await {
             print!("{}", report.text());
         }
     }

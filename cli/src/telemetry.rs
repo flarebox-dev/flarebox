@@ -157,6 +157,7 @@ fn flow() -> Option<SetupFlow> {
 
 async fn question(terminal: &Terminal) -> Result<Option<bool>, CliError> {
     let question = if terminal.setup_guided() {
+        terminal.separator();
         terminal.message("Reports include usage counts, crash locations, daily sync totals, OS, and Koidrive version.");
         terminal
             .message("No file names, paths, contents, error messages, server address, or account.");

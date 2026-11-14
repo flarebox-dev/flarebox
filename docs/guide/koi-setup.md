@@ -16,13 +16,13 @@ If R2 isn't turned on in the account, setup opens the R2 page of the dashboard a
 
 Setup uses `~/Koidrive` for your files:
 
-- With no shared folders on the server, setup creates one named `Koidrive`. Otherwise, select a shared folder or **Create a shared folder**. Creating one asks for its name. Shared folders with the same name show a short ID.
-- If `~/Koidrive` is missing or empty, setup creates or links it without another question.
+- With no shared folders on the server, setup creates one named `Koidrive`. Otherwise, select a shared folder or **Create a shared folder**. Enter a new name. If the name exists, setup asks again. Shared folders with the same name show a short ID.
+- If `~/Koidrive` is missing or empty, setup creates or links it without another question. Files excluded by the built-in rules, such as `.DS_Store`, do not make a folder nonempty.
 - If the folder holds files, **What should Koidrive do?** offers **Use another folder** first and **Sync these files** second. Syncing uploads the local files and downloads the shared folder's files. To keep those local files out of sync, select **Use another folder** and enter a path at **Folder to sync**. A path to a file, an unreadable path, or an unwritable folder also leads to this path question.
 
 Setup links the folder and starts background sync. If you cancel a folder question, this device stays connected and no folder is linked.
 
-The daemon checks the folder again before it links it. If the folder was replaced, or files you didn't approve arrived while setup waited, it refuses the link, and you run `koi setup` again. A shared-folder name that matches several spaces is refused with their IDs. Paths that lead nowhere and folders without write access are refused before a pairing code is used.
+The daemon checks the folder again before it links it. If the folder was replaced, or files you didn't approve arrived while setup waited, it refuses the link, and you run `koi setup` again.
 
 The last question is **Send anonymous usage reports?**, unless you already chose or an environment variable decides it. Press Enter for Yes. [Usage reports](telemetry.md) lists what they hold.
 
@@ -33,7 +33,11 @@ Setup complete. Add files to ~/Koidrive.
 Check sync: koi status
 ```
 
-If background sync is off, setup reports **Folder linked. Background sync is off.** Set `background = true` under `[service]` in `config.toml`, then run `koi service start`. Paused, blocked, or failed sync shows its reason and recovery command rather than a successful finish.
+If background sync is off in `config.toml`, setup reports **Folder linked. Background sync is off in config.toml.** A daemon you started separately can still run. Set `background = true` under `[service]` in `config.toml`, then run `koi service start`. Paused, blocked, or failed sync shows its reason and recovery command rather than a successful finish.
+
+On Linux, if sync stops when you log out, run `sudo loginctl enable-linger "$USER"` to keep sync running without a login session.
+
+If the final status check does not answer within five seconds, setup reports **Folder linked. Could not confirm background sync.** Run `koi status` to check again.
 
 On an Apple silicon Mac, attended setup also installs the matching release of Koidrive.app in `/Applications`, or `~/Applications` when `/Applications` is not writable, and requests that it open. It verifies the release checksum, the app's Developer ID and notarization before replacing an older copy. A verified equal or newer app needs no download. Add `--no-app` to skip installation and opening. JSON, unattended setup, CI and other platforms skip this step.
 
@@ -83,7 +87,7 @@ printf '%s\n' "$KOI_PAIRING_CODE" | koi setup --pairing-code-stdin \
   --folder "$HOME/Koidrive" --space "$KOI_SPACE" --telemetry off --json
 ```
 
-With `--folder`, setup asks nothing, with or without a terminal. `--space` takes a space's ID or name, as `koi space list` shows it, and must name a space that exists. Setup creates a missing folder. A folder that already holds files needs `--accept-existing-files`: its files upload, and the space's files download into it. Setup checks the arguments, the folder and the code before it uses the code, which works once.
+With `--folder`, setup asks nothing, with or without a terminal. `--space` takes a space's ID or name, as `koi space list` shows it, and must name a space that exists. A name that matches several spaces is refused with their IDs. Setup creates a missing folder. A folder that already holds files needs `--accept-existing-files`: its files upload, and the space's files download into it. Setup checks the arguments, the folder and the code before it uses the code, which works once.
 
 On a machine that is already connected, `--pairing-code-stdin` is optional, and setup links the folder without pairing again. A code for another server is refused. A machine that isn't connected needs the code, or setup stops with `auth_required` (exit 4). Running the same command again changes nothing and reports `unchanged`.
 
