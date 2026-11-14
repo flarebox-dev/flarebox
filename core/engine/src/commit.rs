@@ -1403,6 +1403,7 @@ impl Commits {
                                 code == Code::Superseded
                                     && !node.trashed
                                     && node.meta_rev == result.seq
+                                    && node.content_rev.max(node.edit_rev) <= result.seq
                                     && remote_below(trees, id, &revivers)
                             });
                             if let Some(revived) = revived {

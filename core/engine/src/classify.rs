@@ -1436,7 +1436,8 @@ impl Trees {
             let Some(node) = self.r.get(&id).filter(|node| !node.trashed) else {
                 continue;
             };
-            if self.l.get(&id).is_some() || !here(node.meta_rev) {
+            let edited_since = node.content_rev.max(node.edit_rev) > node.meta_rev;
+            if self.l.get(&id).is_some() || edited_since || !here(node.meta_rev) {
                 continue;
             }
             let shape = node.shape.clone();
