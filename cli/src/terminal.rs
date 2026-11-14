@@ -7,6 +7,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::process::{ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use cliclack::Theme as _;
 use koidrive_ipc::Code;
 use rustix::termios::{LocalModes, OptionalActions, Termios, tcgetattr, tcsetattr};
 use serde::{Deserialize, Serialize};
@@ -53,7 +54,6 @@ enum Prompt {
     Input {
         question: String,
         secret: bool,
-        default: Option<String>,
     },
     Select {
         question: String,
@@ -379,7 +379,38 @@ impl Drop for SavedTerminal {
 
 pub struct Terminal {
     interaction: Interaction,
+    setup: bool,
     active: Mutex<Option<ActivePrompt>>,
+}
+
+pub struct Progress<'a> {
+    terminal: &'a Terminal,
+    bar: Option<cliclack::ProgressBar>,
+}
+
+impl Progress<'_> {
+    pub fn update(&self, message: &str) {
+        let message = crate::printable(message);
+        match &self.bar {
+            Some(bar) => bar.set_message(message),
+            None => self.terminal.message(&message),
+        }
+    }
+
+    pub fn finish(mut self, message: &str) {
+        if let Some(bar) = self.bar.take() {
+            bar.clear();
+        }
+        self.terminal.complete(message);
+    }
+}
+
+impl Drop for Progress<'_> {
+    fn drop(&mut self) {
+        if let Some(bar) = &self.bar {
+            bar.clear();
+        }
+    }
 }
 
 fn nonempty(name: &str) -> bool {
@@ -424,8 +455,20 @@ impl Terminal {
         colors(interaction != Interaction::Rich);
         Self {
             interaction,
+            setup: false,
             active: Mutex::new(None),
         }
+    }
+
+    pub fn setup(plain: bool, guided: bool) -> Self {
+        Self {
+            setup: true,
+            ..Self::new(plain, guided)
+        }
+    }
+
+    pub fn setup_guided(&self) -> bool {
+        self.setup && self.guided()
     }
 
     fn interaction(guided: bool, plain: bool, width: Option<u16>) -> Interaction {
@@ -443,9 +486,69 @@ impl Terminal {
     pub fn message(&self, message: &str) {
         let message = crate::printable(message);
         if self.interaction == Interaction::Rich {
-            let _ = cliclack::log::info(message);
+            if self.setup {
+                let theme = DefaultTheme;
+                let symbol = theme
+                    .bar_color(&cliclack::ThemeState::Submit)
+                    .apply_to("│")
+                    .to_string();
+                eprint!(
+                    "{}",
+                    theme.format_log_with_spacing(&message, &symbol, false)
+                );
+            } else {
+                let _ = cliclack::log::info(message);
+            }
         } else {
             eprintln!("{message}");
+        }
+    }
+
+    pub fn complete(&self, message: &str) {
+        let message = crate::printable(message);
+        if self.interaction == Interaction::Rich {
+            let theme = DefaultTheme;
+            eprint!(
+                "{}",
+                theme.format_log_with_spacing(&message, &theme.submit_symbol(), false)
+            );
+        } else {
+            eprintln!("{message}.");
+        }
+    }
+
+    pub fn progress(&self, message: &str) -> Progress<'_> {
+        self.start_progress(message, true)
+    }
+
+    pub fn continue_progress(&self, message: &str) -> Progress<'_> {
+        self.start_progress(message, false)
+    }
+
+    fn start_progress(&self, message: &str, announce: bool) -> Progress<'_> {
+        let bar = (self.interaction == Interaction::Rich).then(cliclack::spinner);
+        match &bar {
+            Some(bar) => bar.start(crate::printable(message)),
+            None if announce => self.message(message),
+            None => {}
+        }
+        Progress {
+            terminal: self,
+            bar,
+        }
+    }
+
+    pub fn outro(&self, message: &str) {
+        let message = message
+            .trim_end()
+            .lines()
+            .map(crate::printable)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if self.interaction == Interaction::Rich {
+            let _ = cliclack::outro(message.replace('\n', "\n   "));
+        } else {
+            eprintln!("\n{message}");
         }
     }
 
@@ -462,16 +565,6 @@ impl Terminal {
         self.text(Prompt::Input {
             question: question.into(),
             secret,
-            default: None,
-        })
-        .await
-    }
-
-    pub async fn input_or(&self, question: &str, default: &str) -> Result<String, PromptFailure> {
-        self.text(Prompt::Input {
-            question: question.into(),
-            secret: false,
-            default: Some(default.into()),
         })
         .await
     }
@@ -541,6 +634,14 @@ impl Terminal {
         tcsetattr(&saved.input, OptionalActions::Flush, &hidden).map_err(io::Error::from)?;
         let size = rustix::termios::tcgetwinsize(io::stderr()).map_err(io::Error::from)?;
         let (bridge, input) = InputBridge::new(&saved.input, io::stderr(), size)?;
+        if self.setup && self.interaction == Interaction::Rich {
+            eprintln!(
+                "{}",
+                DefaultTheme
+                    .bar_color(&cliclack::ThemeState::Submit)
+                    .apply_to("│")
+            );
+        }
         let child = tokio::process::Command::new(std::env::current_exe()?)
             .arg("_prompt")
             .arg(if self.interaction == Interaction::Rich {
@@ -691,27 +792,16 @@ fn line(question: &str, secret: bool) -> Result<String, PromptFailure> {
 
 fn interact(request: Prompt, rich: bool) -> Result<Answer, PromptFailure> {
     match request {
-        Prompt::Input {
-            question,
-            secret,
-            default,
-        } => {
+        Prompt::Input { question, secret } => {
             let question = crate::printable(&question);
             let text = if rich && secret {
                 cliclack::password(question).interact()?
             } else if rich {
-                let mut input = cliclack::input(question);
-                if let Some(default) = &default {
-                    input = input.default_input(default);
-                }
-                input.interact::<String>()?
+                cliclack::input(question).interact::<String>()?
             } else {
                 line(&format!("{question}: "), secret)?
             };
-            Ok(Answer::Text(match default {
-                Some(default) if text.trim().is_empty() => default,
-                _ => text,
-            }))
+            Ok(Answer::Text(text))
         }
         Prompt::Select { question, items } => {
             if items.is_empty() {
@@ -719,7 +809,7 @@ fn interact(request: Prompt, rich: bool) -> Result<Answer, PromptFailure> {
             }
             let question = crate::printable(&question);
             if rich {
-                let mut select = cliclack::select(question);
+                let mut select = cliclack::select(question).initial_value(0);
                 for (index, item) in items.iter().enumerate() {
                     select = select.item(index, crate::printable(item), "");
                 }

@@ -2,28 +2,38 @@
 
 `koi setup` sets up this machine in one run: it connects to a server, signs this machine in as a device, and links a folder. Its Cloudflare login works only for the project's test account, as [Set up with the Cloudflare login](setup.md#set-up-with-the-cloudflare-login) explains. A pairing code works for everyone.
 
-## The guided setup asks two sets of questions
+## Connect this device and link a folder
 
-On a terminal, `koi setup` first asks how to connect this machine:
+On a terminal, `koi setup` asks **How do you want to connect?** Cloudflare is selected by default. Use the arrow keys and Enter:
 
 1. Log in with Cloudflare. Your browser opens Cloudflare's login page. Pick the account and select **Authorize**. Then Koidrive looks for its servers in that account:
    - With no server, it deploys one. It creates an R2 bucket, uploads the server as a Worker, turns on its `workers.dev` address, and claims the server with this device.
    - With one server, it adds this device to it.
    - With several, it asks which one.
-2. Enter a pairing code from another device, written as `<code>@<host>`. For a code without the host, run `koi join <code> --server <address>` instead.
+2. **Enter a pairing code** from another device, written as `<code>@<host>`. On that device, run `koi device invite`. For a code without the host, run `koi join <code> --server <address>`.
 
 If R2 isn't turned on in the account, setup opens the R2 page of the dashboard and waits up to 30 minutes while you complete its checkout.
 
-Once this machine is connected, setup asks which folder to sync:
+Setup uses `~/Koidrive` for your files:
 
-- The shared folder: a space whose files are the same on each of your devices. When the server has none, setup proposes one named `Koidrive`. Otherwise it lists them, adds the end of the ID when two have the same name, and offers to create a new one.
-- Where its files go on this machine. The default is `~/Koidrive`, shown as a full path. Press Enter to use it, or type another path. Setup asks before it creates a missing folder or a new shared folder. A folder that already holds files is linked only after you agree: its files upload, and the shared folder's files download into it. A path to a file is refused, and setup asks again.
+- With no shared folders on the server, setup creates one named `Koidrive`. Otherwise, select a shared folder or **Create a shared folder**. Creating one asks for its name. Shared folders with the same name show a short ID.
+- If `~/Koidrive` is missing or empty, setup creates or links it without another question.
+- If the folder holds files, **What should Koidrive do?** offers **Use another folder** first and **Sync these files** second. Syncing uploads the local files and downloads the shared folder's files. To keep those local files out of sync, select **Use another folder** and enter a path at **Folder to sync**. A path to a file, an unreadable path, or an unwritable folder also leads to this path question.
 
-Setup then links the folder, as `koi folder link` does, and starts background sync. It ends with the folder to add files to and `koi status`, which shows how sync is going. If you cancel a folder question, this machine stays connected and no folder is linked.
+Setup links the folder and starts background sync. If you cancel a folder question, this device stays connected and no folder is linked.
 
 The daemon checks the folder again before it links it. If the folder was replaced, or files you didn't approve arrived while setup waited, it refuses the link, and you run `koi setup` again. A shared-folder name that matches several spaces is refused with their IDs. Paths that lead nowhere and folders without write access are refused before a pairing code is used.
 
-After setup succeeds, it asks whether to send anonymous usage reports, unless you already chose or an environment variable decides it. Press Enter for yes. [Usage reports](telemetry.md) lists what they hold.
+The last question is **Send anonymous usage reports?**, unless you already chose or an environment variable decides it. Press Enter for Yes. [Usage reports](telemetry.md) lists what they hold.
+
+When background sync is running, setup ends with:
+
+```text
+Setup complete. Add files to ~/Koidrive.
+Check sync: koi status
+```
+
+If background sync is off, setup reports **Folder linked. Background sync is off.** Set `background = true` under `[service]` in `config.toml`, then run `koi service start`. Paused, blocked, or failed sync shows its reason and recovery command rather than a successful finish.
 
 On an Apple silicon Mac, attended setup also installs the matching release of Koidrive.app in `/Applications`, or `~/Applications` when `/Applications` is not writable, and requests that it open. It verifies the release checksum, the app's Developer ID and notarization before replacing an older copy. A verified equal or newer app needs no download. Add `--no-app` to skip installation and opening. JSON, unattended setup, CI and other platforms skip this step.
 
@@ -31,14 +41,14 @@ If the app step fails, the device stays connected and its linked folders stay li
 
 ## Run it again to finish or check
 
-If a setup stops halfway, for example because the network dropped, run `koi setup` again. It finishes from where it stopped. On a machine that is already connected, it doesn't log in or pair again. With a linked folder, it lists the linked folders without changing their links. Without one, it goes on to the folder questions.
+If setup stops halfway, run `koi setup` again. A connected device skips login and pairing. With linked folders, it lists them without changing their links. When sync is running, it ends with **Setup is already complete. Your folders have not changed.** and `Check sync: koi status`. Without a linked folder, it continues with folder setup.
 
 ## Options
 
 | Option | Effect |
 |---|---|
 | `--name <name>` | The device's name. The default is this machine's host name |
-| `--plain` | Numbered, line-oriented questions without color or animation. `KOI_PLAIN=1`, narrow terminals and `TERM=dumb` do the same. A nonempty `NO_COLOR` turns off color only |
+| `--plain` | Numbered, line-oriented questions without color or animation. Enter a number to select an option. `KOI_PLAIN=1`, narrow terminals, and `TERM=dumb` do the same. A nonempty `NO_COLOR` turns off color only |
 | `--interactive` | Runs the guided setup even where setup would otherwise ask nothing. Fails with exit status 2 without a terminal, and can't be used with `--json` |
 | `--no-browser` | Prints the login page's address instead of opening a browser. Needs `--interactive` |
 | `--port <port>` | The local port for the login callback, for example to forward it over SSH |
@@ -49,6 +59,8 @@ If a setup stops halfway, for example because the network dropped, run `koi setu
 Pairing codes and pasted login callback addresses are hidden while you type.
 
 With `--no-browser`, open the printed address on any device, log in, and select **Authorize**. The browser then fails to load a page on `127.0.0.1`. Copy that page's address and paste it into the terminal.
+
+If opening the browser fails, setup prints the full address to open. If no tab appears despite a successful browser request, rerun with `--interactive --no-browser`.
 
 ## Without a terminal, setup asks nothing
 

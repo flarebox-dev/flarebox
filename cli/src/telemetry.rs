@@ -156,11 +156,20 @@ fn flow() -> Option<SetupFlow> {
 }
 
 async fn question(terminal: &Terminal) -> Result<Option<bool>, CliError> {
-    terminal.message("Send anonymous usage reports to the Koidrive project?");
-    terminal.message("Reports hold command and error counts, crash locations, daily sync totals, and your OS and Koidrive version.");
-    terminal.message("They never hold file names, paths, contents, error messages, your server address or your account.");
-    terminal.message("Preview: koi telemetry preview. Turn off: koi telemetry off.");
-    match terminal.confirm("Send reports?", true).await {
+    let question = if terminal.setup_guided() {
+        terminal.message("Reports include usage counts, crash locations, daily sync totals, OS, and Koidrive version.");
+        terminal
+            .message("No file names, paths, contents, error messages, server address, or account.");
+        terminal.message("Preview: koi telemetry preview. Turn off: koi telemetry off.");
+        "Send anonymous usage reports?"
+    } else {
+        terminal.message("Send anonymous usage reports to the Koidrive project?");
+        terminal.message("Reports hold command and error counts, crash locations, daily sync totals, and your OS and Koidrive version.");
+        terminal.message("They never hold file names, paths, contents, error messages, your server address or your account.");
+        terminal.message("Preview: koi telemetry preview. Turn off: koi telemetry off.");
+        "Send reports?"
+    };
+    match terminal.confirm(question, true).await {
         Ok(answer) => Ok(Some(answer)),
         Err(PromptFailure::Cancelled) => Err(PromptFailure::Cancelled.into()),
         Err(_) => Ok(None),

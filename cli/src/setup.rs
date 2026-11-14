@@ -13,11 +13,13 @@ mod claim;
 #[cfg(test)]
 pub(crate) mod fake;
 mod state;
+#[cfg(feature = "test-setup")]
+mod testing;
 mod uninstall;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::process::{Command as Process, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -41,7 +43,7 @@ use crate::ipc;
 use crate::pairing::Invitation;
 use crate::printable;
 use crate::report::{AccountData, Choice, ChoicesData, Done, FolderData, Outcome, SetupData};
-use crate::terminal::{Terminal, read_line};
+use crate::terminal::{Progress, Terminal, read_line};
 use claim::Claim;
 use state::{SetupState, StateFile, Step};
 
@@ -303,21 +305,23 @@ pub async fn setup(
     }
     terminal.intro();
     if connected(paths) {
-        terminal.message("This computer is already connected to Koidrive.");
+        terminal.complete("This device is already connected");
         let folders = match ipc::run(paths, Request::Status).await? {
             Response::Status { status } => status.folders,
             other => return Err(crate::unexpected(other)),
         };
         if !folders.is_empty() {
             for folder in &folders {
-                terminal.message(&format!(
-                    "{} syncs with {}.",
-                    folder.path, folder.space_name
+                terminal.complete(&format!(
+                    "{} is linked to {}",
+                    shown_folder(Path::new(&folder.path)),
+                    folder.space_name
                 ));
             }
-            terminal.message("Your device and folders have not changed.");
-            terminal.message("Check sync: koi status");
-            return Ok(Done::printed());
+            return Ok(Done {
+                note: "Setup is already complete. Your folders have not changed.\nCheck sync: koi status\n".into(),
+                ..Done::printed()
+            });
         }
     } else {
         connect(paths, device_name, login, terminal.clone()).await?;
@@ -333,10 +337,10 @@ async fn connect(
 ) -> Result<(), CliError> {
     let route = terminal
         .select(
-            "How do you want to set up Koidrive on this machine?",
+            "How do you want to connect?",
             vec![
                 "Log in with Cloudflare".into(),
-                "Enter a pairing code from another device".into(),
+                "Enter a pairing code".into(),
             ],
         )
         .await?;
@@ -347,12 +351,15 @@ async fn connect(
             with_session(login, terminal.clone(), async |session| {
                 session.setup(paths, device_name).await
             })
-            .await
+            .await?;
+            terminal.complete("This device is connected");
+            Ok(())
         }
         1 => {
             crate::telemetry::set_flow(SetupFlow::Pairing);
-            terminal.message("On your connected computer, run koi device invite.");
+            terminal.message("On your other device, run koi device invite.");
             let code = terminal.input("Pairing code", true).await?;
+            let progress = terminal.progress("Connecting this device...");
             let joining = async {
                 let invitation = invitation(&code)?;
                 let request = Request::Pair {
@@ -360,9 +367,11 @@ async fn connect(
                     code: invitation.code,
                     name: device_name.to_owned(),
                 };
-                report_paired(paths, ipc::run(paths, request).await?)
+                report_paired(paths, ipc::run(paths, request).await?, &terminal)
             };
-            crate::telemetry::step(SetupStep::Pair, joining).await
+            crate::telemetry::step(SetupStep::Pair, joining).await?;
+            progress.finish("This device is connected");
+            Ok(())
         }
         _ => Err(CliError::from(
             "the terminal returned an invalid setup choice",
@@ -375,16 +384,21 @@ async fn onboard(paths: &Paths, terminal: &Terminal) -> Result<Done, CliError> {
         .map_err(|error| error.to_string())?
         .ok_or(DriverError::NotPaired)?;
     let auth = crate::reading(paths, &credential)?;
+    let mut progress = Some(terminal.progress("Preparing ~/Koidrive..."));
     let spaces = auth.api().list_spaces(&auth).await?.spaces;
+    if !spaces.is_empty() {
+        drop(progress.take());
+    }
     let target = shared_folder(terminal, &spaces).await?;
     let SelectedFolder {
         folder,
         local,
         directory,
-    } = local_folder(terminal, &target).await?;
+    } = local_folder(terminal, &target, &mut progress).await?;
+    let progress = progress
+        .unwrap_or_else(|| terminal.progress(&format!("Preparing {}...", shown_folder(&folder))));
     if local == Local::Missing {
         create(&folder)?;
-        terminal.message(&format!("Done. Created {}.", folder.display()));
     }
     let directory = directory
         .map(Ok)
@@ -392,10 +406,7 @@ async fn onboard(paths: &Paths, terminal: &Terminal) -> Result<Done, CliError> {
     let space = match target {
         Target::Existing(space) => space,
         Target::New(name) => match crate::named_space(&auth, &spaces, &name).await? {
-            crate::Named::Created(space) => {
-                terminal.message(&format!("Done. Created the shared folder {}.", space.name));
-                space
-            }
+            crate::Named::Created(space) => space,
             crate::Named::Existing(space) => space,
         },
     };
@@ -403,15 +414,12 @@ async fn onboard(paths: &Paths, terminal: &Terminal) -> Result<Done, CliError> {
         directory,
         accept_existing_files: local == Local::Files,
     };
-    let (status, outcome) =
-        crate::link(paths, folder.clone(), space.space_id, Some(approval)).await?;
-    terminal.message(&match outcome {
-        Outcome::Unchanged => format!(
-            "{} is already linked to {}.",
-            status.path, status.space_name
-        ),
-        _ => format!("Done. Linked {} to {}.", status.path, status.space_name),
-    });
+    let (status, _) = crate::link(paths, folder.clone(), space.space_id, Some(approval)).await?;
+    progress.finish(&format!(
+        "{} is linked to {}",
+        shown_folder(Path::new(&status.path)),
+        status.space_name
+    ));
     let data = SetupData {
         account: AccountData::of(&credential.account()),
         folder: FolderData::of(&status),
@@ -438,7 +446,6 @@ impl Target {
 
 async fn shared_folder(terminal: &Terminal, spaces: &[SpaceInfo]) -> Result<Target, CliError> {
     if spaces.is_empty() {
-        terminal.message("Where should Koidrive sync your files?");
         return Ok(Target::New(DEFAULT_FOLDER.to_owned()));
     }
     let mut items: Vec<String> = (spaces.iter())
@@ -460,9 +467,7 @@ async fn shared_folder(terminal: &Terminal, spaces: &[SpaceInfo]) -> Result<Targ
         return Ok(Target::Existing(space.clone()));
     }
     loop {
-        let answer = terminal
-            .input("Name of the new shared folder", false)
-            .await?;
+        let answer = terminal.input("Shared folder name", false).await?;
         let name = answer.trim();
         match crate::short_name(name) {
             Ok(_) if name.is_empty() => terminal.message("Enter a name for the shared folder."),
@@ -509,62 +514,72 @@ fn directory_identity(folder: &Path) -> Result<DirectoryIdentity, CliError> {
         })
 }
 
-async fn local_folder(terminal: &Terminal, target: &Target) -> Result<SelectedFolder, CliError> {
-    let default = home()?.join(DEFAULT_FOLDER);
-    let shown = default.display().to_string();
+async fn local_folder(
+    terminal: &Terminal,
+    target: &Target,
+    progress: &mut Option<Progress<'_>>,
+) -> Result<SelectedFolder, CliError> {
+    let mut folder = home()?.join(DEFAULT_FOLDER);
     loop {
-        terminal.message(&format!("Folder: {shown}"));
-        let answer = terminal
-            .input_or(
-                "Press Enter to use this folder, or type another path",
-                &shown,
-            )
-            .await?;
-        let folder = match answer == shown {
-            true => default.clone(),
-            false => crate::absolute(&expanded(&typed(&answer))?)?,
-        };
         let local = match inspect(&folder) {
             Ok(local) => local,
             Err(problem) => {
+                drop(progress.take());
                 terminal.message(&format!("{problem}. Choose another folder."));
+                folder = read_folder(terminal).await?;
                 continue;
             }
         };
-        let path = folder.display();
         let directory = (local != Local::Missing)
             .then(|| directory_identity(&folder))
             .transpose()?;
-        let name = target.name();
-        let question = match (local, target) {
-            (Local::Missing, Target::New(_)) => {
-                format!("Create {path} and its shared folder named {name}?")
-            }
-            (Local::Missing, Target::Existing(_)) => format!("Create {path}?"),
-            (Local::Empty, Target::New(_)) => {
-                format!("Create a shared folder named {name} for {path}?")
-            }
-            (Local::Empty, Target::Existing(_)) => {
-                return Ok(SelectedFolder {
-                    folder,
-                    local,
-                    directory,
-                });
-            }
-            (Local::Files, Target::Existing(_)) => format!(
-                "{path} contains files. Its files will upload to {name}, and files in {name} will download here. Link this folder?"
-            ),
-            (Local::Files, Target::New(_)) => format!(
-                "{path} contains files. They will upload to a new shared folder named {name}. Link this folder?"
-            ),
-        };
-        if terminal.confirm(&question, local != Local::Files).await? {
+        if local != Local::Files {
             return Ok(SelectedFolder {
                 folder,
                 local,
                 directory,
             });
         }
+        drop(progress.take());
+        let path = shown_folder(&folder);
+        let name = target.name();
+        match target {
+            Target::Existing(_) => {
+                terminal.message(&format!(
+                    "{path} contains files. They will upload to {name}."
+                ));
+                terminal.message(&format!("Files in {name} will download into {path}."));
+            }
+            Target::New(_) => terminal.message(&format!(
+                "{path} contains files. They will upload to a new shared folder named {name}."
+            )),
+        }
+        if terminal
+            .select(
+                "What should Koidrive do?",
+                vec!["Use another folder".into(), "Sync these files".into()],
+            )
+            .await?
+            == 1
+        {
+            return Ok(SelectedFolder {
+                folder,
+                local,
+                directory,
+            });
+        }
+        folder = read_folder(terminal).await?;
+    }
+}
+
+async fn read_folder(terminal: &Terminal) -> Result<PathBuf, CliError> {
+    loop {
+        let answer = terminal.input("Folder to sync", false).await?;
+        if answer.trim().is_empty() {
+            terminal.message("Enter a folder path.");
+            continue;
+        }
+        return crate::absolute(&expanded(&typed(&answer))?);
     }
 }
 
@@ -666,9 +681,22 @@ fn expanded(path: &Path) -> Result<PathBuf, CliError> {
 
 fn ending(folder: &Path) -> String {
     format!(
-        "Add files to {} to sync them.\nCheck sync: koi status\n",
-        printable(&folder.display().to_string())
+        "Setup complete. Add files to {}.\nCheck sync: koi status\n",
+        printable(&shown_folder(folder))
     )
+}
+
+pub(crate) fn shown_folder(folder: &Path) -> String {
+    if let Ok(home) = home()
+        && let Ok(rest) = folder.strip_prefix(home)
+    {
+        return if rest.as_os_str().is_empty() {
+            "~".into()
+        } else {
+            format!("~/{}", rest.display())
+        };
+    }
+    folder.display().to_string()
 }
 
 async fn scripted(
@@ -757,7 +785,10 @@ async fn scripted(
         folder: FolderData::of(&status),
     };
     let done = Done {
-        note: ending(&folder),
+        note: format!(
+            "Add files to {} to sync them.\nCheck sync: koi status\n",
+            printable(&folder.display().to_string())
+        ),
         ..Done::ok(data, crate::linked(&status, outcome))
     };
     Ok(
@@ -1006,9 +1037,12 @@ fn unfinished(state: &SetupState, account: &str, file: &Path) -> CliError {
     format!("{run}, or delete {} to forget it", file.display()).into()
 }
 
-fn report_paired(paths: &Paths, response: Response) -> Result<(), CliError> {
+fn report_paired(paths: &Paths, response: Response, terminal: &Terminal) -> Result<(), CliError> {
     match response {
         Response::Paired { account } => {
+            if terminal.setup_guided() {
+                return Ok(());
+            }
             println!(
                 "This device is set up as {} ({}) with {}.\nThe credential is in {}.",
                 printable(&account.device_name),
@@ -1071,6 +1105,10 @@ async fn guarded(
         } => outcome,
         how = stopped() => Err(format!("{how}; run the same command again to continue").into()),
     };
+    let terminal = session.terminal.clone();
+    let _progress = terminal
+        .setup_guided()
+        .then(|| terminal.continue_progress("Connecting this device..."));
     session.end().await;
     outcome
 }
@@ -1121,18 +1159,22 @@ async fn confirm(
 }
 
 /// Opens `url` in the default browser, without a shell. A failure only means the user opens it by hand.
-fn open_browser(url: &Url) {
+async fn open_browser(url: &Url) -> bool {
     let opener = if cfg!(target_os = "macos") {
         "open"
     } else {
         "xdg-open"
     };
-    let _ = Process::new(opener)
+    let opened = tokio::process::Command::new(opener)
         .arg(url.as_str())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn();
+        .kill_on_drop(true)
+        .status();
+    tokio::time::timeout(Duration::from_secs(5), opened)
+        .await
+        .is_ok_and(|result| result.is_ok_and(|status| status.success()))
 }
 
 /// A Koidrive server found in the account.
@@ -1190,7 +1232,20 @@ impl Cloud for Session {
 impl Session {
     /// Logs in with Cloudflare and returns once the code is exchanged for a grant, before any other call.
     async fn login(args: &LoginArgs, terminal: Arc<Terminal>) -> Result<Session, CliError> {
+        #[cfg(feature = "test-setup")]
+        let testing = testing::config()?;
         let http = koidrive_cloudflare::http_client().map_err(|error| error.to_string())?;
+        #[cfg(feature = "test-setup")]
+        let http = if testing.is_some() {
+            reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(10))
+                .build()
+                .map_err(|error| error.to_string())?
+        } else {
+            http
+        };
         let loopback = if args.no_browser {
             None
         } else {
@@ -1200,15 +1255,36 @@ impl Session {
             Some(loopback) => loopback.port(),
             None => args.port.unwrap_or(8976),
         };
-        let login = Login::new(Endpoints::cloudflare(), CLIENT_ID, port);
+        let endpoints = Endpoints::cloudflare();
+        #[cfg(feature = "test-setup")]
+        let endpoints = match &testing {
+            Some(testing) => Endpoints {
+                authorize: testing.base.join("oauth2/auth").unwrap(),
+                token: testing.base.join("oauth2/token").unwrap(),
+                revoke: testing.base.join("oauth2/revoke").unwrap(),
+            },
+            None => endpoints,
+        };
+        let login = Login::new(endpoints, CLIENT_ID, port);
         let page = login.authorize_url();
         let code = match &loopback {
             Some(loopback) => {
-                terminal.message(
-                    "Log in with Cloudflare in your browser. If it does not open, open this page:",
-                );
-                terminal.message(page.as_str());
-                open_browser(&page);
+                if terminal.setup_guided() {
+                    let progress = terminal.progress("Opening your browser...");
+                    let opened = open_browser(&page).await;
+                    drop(progress);
+                    if !opened {
+                        terminal.message("Couldn't open your browser. Open this page:");
+                        terminal.message(page.as_str());
+                    }
+                } else {
+                    terminal.message("Log in with Cloudflare in your browser. If it does not open, open this page:");
+                    terminal.message(page.as_str());
+                    open_browser(&page).await;
+                }
+                let _progress = terminal
+                    .setup_guided()
+                    .then(|| terminal.progress("Waiting for Cloudflare login..."));
                 tokio::time::timeout(LOGIN_WAIT, loopback.callback(&login))
                     .await
                     .map_err(|_| {
@@ -1219,25 +1295,51 @@ impl Session {
                     })??
             }
             None => {
-                terminal.message(
-                    "Open this page on any device, log in with Cloudflare and select Authorize:",
-                );
+                terminal.message(if terminal.setup_guided() {
+                    "Open this page on any device:"
+                } else {
+                    "Open this page on any device, log in with Cloudflare and select Authorize:"
+                });
                 terminal.message(page.as_str());
-                terminal.message(
-                    "The browser then fails to load a page on 127.0.0.1. Copy that page's address.",
-                );
-                let pasted = terminal.input("Address", true).await?;
+                terminal.message(if terminal.setup_guided() {
+                    "After you authorize, copy the address of the page that fails to load."
+                } else {
+                    "The browser then fails to load a page on 127.0.0.1. Copy that page's address."
+                });
+                let pasted = terminal
+                    .input(
+                        if terminal.setup_guided() {
+                            "Callback address"
+                        } else {
+                            "Address"
+                        },
+                        true,
+                    )
+                    .await?;
                 let url = Url::parse(&pasted)
                     .map_err(|error| CliError::usage(format!("that is not an address: {error}")))?;
                 login.code_from(&url)?
             }
         };
+        let _progress = terminal.setup_guided().then(|| {
+            if args.no_browser {
+                terminal.progress("Waiting for Cloudflare login...")
+            } else {
+                terminal.continue_progress("Waiting for Cloudflare login...")
+            }
+        });
         let grant = login.exchange(&http, code).await?;
+        drop(_progress);
+        let api_base = Url::parse(API_BASE).expect("the API base is a URL");
+        #[cfg(feature = "test-setup")]
+        let api_base = testing
+            .map(|testing| testing.base.join("client/v4/").unwrap())
+            .unwrap_or(api_base);
         Ok(Session {
             terminal,
             http,
             grant,
-            api_base: Url::parse(API_BASE).expect("the API base is a URL"),
+            api_base,
             account: Account {
                 id: String::new(),
                 name: String::new(),
@@ -1248,15 +1350,22 @@ impl Session {
 
     /// Reads the one account the user picked on the consent page.
     async fn pick_account(&mut self) -> Result<(), CliError> {
-        let accounts = self
-            .terminal
-            .wait("Checking your Cloudflare account...", async {
-                self.api()
-                    .accounts()
-                    .await
-                    .map_err(|error| CliError::from(error).context("cannot list the account"))
-            })
-            .await?;
+        let work = async {
+            self.api()
+                .accounts()
+                .await
+                .map_err(|error| CliError::from(error).context("cannot list the account"))
+        };
+        let accounts = if self.terminal.setup_guided() {
+            let _progress = self
+                .terminal
+                .continue_progress("Waiting for Cloudflare login...");
+            work.await?
+        } else {
+            self.terminal
+                .wait("Checking your Cloudflare account...", work)
+                .await?
+        };
         match <[Account; 1]>::try_from(accounts) {
             Ok([account]) => self.account = account,
             Err(accounts) => {
@@ -1267,10 +1376,15 @@ impl Session {
                 .into());
             }
         }
-        self.terminal.message(&format!(
-            "Logged in to the Cloudflare account {}.",
-            printable(&self.account.name)
-        ));
+        if self.terminal.setup_guided() {
+            self.terminal
+                .complete(&format!("Signed in to {}", self.account.name));
+        } else {
+            self.terminal.message(&format!(
+                "Logged in to the Cloudflare account {}.",
+                printable(&self.account.name)
+            ));
+        }
         Ok(())
     }
 
@@ -1316,6 +1430,10 @@ impl Session {
 
     async fn worker_url(&mut self, script: &str) -> Result<Url, CliError> {
         let subdomain = self.subdomain().await?;
+        #[cfg(feature = "test-setup")]
+        if let Some(testing) = testing::config()? {
+            return Ok(testing.base.join(&format!("workers/{script}/")).unwrap());
+        }
         Url::parse(&format!("https://{script}.{subdomain}.workers.dev/")).map_err(|error| {
             CliError::from(format!(
                 "{script} does not make a workers.dev address: {error}"
@@ -1328,6 +1446,10 @@ impl Session {
     async fn require_r2(&mut self) -> Result<(), CliError> {
         let started = Instant::now();
         let mut told = false;
+        let terminal = self.terminal.clone();
+        let mut progress = terminal
+            .setup_guided()
+            .then(|| terminal.continue_progress("Checking storage..."));
         loop {
             match self
                 .fresh()
@@ -1335,7 +1457,12 @@ impl Session {
                 .buckets(self.account(), Jurisdiction::Default)
                 .await
             {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    if told && let Some(progress) = progress.take() {
+                        progress.finish("R2 is ready");
+                    }
+                    return Ok(());
+                }
                 Err(error) if error.has_code(R2_DISABLED) => {
                     if !told {
                         let page = Url::parse(&format!(
@@ -1343,14 +1470,29 @@ impl Session {
                             self.account()
                         ))
                         .expect("the R2 page is a URL");
-                        println!(
-                            "R2 is not enabled on this account. Koidrive keeps your files in R2."
-                        );
-                        println!(
-                            "Enable it on this page. Its checkout includes free monthly usage and bills use beyond it:\n{page}"
-                        );
-                        open_browser(&page);
-                        println!("Waiting for R2...");
+                        if self.terminal.setup_guided() {
+                            drop(progress.take());
+                            self.terminal
+                                .message("Complete the R2 checkout in your browser to continue.");
+                            let opening = terminal.progress("Opening your browser...");
+                            let opened = open_browser(&page).await;
+                            drop(opening);
+                            if !opened {
+                                self.terminal
+                                    .message("Couldn't open your browser. Open this page:");
+                                self.terminal.message(page.as_str());
+                            }
+                            progress = Some(terminal.progress("Waiting for R2..."));
+                        } else {
+                            println!(
+                                "R2 is not enabled on this account. Koidrive keeps your files in R2."
+                            );
+                            println!(
+                                "Enable it on this page. Its checkout includes free monthly usage and bills use beyond it:\n{page}"
+                            );
+                            open_browser(&page).await;
+                            println!("Waiting for R2...");
+                        }
                         told = true;
                     }
                     if started.elapsed() > R2_WAIT {
@@ -1500,25 +1642,37 @@ impl Session {
     /// `koi setup` after the login: finish an interrupted deploy, deploy a new server, or add this device.
     async fn setup(&mut self, paths: &Paths, device_name: &str) -> Result<(), CliError> {
         if let Some(state) = self.resumable(paths)? {
-            println!(
-                "Continuing the setup that stopped earlier ({}).",
-                state.script
-            );
+            self.terminal.message("Continuing your server setup.");
             return self.finish_deploy(paths, state, device_name).await;
         }
         crate::telemetry::step(SetupStep::R2Checkout, self.require_r2()).await?;
+        let terminal = self.terminal.clone();
+        let progress = terminal.progress("Looking for your server...");
         let mut found = self.find_servers().await?;
         let server = match found.len() {
-            0 => return self.deploy(paths, device_name).await,
-            1 => found.remove(0),
+            0 => {
+                drop(progress);
+                return self.deploy(paths, device_name).await;
+            }
+            1 => {
+                progress.finish("Found your server");
+                found.remove(0)
+            }
             _ => {
+                drop(progress);
                 let choices = found
                     .iter()
-                    .map(|server| format!("{} at {}", server.script.id, server.url))
+                    .map(|server| {
+                        server
+                            .url
+                            .host_str()
+                            .unwrap_or(server.script.id.as_str())
+                            .to_owned()
+                    })
                     .collect();
                 let index = self
                     .terminal
-                    .select("Choose your Koidrive server", choices)
+                    .select("Which server should this device use?", choices)
                     .await?;
                 found.remove(index)
             }
@@ -1528,6 +1682,10 @@ impl Session {
 
     /// Picks a free Worker name and a new bucket name, then deploys and claims a new server (sections 4.3 and 4.4).
     async fn deploy(&mut self, paths: &Paths, device_name: &str) -> Result<(), CliError> {
+        let terminal = self.terminal.clone();
+        let progress = terminal
+            .setup_guided()
+            .then(|| terminal.continue_progress("Preparing storage..."));
         let bundle = embedded_bundle()?;
         let api = self.fresh().await?;
         let scripts: Vec<String> = api
@@ -1545,6 +1703,7 @@ impl Session {
             ..SetupState::default()
         };
         StateFile::new(paths).save(&state)?;
+        drop(progress);
         self.finish_deploy(paths, state, device_name).await
     }
 
@@ -1558,7 +1717,14 @@ impl Session {
         let file = StateFile::new(paths);
         let bundle = embedded_bundle()?;
         let mut key = None;
+        let terminal = self.terminal.clone();
+        let progress = terminal
+            .setup_guided()
+            .then(|| terminal.progress("Preparing storage..."));
         if state.step < Step::BucketCreated {
+            if !terminal.setup_guided() {
+                println!("Creating the R2 bucket {}...", state.bucket);
+            }
             crate::telemetry::step(SetupStep::Bucket, create_bucket(self, &file, &mut state))
                 .await?;
         }
@@ -1570,10 +1736,14 @@ impl Session {
                 &bundle.manifest.default_bucket,
             )
             .await?;
-            println!(
-                "Uploading Koidrive {} as the Worker {}...",
-                bundle.manifest.version, state.script
-            );
+            if let Some(progress) = &progress {
+                progress.update("Deploying your server...");
+            } else {
+                println!(
+                    "Uploading Koidrive {} as the Worker {}...",
+                    bundle.manifest.version, state.script
+                );
+            }
             let secret = Secret::random(32);
             state.secret_set = true;
             file.save(&state)?;
@@ -1588,6 +1758,9 @@ impl Session {
             key = Some(secret);
         }
         let url = self.worker_url(&state.script).await?;
+        if let Some(progress) = &progress {
+            progress.update("Waiting for your server...");
+        }
         if state.step < Step::Serving {
             crate::telemetry::step(SetupStep::Serving, self.serve(&state.script, &url)).await?;
             state.step = Step::Serving;
@@ -1608,6 +1781,12 @@ impl Session {
             info: server_info(&url).await,
             url,
         };
+        if let Some(progress) = progress {
+            progress.finish("Server created");
+        }
+        let _progress = terminal
+            .setup_guided()
+            .then(|| terminal.progress("Connecting this device..."));
         let claim =
             Claim::new(self, paths, &server, device_name, state, key).run(Duration::from_secs(60));
         crate::telemetry::step(SetupStep::Claim, claim).await
@@ -1634,11 +1813,20 @@ impl Session {
         let info = match server.info.clone() {
             Some(info) => info,
             None if interactive => {
-                println!(
-                    "{} stopped halfway through its deploy. Finishing it...",
-                    server.script.id
-                );
+                let terminal = self.terminal.clone();
+                let progress = if terminal.setup_guided() {
+                    Some(terminal.progress("Finishing your server setup..."))
+                } else {
+                    println!(
+                        "{} stopped halfway through its deploy. Finishing it...",
+                        server.script.id
+                    );
+                    None
+                };
                 let info = self.serve(&server.script.id, &server.url).await?;
+                if let Some(progress) = progress {
+                    progress.finish("Server is ready");
+                }
                 server.info = Some(info.clone());
                 info
             }
@@ -1652,12 +1840,19 @@ impl Session {
         };
         let mut window = Duration::from_secs(60);
         if !info.setup_attempts {
-            let reason = format!(
-                "{} runs Koidrive {}, which cannot make a retried claim end with one device. It needs an upgrade to {} first.",
-                server.script.id,
-                info.server_version,
-                embedded_bundle()?.manifest.version
-            );
+            let reason = if self.terminal.setup_guided() {
+                format!(
+                    "Your server needs Koidrive {} before it can connect this device.",
+                    embedded_bundle()?.manifest.version
+                )
+            } else {
+                format!(
+                    "{} runs Koidrive {}, which cannot make a retried claim end with one device. It needs an upgrade to {} first.",
+                    server.script.id,
+                    info.server_version,
+                    embedded_bundle()?.manifest.version
+                )
+            };
             if !interactive {
                 return Err(
                     format!("{reason} Run koi server upgrade, then this command again.").into(),
@@ -1679,6 +1874,15 @@ impl Session {
                 );
             }
             self.upgrade(&server, false).await?;
+            let terminal = self.terminal.clone();
+            let _progress = if terminal.setup_guided() {
+                Some(terminal.progress("Waiting for your server..."))
+            } else {
+                println!(
+                    "Waiting for the server's storage to move to the new version (up to 330 seconds)..."
+                );
+                None
+            };
             wait_for_setup_attempts(&server.url).await?;
             window = Duration::from_secs(330);
         }
@@ -1704,6 +1908,10 @@ impl Session {
                 ..SetupState::default()
             },
         };
+        let terminal = self.terminal.clone();
+        let _progress = terminal
+            .setup_guided()
+            .then(|| terminal.progress("Connecting this device..."));
         let claim = Claim::new(self, paths, &server, device_name, state, None).run(window);
         crate::telemetry::step(SetupStep::Claim, claim).await
     }
@@ -1752,10 +1960,16 @@ impl Session {
             .bucket
             .clone()
             .ok_or_else(|| format!("{} binds no R2 bucket", server.script.id))?;
-        println!(
-            "Uploading Koidrive {} over {} {}...",
-            bundle.manifest.version, server.script.id, info.server_version
-        );
+        let terminal = self.terminal.clone();
+        let progress = if terminal.setup_guided() {
+            Some(terminal.progress("Updating your server..."))
+        } else {
+            println!(
+                "Uploading Koidrive {} over {} {}...",
+                bundle.manifest.version, server.script.id, info.server_version
+            );
+            None
+        };
         self.upload(
             &bundle,
             &server.script.id,
@@ -1765,10 +1979,14 @@ impl Session {
         )
         .await?;
         wait_until_serving(&server.url, Some(&bundle.manifest.version)).await?;
-        println!(
-            "{} now runs Koidrive {}. Open sync sessions move to it within 5 minutes.",
-            server.script.id, bundle.manifest.version
-        );
+        if let Some(progress) = progress {
+            progress.finish("Server updated");
+        } else {
+            println!(
+                "{} now runs Koidrive {}. Open sync sessions move to it within 5 minutes.",
+                server.script.id, bundle.manifest.version
+            );
+        }
         Ok(())
     }
 
@@ -1889,6 +2107,10 @@ impl Session {
 /// Fails when this koi has no embedded server bundle. The commands that find, deploy or upgrade a server call it before
 /// the Cloudflare login, so that nobody authorizes a login that cannot be used.
 fn bundled() -> Result<(), String> {
+    #[cfg(feature = "test-setup")]
+    if testing::config()?.is_some() {
+        return Ok(());
+    }
     if SERVER_BUNDLE.is_empty() {
         return Err("this koi was built without a server bundle, so it cannot find, deploy or upgrade a server; build it with KOIDRIVE_SERVER_BUNDLE as docs/guide/install.md describes".into());
     }
@@ -1898,6 +2120,10 @@ fn bundled() -> Result<(), String> {
 /// The embedded server bundle, read through [`Bundle::from_dir`] from a private copy, so the release's bundle passes the
 /// same checks as one on disk.
 pub(crate) fn embedded_bundle() -> Result<Bundle, CliError> {
+    #[cfg(feature = "test-setup")]
+    if let Some(testing) = testing::config()? {
+        return Bundle::from_dir(&testing.bundle).map_err(|error| error.to_string().into());
+    }
     bundled()?;
     let broken = |error: &dyn std::fmt::Display| {
         CliError::from(format!("this koi's server bundle is broken: {error}"))
@@ -1921,7 +2147,6 @@ async fn create_bucket(
     file: &StateFile,
     state: &mut SetupState,
 ) -> Result<(), CliError> {
-    println!("Creating the R2 bucket {}...", state.bucket);
     let account = cloud.account().to_owned();
     match cloud
         .fresh()
@@ -2013,6 +2238,12 @@ fn newer(a: &str, b: &str) -> bool {
 
 /// The Koidrive API of the server at `url`. Tests serve it over http on a loopback address.
 fn server_api(url: &Url) -> Result<Api, ApiError> {
+    #[cfg(feature = "test-setup")]
+    if let Some(testing) = testing::config().map_err(ApiError::Url)?
+        && url.origin() == testing.base.origin()
+    {
+        return Api::local_development(url.clone());
+    }
     if cfg!(test) {
         Api::local_development(url.clone())
     } else {
@@ -2051,7 +2282,6 @@ async fn wait_until_serving(url: &Url, version: Option<&str>) -> Result<ServerIn
 
 /// Polls until the Account DO reports `setup_attempts`, which can take up to 300 seconds after an upgrade.
 async fn wait_for_setup_attempts(url: &Url) -> Result<(), CliError> {
-    println!("Waiting for the server's storage to move to the new version (up to 330 seconds)...");
     let started = Instant::now();
     loop {
         if server_info(url)
