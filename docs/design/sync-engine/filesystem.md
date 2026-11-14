@@ -163,6 +163,7 @@ A node is excluded on this device when any of these matches the rules: its posit
 - A node whose local copy has not moved stays excluded, so a remote move into an ignored path never moves the local copy.
 - Freezing has two limits. S still takes what L and R both hold for the node. And S gives up a position that neither L nor R holds any more: with the node in L and live in R, S takes R's position, or the local copy's when S cannot hold the node at R's, and keeps its content for comparison when the node is included again; otherwise S drops the node, which is then resolved like a node never synced.
 - A folder that S drops gives up its S entry together with every node S holds below it, when all of them are ignored too.
+- A folder that L no longer holds, kept on the server because R holds an excluded node below it, is synced in neither direction. Like an excluded node's, its S entry gives up a position that neither L nor R holds and takes R's position, so it never keeps another node out of S.
 - An excluded node is not a deletion and never enters the mass-delete ledger. It is ineligible for convergence (§3.4), and its local copy is left exactly as it is.
 
 ### Parking and exclusion

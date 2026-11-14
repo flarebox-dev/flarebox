@@ -1275,7 +1275,12 @@ impl Trees {
         let remote = self.r.live(id);
         let held = |shape: Option<&Shape>| shape.is_some_and(|shape| shape.same_position(synced));
         let placed = local.filter(|node| !node.parked).map(|node| &node.shape);
-        if held(placed) || held(remote) || !self.ignored(id) {
+        if held(placed) || held(remote) {
+            return None;
+        }
+        let ignored = self.ignored(id);
+        let kept = !ignored && self.kept_for_excluded()(id);
+        if !(ignored || kept) {
             return None;
         }
         let at = |shape: &Shape| {
@@ -1286,7 +1291,7 @@ impl Trees {
             })
         };
         let mut next = Vec::new();
-        if local.is_some()
+        if (local.is_some() || kept)
             && let Some(remote) = remote
         {
             next.push(at(remote));
