@@ -1073,11 +1073,12 @@ impl Folder {
                 }
             }
         }
+        let kept_for_excluded = trees.kept_for_excluded();
         move |id: &String| {
             self.engine.effects.blocked().contains_key(id)
                 || self.engine.commits.problems().contains(id)
                 || trees.excluded(id)
-                || trees.kept_for_excluded(id)
+                || kept_for_excluded(id.as_str())
                 || (above_blocked.contains(id.as_str()) && trees.remote().live(id).is_none())
                 || held.contains_key(id)
         }
