@@ -4,8 +4,13 @@ import argparse
 import functools
 import http.server
 from pathlib import Path
+import socketserver
 import ssl
 import subprocess
+
+
+class Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    daemon_threads = True
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -44,7 +49,7 @@ def main():
     parser.add_argument("--redirect", metavar="ORIGIN", help="answer with a 302 to ORIGIN followed by the request path")
     parser.add_argument("--only", action="append", default=[], metavar="NAME", help="redirect only paths ending in NAME")
     args = parser.parse_args()
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Handler, directory=args.root))
+    server = Server(("127.0.0.1", 0), functools.partial(Handler, directory=args.root))
     scheme = "http"
     if args.tls:
         cert, key = certificate(Path(args.tls))
