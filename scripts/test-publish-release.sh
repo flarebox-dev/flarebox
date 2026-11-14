@@ -1,9 +1,5 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-#
-# Tests scripts/publish-release.sh against a stub gh that keeps releases and their uploaded file names
-# in a directory and follows GitHub's rules for Latest: --latest=true moves it, --latest=false leaves it,
-# and a draft or a prerelease is never Latest. The release list goes through the script's own jq filter.
 set -euo pipefail
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
@@ -78,7 +74,7 @@ ssh-keygen -q -t ed25519 -N '' -C koidrive-release -f "$tmp/release-key"
 ssh-keygen -q -t ed25519 -N '' -C other -f "$tmp/other-key"
 printf 'koidrive namespaces="koidrive-release" %s\n' "$(cut -d' ' -f1,2 "$tmp/release-key.pub")" > "$tmp/allowed-signers"
 RELEASE_SIGNING_KEY=$(cat "$tmp/release-key")
-export PATH="$tmp/bin:$PATH" GH_REPO=koidrive/koidrive GH_STUB_DIR="$tmp/db" PRERELEASE_TAGS_PUBLISH_AS=latest
+export PATH="$tmp/bin:$PATH" GH_REPO=koidrive/koidrive GH_STUB_DIR="$tmp/db" PRERELEASE_TAGS_PUBLISH_AS=normal-release
 export RELEASE_ALLOWED_SIGNERS="$tmp/allowed-signers" RELEASE_SIGNING_KEY
 passed=0
 
