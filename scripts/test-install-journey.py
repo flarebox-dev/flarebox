@@ -473,7 +473,7 @@ exec /bin/mv "$@"''')
 
     def test_release_without_signature_is_refused(self):
         self.sums.with_name("SHA256SUMS.sig").unlink()
-        self.refused_install("Could not download SHA256SUMS.sig, so the release cannot be verified")
+        self.refused_install("Could not download SHA256SUMS.sig, so the release cannot be verified; the existing installation has not changed. Retry, or set KOIDRIVE_VERSION to v0.1.0-alpha.4 or later")
 
     def test_missing_or_old_ssh_keygen_warns_and_still_installs(self):
         self.sign(self.other_key)

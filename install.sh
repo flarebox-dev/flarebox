@@ -83,7 +83,7 @@ main() {
     printf 'Downloading %s (%s)\n' "$archive" "$version"
     fetch "$archive"
     fetch SHA256SUMS
-    fetch SHA256SUMS.sig || fail 'Could not download SHA256SUMS.sig, so the release cannot be verified; the existing installation has not changed'
+    fetch SHA256SUMS.sig || fail 'Could not download SHA256SUMS.sig, so the release cannot be verified; the existing installation has not changed. Retry, or set KOIDRIVE_VERSION to v0.1.0-alpha.4 or later'
     if command -v ssh-keygen >/dev/null 2>&1 && ssh-keygen -\? 2>&1 | grep -q 'ssh-keygen -Y verify'; then
         printf '%s\n' 'koidrive namespaces="koidrive-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHrojC3pUxk7xAzY+3xU5cpMnCpa2jPxjMu/xH/xL/+n' > "$tmp/allowed-signers"
         ssh-keygen -Y verify -f "$tmp/allowed-signers" -I koidrive -n koidrive-release -s "$tmp/SHA256SUMS.sig" < "$tmp/SHA256SUMS" >/dev/null 2>&1 ||
