@@ -139,12 +139,10 @@ public final class AppModel {
         }
     }
 
-    /// Whether the syncing arrows on the menu bar icon turn.
     public func turnsMenuBarArrows(reduceMotion: Bool) -> Bool {
         !reduceMotion && iconBadge == .syncing
     }
 
-    /// Whether the syncing arrows next to the popover's headline turn.
     public func turnsHeadlineArrows(reduceMotion: Bool) -> Bool {
         !reduceMotion && (headline == .status(.syncing) || headline == .status(.connecting))
     }

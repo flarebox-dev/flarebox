@@ -30,8 +30,7 @@ struct MenuBarLabel: View {
     }
 }
 
-/// MenuBarExtra draws its label as a still image, so the turning arrows are a layer-backed image view on the status
-/// item's button, animated by Core Animation outside the app process.
+/// MenuBarExtra draws its label as a still image, so the turning arrows are an image view on the status item's button.
 @MainActor
 @Observable
 final class TurningArrows {
