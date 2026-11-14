@@ -27,8 +27,8 @@ import uuid
 
 REPO = Path(__file__).resolve().parents[1]
 RELEASE = "https://github.com/koidrive/koidrive/releases/download"
-HELD_COMMIT = "5f34b5fe3c1f6748408dae85b6c6443defd9d0a2"
-HELD_SHA = "bb05188255cb66c87971ae7847992d4ed5c5d7a532c5d4fbf19d3726f52fcad0"
+HELD_COMMIT = "c2258558f13afc85d8864de3a9cfab228ee39a31"
+HELD_SHA = "efb1403a59376fbdb11b62ecc590c6125bea585374b6fba2a5de6b249faa538d"
 HELD_URL = f"https://raw.githubusercontent.com/koidrive/koidrive/{HELD_COMMIT}/install.sh"
 INSTALLER_SOURCES = {"held": HELD_URL, "live": "https://koidrive.com/install.sh"}
 APP = Path("/Applications/Koidrive.app")

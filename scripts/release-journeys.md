@@ -11,7 +11,7 @@ Each runtime case gets a separate [GitHub-hosted macOS 26 runner](https://docs.g
 | Formula first | Record whether Homebrew rejects the binary collision or installs the app while skipping its CLI link. The formula's executable and version must remain intact, including after cask removal. Evidence includes the exact warning or error and resulting installation state. |
 | Shell installer | The pinned installer runs through `curl \| sh` in a controlling terminal, completes guided setup with the released CLI, and leaves a usable installation. Cleanup stops the test's app and services. |
 
-The manual shell case uses immutable installer commit `5f34b5fe3c1f6748408dae85b6c6443defd9d0a2`, checked against SHA-256 `bb05188255cb66c87971ae7847992d4ed5c5d7a532c5d4fbf19d3726f52fcad0`. It exercises the installer before publication without deploying it. A local Worker and public CLI commands supply test authentication and a shared folder. They do not substitute for the installer or pre-link its folder.
+The manual shell case uses immutable installer commit `c2258558f13afc85d8864de3a9cfab228ee39a31`, checked against SHA-256 `efb1403a59376fbdb11b62ecc590c6125bea585374b6fba2a5de6b249faa538d`. It exercises the installer before publication without deploying it. A local Worker and public CLI commands supply test authentication and a shared folder. They do not substitute for the installer or pre-link its folder.
 
 The manual `installer_source` input defaults to `held`, the immutable raw URL. Set it to `live` to download `https://koidrive.com/install.sh` after deployment. Both manual sources must match the same accepted SHA-256 before any installer or bootstrap CLI executes. No custom URL or digest input is accepted.
 
