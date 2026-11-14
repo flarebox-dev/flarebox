@@ -8748,3 +8748,31 @@ fn a_lost_rename_another_device_sent_again_gives_way_to_a_later_delete() {
     )
     .unwrap();
 }
+
+#[test]
+fn a_file_in_a_folder_a_restore_lost_takes_another_devices_later_edit_without_a_recovery_copy() {
+    let phases = [
+        vec![
+            (0, drawn(1, 0, 0, 2)),
+            (0, drawn(1, 0, 0, 0)),
+            (1, drawn(0, 0, 0, 3)),
+            (1, drawn(0, 0, 0, 0)),
+        ],
+        vec![
+            (0, drawn(2, 2598238505695608102, 0, 0)),
+            (0, drawn(0, 0, 0, 5)),
+            (1, drawn(0, 0, 11126111642893, 0)),
+            (0, drawn(0, 0, 1012958439577005857, 0)),
+            (0, drawn(4, 2416387676764917897, 0, 0)),
+            (0, drawn(2, 2134680043631170611, 0, 0)),
+            (0, BACKUP),
+            (0, drawn(3, 5652013970099393645, 9121562378940609530, 0)),
+        ],
+        vec![
+            (0, RESTORE),
+            (0, drawn(0, 0, 0, 6)),
+            (0, drawn(2, 6280342146051809032, 0, 0)),
+        ],
+    ];
+    converge(2, &phases).unwrap();
+}
