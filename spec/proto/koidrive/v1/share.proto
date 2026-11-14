@@ -18,6 +18,9 @@ message CreateShareLinkRequest {
   bool no_expiry = 3;
   // Empty for a link without a password; otherwise 8 to 256 Unicode scalar values.
   string password = 4;
+  // A random value, at most 64 characters, that the client chooses once per intended link and sends with every
+  // resend of it. A resend returns what the first request created (RFC 0024).
+  string request_id = 5;
 }
 
 // One link, as the owner sees it.

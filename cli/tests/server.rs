@@ -328,6 +328,7 @@ async fn a_headless_device_pairs_links_and_follows_the_change_stream() {
             &owner,
             &CreateSpaceRequest {
                 name: space_name.clone(),
+                request_id: String::new(),
             },
         )
         .await
@@ -582,6 +583,7 @@ async fn a_device_revokes_a_lost_one_and_stops_syncing_when_another_revokes_it()
             code: pairing.code,
             device_name: "lost laptop".into(),
             platform: "test".into(),
+            request_id: String::new(),
         })
         .await
         .unwrap();
@@ -643,6 +645,7 @@ async fn a_device_revokes_a_lost_one_and_stops_syncing_when_another_revokes_it()
             &owner,
             &CreateSpaceRequest {
                 name: space_name.clone(),
+                request_id: String::new(),
             },
         )
         .await
@@ -775,7 +778,13 @@ async fn usage_lists_what_each_space_stores() {
     let name = format!("usage {}", uuidv7());
     let space = owner
         .api()
-        .create_space(&owner, &CreateSpaceRequest { name: name.clone() })
+        .create_space(
+            &owner,
+            &CreateSpaceRequest {
+                name: name.clone(),
+                request_id: String::new(),
+            },
+        )
         .await
         .unwrap();
 
@@ -884,7 +893,13 @@ async fn of_two_copies_of_one_credential_only_the_one_that_rotates_it_keeps_work
     let name = format!("rotation {}", uuidv7());
     owner
         .api()
-        .create_space(&owner, &CreateSpaceRequest { name: name.clone() })
+        .create_space(
+            &owner,
+            &CreateSpaceRequest {
+                name: name.clone(),
+                request_id: String::new(),
+            },
+        )
         .await
         .unwrap();
     let folder = first.path("Rotation");
@@ -993,6 +1008,7 @@ async fn trash_and_versions_list_what_the_space_keeps() {
             &owner,
             &CreateSpaceRequest {
                 name: space_name.clone(),
+                request_id: String::new(),
             },
         )
         .await
@@ -1180,6 +1196,7 @@ async fn restore_brings_back_a_deleted_file_and_an_earlier_version() {
             &owner,
             &CreateSpaceRequest {
                 name: space_name.clone(),
+                request_id: String::new(),
             },
         )
         .await
@@ -1738,6 +1755,7 @@ async fn a_linked_folder_syncs_in_the_systemd_user_service_until_the_last_unlink
             &owner,
             &CreateSpaceRequest {
                 name: space_name.clone(),
+                request_id: String::new(),
             },
         )
         .await
@@ -1824,7 +1842,13 @@ async fn a_share_link_opens_what_it_shares_until_it_is_revoked() {
         let owner = owner.clone();
         async move {
             (owner.api())
-                .create_space(&owner, &CreateSpaceRequest { name })
+                .create_space(
+                    &owner,
+                    &CreateSpaceRequest {
+                        name,
+                        request_id: String::new(),
+                    },
+                )
                 .await
                 .unwrap()
         }
@@ -2096,6 +2120,7 @@ async fn refuses_local_replacements_and_edits_that_have_not_synced() {
             &owner,
             &CreateSpaceRequest {
                 name: space_name.clone(),
+                request_id: String::new(),
             },
         )
         .await

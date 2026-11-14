@@ -33,3 +33,4 @@ Spec v0 was drafted outside this repository, and the schema here is its current 
 | [0021](rfc/0021-human-auth.md) | A person signs in with a passkey or approves a new device | RFC 0006 §2 and §6, RFC 0009 §1 and RFC 0020 §2.2 and §3.1 (not folded into them); RFC 0020, RFC 0022 |
 | [0022](rfc/0022-server-features.md) | The server announces the features it has turned on | Spec v0 §15 (`GET /v1/server`) and `Welcome` (not folded into it) |
 | [0023](rfc/0023-trash-deletion-time.md) | When and from which device each node in the trash was deleted | Spec v0 §4.1, R8 and R9; RFC 0012 |
+| [0024](rfc/0024-create-retries.md) | A resent create returns what the first request made | Spec v0 §15; RFC 0005 §2 and RFC 0008 (not folded into them) |

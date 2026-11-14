@@ -72,6 +72,10 @@ pub struct ClaimRequest {
     /// whose responses were lost leave one device in the end.
     #[prost(string, tag="5")]
     pub setup_attempt: ::prost::alloc::string::String,
+    /// A random value, at most 64 characters, that the client chooses once per intended claim and sends with every
+    /// resend of it. A resend returns what the first request created (RFC 0024).
+    #[prost(string, tag="6")]
+    pub request_id: ::prost::alloc::string::String,
 }
 /// Response of POST /v1/pair/start, called by an already paired device.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -91,6 +95,10 @@ pub struct PairCompleteRequest {
     pub device_name: ::prost::alloc::string::String,
     #[prost(string, tag="3")]
     pub platform: ::prost::alloc::string::String,
+    /// A random value, at most 64 characters, that the client chooses once per intended pairing and sends with every
+    /// resend of it. A resend returns what the first request created (RFC 0024).
+    #[prost(string, tag="4")]
+    pub request_id: ::prost::alloc::string::String,
 }
 /// Response of POST /v1/claim and POST /v1/pair/complete.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -160,6 +168,10 @@ pub struct SpaceInfo {
 pub struct CreateSpaceRequest {
     #[prost(string, tag="1")]
     pub name: ::prost::alloc::string::String,
+    /// A random value, at most 64 characters, that the client chooses once per intended space and sends with every
+    /// resend of it. A resend returns what the first request created (RFC 0024).
+    #[prost(string, tag="2")]
+    pub request_id: ::prost::alloc::string::String,
 }
 /// Response of GET /v1/spaces?cursor=, at most 100 spaces per page (RFC 0007 section 2).
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1325,6 +1337,10 @@ pub struct CreateShareLinkRequest {
     /// Empty for a link without a password; otherwise 8 to 256 Unicode scalar values.
     #[prost(string, tag="4")]
     pub password: ::prost::alloc::string::String,
+    /// A random value, at most 64 characters, that the client chooses once per intended link and sends with every
+    /// resend of it. A resend returns what the first request created (RFC 0024).
+    #[prost(string, tag="5")]
+    pub request_id: ::prost::alloc::string::String,
 }
 /// One link, as the owner sees it.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

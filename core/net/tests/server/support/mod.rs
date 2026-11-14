@@ -59,6 +59,7 @@ async fn claim() -> DeviceCredentials {
         device_name: "owner".into(),
         platform: "test".into(),
         setup_attempt: String::new(),
+        request_id: String::new(),
     };
     api().claim(&request).await.expect("the claim succeeds")
 }
@@ -90,6 +91,7 @@ pub async fn new_device(name: &str) -> Credentials {
         code: started.code,
         device_name: name.into(),
         platform: "test".into(),
+        request_id: String::new(),
     };
     Credentials::from(&api().pair_complete(&request).await.unwrap())
 }
@@ -102,6 +104,7 @@ pub async fn new_space() -> SpaceInfo {
             &owner,
             &CreateSpaceRequest {
                 name: format!("test {}", uuidv7()),
+                request_id: String::new(),
             },
         )
         .await

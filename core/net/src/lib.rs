@@ -16,6 +16,7 @@ mod api;
 mod auth;
 mod backoff;
 mod chunks;
+mod create;
 mod error;
 mod event;
 mod session;
@@ -30,6 +31,7 @@ pub use backoff::Backoff;
 pub use chunks::{
     ChunkError, DEFAULT_UPLOAD_CONCURRENCY, MAX_CHUNKS_PER_CALL, Transfer, UploadGate, matches,
 };
+pub use create::{request_id, resend_lost};
 pub use error::{ApiError, CallError, NotResent, Resend, ServerError, StopReason};
 pub use event::{Committed, DisconnectReason, Event};
 pub use session::{

@@ -358,6 +358,7 @@ async fn upload_benchmark() {
                 &auth,
                 &CreateSpaceRequest {
                     name: format!("Upload benchmark {rep} N={n}"),
+                    request_id: String::new(),
                 },
             )
             .await

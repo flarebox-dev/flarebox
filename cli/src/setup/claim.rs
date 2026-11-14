@@ -150,6 +150,7 @@ impl<'a> Claim<'a> {
             device_name: self.device_name.to_owned(),
             platform: std::env::consts::OS.to_owned(),
             setup_attempt: self.state.setup_attempt.clone().unwrap_or_default(),
+            request_id: String::new(),
         };
         let started = Instant::now();
         if !self.session.terminal.setup_guided() {

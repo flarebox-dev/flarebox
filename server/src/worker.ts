@@ -275,8 +275,8 @@ async function route(request: Request, env: Env): Promise<Response> {
       if (refused) return refused;
       const body = await readMessage(request, CreateSpaceRequestSchema);
       checkNames({ name: body.name });
-      const created = await account(env).createSpace({ userId: identity.userId, name: body.name });
-      if (!created.ok) return errorReply(request, created.code, created.message, 409);
+      const created = await account(env).createSpace({ userId: identity.userId, name: body.name, requestId: body.requestId });
+      if (!created.ok) return errorReply(request, created.code, created.message, created.code === Error_Code.INVALID_ARGUMENT ? 409 : undefined);
       return reply(request, SpaceInfoSchema, create(SpaceInfoSchema, created.value), 201);
     }
   }

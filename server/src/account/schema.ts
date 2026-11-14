@@ -70,6 +70,20 @@ export const MIGRATIONS: readonly Migration[] = [
     const columns = sql.exec("SELECT name FROM pragma_table_info('devices')").toArray().map((row) => row.name);
     if (!columns.includes("rotation_clock_ms")) sql.exec("ALTER TABLE devices ADD COLUMN rotation_clock_ms INTEGER NOT NULL DEFAULT 0");
   },
+  (sql) => {
+    const add = (table: string, column: string) => {
+      const columns = sql.exec(`SELECT name FROM pragma_table_info('${table}')`).toArray().map((row) => row.name);
+      if (!columns.includes(column)) sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
+    };
+    add("spaces", "request_id");
+    add("share_links", "request_id");
+    add("pairing_codes", "request_id");
+    add("pairing_codes", "paired_device_id");
+    add("claim_codes", "request_id");
+    add("claim_codes", "claimed_device_id");
+    sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS spaces_request ON spaces(owner_id, request_id) WHERE request_id IS NOT NULL");
+    sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS share_links_request ON share_links(space_id, request_id) WHERE request_id IS NOT NULL");
+  },
 ];
 
 export function migrate(sql: Sql): void {

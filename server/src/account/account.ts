@@ -28,7 +28,7 @@ import type { SpaceDO } from "../space-do";
 import { isUuidV7, uuidv7 } from "../ids";
 import { knownPrincipal } from "../policy";
 import { FORMAT_VERSION } from "../space/space";
-import { type Outcome, type ResolvedLink, type ShareOutcome, ShareLinks } from "../share/links";
+import { MAX_REQUEST_ID_LENGTH, type Outcome, type ResolvedLink, type ShareOutcome, ShareLinks } from "../share/links";
 
 const CLAIM_CODE_MS = 3_600_000;
 const PAIRING_CODE_MS = 10 * 60_000;
@@ -159,7 +159,7 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
     protected abstract spaceStub(spaceId: string): SpaceDirectory;
     private keyCache: ServerKey | undefined;
     private readonly driving = new Set<string>();
-    private readonly creating = new Set<string>();
+    private readonly creating = new Map<string, string>();
     private readonly admitting = new Set<string>();
     sessionLeaseMs = SESSION_LEASE_MS;
     clock: () => number = () => Date.now();
@@ -195,12 +195,14 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
     }
 
     async claim(
-      args: { code: string; userName: string; deviceName: string; platform: string; setupAttempt?: string },
+      args: { code: string; userName: string; deviceName: string; platform: string; setupAttempt?: string; requestId?: string },
       client = "",
       recoveryKey?: string,
     ): Promise<Outcome<DeviceCredentials>> {
       const setupAttempt = args.setupAttempt ?? "";
       if (setupAttempt.length > MAX_SETUP_ATTEMPT_LENGTH) return failure(Error_Code.INVALID_ARGUMENT, `setup_attempt is longer than ${MAX_SETUP_ATTEMPT_LENGTH} characters`);
+      const requestId = args.requestId ?? "";
+      if (requestId.length > MAX_REQUEST_ID_LENGTH) return failure(Error_Code.INVALID_ARGUMENT, `request_id is longer than ${MAX_REQUEST_ID_LENGTH} characters`);
       const nowMs = Date.now();
       const ownerBefore = ownerOf(this.sql);
       const userId = ownerBefore ?? uuidv7(nowMs);
@@ -217,10 +219,12 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
         userName: args.userName,
         deviceId: device.credentials.deviceId,
         setupAttempt,
+        requestId,
         storeDevice: device.store,
       };
       const outcome = this.db.transactionSync(() => redeemClaim(this.sql, attempt));
       if (!outcome.ok) return outcome;
+      if ("earlierDevice" in outcome) return (await this.reissue(outcome.earlierDevice, nowMs)) ?? failure(Error_Code.FORBIDDEN, "this deployment already has an owner");
       for (const deviceId of outcome.revoke) {
         if (!stillUnused(this.sql, deviceId, setupAttempt, userId)) continue;
         await this.revokeDevice(deviceId).catch((error: unknown) => console.error("setup attempt cleanup failed", deviceId, errorText(error)));
@@ -229,12 +233,6 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
         return failure(Error_Code.FORBIDDEN, "a later claim of this setup attempt replaced this one; set a new recovery key and claim again");
       }
       return ok(create(DeviceCredentialsSchema, { ...device.credentials, userName: this.userName(userId) }));
-    }
-
-    private async addDevice(userId: string, deviceName: string, platform: string, nowMs: number, issuedBy: string): Promise<DeviceCredentials> {
-      const device = await this.prepareDevice(userId, deviceName, platform, nowMs, issuedBy);
-      device.store();
-      return create(DeviceCredentialsSchema, { ...device.credentials, userName: this.userName(userId) });
     }
 
     private userName(userId: string): string {
@@ -304,14 +302,54 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       return ok({ code: `${code.slice(0, 4)}-${code.slice(4)}`, expiresAtMs });
     }
 
-    async completePairing(args: { code: string; deviceName: string; platform: string }, client: string): Promise<Outcome<DeviceCredentials>> {
+    async completePairing(
+      args: { code: string; deviceName: string; platform: string; requestId?: string },
+      client: string,
+    ): Promise<Outcome<DeviceCredentials>> {
       const nowMs = Date.now();
-      const row = this.sql
-        .exec("DELETE FROM pairing_codes WHERE code_hash = ? AND expires_at_ms > ? RETURNING device_id", await codeHash(args.code), nowMs)
-        .toArray()[0];
+      const requestId = args.requestId ?? "";
+      if (requestId.length > MAX_REQUEST_ID_LENGTH) return failure(Error_Code.INVALID_ARGUMENT, `request_id is longer than ${MAX_REQUEST_ID_LENGTH} characters`);
+      const hash = await codeHash(args.code);
+      const refused = () => wrongCode(this.sql, "pair", client, nowMs, "invalid or expired pairing code");
+      const row = this.sql.exec("SELECT * FROM pairing_codes WHERE code_hash = ? AND expires_at_ms > ?", hash, nowMs).toArray()[0];
       const inviter = row && this.activeDevice(String(row.device_id));
-      if (!inviter) return wrongCode(this.sql, "pair", client, nowMs, "invalid or expired pairing code");
-      return ok(await this.addDevice(inviter.user_id, args.deviceName, args.platform, nowMs, inviter.device_id));
+      if (!inviter) return refused();
+      if (row.paired_device_id !== null) {
+        const again = requestId && row.request_id === requestId ? await this.reissue(String(row.paired_device_id), nowMs) : undefined;
+        return again ?? refused();
+      }
+      const device = await this.prepareDevice(inviter.user_id, args.deviceName, args.platform, nowMs, inviter.device_id);
+      const paired = this.db.transactionSync(() => {
+        const taken = this.sql
+          .exec("UPDATE pairing_codes SET request_id = ?, paired_device_id = ? WHERE code_hash = ? AND paired_device_id IS NULL RETURNING 1", requestId || null, device.credentials.deviceId, hash)
+          .toArray().length > 0;
+        if (taken) device.store();
+        return taken;
+      });
+      if (!paired) return failure(Error_Code.RETRY_LATER, "this pairing code is being used; retry");
+      return ok(create(DeviceCredentialsSchema, { ...device.credentials, userName: this.userName(inviter.user_id) }));
+    }
+
+    private async reissue(deviceId: string, nowMs: number): Promise<Outcome<DeviceCredentials> | undefined> {
+      const device = this.activeDevice(deviceId);
+      if (!device || device.last_seen_ms !== null) return undefined;
+      const refresh = base64url(crypto.getRandomValues(new Uint8Array(32)));
+      const refreshHash = (await sha256(encoder.encode(refresh))).slice().buffer;
+      const access = await this.accessToken(device, nowMs);
+      const replaced = this.sql
+        .exec("UPDATE devices SET refresh_hash = ? WHERE device_id = ? AND last_seen_ms IS NULL AND revoked_at_ms IS NULL RETURNING 1", refreshHash, deviceId)
+        .toArray().length > 0;
+      if (!replaced) return undefined;
+      return ok(
+        create(DeviceCredentialsSchema, {
+          userId: device.user_id,
+          deviceId,
+          refreshCredential: refresh,
+          access,
+          credentialExpiresAtMs: 0n,
+          userName: this.userName(device.user_id),
+        }),
+      );
     }
 
     async refreshAccess(args: {
@@ -432,25 +470,34 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       await this.armAlarm();
     }
 
-    async createSpace(args: { userId: string; name: string }): Promise<Outcome<SpaceInfo>> {
+    async createSpace(args: { userId: string; name: string; requestId?: string }): Promise<Outcome<SpaceInfo>> {
       const nowMs = Date.now();
       const spaceId = uuidv7(nowMs);
       const name = args.name.trim() || "Koidrive";
+      const requestId = args.requestId ?? "";
+      if (requestId.length > MAX_REQUEST_ID_LENGTH) return failure(Error_Code.INVALID_ARGUMENT, `request_id is longer than ${MAX_REQUEST_ID_LENGTH} characters`);
+      if (requestId) {
+        const made = this.sql.exec("SELECT * FROM spaces WHERE owner_id = ? AND request_id = ?", args.userId, requestId).toArray()[0] as unknown as SpaceRow | undefined;
+        if (made) return made.name === name ? ok(spaceInfo(made)) : failure(Error_Code.INVALID_ARGUMENT, "this request_id was used with another name");
+      }
       const held = JSON.stringify([args.userId, name]);
-      if (this.creating.has(held) || this.sql.exec("SELECT 1 FROM spaces WHERE owner_id = ? AND name = ?", args.userId, name).toArray().length > 0) {
+      const holder = this.creating.get(held);
+      if (requestId && holder === requestId) return failure(Error_Code.RETRY_LATER, "this space is still being created; retry");
+      if (holder !== undefined || this.sql.exec("SELECT 1 FROM spaces WHERE owner_id = ? AND name = ?", args.userId, name).toArray().length > 0) {
         return failure(Error_Code.INVALID_ARGUMENT, "you already have a space with this name");
       }
-      this.creating.add(held);
+      this.creating.set(held, requestId);
       try {
         const spaceKey = await deriveSpaceKey((await this.serverKey()).secret, spaceId);
         await this.spaceStub(spaceId).init({ spaceId, name, ownerUserId: args.userId, spaceKey });
         this.sql.exec(
-          "INSERT INTO spaces (space_id, name, owner_id, created_at_ms, format_version, list_seq) VALUES (?, ?, ?, ?, ?, (SELECT COALESCE(MAX(list_seq), 0) + 1 FROM spaces))",
+          "INSERT INTO spaces (space_id, name, owner_id, created_at_ms, format_version, list_seq, request_id) VALUES (?, ?, ?, ?, ?, (SELECT COALESCE(MAX(list_seq), 0) + 1 FROM spaces), ?)",
           spaceId,
           name,
           args.userId,
           nowMs,
           FORMAT_VERSION,
+          requestId || null,
         );
       } finally {
         this.creating.delete(held);
