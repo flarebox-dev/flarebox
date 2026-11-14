@@ -1,8 +1,10 @@
 # Koidrive for macOS
 
-A menu bar app over the `koi` command, for macOS 26 or later on Apple silicon. The app carries `koi` in `Contents/Helpers/koi` and shows the same device, folders and background service as `koi status`. Through `core/ffi` and [UniFFI](https://mozilla.github.io/uniffi-rs/), it runs each change as a `koi --json` command and follows the state of the sync daemon over its socket. While no daemon runs, it reads the state with `koi status`.
+The full Koidrive sync client for macOS 26 or later on Apple silicon. Use the setup window to connect to your server, sign in this Mac and link a folder. The menu bar shows sync status and notices, opens folders in Finder and lets you pause or resume sync. **Needs You** asks for decisions before risky changes. **Settings** has **Folders**, **Account**, **Storage**, **Problems** and **General** tabs. See the [Mac app guide](../../docs/guide/macos.md) for setup and everyday use.
 
-The app has a menu bar menu (status, notices, pause and resume, open folder), a first-run setup window (server, sign-in, folder), a **Needs You** window for questions, and settings with **Folders**, **Account**, **Storage**, **Problems** and **General** tabs. The menu bar shows no transfer progress or recent changes, because the session reports neither. There is no File Provider extension, so every synced file is on disk.
+The menu bar shows no transfer progress or recent changes, because the session reports neither. There is no File Provider extension, so every synced file is on disk.
+
+The app carries `koi` in `Contents/Helpers/koi` and shares its device, folders and background service with the CLI. Through `core/ffi` and [UniFFI](https://mozilla.github.io/uniffi-rs/), it runs each change as a `koi --json` command and follows the sync daemon over its socket. While no daemon runs, it reads the state with `koi status`.
 
 ## Requirements
 
