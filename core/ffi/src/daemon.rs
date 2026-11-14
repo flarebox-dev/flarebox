@@ -12,17 +12,18 @@ use koidrive_net::{Api, PROTO_MAX, PROTO_MIN};
 use tokio::runtime::Runtime;
 use tokio::sync::{Notify, watch};
 
-use crate::core::{Core, Events, pairing_code};
+use crate::core::{Core, Events, pairing_code, refuse_line_breaks};
 use crate::helper::{
     AccountData, DevicesData, Done, FolderData, Helper, InvitationData, Outcome, Refusal,
-    RequestsData, RestoreAskedData, SpaceData, SpacesData, TrashData, UsagesData, VersionsData,
+    RequestsData, RestoreAskedData, ShareLinkData, ShareLinksData, SharedData, SpaceData,
+    SpacesData, TrashData, UsagesData, VersionsData,
 };
 use crate::profile::Profile;
 use crate::state::{self, Halted};
 use crate::types::{
-    Account, Answer, Device, FileVersions, LinkedFolder, PairingCode, RestoreAsked, RestoreRequest,
-    ServerInfo, SessionError, SessionEvent, SessionState, Space, SpaceUsage, SyncStatus,
-    TelemetrySetting, Trash,
+    Account, Answer, Device, FileVersions, LinkedFolder, NewShareLink, PairingCode, RestoreAsked,
+    RestoreRequest, ServerInfo, SessionError, SessionEvent, SessionState, ShareExpiry, ShareLink,
+    Space, SpaceUsage, SyncStatus, TelemetrySetting, Trash,
 };
 
 const LOOK_AGAIN: Duration = Duration::from_secs(1);
@@ -646,6 +647,42 @@ impl Core for DaemonCore {
             .run(&["history", "requests", "--", absolute(path)?]))
         .map_err(|refusal| refusal.at(path))?;
         Ok(done.data::<RequestsData>()?.requests())
+    }
+
+    fn share_links(&self) -> Result<Vec<ShareLink>, SessionError> {
+        let done = self.helper.run(&["share", "list", "--all"])?;
+        Ok(done.data::<ShareLinksData>()?.links())
+    }
+
+    fn create_share_link(
+        &self,
+        path: &str,
+        expiry: ShareExpiry,
+        password: Option<String>,
+    ) -> Result<NewShareLink, SessionError> {
+        let expires = match expiry {
+            ShareExpiry::Day => "1d",
+            ShareExpiry::Week => "7d",
+            ShareExpiry::Month => "30d",
+        };
+        let mut args = vec!["share", "create", "--expires", expires];
+        let input = match password {
+            Some(password) => {
+                refuse_line_breaks(&password)?;
+                args.push("--password");
+                Some(password + "\n")
+            }
+            None => None,
+        };
+        args.extend(["--", absolute(path)?]);
+        let done = (self.helper.run_with_input(&args, input.as_deref()))
+            .map_err(|refusal| refusal.at(path))?;
+        Ok(done.data::<SharedData>()?.shared())
+    }
+
+    fn revoke_share_link(&self, link_id: &str) -> Result<ShareLink, SessionError> {
+        let done = self.helper.run(&["share", "revoke", "--", link_id])?;
+        Ok(done.data::<ShareLinkData>()?.link())
     }
 
     fn answer(&self, question_id: &str, answer: Answer) -> Result<(), SessionError> {

@@ -25,6 +25,7 @@ impl From<CliError> for Response {
         Response::Error {
             message: error.message,
             code: error.code,
+            reason: error.reason,
             next: error.next,
         }
     }
@@ -366,8 +367,10 @@ pub async fn run(paths: &Paths, request: Request) -> Result<Response, CliError> 
         Response::Error {
             message,
             code,
+            reason,
             next,
         } => Err(CliError {
+            reason,
             next,
             ..CliError::new(code, message)
         }),
@@ -416,6 +419,16 @@ pub(crate) mod tests {
         );
         assert_eq!(error.code, Code::StaleDecision);
         assert_eq!(error.next, [Next::of(&["koi", "resolve", "--json"])]);
+        let short = Request::Share {
+            path: dir.path().join("report.docx"),
+            expiry: koidrive_driver::Expiry::Default,
+            password: Some(koidrive_driver::Secret("short".into())),
+        };
+        let error = run(&paths, short).await.unwrap_err();
+        assert_eq!(
+            (error.code, error.reason),
+            (Code::Usage, Some(koidrive_ipc::Reason::PasswordLength))
+        );
         server.abort();
     }
 
@@ -705,6 +718,7 @@ pub(crate) mod tests {
             code,
             message,
             next,
+            ..
         } = answer("q1", Answer::Restore).await
         else {
             panic!("another answer was taken");
