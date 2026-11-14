@@ -18,6 +18,8 @@ const UNIT: &str = include_str!("../systemd/koidrive.service");
 
 const STARTUP: Duration = Duration::from_secs(10);
 
+/// How long a started service may take to show as running. launchd spawns a job a moment after `launchctl bootstrap`
+/// returns, so the first read can still find it not running.
 const SPAWN: Duration = Duration::from_secs(5);
 
 const PROBE: Duration = Duration::from_secs(5);
@@ -119,6 +121,8 @@ impl Service {
         unit
     }
 
+    /// The launch agent's property list. A plist cannot unset a variable that launchd's own environment sets, so an
+    /// unset one is written empty, which the daemon reads as unset.
     pub fn plist(&self) -> String {
         let mut env = String::from("\t\t<key>KOIDRIVE_LOG</key>\n\t\t<string>info</string>\n");
         for (name, value) in &self.env {

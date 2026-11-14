@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use koidrive_driver::{Driver, Question};
 
+/// The decisions open when it is called are the baseline, so call it before the folders start.
 pub fn decisions(driver: Driver) -> impl Future<Output = ()> {
     let mut watch = driver.watch();
     let mut open = driver.questions().unwrap_or_default();

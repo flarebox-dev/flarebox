@@ -207,6 +207,10 @@ pub async fn handle(driver: &Driver, request: Request) -> Response {
 
 static READING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
+/// The linked folders this process may not read. macOS keeps a launch agent out of the folders that its privacy
+/// settings guard, such as Documents, until the person allows it, and asks while the first read waits. Each read
+/// runs on a thread of its own, which a read waiting for the person keeps until the answer, so the runtime never waits
+/// for it. A folder whose earlier read still waits gets no second thread, however often the status is asked for.
 async fn unreadable(folders: Vec<FolderStatus>) -> Vec<Blocked> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     let reads: Vec<_> = (folders.into_iter())
