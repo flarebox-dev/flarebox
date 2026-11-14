@@ -345,7 +345,7 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
           device.refresh_hash,
         )
         .toArray().length > 0;
-      if (!replaced) return undefined;
+      if (!replaced) return this.activeDevice(deviceId)?.last_seen_ms === null ? failure(Error_Code.RETRY_LATER, "another request is issuing this device's credential; retry") : undefined;
       return ok(
         create(DeviceCredentialsSchema, {
           userId: device.user_id,
