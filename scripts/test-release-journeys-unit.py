@@ -1173,6 +1173,42 @@ class ReleaseJourneys(unittest.TestCase):
         self.assertTrue(all(label in str(caught.exception) for label in labels))
         self.assertTrue(all(path.exists() for path in paths))
 
+    def test_byte_sync_passes_only_when_each_file_arrives_with_its_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder, peer = Path(tmp) / "a", Path(tmp) / "b"
+            folder.mkdir()
+            peer.mkdir()
+
+            def copying(predicate, timeout=60):
+                for source, destination in ((folder, peer), (peer, folder)):
+                    for path in source.glob("*.bin"):
+                        if not (destination / path.name).exists():
+                            (destination / path.name).write_bytes(path.read_bytes())
+                return predicate()
+
+            with patch.object(DRIVER, "until", copying):
+                transfers = DRIVER.byte_sync(folder, peer, "before-")
+            self.assertEqual([t["name"] for t in transfers], ["before-outbound.bin", "before-inbound.bin"])
+            self.assertTrue(all(t["passed"] for t in transfers))
+            self.assertTrue(DRIVER.preserved(transfers, folder, peer))
+            with patch.object(DRIVER, "until", lambda predicate, timeout=60: predicate()):
+                stalled = DRIVER.byte_sync(folder, peer, "after-")
+            self.assertEqual([t["passed"] for t in stalled], [False, False])
+
+    def test_preserved_fails_for_changed_or_missing_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder, peer = Path(tmp) / "a", Path(tmp) / "b"
+            folder.mkdir()
+            peer.mkdir()
+            (folder / "kept.bin").write_bytes(b"kept")
+            (peer / "kept.bin").write_bytes(b"kept")
+            transfers = [{"name": "kept.bin", "sha256": DRIVER.sha256(folder / "kept.bin"), "passed": True}]
+            self.assertTrue(DRIVER.preserved(transfers, folder, peer))
+            (peer / "kept.bin").write_bytes(b"changed")
+            self.assertFalse(DRIVER.preserved(transfers, folder, peer))
+            (peer / "kept.bin").unlink()
+            self.assertFalse(DRIVER.preserved(transfers, folder, peer))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

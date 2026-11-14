@@ -919,23 +919,9 @@ def installer(evidence, root, ownership, assets, source="held", reference="accep
                        and status.get("service", {}).get("state") == "running"
                        and "dev.koidrive.koi" in agents
                        and any(f.get("path") == str(folder) for f in status.get("folders", [])))
-        invite = koi_json(evidence, binary, "device", "invite")
-        join = invite["join_argv"]
-        if (not isinstance(join, list) or len(join) != 5 or join[:2] != ["koi", "join"]
-                or join[3] != "--server" or join[4].rstrip("/") != url):
-            raise RuntimeError("Public device invite returned an unexpected command")
-        evidence.secrets.append(join[2])
-        koi_json(evidence, binary, *join[1:], "--name", "Peer", env=peer_env)
         peer_folder = root / "PeerSync"
-        peer_folder.mkdir()
-        koi_json(evidence, binary, "folder", "link", peer_folder, "--space", "Journey", env=peer_env)
-        transfers = []
-        for source, destination, name in ((folder, peer_folder, "outbound.bin"), (peer_folder, folder, "inbound.bin")):
-            content = os.urandom(4096)
-            (source / name).write_bytes(content)
-            target = destination / name
-            received = until(lambda: target.is_file() and target.read_bytes() == content, 90)
-            transfers.append({"name": name, "sha256": hashlib.sha256(content).hexdigest(), "passed": received})
+        pair_peer(evidence, binary, url, peer_env, peer_folder)
+        transfers = byte_sync(folder, peer_folder, "")
         evidence.check("exact byte sync", all(t["passed"] for t in transfers), json.dumps(transfers))
         final_attrs = {path: quarantine(evidence, path, required=False) for path in initial_attrs}
         evidence.check("xattrs preserved", all(quarantine_paths(initial) <= quarantine_paths(final_attrs[path])
@@ -964,6 +950,35 @@ def installer(evidence, root, ownership, assets, source="held", reference="accep
         evidence.cleanup("no loaded owned services", lambda: assert_native_absent(evidence, owned_labels))
 
 
+def pair_peer(evidence, binary, url, peer_env, peer_folder):
+    invite = koi_json(evidence, binary, "device", "invite")
+    join = invite["join_argv"]
+    if (not isinstance(join, list) or len(join) != 5 or join[:2] != ["koi", "join"]
+            or join[3] != "--server" or join[4].rstrip("/") != url):
+        raise RuntimeError("Public device invite returned an unexpected command")
+    evidence.secrets.append(join[2])
+    koi_json(evidence, binary, *join[1:], "--name", "Peer", env=peer_env)
+    peer_folder.mkdir()
+    koi_json(evidence, binary, "folder", "link", peer_folder, "--space", "Journey", env=peer_env)
+
+
+def byte_sync(folder, peer_folder, prefix):
+    transfers = []
+    for source, destination, direction in ((folder, peer_folder, "outbound"), (peer_folder, folder, "inbound")):
+        name = prefix + direction + ".bin"
+        content = os.urandom(4096)
+        (source / name).write_bytes(content)
+        target = destination / name
+        received = until(lambda: target.is_file() and target.read_bytes() == content, 90)
+        transfers.append({"name": name, "sha256": hashlib.sha256(content).hexdigest(), "passed": received})
+    return transfers
+
+
+def preserved(transfers, *folders):
+    return all((folder / t["name"]).is_file() and sha256(folder / t["name"]) == t["sha256"]
+               for t in transfers for folder in folders)
+
+
 def homebrew_update(evidence, root, ownership, entries):
     brew_prepare(evidence, entries, "cask")
     home = Path.home()
@@ -977,6 +992,9 @@ def homebrew_update(evidence, root, ownership, entries):
     _, log, _ = evidence.run(["git", "-C", tap, "log", "--format=%H %s"])
     commit, previous = previous_tap_release(log, current)
     evidence.report["previous_release"] = {"version": previous, "tap_commit": commit}
+    peer_env = {**evidence.env, "XDG_CONFIG_HOME": str(root / "peer/config"),
+                "XDG_STATE_HOME": str(root / "peer/state"), "XDG_RUNTIME_DIR": str(root / "peer/runtime")}
+    peer_folder = root / "PeerSync"
     owned_labels = {"dev.koidrive.koi"}
     installed = False
     try:
@@ -990,9 +1008,12 @@ def homebrew_update(evidence, root, ownership, entries):
         koi_json(evidence, link, "space", "create", "Journey")
         folder.mkdir()
         koi_json(evidence, link, "folder", "link", folder, "--space", "Journey")
+        pair_peer(evidence, link, url, peer_env, peer_folder)
         before = koi_json(evidence, link, "status")
+        earlier = byte_sync(folder, peer_folder, "before-")
         evidence.check("previous release syncs", before.get("running") is True
-                       and any(f.get("path") == str(folder) for f in before.get("folders", [])), json.dumps(before))
+                       and any(f.get("path") == str(folder) for f in before.get("folders", []))
+                       and all(t["passed"] for t in earlier), json.dumps({"status": before, "transfers": earlier}))
         status, out, err = evidence.run([link, "update", "--json"], required=False, timeout=900,
                                         env={**evidence.env, "PATH": SYSTEM_PATH})
         envelope = json.loads(out) if out.strip().startswith("{") else {}
@@ -1015,15 +1036,18 @@ def homebrew_update(evidence, root, ownership, entries):
         version(evidence, link, "updated version")
         _, refreshed, _ = evidence.run(["git", "-C", tap, "rev-parse", "HEAD"])
         evidence.check("koidrive tap refreshed", refreshed == head, refreshed)
+        evidence.check("files from before the update kept", preserved(earlier, folder, peer_folder), json.dumps(earlier))
         after = koi_json(evidence, link, "status")
+        later = byte_sync(folder, peer_folder, "after-")
         evidence.check("updated service syncs", after.get("running") is True
-                       and any(f.get("path") == str(folder) for f in after.get("folders", [])), json.dumps(after))
+                       and any(f.get("path") == str(folder) for f in after.get("folders", []))
+                       and all(t["passed"] for t in later), json.dumps({"status": after, "transfers": later}))
     finally:
         safe = True
         if APP.exists():
             safe &= evidence.cleanup("terminate exact installed app", lambda: stop_app(evidence, APP))
         safe &= evidence.cleanup("owned native services", lambda: owned_labels.update(service_cleanup(
-            evidence, {str(home / ".local/state")}, [link, APP / "Contents/Helpers/koi"])))
+            evidence, {str(home / ".local/state"), peer_env["XDG_STATE_HOME"]}, [link, APP / "Contents/Helpers/koi"])))
         if installed:
             evidence.cleanup("cask uninstall and zap", lambda: evidence.run(["brew", "uninstall", "--zap", "--cask", TAP], timeout=180))
         evidence.cleanup("koidrive tap restored", lambda: evidence.run(["git", "-C", tap, "reset", "--hard", "--quiet", head.strip()]))
