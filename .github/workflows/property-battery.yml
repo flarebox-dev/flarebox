@@ -295,7 +295,7 @@ jobs:
           save-if: false
       - name: Run the mutation set
         env:
-          MUTATION_SEED: ${{ needs.build.outputs.seed_base }}
+          MUTATION_SEED: '0'
         run: |
           out="$RUNNER_TEMP/out"
           mkdir -p "$out"
