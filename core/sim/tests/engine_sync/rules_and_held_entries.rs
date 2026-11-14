@@ -420,3 +420,26 @@ fn a_server_entry_below_a_folder_moved_out_of_what_the_rules_include_here_is_lef
         .unwrap();
     }
 }
+
+#[test]
+fn a_folder_deleted_here_that_another_device_renamed_comes_back_once_nothing_excluded_is_left_in_it() {
+    let seed = [act(0, 0, 0, 6, 0)];
+    let local = [act(4, 0, 0, 0, 0)];
+    let remote = [act(1, 0, 1, 3, 0)];
+    let during = [
+        (false, vec![act(3, 0, 0, 2, 0)]),
+        (true, vec![act(2, 0, 0, 0, 0)]),
+        (false, vec![act(4, 1, 0, 0, 0)]),
+        (true, vec![act(2, 0, 0, 0, 0)]),
+    ];
+    let rulings = [Ruling::Exclude(vec!["*.txt"])];
+    for cut in CUTS {
+        let ran = run_ignoring(&seed, &local, &remote, MAX_OPS, false, &during, cut, &rulings, Answer::Delete, false).unwrap();
+        let root = ran.space.space_id().to_owned();
+        let folders: Vec<_> = (ran.space.nodes().into_iter())
+            .filter(|n| n.node_id != root && n.kind == 1 && n.status == 1)
+            .map(|n| n.name)
+            .collect();
+        assert_eq!((ran.deletes, folders), (0, vec!["b".to_owned()]), "{cut:?}");
+    }
+}

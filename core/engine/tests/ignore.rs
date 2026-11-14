@@ -1129,3 +1129,48 @@ fn a_file_another_device_owed_a_rename_to_an_ignored_name_stays_where_it_is() {
         Some("a.txt")
     );
 }
+
+#[test]
+fn a_kept_folder_another_device_moves_below_the_folder_taking_its_stale_name_comes_back_there() {
+    let mut trees = trees(&[
+        synced("d", dir(ROOT, "ss")),
+        synced("log", file("d", "a.log", 1)),
+    ]);
+    trees.set_rules(&AT_ROOT, rules("*.log\n"));
+    trees.remove_local("log");
+    trees.remove_local("d");
+    trees.set_remote("d".into(), remote(dir(ROOT, "b")));
+    trees.set_local("new".into(), local(dir(ROOT, "ß"), 9));
+    trees.set_remote("new".into(), remote(dir(ROOT, "ß")));
+    trees.set_remote("d".into(), remote(dir("new", "b")));
+    assert!(!trees.ignored("d"));
+    assert!(trees.kept_for_excluded()("d"));
+    assert_eq!(ops(&mut trees), []);
+    let done: Vec<String> = effects(&mut trees).into_iter().map(|(id, _)| id).collect();
+    assert_eq!(done, ["d"]);
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(trees.synced().live("new"), Some(&dir(ROOT, "ß")));
+    assert_eq!(trees.synced().live("d"), Some(&dir("new", "b")));
+    assert_eq!(ops(&mut trees), []);
+}
+
+#[test]
+fn a_kept_folder_another_device_renames_comes_back_with_what_the_rules_let_in() {
+    let mut trees = trees(&[
+        synced("d", dir(ROOT, "ss")),
+        synced("log", file("d", "a.log", 1)),
+    ]);
+    trees.set_rules(&AT_ROOT, rules("/ss/a.log\n"));
+    trees.remove_local("log");
+    trees.remove_local("d");
+    trees.set_remote("d".into(), remote(dir(ROOT, "b")));
+    assert!(!trees.ignored("d"));
+    assert!(trees.excluded("log"));
+    assert!(trees.kept_for_excluded()("d"));
+    assert_eq!(ops(&mut trees), []);
+    let done: Vec<String> = effects(&mut trees).into_iter().map(|(id, _)| id).collect();
+    assert_eq!(done, ["d", "log"]);
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(trees.synced().live("log"), Some(&file("d", "a.log", 1)));
+    assert_eq!(ops(&mut trees), []);
+}

@@ -1278,9 +1278,7 @@ impl Trees {
         if held(placed) || held(remote) {
             return None;
         }
-        let ignored = self.ignored(id);
-        let kept = !ignored && self.kept_for_excluded()(id);
-        if !(ignored || kept) {
+        if !self.ignored(id) && !self.kept_for_excluded()(id) {
             return None;
         }
         let at = |shape: &Shape| {
@@ -1291,7 +1289,7 @@ impl Trees {
             })
         };
         let mut next = Vec::new();
-        if (local.is_some() || kept)
+        if local.is_some()
             && let Some(remote) = remote
         {
             next.push(at(remote));
@@ -2779,7 +2777,7 @@ impl Trees {
             next += 1;
             below.extend(self.s_names.children(&folder).cloned());
         }
-        if !below.iter().all(|node| self.ignored(node)) {
+        if !below[1..].iter().all(|node| self.ignored(node)) {
             return Vec::new();
         }
         for node in below.iter().rev() {
