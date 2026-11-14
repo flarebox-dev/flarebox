@@ -208,4 +208,5 @@ if GH_STUB_FAIL_LIST=1 bash "$root/scripts/homebrew-track.sh" v0.1.0-alpha.2 "$t
 fi
 pass 'a failed release list stops cask tracking'
 
+"$BASH" "$root/scripts/test-homebrew-cask-install-errors.sh"
 echo "Passed $passed Homebrew cask tests"

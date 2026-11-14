@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-set -euo pipefail
+set -Eeuo pipefail
+if [ "${BASH_VERSINFO[0]}" -lt 5 ]; then
+    printf 'FAIL the cask lifecycle fixture requires Bash 5 or newer; got %s\n' "$BASH_VERSION" >&2
+    exit 2
+fi
+trap 'printf "FAIL %s:%s status=%s pipeline=%s version=%s command=%s\n" "${BASH_SOURCE[0]}" "$LINENO" "$?" "${PIPESTATUS[*]}" "${version:-not-started}" "$BASH_COMMAND" >&2' ERR
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 tap=koidrive/tap
@@ -59,7 +64,7 @@ EOF
 #!/bin/sh
 printf 'koi %s\n' '$version'
 EOF
-    hdiutil create -quiet -volname Koidrive -srcfolder "$tmp/image" -format UDZO "$release/Koidrive-$version-arm64.dmg"
+    hdiutil create -volname Koidrive -srcfolder "$tmp/image" -format UDZO "$release/Koidrive-$version-arm64.dmg"
     (cd "$release" && shasum -a 256 ./*.dmg | sed 's#  ./#  #' > SHA256SUMS)
     KOIDRIVE_RELEASE_BASE_URL="file://$releases" bash "$root/scripts/homebrew-cask.sh" "$tag" "$release/SHA256SUMS" \
         > "$repository/Casks/koidrive.rb"

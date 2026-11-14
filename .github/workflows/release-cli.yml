@@ -166,7 +166,7 @@ jobs:
         run: |
           shellcheck -s sh install.sh scripts/test-install.sh
           shellcheck scripts/publish-release.sh scripts/test-publish-release.sh
-          shellcheck scripts/homebrew-formula.sh scripts/homebrew-cask.sh scripts/homebrew-track.sh scripts/test-homebrew-formula.sh scripts/test-homebrew-cask.sh scripts/test-homebrew-install.sh scripts/test-homebrew-cask-install.sh
+          shellcheck scripts/homebrew-formula.sh scripts/homebrew-cask.sh scripts/homebrew-track.sh scripts/test-homebrew-formula.sh scripts/test-homebrew-cask.sh scripts/test-homebrew-install.sh scripts/test-homebrew-cask-install.sh scripts/test-homebrew-cask-install-errors.sh
       - name: Test publishing a release against a stub gh
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
@@ -268,7 +268,12 @@ jobs:
           bash scripts/test-homebrew-install.sh package/koi "$TARGET"
       - name: Install the app and CLI from a local tap
         if: runner.os == 'macOS'
-        run: bash scripts/test-homebrew-cask-install.sh
+        run: |
+          HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 brew install bash
+          fixture_bash="$(brew --prefix bash)/bin/bash"
+          "$fixture_bash" --version
+          "$fixture_bash" scripts/test-homebrew-cask-install-errors.sh
+          "$fixture_bash" scripts/test-homebrew-cask-install.sh
 
   sign-macos:
     name: Sign and notarize the macOS CLI
