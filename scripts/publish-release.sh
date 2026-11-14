@@ -1,26 +1,11 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-#
-# Publishes the GitHub release for a version tag with the files in a directory, then checks the result.
-# The directory holds the CLI tarballs, the app's disk image Koidrive-<version>-arm64.dmg, SHA256SUMS,
-# which lists each of them, and SHA256SUMS.sig; the script refuses to publish anything else.
-# The release becomes Latest only when no published release that can be Latest (not a draft and not a
-# prerelease) has a higher version, so a rerun or an older tag leaves Latest where it is.
-# Usage: publish-release.sh <tag> <directory>
-# Environment:
-#   GH_REPO                     owner/name of the repository
-#   RELEASE_ALLOWED_SIGNERS     ssh-keygen allowed-signers file with the release key that signs SHA256SUMS
-#   PRERELEASE                  true for an -alpha.N or -rc.N tag, false for vX.Y.Z
-#   PRERELEASE_TAGS_PUBLISH_AS  latest: an -alpha.N or -rc.N tag is published as a normal release;
-#                               prerelease: it is published as a GitHub prerelease
 set -euo pipefail
 
 tag=${1:?usage: publish-release.sh <tag> <directory>}
 files=${2:?usage: publish-release.sh <tag> <directory>}
 : "${GH_REPO:?is not set}" "${PRERELEASE:?is not set}" "${PRERELEASE_TAGS_PUBLISH_AS:?is not set}" "${RELEASE_ALLOWED_SIGNERS:?is not set}"
 
-# version_key prints a key for vX.Y.Z[-alpha.N|-rc.N] that sorts as text in version order, with
-# alpha before rc before the release itself. It fails for any other tag.
 version_key() {
     [[ $1 =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-(alpha|rc)\.([0-9]+))?$ ]] || return 1
     local stage=2

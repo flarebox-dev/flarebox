@@ -519,9 +519,7 @@ jobs:
           TAG: ${{ github.ref_name }}
           PRERELEASE: ${{ needs.release-ref.outputs.prerelease }}
           RELEASE_ALLOWED_SIGNERS: .github/release-allowed-signers
-          # latest: an -alpha.N or -rc.N tag becomes a normal release, and Latest (which install.sh downloads by default) unless a published release has a higher version.
-          # prerelease: it becomes a GitHub prerelease, which install.sh skips unless KOIDRIVE_VERSION names it.
-          PRERELEASE_TAGS_PUBLISH_AS: latest
+          PRERELEASE_TAGS_PUBLISH_AS: normal-release
         run: scripts/publish-release.sh "$TAG" dist
 
   homebrew:
