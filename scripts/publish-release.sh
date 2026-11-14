@@ -7,7 +7,7 @@ files=${2:?usage: publish-release.sh <tag> <directory>}
 : "${GH_REPO:?is not set}" "${PRERELEASE:?is not set}" "${PRERELEASE_TAGS_PUBLISH_AS:?is not set}" "${RELEASE_ALLOWED_SIGNERS:?is not set}"
 
 version_key() {
-    [[ $1 =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-(alpha|rc)\.([0-9]+))?$ ]] || return 1
+    [[ $1 =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|rc)\.(0|[1-9][0-9]*))?$ ]] || return 1
     local stage=2
     case ${BASH_REMATCH[5]} in alpha) stage=0 ;; rc) stage=1 ;; esac
     printf '%010d.%010d.%010d.%d.%010d\n' "$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[2]}))" \
@@ -15,6 +15,12 @@ version_key() {
 }
 
 own=$(version_key "$tag") || { echo "::error::$tag is not a vX.Y.Z, vX.Y.Z-alpha.N or vX.Y.Z-rc.N tag."; exit 1; }
+case $PRERELEASE_TAGS_PUBLISH_AS in
+    normal-release | prerelease) ;;
+    *) echo "::error::PRERELEASE_TAGS_PUBLISH_AS is $PRERELEASE_TAGS_PUBLISH_AS, expected normal-release or prerelease."; exit 1 ;;
+esac
+if [[ $tag == *-* ]]; then tagged_prerelease=true; else tagged_prerelease=false; fi
+[ "$PRERELEASE" = "$tagged_prerelease" ] || { echo "::error::PRERELEASE is $PRERELEASE, but $tag means $tagged_prerelease."; exit 1; }
 
 dmg="Koidrive-${tag#v}-arm64.dmg"
 sums="$files/SHA256SUMS"

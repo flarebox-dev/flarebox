@@ -50,6 +50,9 @@ expect_refused() {
 }
 
 sums > "$tmp/SHA256SUMS"
+for tag in v01.0.0 v0.01.0 v0.1.00 v0.1.0-alpha.01; do
+    expect_refused "$tag is not a vX.Y.Z" "a tag with a leading zero, $tag, is refused" "$tag" "$tmp/SHA256SUMS"
+done
 cat > "$tmp/expected.rb" <<'EOF'
 class Koidrive < Formula
   desc "File sync you deploy to your own Cloudflare account"

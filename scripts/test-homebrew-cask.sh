@@ -107,7 +107,7 @@ render v0.1.0 "$tmp/SHA256SUMS" > "$tmp/second.rb"
 cmp "$tmp/first.rb" "$tmp/second.rb" || fail 'rendering is not deterministic'
 pass 'rendering the same release is deterministic'
 
-for tag in 0.1.0 v0.1 v0.1.0-beta.1 v0.1.0-alpha v0.1.0-alpha.1.2 v0.1.0+build v0.1.0/extra 'v0.1.0"' ''; do
+for tag in v01.0.0 v0.01.0 v0.1.00 v0.1.0-alpha.01 0.1.0 v0.1 v0.1.0-beta.1 v0.1.0-alpha v0.1.0-alpha.1.2 v0.1.0+build v0.1.0/extra 'v0.1.0"' ''; do
     expect_refused 'is not a vX.Y.Z' "invalid tag '$tag' is refused" "$tag" "$tmp/SHA256SUMS"
 done
 expect_refused 'usage:' 'no arguments are refused'

@@ -74,7 +74,8 @@ ssh-keygen -q -t ed25519 -N '' -C koidrive-release -f "$tmp/release-key"
 ssh-keygen -q -t ed25519 -N '' -C other -f "$tmp/other-key"
 printf 'koidrive namespaces="koidrive-release" %s\n' "$(cut -d' ' -f1,2 "$tmp/release-key.pub")" > "$tmp/allowed-signers"
 RELEASE_SIGNING_KEY=$(cat "$tmp/release-key")
-export PATH="$tmp/bin:$PATH" GH_REPO=koidrive/koidrive GH_STUB_DIR="$tmp/db" PRERELEASE_TAGS_PUBLISH_AS=normal-release
+unset PRERELEASE PRERELEASE_TAGS_PUBLISH_AS prerelease mode
+export PATH="$tmp/bin:$PATH" GH_REPO=koidrive/koidrive GH_STUB_DIR="$tmp/db"
 export RELEASE_ALLOWED_SIGNERS="$tmp/allowed-signers" RELEASE_SIGNING_KEY
 passed=0
 
@@ -95,9 +96,9 @@ sign_with() {
     ssh-keygen -q -Y sign -f "$1" -n "$2" "$tmp/dist/SHA256SUMS"
 }
 publish_staged() {
-    local prerelease=false
-    if [[ $1 == *-* ]]; then prerelease=true; fi
-    PRERELEASE=$prerelease bash "$root/scripts/publish-release.sh" "$1" "$tmp/dist"
+    local derived=false
+    if [[ $1 == *-* ]]; then derived=true; fi
+    PRERELEASE=${prerelease:-$derived} PRERELEASE_TAGS_PUBLISH_AS=${mode:-normal-release} bash "$root/scripts/publish-release.sh" "$1" "$tmp/dist"
 }
 publish() {
     stage "$1"
@@ -250,11 +251,40 @@ expect_latest v0.10.0 'versions compare as numbers'
 
 fresh
 publish v0.1.0
-PRERELEASE_TAGS_PUBLISH_AS=prerelease publish v0.2.0-alpha.1
+mode=prerelease publish v0.2.0-alpha.1
 expect_latest v0.1.0 'a prerelease-mode alpha leaves Latest'
 [ "$(cat "$tmp/db/release-v0.2.0-alpha.1")" = "false true" ] || { echo 'FAIL the alpha is not a prerelease' >&2; exit 1; }
 pass 'a prerelease-mode alpha is a GitHub prerelease'
 publish v0.1.1
 expect_latest v0.1.1 'a GitHub prerelease does not hold back Latest'
+
+fresh
+stage v0.2.0-alpha.1
+mode=prerelase expect_refused v0.2.0-alpha.1 'PRERELEASE_TAGS_PUBLISH_AS is prerelase, expected normal-release or prerelease' 'a misspelled prerelease mode is refused'
+expect_latest none 'a misspelled prerelease mode leaves Latest'
+prerelease=false expect_refused v0.2.0-alpha.1 'PRERELEASE is false, but v0.2.0-alpha.1 means true' 'a PRERELEASE that disagrees with the tag is refused'
+stage v0.2.0
+prerelease=True expect_refused v0.2.0 'PRERELEASE is True, but v0.2.0 means false' 'a PRERELEASE other than true or false is refused'
+
+fresh
+(
+    export PRERELEASE=false PRERELEASE_TAGS_PUBLISH_AS=prerelase
+    publish v0.3.0-alpha.1
+)
+expect_latest v0.3.0-alpha.1 'an exported PRERELEASE or mode does not reach the publish'
+
+for tag in v01.0.0 v0.01.0 v0.1.00 v0.1.0-alpha.01; do
+    stage "$tag"
+    expect_refused "$tag" "$tag is not a vX.Y.Z" "a tag with a leading zero, $tag, is refused"
+done
+workflow_tag_check=$(grep -F "[[ \"\$TAG\" =~" "$root/.github/workflows/release-cli.yml")
+[ -n "$workflow_tag_check" ] || { echo 'FAIL release-cli.yml has no tag check' >&2; exit 1; }
+for tag in v01.0.0 v0.01.0 v0.1.00 v0.1.0-alpha.01 v0.1 v0.1.0-beta.1; do
+    if TAG=$tag bash -c "$workflow_tag_check" > /dev/null 2>&1; then echo "FAIL the release workflow accepts $tag" >&2; exit 1; fi
+done
+for tag in v0.0.0 v0.1.0 v10.20.30 v0.1.0-alpha.4 v1.0.0-rc.0; do
+    TAG=$tag bash -c "$workflow_tag_check" > /dev/null || { echo "FAIL the release workflow refuses $tag" >&2; exit 1; }
+done
+pass 'the release workflow accepts only tags without leading zeros'
 
 echo "Passed $passed release publishing tests"

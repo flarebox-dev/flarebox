@@ -6,7 +6,7 @@ tag=${1:?usage: homebrew-formula.sh <tag> <SHA256SUMS>}
 sums=${2:?usage: homebrew-formula.sh <tag> <SHA256SUMS>}
 base=${KOIDRIVE_RELEASE_BASE_URL:-https://github.com/koidrive/koidrive/releases}
 
-[[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|rc)\.[0-9]+)?$ ]] || { echo "::error::$tag is not a vX.Y.Z, vX.Y.Z-alpha.N or vX.Y.Z-rc.N tag." >&2; exit 1; }
+[[ $tag =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|rc)\.(0|[1-9][0-9]*))?$ ]] || { echo "::error::$tag is not a vX.Y.Z, vX.Y.Z-alpha.N or vX.Y.Z-rc.N tag." >&2; exit 1; }
 [ -f "$sums" ] || { echo "::error::$sums does not exist." >&2; exit 1; }
 
 sha() {
