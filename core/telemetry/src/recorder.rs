@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::schema::{Counter, DailyReport, Event, Level, Measure};
@@ -13,7 +13,7 @@ pub struct Recorder(Arc<Shared>);
 
 #[derive(Debug, Default)]
 struct Shared {
-    on: AtomicBool,
+    switches: AtomicU64,
     pending: Mutex<Pending>,
 }
 
@@ -36,7 +36,7 @@ impl Recorder {
     }
 
     pub fn is_on(&self) -> bool {
-        self.0.on.load(Ordering::Relaxed)
+        self.session().is_some()
     }
 
     /// Starts or stops recording, for every clone. Stopping drops what is held.
@@ -44,10 +44,19 @@ impl Recorder {
         let Ok(mut pending) = self.0.pending.lock() else {
             return;
         };
-        self.0.on.store(on, Ordering::Relaxed);
+        if self.is_on() != on {
+            self.0.switches.fetch_add(1, Ordering::Relaxed);
+        }
         if !on {
             *pending = Pending::default();
         }
+    }
+
+    /// Names the current stretch of recording, from being switched on to being switched off, or none while off. A
+    /// collector that measures across calls, such as a duration, keeps a start only while the session is the same.
+    pub fn session(&self) -> Option<u64> {
+        let switches = self.0.switches.load(Ordering::Relaxed);
+        (switches % 2 == 1).then_some(switches)
     }
 
     pub fn count(&self, counter: Counter, by: u64) {
@@ -204,6 +213,20 @@ mod tests {
         clone.count_on(1, Counter::Command(Command::Status), 1);
         recorder.switch(true);
         assert_eq!(recorder.take(), Pending::default());
+    }
+
+    #[test]
+    fn each_stretch_of_recording_is_its_own_session() {
+        let recorder = Recorder::off();
+        assert_eq!(recorder.session(), None);
+        recorder.switch(true);
+        let first = recorder.session().unwrap();
+        recorder.switch(true);
+        assert_eq!(recorder.clone().session(), Some(first));
+        recorder.switch(false);
+        assert_eq!(recorder.session(), None);
+        recorder.switch(true);
+        assert_ne!(recorder.session(), Some(first));
     }
 
     #[test]

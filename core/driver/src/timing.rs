@@ -60,8 +60,24 @@ impl Time {
 
 pub(crate) struct Timing {
     recorder: Recorder,
-    state: Option<Box<State>>,
+    state: Live,
     first: Option<First>,
+}
+
+#[derive(Default)]
+struct Live(Option<(u64, Box<State>)>);
+
+impl Live {
+    fn get(&mut self, recorder: &Recorder) -> Option<&mut State> {
+        let Some(session) = recorder.session() else {
+            self.0 = None;
+            return None;
+        };
+        if self.0.as_ref().is_none_or(|(held, _)| *held != session) {
+            self.0 = Some((session, Box::default()));
+        }
+        self.0.as_mut().map(|(_, state)| &mut **state)
+    }
 }
 
 struct First {
@@ -129,7 +145,7 @@ impl Timing {
             == Some(linked_ms);
         Self {
             recorder: Recorder::off(),
-            state: None,
+            state: Live::default(),
             first: eligible.then_some(First {
                 path,
                 linked_ms,
@@ -139,7 +155,7 @@ impl Timing {
     }
 
     pub fn enable(&mut self, recorder: Recorder) {
-        self.state = recorder.is_on().then(Box::default);
+        self.state = Live::default();
         self.recorder = recorder;
     }
 
@@ -198,7 +214,9 @@ impl Timing {
     }
 
     pub fn status(&mut self, status: FolderState, at: Time) {
-        let Some(state) = &mut self.state else { return };
+        let Some(state) = self.state.get(&self.recorder) else {
+            return;
+        };
         let syncing = matches!(status, FolderState::Bootstrapping | FolderState::CatchingUp);
         if syncing {
             state.syncing.get_or_insert(at.mono);
@@ -214,7 +232,9 @@ impl Timing {
     }
 
     pub fn drained(&mut self, at: Time) {
-        let Some(state) = &mut self.state else { return };
+        let Some(state) = self.state.get(&self.recorder) else {
+            return;
+        };
         state.download.finish(
             &self.recorder,
             at,
@@ -238,7 +258,7 @@ impl Timing {
         device: &str,
         at: Time,
     ) {
-        if self.state.is_none() {
+        if self.state.get(&self.recorder).is_none() {
             return;
         }
         let mut last = before;
@@ -264,7 +284,9 @@ impl Timing {
     }
 
     pub fn changes(&mut self, changes: &[ChangeRecord], seq: u64, committed_ms: i64, at: Time) {
-        let Some(state) = &mut self.state else { return };
+        let Some(state) = self.state.get(&self.recorder) else {
+            return;
+        };
         for change in changes {
             let (node, revision) = match &change.change {
                 Some(change_record::Change::Node(node)) => (
@@ -294,13 +316,15 @@ impl Timing {
     }
 
     pub fn clear_origins(&mut self) {
-        if let Some(state) = &mut self.state {
+        if let Some(state) = self.state.get(&self.recorder) {
             state.origins.clear();
         }
     }
 
     pub fn forget(&mut self, changes: &[ChangeRecord]) {
-        let Some(state) = &mut self.state else { return };
+        let Some(state) = self.state.get(&self.recorder) else {
+            return;
+        };
         for change in changes {
             match &change.change {
                 Some(change_record::Change::Node(node)) => {
@@ -320,9 +344,7 @@ impl Timing {
         remote: Option<&RemoteNode>,
         at: Time,
     ) -> Bytes {
-        let Some(state) = &mut self.state else {
-            return None;
-        };
+        let state = self.state.get(&self.recorder)?;
         let revision = remote.map(|node| (node.content_rev, node.meta_rev, node.trashed));
         let origin = state
             .origins
@@ -358,7 +380,9 @@ impl Timing {
     }
 
     pub fn applied(&mut self, effect_id: &str, success: bool, at: Time) {
-        let Some(state) = &mut self.state else { return };
+        let Some(state) = self.state.get(&self.recorder) else {
+            return;
+        };
         let Some(planned) = state.effects.remove(effect_id) else {
             return;
         };
@@ -385,7 +409,7 @@ impl Timing {
     }
 
     pub fn uploading(&mut self, commit: &Commit, at: Time) -> Bytes {
-        let state = self.state.as_mut()?;
+        let state = self.state.get(&self.recorder)?;
         if commit.ops.iter().any(|op| {
             matches!(
                 op.op,
@@ -398,7 +422,9 @@ impl Timing {
     }
 
     pub fn uploaded(&mut self, commit: &Commit, result: &CommitResult) {
-        let Some(state) = &mut self.state else { return };
+        let Some(state) = self.state.get(&self.recorder) else {
+            return;
+        };
         if state.upload.start.is_none() {
             return;
         }
@@ -483,11 +509,61 @@ mod tests {
     fn tracker(recorder: &Recorder) -> Timing {
         let mut timing = Timing {
             recorder: Recorder::off(),
-            state: None,
+            state: Live::default(),
             first: None,
         };
         timing.enable(recorder.clone());
         timing
+    }
+
+    #[test]
+    fn a_folder_opened_before_reports_were_on_times_syncs_once_they_are() {
+        let recorder = Recorder::off();
+        let mut timing = tracker(&recorder);
+        recorder.switch(true);
+        let at = time();
+        timing.status(FolderState::CatchingUp, at);
+        timing.status(FolderState::UpToDate, later(at, Duration::from_secs(1)));
+        assert!(
+            !reports(&recorder)["1"]["histograms"]["syncing_ms"]["completed"].is_null(),
+            "no syncing sample after reports were turned on"
+        );
+    }
+
+    #[test]
+    fn a_span_that_reports_were_off_for_part_of_is_dropped() {
+        let recorder = Recorder::on();
+        let mut timing = tracker(&recorder);
+        let at = time();
+        timing.status(FolderState::CatchingUp, at);
+        recorder.switch(false);
+        recorder.switch(true);
+        timing.status(FolderState::UpToDate, later(at, Duration::from_secs(10)));
+        assert!(recorder.take().days.is_empty());
+    }
+
+    #[test]
+    fn an_upload_that_finished_while_reports_were_off_is_dropped() {
+        let recorder = Recorder::on();
+        let mut timing = tracker(&recorder);
+        let at = time();
+        let commit = commit();
+        let bytes = timing.uploading(&commit, at);
+        recorder.switch(false);
+        add_bytes(&bytes, 10_000);
+        timing.uploaded(
+            &commit,
+            &CommitResult {
+                results: vec![OpResult {
+                    code: op_result::Code::Applied as i32,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        recorder.switch(true);
+        timing.drained(later(at, Duration::from_secs(10)));
+        assert!(recorder.take().days.is_empty());
     }
 
     fn reports(recorder: &Recorder) -> Value {
@@ -630,7 +706,7 @@ mod tests {
         let mut off = Timing::open_at(&store, at.unix_ms, at);
         off.first_sync(1, at);
         assert!(!Timing::open_at(&store, at.unix_ms, at).has_first());
-        assert!(off.state.is_none());
+        assert!(off.state.0.is_none());
     }
 
     #[test]
@@ -655,7 +731,7 @@ mod tests {
         timing.status(FolderState::CatchingUp, at);
         timing.status(FolderState::CatchingUp, later(at, Duration::from_secs(600)));
         timing.status(FolderState::UpToDate, later(at, Duration::from_secs(900)));
-        assert!(timing.state.is_none());
+        assert!(timing.state.0.is_none());
         assert!(off.take().days.is_empty());
     }
 
