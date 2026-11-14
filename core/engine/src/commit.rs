@@ -2113,7 +2113,9 @@ fn rebase(
             Class::Concurrent => {
                 agreed.extend(take_agreed(trees, id).map(|s| (id.clone(), Some(s))))
             }
-            Class::Same => agreed.push((id.clone(), trees.remote().live(id).cloned())),
+            Class::Same if !trees.waits_for_half(id) => {
+                agreed.push((id.clone(), trees.remote().live(id).cloned()))
+            }
             _ => {}
         }
     }

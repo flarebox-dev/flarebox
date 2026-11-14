@@ -1207,6 +1207,10 @@ impl Trees {
         &self.halves
     }
 
+    pub(crate) fn waits_for_half(&self, id: &str) -> bool {
+        self.halves.contains_key(id) && self.l.get(id).is_none()
+    }
+
     /// When the earliest wait of [`Trees::release_halves`] ends, if any is left.
     pub fn halves_due(&self) -> Option<u64> {
         self.halves
@@ -2408,6 +2412,9 @@ impl Trees {
             match self.class(&id) {
                 Class::InSync if !self.parked(&id) => {
                     self.dirty.remove(&id);
+                }
+                Class::Same if self.waits_for_half(&id) => {
+                    self.dirty.insert(id);
                 }
                 Class::Same => {
                     self.dirty.insert(id.clone());

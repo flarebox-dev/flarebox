@@ -5548,3 +5548,26 @@ fn a_file_the_server_loses_while_it_waits_for_the_other_half_of_its_move_ends_in
     ];
     converge(2, &phases).unwrap();
 }
+
+#[test]
+fn a_file_trashed_while_its_renamed_folder_waits_for_its_move_stays_trashed() {
+    let made = vec![(0, folder("b")), (0, user(1, 0, 1, "a"))];
+    let mut split = vec![(1, delete(1))];
+    split.extend(commit(1));
+    split.extend([(0, rename(0, 0, "a")), (0, DELIVER), (0, Step::ScanLeft)]);
+    converge(2, &[made, split]).unwrap();
+}
+
+#[test]
+fn a_file_trashed_while_its_renamed_folder_waits_for_its_move_stays_trashed_through_a_commit() {
+    let made = vec![(0, folder("b")), (0, user(1, 0, 1, "a"))];
+    let mut split = vec![(1, delete(1))];
+    split.extend(commit(1));
+    split.extend([
+        (0, rename(0, 0, "a")),
+        (0, DELIVER),
+        (0, Step::ScanLeft),
+        (0, COMMIT),
+    ]);
+    converge(2, &[made, split]).unwrap();
+}
