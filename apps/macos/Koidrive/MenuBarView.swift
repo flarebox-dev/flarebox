@@ -74,7 +74,7 @@ final class TurningArrows {
         }
         turn.duration = 1.6
         turn.repeatCount = .infinity
-        turn.preferredFrameRateRange = CAFrameRateRange(minimum: 20, maximum: 30, preferred: 30)
+        turn.preferredFrameRateRange = CAFrameRateRange(minimum: 15, maximum: 20, preferred: 20)
         layer.add(turn, forKey: "turn")
         return arrows
     }
