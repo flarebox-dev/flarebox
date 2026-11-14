@@ -2451,15 +2451,6 @@ impl World {
                     "its disk has {here:?} at {path:?} and the server has {there:?}"
                 ));
             }
-            let unheld = (device.disk.entries().values())
-                .filter_map(|entry| Some(entry.content.as_ref()?.mtime_ns))
-                .find(|write| !stored(&self.held, *write) && !self.rewound.contains_key(write));
-            if let Some(write) = unheld {
-                return Err(Failure::Broken(format!(
-                    "device {d} is quiet with write {write} on its disk, which the server never \
-                     held: a later write of another device can replace it unseen"
-                )));
-            }
             let trees = &engine.trees;
             let mut ids: BTreeSet<&NodeId> = nodes.iter().map(|(id, _)| id).collect();
             ids.extend(trees.local().iter().map(|(id, _)| id));
