@@ -12,7 +12,7 @@ curl -fsSL https://koidrive.com/install.sh | sh
 
 On a Mac, the installer continues into guided setup in your terminal. Setup installs and verifies the macOS app and helps you connect this machine. On Linux, run `~/.local/bin/koi setup` after installation.
 
-The installer downloads the latest [GitHub release](https://github.com/koidrive/koidrive/releases) for your system, checks it against the release's `SHA256SUMS` file and installs `koi` in `~/.local/bin`. It never needs root. The release includes the server, so you can deploy a server without Node.js or Rust. On macOS, the release's `koi` is signed with a Developer ID and notarized.
+The installer downloads the latest [GitHub release](https://github.com/koidrive/koidrive/releases) for your system, checks it against the release's `SHA256SUMS` file and installs `koi` in `~/.local/bin`. It downloads only over HTTPS and never needs root. The release includes the server, so you can deploy a server without Node.js or Rust. On macOS, the release's `koi` is signed with a Developer ID and notarized, and the installer refuses a `koi` without Koidrive's Developer ID signature.
 
 ## Use koi in your shell
 
@@ -87,7 +87,7 @@ To install a given version or into another directory, set `KOIDRIVE_VERSION` or 
 curl -fsSL https://koidrive.com/install.sh | KOIDRIVE_VERSION=v0.1.0-alpha.1 KOIDRIVE_INSTALL_DIR="$HOME/bin" sh
 ```
 
-The installer needs `curl`, `tar`, `awk`, `grep`, `sed`, `mktemp`, and `sha256sum` or `shasum`. `KOIDRIVE_RELEASE_BASE_URL` replaces `https://github.com/koidrive/koidrive/releases` with a mirror that serves the same files. The checksum comes from the same place as the binary, so use only a mirror you trust.
+The installer needs `curl`, `tar`, `awk`, `grep`, `sed`, `mktemp`, and `sha256sum` or `shasum`, plus `codesign` on macOS. `KOIDRIVE_RELEASE_BASE_URL` replaces `https://github.com/koidrive/koidrive/releases` with an `https://` mirror that serves the same files. On Linux the checksum comes from the same place as the binary, so use only a mirror you trust.
 
 ## Build from source
 
