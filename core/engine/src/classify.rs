@@ -1432,11 +1432,11 @@ impl Trees {
     /// doesn't hold a local delete again when `here` says this device brought it back at the
     /// node's revision.
     pub fn listed_removals(&mut self, removed: BTreeMap<NodeId, u64>, here: impl Fn(u64) -> bool) {
-        for id in removed.into_keys() {
+        for (id, removed_at) in removed {
             let Some(node) = self.r.get(&id).filter(|node| !node.trashed) else {
                 continue;
             };
-            let edited_since = node.content_rev.max(node.edit_rev) > node.meta_rev;
+            let edited_since = node.content_rev.max(node.edit_rev) > removed_at;
             if self.l.get(&id).is_some() || edited_since || !here(node.meta_rev) {
                 continue;
             }
