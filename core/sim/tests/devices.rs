@@ -5077,3 +5077,51 @@ fn a_folder_deleted_on_a_device_that_hears_its_owed_rename_before_a_scan_stays_d
     ]);
     converge(3, &[vec![(0, file("a"))], steps]).unwrap();
 }
+
+#[test]
+fn an_edit_whose_commit_a_restore_took_before_its_result_is_sent_again_where_another_device_lost_its_move()
+ {
+    use koidrive_sim::world::{Reply::*, Step::*};
+    let u = |kind, target, parent, name, text| {
+        User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text,
+        })
+    };
+    let phases = vec![
+        vec![(0, u(1, 0, 0, 0, 2)), (0, Backup)],
+        vec![
+            (0, u(2, 0, 0, 0, 0)),
+            (0, Scan),
+            (0, Commit(Served)),
+            (0, Commit(Served)),
+            (0, u(2, 0, 0, 0, 0)),
+            (0, Restore),
+            (0, u(0, 0, 0, 3, 0)),
+            (0, u(3, 6932547575979965906, 0, 1, 0)),
+        ],
+        vec![
+            (1, Backup),
+            (1, u(3, 10703750447421770167, 0, 4, 0)),
+            (1, Scan),
+            (1, Commit(Served)),
+            (1, Commit(Served)),
+            (1, u(2, 10703750447421770167, 0, 0, 0)),
+            (1, Restore),
+        ],
+        vec![
+            (0, u(2, 6402246228121299803, 0, 0, 0)),
+            (0, Scan),
+            (0, Commit(Served)),
+            (0, Commit(Served)),
+            (0, u(2, 6402246228121299803, 0, 0, 0)),
+            (2, Work(0)),
+            (1, Deliver(0)),
+            (0, Restore),
+        ],
+    ];
+    converge(3, &phases).unwrap();
+}

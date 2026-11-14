@@ -999,3 +999,40 @@ fn a_store_older_than_the_disk_stops_for_recovery_even_when_the_server_lost_its_
         Ok(_) => panic!("the folder opened with a store older than the disk"),
     }
 }
+
+#[test]
+fn an_edit_whose_commit_is_abandoned_after_the_server_reported_a_loss_is_sent_again() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    a.create(&mut remote, &site.root.join("notes.txt"), b"written on a");
+    fs::write(site.root.join("notes.txt"), b"edited on a").unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    let upload = a.work.pop_front().unwrap();
+    a.perform(upload, &mut remote).unwrap();
+    let Some(Work::Send(commit)) = a.work.pop_front() else {
+        panic!("the edit is sent after its upload");
+    };
+    let Some(op::Op::UpdateContent(update)) = &commit.ops[0].op else {
+        panic!("the commit edits notes.txt: {:?}", kinds(&commit));
+    };
+    a.event(Event::ResyncRequired(ResyncRequired {
+        reason: Reason::AheadOfServer as i32,
+        restore_seq: 0,
+        restore_point_ms: 0,
+    }))
+    .unwrap();
+    assert!(a.folder.engine.commits.in_flight().is_some());
+    let step = a
+        .folder
+        .sent(Err(CallError::Server(put_off(Code::HeadMoved))));
+    a.take(step).unwrap();
+    assert!(a.folder.engine.commits.in_flight().is_none());
+    assert!(a.folder.engine.trees.state().dropped_edits.contains(&update.node_id));
+    a.run(&mut remote);
+    a.settle();
+    a.run(&mut remote);
+    assert!(a.folder.engine.trees.state().dropped_edits.is_empty());
+    assert_eq!(remote.names(), ["notes.txt"]);
+    let (other, _b) = linked(&mut remote, "b");
+    assert_eq!(fs::read(other.root.join("notes.txt")).unwrap(), b"edited on a");
+}

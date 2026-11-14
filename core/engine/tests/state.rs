@@ -124,6 +124,7 @@ fn trees_state() -> TreesState {
         )]
         .into(),
         unsent_edits: Default::default(),
+        dropped_edits: ["a".into()].into(),
         resends: Default::default(),
         local_changes: ["b".into()].into(),
         replaced_versions: [("a".into(), vec!["v1".into()])].into(),

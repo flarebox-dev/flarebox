@@ -382,7 +382,7 @@ impl Folder {
                         "the server's log does not continue from the store; reading the tree again"
                     );
                     if reason == Reason::AheadOfServer {
-                        self.step(|engine, tx| engine.server_behind(tx))?;
+                        self.step(|engine, tx| engine.server_behind(tx, Vec::new()))?;
                     }
                     self.list_again(&mut work);
                 }
@@ -1066,9 +1066,10 @@ impl Folder {
             if adopt {
                 engine.commits.adopt(welcome.device_seq);
             }
+            let in_flight = engine.commits.edited_in_flight();
             let reconnect = engine.commits.connected(welcome);
             if reconnect == Reconnect::AheadOfServer {
-                engine.server_behind(tx)?;
+                engine.server_behind(tx, in_flight)?;
             }
             Ok(reconnect)
         })?;
@@ -1306,10 +1307,11 @@ impl Folder {
         };
         let before = self.engine.commits.problems().clone();
         let failure = self.step(|engine, tx| {
+            let in_flight = engine.commits.edited_in_flight();
             let failure = (engine.commits.failed(&refusal.0))
                 .map_err(|error| Stop::Protocol(format!("a refused commit: {error:?}")))?;
             if matches!(failure, Failure::Resync) {
-                engine.server_behind(tx)?;
+                engine.server_behind(tx, in_flight)?;
             }
             Ok(failure)
         })?;

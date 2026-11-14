@@ -374,6 +374,19 @@ impl Commits {
         })
     }
 
+    /// The files the commit in flight edits, other than by a resend.
+    pub fn edited_in_flight(&self) -> Vec<NodeId> {
+        let ops = (self.in_flight.as_ref()).map_or(&[][..], |flight| &flight.commit.ops[..]);
+        (ops.iter())
+            .filter_map(|op| match &op.op {
+                Some(op::Op::UpdateContent(update)) if !update.resend => {
+                    Some(update.node_id.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Whether one of this device's commits that the server lost has seq `seq`: one above
     /// [`Commits::held_through`], until R is listed again.
     pub fn lost_here(&self, seq: u64) -> bool {

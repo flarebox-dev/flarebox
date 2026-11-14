@@ -84,6 +84,10 @@ pub struct TreesState {
     /// The files whose content in L is an edit of this device that the server does not hold,
     /// although S and R may hold the same bytes (section 4.4).
     pub unsent_edits: BTreeSet<NodeId>,
+    /// The files the commit in flight edited when this device learned that the server lost commits
+    /// of it. The bootstrap after the loss takes each whose content in L still differs from S's
+    /// as a lost edit (section 4.4).
+    pub dropped_edits: BTreeSet<NodeId>,
     /// The nodes a delete of a conflict answer removes, each with the file the answer keeps, which the delete
     /// requires live (RFC 0015). Each is held while R holds the node trashed by that delete, or while its delete is
     /// sent again after the server lost it (section 4.4).
@@ -202,6 +206,7 @@ pub struct TreesChanges {
     pub moved_here: MapChanges<NodeId, MovedHere>,
     pub past_positions: MapChanges<NodeId, Vec<Agreed>>,
     pub unsent_edits: SetChanges<NodeId>,
+    pub dropped_edits: SetChanges<NodeId>,
     pub replaced_versions: MapChanges<NodeId, Vec<String>>,
     pub resends: SetChanges<NodeId>,
     pub local_changes: SetChanges<NodeId>,
@@ -228,6 +233,7 @@ impl TreesChanges {
             moved_here,
             past_positions,
             unsent_edits,
+            dropped_edits,
             replaced_versions,
             resends,
             local_changes,
@@ -250,6 +256,7 @@ impl TreesChanges {
             moved_here: map_changes(&before.moved_here, moved_here),
             past_positions: map_changes(&before.past_positions, past_positions),
             unsent_edits: set_changes(&before.unsent_edits, unsent_edits),
+            dropped_edits: set_changes(&before.dropped_edits, dropped_edits),
             replaced_versions: map_changes(&before.replaced_versions, replaced_versions),
             resends: set_changes(&before.resends, resends),
             local_changes: set_changes(&before.local_changes, local_changes),
