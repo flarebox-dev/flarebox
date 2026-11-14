@@ -176,6 +176,15 @@ jobs:
             binaries=$(grep -cE '^ *(Running |Doc-tests )' <<< "$plain" || true)
             results=$(grep -cE '^test result: ' <<< "$plain" || true)
             sed -nE 's/^test (.+) \.\.\. FAILED$/\1/p' <<< "$plain" >> "$out/failed-tests.txt"
+            git status --porcelain --untracked-files=all -- '*.proptest-regressions' '*/proptest-regressions/*.txt' '*.cases/*.txt' | cut -c4- | while read -r file; do
+              mkdir -p "$out/regressions/run-$run/$(dirname "$file")"
+              cp "$file" "$out/regressions/run-$run/$file"
+              if git ls-files --error-unmatch -- "$file" > /dev/null 2>&1; then
+                git checkout --quiet -- "$file"
+              else
+                rm "$file"
+              fi
+            done
             total_passed=$((total_passed + passed))
             total_failed=$((total_failed + failed))
             if [ "$code" -eq 0 ] && [ $((passed + failed)) -gt 0 ]; then
@@ -213,14 +222,10 @@ jobs:
               echo "$repro"
               echo '```'
               echo
-              echo "The heavy-tests-$RUNNER_OS artifact holds this summary, each run's log and any new proptest case files."
+              echo "Each run starts from the case files in the commit, so its seed reproduces it on a clean checkout. The heavy-tests-$RUNNER_OS artifact holds this summary, each run's log, and under regressions/run-<k>/ the proptest case files run k saved. To replay a saved case, copy its file to the same path in the checkout and run the command with PROPTEST_CASES=0."
             fi
           } >> "$out/summary.md"
           tee -a "$GITHUB_STEP_SUMMARY" < "$out/summary.md"
-          git status --porcelain --untracked-files=all -- '*.proptest-regressions' '*/proptest-regressions/*.txt' '*.cases/*.txt' | cut -c4- | while read -r file; do
-            mkdir -p "$out/regressions/$(dirname "$file")"
-            cp "$file" "$out/regressions/$file"
-          done
           [ "$green" -eq "$REPEAT" ]
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
