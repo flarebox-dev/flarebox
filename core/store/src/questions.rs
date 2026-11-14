@@ -1,16 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The rows of the engine's open questions (`AskUser`, design §1) and of the mass-delete guard
-//! (§6.1): each question with its kind, the items it holds and an answer it took but has not
-//! applied yet, the deletions in the guard's window
-//! and the deletions the person confirmed. Every held node keeps the revisions R held for it when
-//! it was asked, or none when R did not hold it, and a held node R did not hold keeps the shape L
-//! had for it. They are engine state, part of
-//! [`CommitsState`], and [`Tx::set_engine_state`] writes them with the commit or the hold that
-//! changes them.
-//!
-//! [`CommitsState`]: koidrive_engine::state::CommitsState
-
 use std::collections::BTreeMap;
 
 use koidrive_engine::guard::{Counted, GuardState, RemoteDeletion, Trash};
@@ -23,7 +12,6 @@ use rusqlite::{Row, params};
 use crate::engine::{kind, node_kind};
 use crate::{Error, Result, Tx, decode};
 
-/// Held items by owner: a question's ID, or the empty string for the guard's confirmed deletions.
 type HeldBy = BTreeMap<String, BTreeMap<NodeId, Held>>;
 
 impl Tx<'_> {
@@ -191,9 +179,6 @@ impl Tx<'_> {
         Ok(guard)
     }
 
-    /// Writes what changed in the guard, row by row: each deletion in the window, each confirmed deletion with its
-    /// members, and each other device's deletion, counted or dismissed. The limits of the confirmed deletions are
-    /// written whole.
     pub(crate) fn write_guard(&self, changes: &GuardChanges) -> Result<()> {
         let GuardChanges {
             ledger,
@@ -284,9 +269,6 @@ impl Tx<'_> {
         Ok(())
     }
 
-    /// The held items that `items` and `members` select, by owner. Each item row is the owner,
-    /// the topmost node and its files, and each member row the owner, the topmost node, the node
-    /// and its two revisions.
     fn held(&self, items: &str, members: &str) -> Result<HeldBy> {
         let mut held = HeldBy::new();
         let mut stmt = self.0.prepare_cached(items)?;
@@ -322,8 +304,6 @@ fn limit_name(limit: Limit) -> String {
     }
 }
 
-/// A deletion's trash as the store keeps it: whether R told its group, the group or the empty
-/// string, and the seq of its commit or the bound on it.
 fn split_trash(trash: &Trash) -> (bool, &str, u64) {
     match trash {
         Trash::Group { group, seq } => (true, group, *seq),
