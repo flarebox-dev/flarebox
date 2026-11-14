@@ -1473,6 +1473,7 @@ impl World {
                 let moved = trees.moved_here();
                 let untaken = trees.untaken_changes(|seq| commits.lost_here(seq));
                 let records = trees.remote_records();
+                let removed = trees.removed_here();
                 let root = trees.remote().root.clone();
                 let mut listed = BTreeMap::new();
                 for state in nodes.iter().filter(|state| state.node_id != root) {
@@ -1494,6 +1495,7 @@ impl World {
                         trees.set_listed_remote(id, node);
                     }
                 }
+                trees.listed_removals(removed, |seq, nodes| commits.listed_here(seq, nodes));
                 if *behind {
                     trees.forget_lost(
                         trashed,

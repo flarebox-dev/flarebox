@@ -81,3 +81,49 @@ fn a_rename_out_of_the_trash_holds_a_create_onto_a_member_its_user_removed_until
     });
     assert_eq!(ops(&commit), [delete("g"), create]);
 }
+
+fn listed_after_a_rename_out_of_the_trash(answer: Option<bool>, moved_here: bool) -> Option<Vec<op::Op>> {
+    let mut trees = trees(&[
+        ("t", Some(dir(ROOT, "T2")), Some(dir(ROOT, "T")), Some(trashed(dir(ROOT, "T")))),
+        ("g", None, Some(file("t", "g", 1)), Some(trashed(file("t", "g", 1)))),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [mv("t", ROOT, "T2")]);
+    use op_result::Code;
+    let answered = |commits: &mut Commits| {
+        commits.received(result(2, vec![outcome(Code::Applied)])).unwrap();
+    };
+    if answer == Some(true) {
+        answered(&mut commits);
+    }
+    let name = if moved_here { "T2" } else { "T3" };
+    let removed = trees.removed_here();
+    trees.set_listed_remote("t".into(), remote_at(dir(ROOT, name), 2));
+    trees.set_listed_remote("g".into(), remote_at(file("t", "g", 1), 2));
+    if !moved_here {
+        commits.abandon();
+    }
+    trees.listed_removals(removed, |seq, nodes| commits.listed_here(seq, nodes));
+    if answer == Some(false) {
+        answered(&mut commits);
+    }
+    commits.acknowledge(&mut trees, 2);
+    trees.settle();
+    build(&mut commits, &mut trees, &mut ids).map(|commit| ops(&commit))
+}
+
+#[test]
+fn a_listing_after_a_rename_out_of_the_trash_was_applied_deletes_the_member_its_user_removed_again() {
+    for answer in [Some(true), Some(false)] {
+        let sent = listed_after_a_rename_out_of_the_trash(answer, true);
+        assert_eq!(sent, Some(vec![delete("g")]), "answer first: {answer:?}");
+    }
+}
+
+#[test]
+fn a_listing_after_another_device_renamed_the_folder_out_of_the_trash_downloads_the_member() {
+    let sent = listed_after_a_rename_out_of_the_trash(None, false);
+    assert_eq!(sent.as_deref().unwrap_or_default().iter().filter(|op| **op == delete("g")).count(), 0);
+}
+

@@ -489,6 +489,7 @@ impl Engine {
         let moved = self.trees.moved_here();
         let untaken = self.trees.untaken_changes(|seq| commits.lost_here(seq));
         let records = self.trees.remote_records();
+        let removed = self.trees.removed_here();
         let root = self.trees.remote().root.clone();
         let mut tree = Tree::new(root.clone());
         for state in staging.nodes.values().filter(|state| state.node_id != root) {
@@ -513,6 +514,8 @@ impl Engine {
                 self.trees.set_listed_remote(id.clone(), node.clone());
             }
         }
+        let commits = &self.commits;
+        (self.trees).listed_removals(removed, |seq, nodes| commits.listed_here(seq, nodes));
         if behind {
             (self.trees).forget_lost(
                 trashed,

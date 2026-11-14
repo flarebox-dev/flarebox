@@ -1424,6 +1424,41 @@ impl Trees {
         self.removed_here.contains_key(id)
     }
 
+    pub fn removed_here(&self) -> BTreeMap<NodeId, u64> {
+        (*self.removed_here).clone()
+    }
+
+    /// After a listing replaces R, makes each node of `removed` that R now holds live and L
+    /// doesn't hold a local delete again when `here`, given the node's revision and the node
+    /// with the folders above it, says this device brought it back.
+    pub fn listed_removals(
+        &mut self,
+        removed: BTreeMap<NodeId, u64>,
+        here: impl Fn(u64, &[NodeId]) -> bool,
+    ) {
+        for id in removed.into_keys() {
+            let Some(node) = self.r.get(&id).filter(|node| !node.trashed) else {
+                continue;
+            };
+            let mut nodes = vec![id.clone()];
+            let mut current = &node.shape.parent;
+            while let Some(above) = self.r.get(current) {
+                if nodes.len() > self.r.len() {
+                    break;
+                }
+                nodes.push(current.clone());
+                current = &above.shape.parent;
+            }
+            if self.l.get(&id).is_some() || !here(node.meta_rev, &nodes) {
+                continue;
+            }
+            let shape = node.shape.clone();
+            if !self.set_synced_if_valid(id.clone(), Some(shape.clone())) {
+                self.wait(id, Some(shape), Origin::Other);
+            }
+        }
+    }
+
     pub(crate) fn removed_restored(&self, id: &str, target: &str) -> Vec<NodeId> {
         let Some(node) = self.r.get(id).filter(|node| node.trashed) else {
             return Vec::new();
