@@ -1,6 +1,6 @@
 # Testing
 
-[CI](../.github/workflows/ci.yml) runs every test suite on each pull request, in the merge queue and on `main`. The [property battery](#the-property-battery-runs-nightly-and-on-demand) runs the property tests at high case counts every night and when you start it. To run the Rust checks that CI runs:
+[CI](../.github/workflows/ci.yml) runs every test suite on each pull request, in the merge queue and on `main`. The [property battery](#the-property-battery-runs-nightly-and-on-demand) runs the property tests at high case counts every night and when you start it. The [heavy tests workflow](#heavy-tests-run-on-github-actions) runs one package's tests on Ubuntu and macOS as many times as you ask. To run the Rust checks that CI runs:
 
 ```sh
 cargo fmt --all --check
@@ -110,6 +110,33 @@ git checkout <commit> && PROPTEST_CASES=8192 PROPTEST_RNG_SEED=<seed> cargo test
 ```
 
 The command reproduces the failure locally. The `failure-shard-<k>` artifact holds the seed, the commands, the test logs and any new `*.cases/cc-<seed>.txt` files, including their `# shrinks to` descriptions. Copy the case files into the same paths in the checkout, then run the failing property with `PROPTEST_CASES=0` to replay saved cases without generating random cases.
+
+## Heavy tests run on GitHub Actions
+
+The [heavy tests workflow](../.github/workflows/heavy-tests.yml) runs one package's tests on GitHub-hosted Ubuntu and macOS runners, once or many times. Use it for long property runs, simulation sweeps and checks for flaky tests, rather than a local machine. Start it from `main` with [gh](https://cli.github.com/) and name the branch, tag or commit to test in `ref`:
+
+```sh
+gh workflow run heavy-tests.yml --ref main -f ref=feat/my-branch -f crate=koidrive-sim -f test=engine_sync -f cases=4096
+gh workflow run heavy-tests.yml --ref main -f ref=feat/my-branch -f crate=koidrive-driver -f filter=watcher -f repeat=20 -f os=macos
+gh run list --workflow heavy-tests.yml --limit 1   # the run's ID, for gh run watch <id>
+```
+
+| Input | What it sets | Default |
+|---|---|---|
+| `ref` | The branch, tag or commit to test | The ref the run starts from |
+| `crate` | The package, as for `cargo test -p` | Required |
+| `test` | One integration test target, as for `cargo test --test` | Every target of the package |
+| `filter` | A test name filter, as for `cargo test` | Every test |
+| `cases` | `PROPTEST_CASES` | Each property's own count |
+| `repeat` | How many times each OS runs the selection, 1 to 100 | 1 |
+| `seed` | `PROPTEST_RNG_SEED` of the first run; run k uses seed + k - 1 | Run ID × 1000 |
+| `features` | Cargo features, comma-separated, such as `koidrive-engine/serde` | None |
+| `ignored` | Also runs the tests marked `#[ignore]` | Off |
+| `os` | `both`, `ubuntu` or `macos` | `both` |
+
+The workflow tests one commit: it resolves `ref` once, so both operating systems test the same code even if the branch moves. Each OS job builds the tests once and then runs them `repeat` times. Its summary has one row per run with the seed, the result and the passed, failed and ignored counts, then the failing tests with the number of runs each failed in, and a command that reproduces a run from its seed. The log of the job's `Run the tests` step ends with the same summary, so `gh run view <run-id> --log` shows it too. A run whose test binary crashes, or that runs no test, counts as not finished cleanly. The job fails unless every run passed, and stops after 340 minutes. Each run starts from the case files in the commit: the job moves the case files a run saves into the `heavy-tests-<OS>` artifact under `regressions/run-<k>/`, so a later run never replays them and a run's seed reproduces it on a clean checkout. The artifact also holds the summary and each run's log. To replay a saved case, copy its file to the same path and run the test with `PROPTEST_CASES=0`.
+
+To compare a fix with the code before it, start two runs with the same `seed` and `repeat`: one with `ref` set to the commit before the fix and one with the fix. While the properties' strategies are the same, run k of each tests the same cases.
 
 ## The mutation set
 
