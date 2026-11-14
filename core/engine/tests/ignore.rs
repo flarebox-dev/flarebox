@@ -533,6 +533,66 @@ fn a_remote_change_to_an_excluded_node_does_not_bring_back_a_folder_the_user_del
 }
 
 #[test]
+fn a_folder_deleted_here_that_another_device_moved_comes_back_there_and_frees_its_old_name() {
+    let mut trees = trees(&[
+        synced("m", dir(ROOT, "m")),
+        ("d", None, Some(dir(ROOT, "d")), Some(dir("m", "d"))),
+        (
+            "log",
+            None,
+            Some(file("d", "a.log", 1)),
+            Some(file("d", "a.log", 1)),
+        ),
+        (
+            "new",
+            Some(file(ROOT, "d", 2)),
+            None,
+            Some(file(ROOT, "d", 2)),
+        ),
+    ]);
+    trees.set_rules(&AT_ROOT, rules("*.log\n"));
+    assert!(trees.kept_for_excluded()("d"));
+    assert_eq!(ops(&mut trees), []);
+    assert_eq!(nodes(&effects(&mut trees)), ["d"]);
+    assert_eq!(trees.local().live("d"), Some(&dir("m", "d")));
+    assert_eq!(trees.synced().live("d"), Some(&dir("m", "d")));
+    assert_eq!(trees.synced().live("new"), Some(&file(ROOT, "d", 2)));
+    assert_eq!(trees.check(), Ok(()));
+    trees.set_rules(&AT_ROOT, None);
+    assert_eq!(ops(&mut trees), [delete("log")]);
+}
+
+#[test]
+fn a_kept_folder_and_the_node_that_takes_its_name_swap_names_in_s() {
+    for holder in [dir as fn(&str, &str) -> Shape, |parent, name| {
+        file(parent, name, 3)
+    }] {
+        let mut trees = trees(&[
+            ("d", None, Some(dir(ROOT, "d")), Some(dir(ROOT, "m"))),
+            (
+                "log",
+                None,
+                Some(file("d", "a.log", 1)),
+                Some(file("d", "a.log", 1)),
+            ),
+            (
+                "m",
+                Some(holder(ROOT, "d")),
+                Some(holder(ROOT, "m")),
+                Some(holder(ROOT, "d")),
+            ),
+        ]);
+        trees.set_rules(&AT_ROOT, rules("*.log\n"));
+        assert!(trees.kept_for_excluded()("d"));
+        assert_eq!(ops(&mut trees), []);
+        assert_eq!(nodes(&effects(&mut trees)), ["d"]);
+        assert_eq!(trees.synced().live("d"), Some(&dir(ROOT, "m")));
+        assert_eq!(trees.synced().live("m"), Some(&holder(ROOT, "d")));
+        assert_eq!(trees.check(), Ok(()));
+    }
+}
+
+#[test]
 fn a_parked_node_the_rules_now_exclude_is_moved_back_to_where_l_keeps_it() {
     let mut trees = trees(&[(
         "a",
@@ -1128,4 +1188,48 @@ fn a_file_another_device_owed_a_rename_to_an_ignored_name_stays_where_it_is() {
         trees.local().get("a").map(|node| node.shape.name.as_str()),
         Some("a.txt")
     );
+}
+
+#[test]
+fn a_kept_folder_another_device_moves_below_the_folder_taking_its_stale_name_comes_back_there() {
+    let mut trees = trees(&[
+        synced("d", dir(ROOT, "ss")),
+        synced("log", file("d", "a.log", 1)),
+    ]);
+    trees.set_rules(&AT_ROOT, rules("*.log\n"));
+    trees.remove_local("log");
+    trees.remove_local("d");
+    trees.set_remote("d".into(), remote(dir(ROOT, "b")));
+    trees.set_local("new".into(), local(dir(ROOT, "ß"), 9));
+    trees.set_remote("new".into(), remote(dir(ROOT, "ß")));
+    trees.set_remote("d".into(), remote(dir("new", "b")));
+    assert!(!trees.ignored("d"));
+    assert!(trees.kept_for_excluded()("d"));
+    assert_eq!(ops(&mut trees), []);
+    let done: Vec<String> = effects(&mut trees).into_iter().map(|(id, _)| id).collect();
+    assert_eq!(done, ["d"]);
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(trees.synced().live("new"), Some(&dir(ROOT, "ß")));
+    assert_eq!(trees.synced().live("d"), Some(&dir("new", "b")));
+    assert_eq!(ops(&mut trees), []);
+}
+
+#[test]
+fn a_kept_folder_another_device_renames_comes_back_and_the_child_the_rules_let_in_is_deleted() {
+    let mut trees = trees(&[
+        synced("d", dir(ROOT, "ss")),
+        synced("log", file("d", "a.log", 1)),
+    ]);
+    trees.set_rules(&AT_ROOT, rules("/ss/a.log\n"));
+    trees.remove_local("log");
+    trees.remove_local("d");
+    trees.set_remote("d".into(), remote(dir(ROOT, "b")));
+    assert!(!trees.ignored("d"));
+    assert!(trees.excluded("log"));
+    assert!(trees.kept_for_excluded()("d"));
+    assert_eq!(ops(&mut trees), []);
+    let done: Vec<String> = effects(&mut trees).into_iter().map(|(id, _)| id).collect();
+    assert_eq!(done, ["d"]);
+    assert_eq!(trees.check(), Ok(()));
+    assert_eq!(ops(&mut trees), [delete("log")]);
 }
