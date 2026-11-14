@@ -308,6 +308,28 @@ class ReleaseJourneys(unittest.TestCase):
         self.assertIn('--installer-reference "$INSTALLER_REFERENCE"', journeys)
         self.assertRegex(release, r"(?s)  release-journeys:\n.*?installer_source: live")
 
+    def test_release_order_ranks_alphas_then_candidates_then_the_release(self):
+        ordered = ["0.1.0-alpha.4", "0.1.0-alpha.10", "0.1.0-rc.1", "0.1.0", "0.1.1-alpha.1", "0.2.0"]
+        self.assertEqual(sorted(reversed(ordered), key=DRIVER.release_order), ordered)
+        for version in ("0.1", "v0.1.0", "0.1.0-beta.1", "0.1.0-alpha.01"):
+            with self.subTest(version=version), self.assertRaises(ValueError):
+                DRIVER.release_order(version)
+
+    def test_previous_tap_release_is_the_newest_older_release_below_the_tag(self):
+        log = "\n".join(sha * 40 + " " + subject for sha, subject in (
+            ("e", "koidrive 0.1.0-alpha.6"), ("d", "koidrive 0.1.0-alpha.5"), ("c", "Fix the cask caveats"),
+            ("b", "koidrive 0.1.0-alpha.4"), ("a", "Initial commit"))) + "\n"
+        self.assertEqual(DRIVER.previous_tap_release(log, "0.1.0-alpha.5"), ("b" * 40, "0.1.0-alpha.4"))
+        self.assertEqual(DRIVER.previous_tap_release(log, "0.1.0-alpha.6"), ("d" * 40, "0.1.0-alpha.5"))
+        for current in ("0.1.0-alpha.4", "0.1.0-alpha.7"):
+            with self.subTest(current=current), self.assertRaises(RuntimeError):
+                DRIVER.previous_tap_release(log, current)
+
+    def test_homebrew_update_runs_with_the_worker_and_in_the_full_matrix(self):
+        journeys = (DRIVER.REPO / ".github/workflows/release-journeys.yml").read_text()
+        self.assertEqual(journeys.count("if: matrix.scenario == 'installer' || matrix.scenario == 'homebrew-update'"), 3)
+        self.assertLessEqual(DRIVER.release_order("0.1.0-alpha.5"), DRIVER.release_order(DRIVER.HOMEBREW_UPDATE_SINCE))
+
     def test_checksums_allow_standard_text_and_binary_markers(self):
         result = DRIVER.checksums("a" * 64 + "  koi.tar.gz\n" + "b" * 64 + " *Koidrive.dmg\n")
         self.assertEqual(result, {"koi.tar.gz": "a" * 64, "Koidrive.dmg": "b" * 64})
@@ -1015,7 +1037,7 @@ class ReleaseJourneys(unittest.TestCase):
         matrix = re.search(r"scenario: \$\{\{ fromJSON\(inputs\.skip_homebrew && '([^']+)' \|\| '([^']+)'\) \}\}", journeys)
         self.assertIsNotNone(matrix)
         self.assertEqual(json.loads(matrix[1]), ["installer"])
-        self.assertEqual(json.loads(matrix[2]), ["formula-conflict", "cask", "installer"])
+        self.assertEqual(json.loads(matrix[2]), ["formula-conflict", "cask", "installer", "homebrew-update"])
         self.assertIn("selected: ${{ steps.tap.outputs.selected }}", release)
         self.assertRegex(release, r"(?s)  release-journeys:\n.*?needs: homebrew.*?skip_homebrew: \$\{\{ needs\.homebrew\.outputs\.selected != 'true' \}\}")
 
