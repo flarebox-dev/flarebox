@@ -433,6 +433,10 @@ pub(crate) fn plain_requested() -> bool {
             .any(|value| value == "--plain")
 }
 
+pub fn rich(plain: bool, width: Option<u16>, terminal_attached: bool) -> bool {
+    terminal_attached && !plain && matches!(width, Some(60..))
+}
+
 pub fn clap_color() -> clap::ColorChoice {
     if nonempty("NO_COLOR") || plain_requested() {
         clap::ColorChoice::Never
@@ -479,9 +483,9 @@ impl Terminal {
     }
 
     fn interaction(guided: bool, plain: bool, width: Option<u16>) -> Interaction {
-        match (guided, plain, width) {
-            (false, _, _) => Interaction::Direct,
-            (true, false, Some(60..)) => Interaction::Rich,
+        match (guided, rich(plain, width, guided)) {
+            (false, _) => Interaction::Direct,
+            (true, true) => Interaction::Rich,
             _ => Interaction::Plain,
         }
     }

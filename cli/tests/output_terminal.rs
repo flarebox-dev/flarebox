@@ -31,6 +31,17 @@ impl Profile {
     }
 
     fn run(&self, args: &[&str], tty: bool, pipe_stdout: bool, vars: &[(&str, &str)]) -> Capture {
+        self.run_at_width(args, tty, pipe_stdout, vars, 100)
+    }
+
+    fn run_at_width(
+        &self,
+        args: &[&str],
+        tty: bool,
+        pipe_stdout: bool,
+        vars: &[(&str, &str)],
+        width: u16,
+    ) -> Capture {
         let mut command = Command::new(env!("CARGO_BIN_EXE_koi"));
         command
             .args(args)
@@ -67,7 +78,7 @@ impl Profile {
                 &slave,
                 rustix::termios::Winsize {
                     ws_row: 32,
-                    ws_col: 100,
+                    ws_col: width,
                     ws_xpixel: 0,
                     ws_ypixel: 0,
                 },
@@ -124,7 +135,11 @@ impl Profile {
         }
     }
 
-    fn share_fixture(&self) -> std::thread::JoinHandle<()> {
+    fn fixture(
+        &self,
+        count: usize,
+        reply: impl Fn(Value) -> Value + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
         let state = self.0.path().join("state/koidrive");
         fs::create_dir_all(&state).unwrap();
         fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
@@ -132,7 +147,7 @@ impl Profile {
         listener.set_nonblocking(true).unwrap();
         std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(15);
-            for _ in 0..2 {
+            for _ in 0..count {
                 let (mut stream, _) = loop {
                     match listener.accept() {
                         Ok(connection) => break connection,
@@ -152,16 +167,7 @@ impl Profile {
                     .read_line(&mut line)
                     .unwrap();
                 let request: Value = serde_json::from_str(&line).unwrap();
-                let response = match request["request"].as_str().unwrap() {
-                    "share" => json!({"response":"shared", "link":{
-                        "id":"0123456789", "url":"https://files.example.com/s/AAAAAAAAAAAAAAAAAAAAAA",
-                        "space_id":"s1", "space_name":"Team", "folder":null, "node_id":"n1",
-                        "target":{"path":"notes.txt", "kind":"file"}, "created_at_ms":1000,
-                        "expires_at_ms":null, "revoked_at_ms":null, "has_password":false, "state":"active"
-                    }}),
-                    "questions" => json!({"response":"questions", "questions":[]}),
-                    other => panic!("unexpected fixture request {other}"),
-                };
+                let response = reply(request);
                 writeln!(stream, "{response}").unwrap();
             }
         })
@@ -172,7 +178,7 @@ impl Profile {
 fn terminal_results_use_the_setup_theme() {
     let output = Profile::new().run(&["resolve"], true, false, &[("NO_COLOR", "1")]);
     assert_eq!(output.exit, 0);
-    assert_eq!(output.terminal, "◇  No decisions are waiting.\n");
+    assert_eq!(output.terminal, "●  No decisions are waiting.\n");
 }
 
 #[test]
@@ -274,7 +280,16 @@ fn help_is_verbatim_on_a_terminal() {
 fn bearer_values_stay_bare_and_explanations_are_styled() {
     for tty in [false, true] {
         let profile = Profile::new();
-        let server = profile.share_fixture();
+        let server = profile.fixture(2, |request| match request["request"].as_str().unwrap() {
+            "share" => json!({"response":"shared", "link":{
+                "id":"0123456789", "url":"https://files.example.com/s/AAAAAAAAAAAAAAAAAAAAAA",
+                "space_id":"s1", "space_name":"Team", "folder":null, "node_id":"n1",
+                "target":{"path":"notes.txt", "kind":"file"}, "created_at_ms":1000,
+                "expires_at_ms":null, "revoked_at_ms":null, "has_password":false, "state":"active"
+            }}),
+            "questions" => json!({"response":"questions", "questions":[]}),
+            other => panic!("unexpected fixture request {other}"),
+        });
         let output = profile.run(
             &["share", "create", "notes.txt"],
             tty,
@@ -299,6 +314,96 @@ fn bearer_values_stay_bare_and_explanations_are_styled() {
                     .starts_with("Anyone with this link can download notes.txt")
             );
             assert!(!output.stderr.contains('│'));
+        }
+    }
+}
+
+#[test]
+fn status_reports_setup_and_halted_folders_as_needing_attention() {
+    let output = Profile::new().run(&["status"], true, false, &[("NO_COLOR", "1")]);
+    assert_eq!(output.exit, 0);
+    assert!(
+        output
+            .terminal
+            .starts_with("▲  Device: not set up; run koi setup\n")
+    );
+    let profile = Profile::new();
+    let path = profile.0.path().join("Work").display().to_string();
+    let server = profile.fixture(1, move |request| {
+        assert_eq!(request["request"], "status");
+        json!({"response":"status", "status":{
+            "account":{"server":"https://files.example.com/", "user_id":"owner",
+                "device_id":"d1", "device_name":"Laptop"},
+            "running":true, "folders":[{"space_id":"s1", "space_name":"Work", "path":path,
+                "state":"halted","history_id":null,"last_seq":null,"head_seq":null,
+                "remote_nodes":0,"local_entries":0,"questions":0,"problem":"fixture disk error"}]
+        }})
+    });
+    let output = profile.run(&["status"], true, false, &[("NO_COLOR", "1")]);
+    server.join().unwrap();
+    assert_eq!(output.exit, 0);
+    assert!(
+        output.terminal.starts_with("▲  Device: Laptop"),
+        "{}",
+        output.terminal
+    );
+    assert!(output.terminal.contains("Halted"));
+    assert!(output.terminal.contains("fixture disk error"));
+    assert!(!output.terminal.contains('◇'));
+}
+
+#[test]
+fn narrow_terminals_use_the_same_plain_fallback_as_setup() {
+    for width in [40, 59] {
+        let output = Profile::new().run_at_width(
+            &["resolve"],
+            true,
+            false,
+            &[("CLICOLOR_FORCE", "1")],
+            width,
+        );
+        assert_eq!(output.terminal, "No decisions are waiting.\n");
+        let output = Profile::new().run_at_width(
+            &["space", "list"],
+            true,
+            false,
+            &[("CLICOLOR_FORCE", "1")],
+            width,
+        );
+        assert_eq!(
+            output.terminal,
+            "koi: this device is not set up; run koi setup first\n"
+        );
+    }
+    let output = Profile::new().run_at_width(&["resolve"], true, false, &[("NO_COLOR", "1")], 60);
+    assert_eq!(output.terminal, "●  No decisions are waiting.\n");
+}
+
+#[test]
+fn pending_decisions_keep_the_plain_prefix_out_of_rich_output() {
+    for tty in [false, true] {
+        let profile = Profile::new();
+        let server = profile.fixture(2, |request| match request["request"].as_str().unwrap() {
+            "pause" => json!({"response":"already_paused"}),
+            "questions" => json!({"response":"questions", "questions":[{
+                "id":"q1", "space_id":"s1", "asked_at_ms":1000,
+                "kind":{"type":"ambiguous_disappearance"}, "items":[]
+            }]}),
+            other => panic!("unexpected fixture request {other}"),
+        });
+        let output = profile.run(&["pause"], tty, false, &[("NO_COLOR", "1")]);
+        server.join().unwrap();
+        assert_eq!(output.exit, 0);
+        if tty {
+            assert!(
+                output
+                    .terminal
+                    .contains("▲  1 needs you; run koi resolve\n")
+            );
+            assert!(!output.terminal.contains("koi: "));
+        } else {
+            assert_eq!(output.stdout, "Sync is already paused.\n");
+            assert_eq!(output.stderr, "koi: 1 needs you; run koi resolve\n");
         }
     }
 }

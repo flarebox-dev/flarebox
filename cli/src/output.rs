@@ -4,14 +4,20 @@ use std::io::{self, IsTerminal};
 
 use cliclack::Theme as _;
 
-use crate::report::Outcome;
-
 #[derive(Clone, Copy, Debug, Default)]
 pub enum Presentation {
     #[default]
     Text,
     Value,
     Literal,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub enum Tone {
+    #[default]
+    Neutral,
+    Completed,
+    Attention,
 }
 
 pub enum Note<'a> {
@@ -26,16 +32,19 @@ impl cliclack::Theme for Theme {}
 
 pub fn rich(command: &str) -> bool {
     !matches!(command, "update" | "_daemon" | "_reconcile")
-        && !crate::terminal::plain_requested()
-        && io::stdout().is_terminal()
-        && io::stderr().is_terminal()
+        && crate::terminal::rich(
+            crate::terminal::plain_requested(),
+            console::Term::stderr()
+                .size_checked()
+                .map(|(_, width)| width),
+            io::stdout().is_terminal() && io::stderr().is_terminal(),
+        )
 }
 
 pub fn print(
     command: &str,
     presentation: Presentation,
-    outcome: Outcome,
-    exit: u8,
+    tone: Tone,
     text: &str,
     note: Note<'_>,
     pending: Option<&str>,
@@ -51,15 +60,16 @@ pub fn print(
             eprint!("{prefix}{note}");
         }
         if let Some(pending) = pending {
-            eprintln!("{pending}");
+            eprintln!("koi: {pending}");
         }
         return;
     }
     crate::terminal::colors(false);
     let theme = Theme;
-    let result_symbol = match (outcome, exit) {
-        (Outcome::Ok, 0) => theme.submit_symbol(),
-        _ => theme.info_symbol(),
+    let result_symbol = match tone {
+        Tone::Completed => theme.submit_symbol(),
+        Tone::Neutral => theme.info_symbol(),
+        Tone::Attention => theme.warning_symbol(),
     };
     match presentation {
         Presentation::Text if !text.is_empty() => {
