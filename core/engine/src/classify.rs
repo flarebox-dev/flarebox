@@ -3117,3 +3117,6 @@ enum Discard {
     Kept,
     Pending,
 }
+
+#[cfg(test)]
+mod tests;
