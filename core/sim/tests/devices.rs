@@ -7149,3 +7149,272 @@ fn a_rename_back_to_the_pending_name_racing_a_delete_does_not_bring_back_the_fol
         );
     }
 }
+
+#[test]
+fn a_folder_keeps_no_pending_name_through_rewinds_and_store_rollbacks() {
+    use Reply::*;
+    use Step::*;
+    let phases: Vec<Vec<(usize, Step)>> = vec![
+        vec![
+            (
+                0,
+                User(Action {
+                    kind: 0,
+                    target: 0,
+                    parent: 0,
+                    name: 0,
+                    text: 0,
+                }),
+            ),
+            (
+                0,
+                User(Action {
+                    kind: 1,
+                    target: 0,
+                    parent: 6980218576785084698,
+                    name: 5,
+                    text: 3,
+                }),
+            ),
+            (
+                1,
+                User(Action {
+                    kind: 2,
+                    target: 0,
+                    parent: 0,
+                    name: 0,
+                    text: 0,
+                }),
+            ),
+            (
+                2,
+                User(Action {
+                    kind: 1,
+                    target: 0,
+                    parent: 4695922804375436334,
+                    name: 1,
+                    text: 0,
+                }),
+            ),
+            (0, Work(0)),
+            (
+                0,
+                User(Action {
+                    kind: 1,
+                    target: 0,
+                    parent: 2890056923779536055,
+                    name: 2,
+                    text: 3,
+                }),
+            ),
+            (
+                1,
+                User(Action {
+                    kind: 1,
+                    target: 5727942886410326177,
+                    parent: 13018960219685472353,
+                    name: 2,
+                    text: 3,
+                }),
+            ),
+            (
+                2,
+                User(Action {
+                    kind: 1,
+                    target: 5196906716127809974,
+                    parent: 521330231311856237,
+                    name: 2,
+                    text: 2,
+                }),
+            ),
+            (
+                0,
+                User(Action {
+                    kind: 3,
+                    target: 10333777345206546146,
+                    parent: 4786810669791805283,
+                    name: 0,
+                    text: 2,
+                }),
+            ),
+            (0, Work(1209161008911898132)),
+            (2, Work(6267707061764293434)),
+            (2, Work(2981037690173829694)),
+        ],
+        vec![
+            (0, Commit(Served)),
+            (
+                1,
+                User(Action {
+                    kind: 3,
+                    target: 13226239514003869164,
+                    parent: 8790259169687068798,
+                    name: 6,
+                    text: 2,
+                }),
+            ),
+            (
+                2,
+                User(Action {
+                    kind: 2,
+                    target: 18071194833586715547,
+                    parent: 6218949041632901671,
+                    name: 2,
+                    text: 2,
+                }),
+            ),
+            (2, Deliver(15695387385703223024)),
+            (
+                1,
+                User(Action {
+                    kind: 0,
+                    target: 9345220605139681005,
+                    parent: 16953462668439231719,
+                    name: 1,
+                    text: 0,
+                }),
+            ),
+            (2, Work(9244999448452558495)),
+            (0, Work(3915609581973158506)),
+            (
+                0,
+                User(Action {
+                    kind: 1,
+                    target: 14792911615287690638,
+                    parent: 12100971707851482584,
+                    name: 6,
+                    text: 2,
+                }),
+            ),
+            (
+                0,
+                User(Action {
+                    kind: 3,
+                    target: 8310676636251247845,
+                    parent: 15856905699621842553,
+                    name: 3,
+                    text: 3,
+                }),
+            ),
+            (1, Work(17144717332709473615)),
+            (0, Backup),
+            (
+                0,
+                User(Action {
+                    kind: 3,
+                    target: 5787055606195510634,
+                    parent: 18053727275733928969,
+                    name: 3,
+                    text: 3,
+                }),
+            ),
+            (1, Commit(Served)),
+            (1, Scan),
+            (0, Effect(Outcome::Run)),
+            (0, Drop),
+            (
+                0,
+                User(Action {
+                    kind: 3,
+                    target: 4293234221220403339,
+                    parent: 4735398761017018611,
+                    name: 2,
+                    text: 2,
+                }),
+            ),
+            (0, Work(9409735233393576633)),
+            (0, Work(13389529914642427933)),
+            (0, Work(2014361990739751959)),
+            (0, Deliver(6317153904806597135)),
+            (1, Work(15069274704306882784)),
+            (1, Work(5504084953793399719)),
+            (0, Effect(Outcome::Run)),
+            (2, Backup),
+            (0, Effect(Outcome::Fail)),
+            (
+                2,
+                User(Action {
+                    kind: 3,
+                    target: 16187060239217063454,
+                    parent: 11560462164387002550,
+                    name: 6,
+                    text: 2,
+                }),
+            ),
+            (2, Backup),
+            (2, Backup),
+            (1, Effect(Outcome::Run)),
+            (1, Commit(Served)),
+            (2, RollBack),
+            (0, Work(6424897993824961991)),
+            (
+                0,
+                User(Action {
+                    kind: 1,
+                    target: 11997499721189524715,
+                    parent: 15963535816863556402,
+                    name: 6,
+                    text: 0,
+                }),
+            ),
+        ],
+        vec![
+            (1, Commit(Served)),
+            (2, Work(11170281843187104097)),
+            (1, Connect),
+            (1, Connect),
+            (1, Effect(Outcome::Run)),
+            (1, Work(8870421899473166975)),
+            (
+                0,
+                User(Action {
+                    kind: 3,
+                    target: 12536107549687834871,
+                    parent: 11346689659078643522,
+                    name: 0,
+                    text: 2,
+                }),
+            ),
+            (1, Work(3100904301983880638)),
+            (1, Duplicate(309888326988107569)),
+            (1, Rewind),
+            (1, Deliver(343719886465334017)),
+            (0, Work(5905904977128725049)),
+            (1, Deliver(9552529758631265802)),
+            (0, Work(2264303773289144885)),
+            (2, Work(716016871678579446)),
+            (1, Commit(Served)),
+            (
+                1,
+                User(Action {
+                    kind: 2,
+                    target: 6419776216784042297,
+                    parent: 11556474060382594156,
+                    name: 4,
+                    text: 0,
+                }),
+            ),
+            (2, Work(7537211416594830433)),
+            (0, Commit(Served)),
+            (1, Effect(Outcome::Crash(Cut::Done))),
+            (0, Work(1765335398415290723)),
+            (0, RollBack),
+            (2, Deliver(15714596177551913368)),
+            (1, Connect),
+            (0, CopyStore),
+            (0, Rewind),
+            (2, Work(6901520755494505989)),
+            (2, Work(7780906830979336587)),
+            (1, Work(17052687445418157714)),
+            (1, Work(15153470601748795340)),
+            (2, Scan),
+            (1, Commit(Served)),
+            (2, Commit(Served)),
+            (0, Work(5329214217807541593)),
+            (2, Work(1679697755313522790)),
+            (0, CopyStore),
+            (1, Commit(Served)),
+        ],
+    ];
+    converge(2, &phases).unwrap();
+}
