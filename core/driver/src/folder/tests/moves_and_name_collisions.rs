@@ -761,3 +761,29 @@ fn a_file_moved_out_and_back_in_after_the_wait_for_its_move_ended_keeps_its_node
         Some(node_named(&a, "e"))
     );
 }
+
+#[test]
+fn a_folder_moved_over_an_empty_folder_takes_its_name() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    fs::create_dir_all(site.root.join("drafts/inner")).unwrap();
+    fs::write(site.root.join("drafts/one.txt"), b"one").unwrap();
+    fs::create_dir(site.root.join("final")).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    a.settle();
+    a.run(&mut remote);
+    assert_eq!(remote.names(), ["drafts", "final", "inner", "one.txt"]);
+    let drafts = node_named(&a, "drafts");
+
+    fs::rename(site.root.join("drafts"), site.root.join("final")).unwrap();
+    a.scan_until(|a| (a.folder.engine.trees.local().get(&drafts)).is_some_and(|node| node.shape.name == "final"));
+    for _ in 0..4 {
+        a.settle();
+        a.run(&mut remote);
+    }
+    assert_eq!(remote.names(), ["final", "inner", "one.txt"]);
+    assert_eq!(
+        remote.space.node(&drafts).map(|state| state.name),
+        Some("final".into())
+    );
+}

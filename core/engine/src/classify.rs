@@ -942,10 +942,20 @@ impl Trees {
     }
 
     /// Whether an open question holds the node's local entry ([`Trees::set_asked`]), or L, S or R
-    /// places it below a folder whose rules are unknown ([`Trees::set_rules_unknown`]). Neither an effect nor a
+    /// places it below a folder whose rules are unknown ([`Trees::set_rules_unknown`]), or L places it at the S
+    /// position of a node that waits for the other half of its move ([`Trees::vanish_local`]). Neither an effect nor a
     /// commit is planned for it, and no effect parks it to make room for another node.
     pub fn held(&self, id: &str) -> bool {
         self.asked.contains(id)
+            || (self.l.get(id))
+                .filter(|node| !node.parked)
+                .is_some_and(|node| {
+                    (self.s_names.holders(&node.shape.parent, &node.shape.name)).any(|other| {
+                        other != id
+                            && self.halves.contains_key(other)
+                            && self.l.get(other).is_none()
+                    })
+                })
             || !self.unknown_rules.is_empty()
                 && (below(&self.l, id, &self.unknown_rules)
                     || below(&self.s, id, &self.unknown_rules)
