@@ -329,6 +329,7 @@ struct Folder {
     /// meanwhile, also after its last task has ended, so the cleanup never leaves a task it does not wait for.
     unlink: Option<Unlink>,
     store: Arc<RwLock<()>>,
+    progress: Arc<Mutex<crate::progress::Tracker>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1293,6 +1294,7 @@ impl Driver {
             run: None,
             unlink: None,
             store: Arc::default(),
+            progress: Arc::default(),
         };
         drop(lock);
         if self.syncs() {
@@ -1348,7 +1350,9 @@ impl Driver {
         let mut folders = self.inner.folders.lock().unwrap();
         match forgotten {
             Ok(()) => {
-                folders.remove(&link.space_id);
+                if let Some(folder) = folders.remove(&link.space_id) {
+                    folder.progress.lock().unwrap().clear();
+                }
                 tracing::info!(space_id = link.space_id, path = %koidrive_fs::quoted(&link.root), "unlinked a folder");
             }
             Err(ref error) => {
@@ -1809,6 +1813,7 @@ impl Driver {
             store,
             auth,
             status: folder.status.clone(),
+            progress: folder.progress.clone(),
             matcher: self.inner.matcher.clone(),
             local: self.inner.local.clone(),
             trash_cap: self.inner.trash_cap,
@@ -2019,6 +2024,7 @@ fn load_folders(paths: &Paths) -> Result<BTreeMap<String, Folder>, DriverError> 
                     run: None,
                     unlink: None,
                     store: Arc::default(),
+                    progress: Arc::default(),
                 },
             )
         })

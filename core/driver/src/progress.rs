@@ -63,14 +63,6 @@ impl Sum {
         Some(totals)
     }
 
-    pub fn end(&mut self, space_id: &str) {
-        let moved = self
-            .live
-            .remove(space_id)
-            .map_or(0, |progress| progress.bytes_done);
-        self.set(space_id, None, moved);
-    }
-
     fn set(&mut self, space_id: &str, progress: Option<Progress>, moved: u64) {
         self.moved += moved;
         match progress {
@@ -291,6 +283,7 @@ mod tests {
 
     struct Folder {
         _dir: tempfile::TempDir,
+        status: Arc<Lifecycle>,
         tracker: Tracker,
     }
 
@@ -302,11 +295,15 @@ mod tests {
             "local_entries": null, "questions": 0, "problem": null,
         }))
         .unwrap();
-        let status = Lifecycle::open(&dir.path().join("store.sqlite"), status).unwrap();
+        let status = Arc::new(Lifecycle::open(&dir.path().join("store.sqlite"), status).unwrap());
         let mut tracker = Tracker::default();
         let progressed = Arc::new(watch::Sender::new(()));
-        tracker.publish_to(Arc::new(status), progressed, sum.clone(), space.into());
-        Folder { _dir: dir, tracker }
+        tracker.publish_to(status.clone(), progressed, sum.clone(), space.into());
+        Folder {
+            _dir: dir,
+            status,
+            tracker,
+        }
     }
 
     fn item(node: &str) -> Item {
@@ -366,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stopped_folder_keeps_the_bytes_it_moved_and_counts_again_from_zero() {
+    fn a_restarted_folder_keeps_its_credit_and_counts_a_chunk_sent_again_once() {
         let sum = Arc::default();
         let (mut a, mut b) = (folder("a", &sum), folder("b", &sum));
         a.want(&[("a", 100)], &[]);
@@ -374,12 +371,25 @@ mod tests {
         b.want(&[("b", 10)], &[]);
         b.credit("b", "1", 1);
         assert_eq!(shown(&sum), Some((31, 110)));
-        drop(a);
-        sum.lock().unwrap().end("a");
-        assert_eq!(shown(&sum), Some((31, 40)));
-        let mut a = folder("a", &sum);
+        let progressed = Arc::new(watch::Sender::new(()));
+        (a.tracker).publish_to(a.status.clone(), progressed, sum.clone(), "a".into());
         a.want(&[("a", 100)], &[]);
-        assert_eq!(shown(&sum), Some((31, 140)));
+        a.credit("a", "1", 30);
+        assert_eq!(shown(&sum), Some((31, 110)));
+        a.credit("a", "2", 20);
+        assert_eq!(shown(&sum), Some((51, 110)));
+    }
+
+    #[test]
+    fn an_unlinked_folder_keeps_the_bytes_it_moved() {
+        let sum = Arc::default();
+        let (mut a, mut b) = (folder("a", &sum), folder("b", &sum));
+        a.want(&[("a", 100)], &[]);
+        a.credit("a", "1", 30);
+        b.want(&[("b", 10)], &[]);
+        b.credit("b", "1", 1);
+        a.tracker.clear();
+        assert_eq!(shown(&sum), Some((31, 40)));
     }
 
     #[test]
