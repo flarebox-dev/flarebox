@@ -195,9 +195,9 @@ export class ShareLinks {
     const requestId = args.requestId ?? "";
     if (!this.ownsSpace(args.userId, args.spaceId)) return notOwner();
     if (requestId.length > MAX_REQUEST_ID_LENGTH) return invalid(`request_id is longer than ${MAX_REQUEST_ID_LENGTH} characters`);
-    const made = () => this.requested(args.spaceId, requestId, args.nodeId, args.origin);
+    const made = () => (requestId ? this.requestedLink(args.spaceId, requestId) : undefined);
     const earlier = made();
-    if (earlier) return earlier;
+    if (earlier) return this.resent(earlier, args);
     if (!isUuidV7(args.nodeId)) return invalid("node_id must be a UUIDv7");
     if (args.noExpiry && args.expiresAtMs !== 0) return invalid("no_expiry cannot be combined with expires_at_ms");
     if (args.expiresAtMs !== 0 && (args.expiresAtMs <= nowMs + MIN_EXPIRY_MS || args.expiresAtMs > nowMs + MAX_EXPIRY_MS)) {
@@ -216,7 +216,7 @@ export class ShareLinks {
     const hash = salt ? await passwordHash(args.password, salt, SHARE_PASSWORD_ITERATIONS) : null;
     const createdMs = this.deps.clock();
     const meanwhile = made();
-    if (meanwhile) return meanwhile;
+    if (meanwhile) return this.resent(meanwhile, args);
     if (this.activeCount(args.spaceId, createdMs) >= MAX_ACTIVE_LINKS) {
       return failure(Error_Code.LIMIT_EXCEEDED, `a space has at most ${MAX_ACTIVE_LINKS} active links`, 413);
     }
@@ -226,11 +226,22 @@ export class ShareLinks {
     return ok(this.message(this.row(linkId)!, args.origin));
   }
 
-  private requested(spaceId: string, requestId: string, nodeId: string, origin: string): ShareOutcome<ShareLink> | undefined {
-    if (!requestId) return undefined;
-    const link = this.sql.exec("SELECT * FROM share_links WHERE space_id = ? AND request_id = ?", spaceId, requestId).toArray()[0] as unknown as ShareLinkRow | undefined;
-    if (!link) return undefined;
-    return link.node_id === nodeId ? ok(this.message(link, origin)) : invalid("this request_id was used with another node_id");
+  private requestedLink(spaceId: string, requestId: string): ShareLinkRow | undefined {
+    return this.sql.exec("SELECT * FROM share_links WHERE space_id = ? AND request_id = ?", spaceId, requestId).toArray()[0] as unknown as ShareLinkRow | undefined;
+  }
+
+  private async resent(
+    link: ShareLinkRow,
+    args: { nodeId: string; expiresAtMs: number; noExpiry: boolean; password: string; origin: string },
+  ): Promise<ShareOutcome<ShareLink>> {
+    const expiresAtMs = args.noExpiry ? null : args.expiresAtMs || link.created_at_ms + DEFAULT_EXPIRY_MS;
+    const samePassword =
+      args.password === ""
+        ? link.password_hash === null
+        : link.password_hash !== null &&
+          sameHash(await passwordHash(args.password, new Uint8Array(link.password_salt!), link.password_iterations!), link.password_hash);
+    if (link.node_id !== args.nodeId || link.expires_at_ms !== expiresAtMs || !samePassword) return invalid("this request_id was used with other fields");
+    return ok(this.message(link, args.origin));
   }
 
   ownerList(args: { userId: string; spaceId: string; cursor: string; origin: string }): ShareOutcome<ShareLinkList> {

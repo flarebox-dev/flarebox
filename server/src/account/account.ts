@@ -159,7 +159,8 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
     protected abstract spaceStub(spaceId: string): SpaceDirectory;
     private keyCache: ServerKey | undefined;
     private readonly driving = new Set<string>();
-    private readonly creating = new Map<string, string>();
+    private readonly creating = new Set<string>();
+    private readonly creatingRequests = new Map<string, string>();
     private readonly admitting = new Set<string>();
     sessionLeaseMs = SESSION_LEASE_MS;
     clock: () => number = () => Date.now();
@@ -337,7 +338,12 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
       const refreshHash = (await sha256(encoder.encode(refresh))).slice().buffer;
       const access = await this.accessToken(device, nowMs);
       const replaced = this.sql
-        .exec("UPDATE devices SET refresh_hash = ? WHERE device_id = ? AND last_seen_ms IS NULL AND revoked_at_ms IS NULL RETURNING 1", refreshHash, deviceId)
+        .exec(
+          "UPDATE devices SET refresh_hash = ? WHERE device_id = ? AND refresh_hash = ? AND last_seen_ms IS NULL AND revoked_at_ms IS NULL RETURNING 1",
+          refreshHash,
+          deviceId,
+          device.refresh_hash,
+        )
         .toArray().length > 0;
       if (!replaced) return undefined;
       return ok(
@@ -480,13 +486,17 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
         const made = this.sql.exec("SELECT * FROM spaces WHERE owner_id = ? AND request_id = ?", args.userId, requestId).toArray()[0] as unknown as SpaceRow | undefined;
         if (made) return made.name === name ? ok(spaceInfo(made)) : failure(Error_Code.INVALID_ARGUMENT, "this request_id was used with another name");
       }
+      const request = JSON.stringify([args.userId, requestId]);
+      const pending = requestId ? this.creatingRequests.get(request) : undefined;
+      if (pending !== undefined) {
+        return pending === name ? failure(Error_Code.RETRY_LATER, "this space is still being created; retry") : failure(Error_Code.INVALID_ARGUMENT, "this request_id was used with another name");
+      }
       const held = JSON.stringify([args.userId, name]);
-      const holder = this.creating.get(held);
-      if (requestId && holder === requestId) return failure(Error_Code.RETRY_LATER, "this space is still being created; retry");
-      if (holder !== undefined || this.sql.exec("SELECT 1 FROM spaces WHERE owner_id = ? AND name = ?", args.userId, name).toArray().length > 0) {
+      if (this.creating.has(held) || this.sql.exec("SELECT 1 FROM spaces WHERE owner_id = ? AND name = ?", args.userId, name).toArray().length > 0) {
         return failure(Error_Code.INVALID_ARGUMENT, "you already have a space with this name");
       }
-      this.creating.set(held, requestId);
+      this.creating.add(held);
+      if (requestId) this.creatingRequests.set(request, name);
       try {
         const spaceKey = await deriveSpaceKey((await this.serverKey()).secret, spaceId);
         await this.spaceStub(spaceId).init({ spaceId, name, ownerUserId: args.userId, spaceKey });
@@ -501,6 +511,7 @@ export function accountLogic<B extends abstract new (...args: any[]) => object>(
         );
       } finally {
         this.creating.delete(held);
+        if (requestId) this.creatingRequests.delete(request);
       }
       return ok(spaceInfo({ space_id: spaceId, name, owner_id: args.userId, created_at_ms: nowMs, format_version: FORMAT_VERSION }));
     }

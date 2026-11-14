@@ -58,6 +58,11 @@ async function deviceNames(owner: DeviceCredentials): Promise<string[]> {
 
 let owner: DeviceCredentials | undefined;
 
+async function getOwner(): Promise<DeviceCredentials> {
+  owner ??= (await call("/v1/claim", { body: body(ClaimRequestSchema, { code: await claimCode(), userName: "Owner", deviceName: "Laptop", platform: "macos" }) }, DeviceCredentialsSchema)).message!;
+  return owner;
+}
+
 describe("RFC 0024 create retries", () => {
   it("answers a retried claim with the device the first claim made", async () => {
     const code = await claimCode();
@@ -77,23 +82,25 @@ describe("RFC 0024 create retries", () => {
   });
 
   it("answers a retried pairing with the device the first pairing made", async () => {
-    const started = await call("/v1/pair/start", { token: owner!.access!.token }, PairStartResponseSchema);
+    const owner = await getOwner();
+    const started = await call("/v1/pair/start", { token: owner.access!.token }, PairStartResponseSchema);
     const pair = (requestId: string) =>
       call("/v1/pair/complete", { body: body(PairCompleteRequestSchema, { code: started.message!.code, deviceName: "Desk", platform: "linux", requestId }) }, DeviceCredentialsSchema);
     const first = await pair("pair-1");
     const again = await pair("pair-1");
     expect(again.status).toBe(200);
     expect(again.message!.deviceId).toBe(first.message!.deviceId);
-    expect(again.message!.userId).toBe(owner!.userId);
+    expect(again.message!.userId).toBe(owner.userId);
     expect((await pair("pair-2")).status).toBe(403);
     expect((await refresh(first.message!)).status).toBe(401);
     expect((await refresh(again.message!)).status).toBe(200);
     expect((await pair("pair-1")).status).toBe(403);
-    expect(await deviceNames(owner!)).toEqual(["Laptop", "Desk"]);
+    expect(await deviceNames(owner)).toEqual(["Laptop", "Desk"]);
   });
 
   it("answers a retried space create with the space the first request made", async () => {
-    const token = owner!.access!.token;
+    const owner = await getOwner();
+    const token = owner.access!.token;
     const createSpace = (name: string, requestId: string) => call("/v1/spaces", { token, body: body(CreateSpaceRequestSchema, { name, requestId }) }, SpaceInfoSchema);
     const first = await createSpace("Photos", "space-1");
     const again = await createSpace("Photos", "space-1");
@@ -111,28 +118,41 @@ describe("RFC 0024 create retries", () => {
       racing.filter((answer) => answer.status === 201).map(() => settled.message!.spaceId),
     );
 
+    const clashing = await Promise.all([createSpace("Video", "space-5"), createSpace("Films", "space-5")]);
+    expect(clashing.map((answer) => answer.status)).toEqual([201, 409]);
+    expect(clashing[1]!.code).toBe(Error_Code.INVALID_ARGUMENT);
+
     const names = (await call("/v1/spaces", { method: "GET", token }, SpaceListSchema)).message!.spaces.map((space) => space.name);
-    expect(names).toEqual(["Photos", "Music"]);
+    expect(names).toEqual(["Photos", "Music", "Video"]);
   });
 
   it("answers a retried share link create with the link the first request made", async () => {
-    const token = owner!.access!.token;
+    const owner = await getOwner();
+    const token = owner.access!.token;
     const space = await call("/v1/spaces", { token, body: body(CreateSpaceRequestSchema, { name: "Shared", requestId: "space-4" }) }, SpaceInfoSchema);
     const spaceId = space.message!.spaceId;
-    const share = (nodeId: string, requestId: string) =>
-      call(`/v1/spaces/${spaceId}/links`, { token, body: body(CreateShareLinkRequestSchema, { nodeId, requestId }) }, ShareLinkSchema);
+    const share = (nodeId: string, requestId: string, init: { password?: string; noExpiry?: boolean } = {}) =>
+      call(`/v1/spaces/${spaceId}/links`, { token, body: body(CreateShareLinkRequestSchema, { nodeId, requestId, ...init }) }, ShareLinkSchema);
     const first = await share(spaceId, "link-1");
     const again = await share(spaceId, "link-1");
     expect(first.status).toBe(201);
     expect(again.status).toBe(201);
     expect(again.message!.url).toBe(first.message!.url);
-    expect(await share(owner!.deviceId, "link-1")).toMatchObject({ status: 400, code: Error_Code.INVALID_ARGUMENT });
+    expect(await share(owner.deviceId, "link-1")).toMatchObject({ status: 400, code: Error_Code.INVALID_ARGUMENT });
+    expect(await share(spaceId, "link-1", { password: "correct horse" })).toMatchObject({ status: 400, code: Error_Code.INVALID_ARGUMENT });
+    expect(await share(spaceId, "link-1", { noExpiry: true })).toMatchObject({ status: 400, code: Error_Code.INVALID_ARGUMENT });
+
+    const locked = await share(spaceId, "link-2", { password: "correct horse" });
+    expect((await share(spaceId, "link-2", { password: "correct horse" })).message!.url).toBe(locked.message!.url);
+    expect(await share(spaceId, "link-2", { password: "wrong horse!" })).toMatchObject({ status: 400, code: Error_Code.INVALID_ARGUMENT });
+    expect(await share(spaceId, "link-2")).toMatchObject({ status: 400, code: Error_Code.INVALID_ARGUMENT });
     const links = await call(`/v1/spaces/${spaceId}/links`, { method: "GET", token }, ShareLinkListSchema);
-    expect(links.message!.links).toHaveLength(1);
+    expect(links.message!.links).toHaveLength(2);
   });
 
   it("refuses a request_id longer than 64 characters", async () => {
-    const answer = await call("/v1/spaces", { token: owner!.access!.token, body: body(CreateSpaceRequestSchema, { name: "Long", requestId: "r".repeat(65) }) }, SpaceInfoSchema);
+    const owner = await getOwner();
+    const answer = await call("/v1/spaces", { token: owner.access!.token, body: body(CreateSpaceRequestSchema, { name: "Long", requestId: "r".repeat(65) }) }, SpaceInfoSchema);
     expect(answer.code).toBe(Error_Code.INVALID_ARGUMENT);
   });
 });
