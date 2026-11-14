@@ -268,7 +268,12 @@ jobs:
           bash scripts/test-homebrew-install.sh package/koi "$TARGET"
       - name: Install the app and CLI from a local tap
         if: runner.os == 'macOS'
-        run: bash scripts/test-homebrew-cask-install.sh
+        run: |
+          HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 brew install bash
+          fixture_bash="$(brew --prefix bash)/bin/bash"
+          "$fixture_bash" --version
+          "$fixture_bash" scripts/test-homebrew-cask-install-errors.sh
+          "$fixture_bash" scripts/test-homebrew-cask-install.sh
 
   sign-macos:
     name: Sign and notarize the macOS CLI

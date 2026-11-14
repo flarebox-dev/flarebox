@@ -9,7 +9,8 @@ mkdir -p "$tmp/bin" "$tmp/images" "$tmp/tap/Casks"
 cat > "$tmp/bin/brew" <<'EOF'
 #!/usr/bin/env bash
 case $1 in
-    tap|list|tap-new|untap) ;;
+    tap|tap-new|untap) ;;
+    list) exit 1 ;;
     --prefix) printf '%s/prefix\n' "$CASK_FIXTURE_TEST_ROOT" ;;
     --repository) printf '%s/tap\n' "$CASK_FIXTURE_TEST_ROOT" ;;
     *) printf 'unexpected brew command: %s\n' "$*" >&2; exit 91 ;;
@@ -40,12 +41,22 @@ export PATH="$tmp/bin:$PATH" CASK_FIXTURE_TEST_ROOT=$tmp HOMEBREW_TEMP=$tmp/imag
 
 for stage in silent native checksum; do
     status=0
-    CASK_FIXTURE_TEST_STAGE=$stage bash "$root/scripts/test-homebrew-cask-install.sh" > "$tmp/output" 2>&1 || status=$?
+    CASK_FIXTURE_TEST_STAGE=$stage "$BASH" "$root/scripts/test-homebrew-cask-install.sh" > "$tmp/output" 2>&1 || status=$?
     expected=73
-    [ "$stage" != checksum ] || expected=75
-    if [ "$status" -ne "$expected" ] || ! grep -qF "status=$expected" "$tmp/output" || ! grep -qF 'version=0.1.0-alpha.2' "$tmp/output" || ! grep -Eq 'test-homebrew-cask-install.sh:[0-9]+' "$tmp/output"; then
+    line=$(grep -nF '    hdiutil create ' "$root/scripts/test-homebrew-cask-install.sh" | cut -d: -f1)
+    if [ "$stage" = checksum ]; then
+        expected=75
+        line=$(grep -nF "    (cd \"\$release\" && shasum " "$root/scripts/test-homebrew-cask-install.sh" | cut -d: -f1)
+    fi
+    first=$(grep '^FAIL ' "$tmp/output" | head -1 || true)
+    if [ "$status" -ne "$expected" ] || ! grep -qF "test-homebrew-cask-install.sh:$line status=$expected" <<< "$first" || ! grep -qF 'version=0.1.0-alpha.2' <<< "$first"; then
         cat "$tmp/output" >&2
-        echo "FAIL $stage failure lacks command, line, version or original status $expected (observed $status)" >&2
+        echo "FAIL $stage failure lacks exact first diagnostic line $line, version or original status $expected (observed $status)" >&2
+        exit 1
+    fi
+    if [ "$stage" != checksum ] && [ "$(grep -c '^FAIL ' "$tmp/output")" -ne 1 ]; then
+        cat "$tmp/output" >&2
+        echo "FAIL $stage failure emitted unrelated diagnostics" >&2
         exit 1
     fi
     case $stage in

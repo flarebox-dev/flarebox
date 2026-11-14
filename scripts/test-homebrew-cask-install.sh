@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 set -Eeuo pipefail
+if [ "${BASH_VERSINFO[0]}" -lt 5 ]; then
+    printf 'FAIL the cask lifecycle fixture requires Bash 5 or newer; got %s\n' "$BASH_VERSION" >&2
+    exit 2
+fi
 trap 'printf "FAIL %s:%s status=%s pipeline=%s version=%s command=%s\n" "${BASH_SOURCE[0]}" "$LINENO" "$?" "${PIPESTATUS[*]}" "${version:-not-started}" "$BASH_COMMAND" >&2' ERR
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
