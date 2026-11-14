@@ -517,16 +517,23 @@ impl Trees {
             && old.is_some_and(|old| {
                 old.meta_rev == node.meta_rev && old.meta_edit_rev != node.meta_edit_rev
             });
-        if let Some(replaced) = (self.r.get(&id))
-            .map(|old| &old.version_id)
-            .filter(|old| !old.is_empty() && **old != node.version_id)
+        if let Some(old) = (self.r.get(&id))
+            .filter(|old| !old.version_id.is_empty() && old.version_id != node.version_id)
         {
             let versions = (self.replaced_versions).get_or_insert_with(id.clone(), Vec::new);
-            if !versions.contains(replaced) {
-                versions.push(replaced.clone());
+            if !versions.contains(&old.version_id) {
+                versions.push(old.version_id.clone());
             }
             if versions.len() > REPLACED_VERSIONS_KEPT {
                 versions.remove(0);
+            }
+            let synced = self.s.live(&id).and_then(|synced| synced.content.as_ref());
+            let held = (old.shape.content.as_ref())
+                .filter(|old| synced.is_some_and(|synced| same_content(synced, old)))
+                .filter(|_| !self.unsent_edits.contains(&id))
+                .map(|content| content.manifest_digest.clone());
+            if let Some(digest) = held {
+                self.hold_content(&id, digest);
             }
         }
         let edited_here = edit
@@ -837,27 +844,6 @@ impl Trees {
         self.note_position(&id);
         self.record_edit_in_trash(&id);
         self.end_change_all_trees_hold(&id);
-        self.record_held_content(&id);
-    }
-
-    fn record_held_content(&mut self, id: &str) {
-        let local = self.l.live(id).and_then(|local| local.content.as_ref());
-        let Some(synced) = self.s.live(id).and_then(|synced| synced.content.as_ref()) else {
-            return;
-        };
-        if !local.is_some_and(|local| same_content(local, synced)) {
-            return;
-        }
-        let digest = synced.manifest_digest.clone();
-        let held = self
-            .held_contents
-            .get_or_insert_with(id.to_owned(), Vec::new);
-        if !held.contains(&digest) {
-            held.push(digest);
-        }
-        if held.len() > HELD_CONTENTS_KEPT {
-            held.remove(0);
-        }
     }
 
     /// Sets L as this device's user made it: from a scan of the disk, or as the copy that keeps a
@@ -886,13 +872,30 @@ impl Trees {
         }
     }
 
+    fn hold_content(&mut self, id: &str, digest: Vec<u8>) {
+        let held = (self.held_contents).get_or_insert_with(id.to_owned(), Vec::new);
+        held.retain(|other| *other != digest);
+        held.push(digest);
+        if held.len() > HELD_CONTENTS_KEPT {
+            held.remove(0);
+        }
+    }
+
+    fn holds_synced_content(&self, id: &str) -> bool {
+        (self.s.live(id).and_then(|synced| synced.content.as_ref())).is_some_and(|content| {
+            (self.held_contents.get(id)).is_some_and(|held| held.contains(&content.manifest_digest))
+        })
+    }
+
     pub fn remove_local(&mut self, id: &str) {
         self.parked_as.remove(id);
         self.unknown_rules.remove(id);
         self.outside.remove(id);
         self.lost.remove(id);
         self.count_held_trash(id, false);
-        self.unsent_edits.remove(id);
+        if self.unsent_edits.remove(id) && !self.holds_synced_content(id) {
+            self.set_synced(id.to_owned(), None);
+        }
         self.resends.remove(id);
         self.local_changes.remove(id);
         self.reverted.remove(id);
@@ -1894,9 +1897,10 @@ impl Trees {
     /// device moving the edit to the local trash. That also undoes a delete by a device that saw the
     /// edit before the loss, which the engine cannot tell apart: the revived file can be deleted
     /// again, while an edit in the local trash would be missing from the server. A file L no longer
-    /// holds takes R's content only when S held those bytes while L did
+    /// holds takes R's content only when this device held those bytes
     /// ([`TreesState::held_contents`]), so a delete made after the edit removes only content this
-    /// device's user had. Otherwise S forgets the file and R's content is downloaded.
+    /// device's user had. Otherwise S forgets the file and R's content is downloaded. A delete
+    /// made after the bootstrap, while the edit is unsent, follows the same rule.
     ///
     /// A file S forgets that L and R hold may hold, or later get, an edit of this device to the
     /// bytes R now holds, such as the content the server went back to (GUN-438). So may a file of
@@ -2073,6 +2077,9 @@ impl Trees {
             }
         }
         for (id, _) in edited {
+            if let Some(content) = self.s.live(&id).and_then(|synced| synced.content.clone()) {
+                self.hold_content(&id, content.manifest_digest);
+            }
             let replaced = self.replaced_versions.get(&id);
             let waits_at = (self.waiting.get(&id))
                 .filter(|_| queued.contains(&id))
@@ -2872,7 +2879,6 @@ impl Trees {
                 self.s_names.remove(id, &old);
             }
         }
-        self.record_held_content(id);
     }
 
     /// The invariants of section 2.2 for all three trees.

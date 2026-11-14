@@ -1110,3 +1110,27 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn content_held_again_stays_among_the_newest_held() {
+    let mut trees = Trees::new(ROOT);
+    let hold = |trees: &mut Trees, digest: u8, version: usize| {
+        let shape = file(ROOT, "a", digest);
+        trees.set_remote(
+            "n".into(),
+            RemoteNode {
+                version_id: format!("v{version}"),
+                ..remote(shape.clone())
+            },
+        );
+        trees.set_local("n".into(), local(shape.clone(), 1));
+        trees.set_synced("n".into(), Some(shape));
+    };
+    let digests = (1..=64u8).chain([1, 65, 66]);
+    for (version, digest) in digests.enumerate() {
+        hold(&mut trees, digest, version);
+    }
+    let held = trees.state().held_contents["n"].clone();
+    assert!(held.contains(&vec![1; 32]), "{held:?}");
+    assert!(!held.contains(&vec![2; 32]), "{held:?}");
+}

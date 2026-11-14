@@ -6256,3 +6256,39 @@ fn a_delete_after_a_restore_lost_its_edit_leaves_a_restored_write_its_user_never
     ];
     converge(2, &phases).unwrap();
 }
+
+fn a_delete_after_a_restore_lost_its_edit(late: &[(usize, Step)]) {
+    use Step::*;
+    let mut third = vec![(0, Restore), (1, Connect)];
+    third.extend([(1, Deliver(0)); 8]);
+    third.extend_from_slice(late);
+    third.push((1, drawn(4, 9116664042309670064, 0, 0)));
+    let phases = vec![
+        vec![(0, drawn(1, 0, 0, 2))],
+        vec![
+            (0, drawn(2, 0, 0, 0)),
+            (1, drawn(3, 0, 0, 3)),
+            (0, Work(0)),
+            (0, Work(0)),
+            (0, Work(0)),
+            (0, drawn(4, 0, 0, 0)),
+            (0, drawn(0, 0, 0, 0)),
+            (0, Work(0)),
+            (1, drawn(2, 0, 0, 0)),
+            (0, Backup),
+            (0, drawn(0, 0, 2953731051851081156, 0)),
+        ],
+        third,
+    ];
+    converge(2, &phases).unwrap();
+}
+
+#[test]
+fn a_delete_after_the_listing_that_lost_its_edit_leaves_a_restored_write_its_user_never_had() {
+    a_delete_after_a_restore_lost_its_edit(&[]);
+}
+
+#[test]
+fn a_delete_after_a_scan_that_follows_the_listing_leaves_a_restored_write_its_user_never_had() {
+    a_delete_after_a_restore_lost_its_edit(&[(1, Step::Scan)]);
+}

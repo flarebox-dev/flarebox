@@ -117,10 +117,11 @@ pub struct TreesState {
     /// takes L's shape, a scan finds L back at the shape S holds, L, S and R hold the same shape,
     /// or L no longer holds it.
     pub local_changes: BTreeSet<NodeId>,
-    /// For each file, the manifest digests of the contents S held while L held the same bytes,
-    /// oldest first, at most [`HELD_CONTENTS_KEPT`](crate::classify::HELD_CONTENTS_KEPT). A lost
-    /// edit whose file L no longer holds is sent again as a delete only of content listed here
-    /// (section 4.4).
+    /// For each file, the manifest digests of the contents this device held, least recently held
+    /// first, at most [`HELD_CONTENTS_KEPT`](crate::classify::HELD_CONTENTS_KEPT): each content S
+    /// held when R moved past it, except one S took back from R for an unsent edit, and the content
+    /// S held when a loss took an edit of the file. A user's delete of a file with a lost edit
+    /// removes only content listed here (section 4.4).
     pub held_contents: BTreeMap<NodeId, Vec<Vec<u8>>>,
 }
 
