@@ -653,7 +653,7 @@ impl Disk {
             .filter(|(_, stale)| !stale)
             .map(|(change, _)| change)
             .collect();
-        if !changes.is_empty() {
+        if !changes.is_empty() || whole && !engine.trees.halves().is_empty() {
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |since| since.as_millis() as u64);

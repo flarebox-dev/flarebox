@@ -238,7 +238,7 @@ The store writes, per `handle` call and in one transaction:
 - the queued restores with the outcomes of those that ended;
 - the entries a Publish answer to a first link released, until the server applies their create (§2.7);
 - the nodes recorded as moved into an ignored folder that is no node, each with its file identity once another entry took its path, and which of them are folders the disk lost that L keeps only for recorded nodes below them (§5.10);
-- the files and folders that wait for the other end of a move, each with when the wait began (§5.1);
+- the files and folders that wait for the other end of a move, each with when the wait began and the content L held for it (§5.1);
 - every open question with what it holds;
 - the ID generator's state (`IdGen::state`).
 

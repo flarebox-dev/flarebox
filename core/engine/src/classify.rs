@@ -8,7 +8,7 @@ use koidrive_ignore::Status;
 
 use crate::ignore::{LocalRules, Matcher, RuleFile, is_rules_file};
 use crate::names::name_key;
-use crate::state::{Agreed, MovedHere, StateError, TreesChanges, TreesState};
+use crate::state::{Agreed, Half, MovedHere, StateError, TreesChanges, TreesState};
 use crate::tracked::{TrackedMap, TrackedSet};
 use crate::tree::{
     Content, FileIdentity, Kind, LocalNode, Names, Node, NodeId, RemoteNode, Shape, Tree,
@@ -32,7 +32,7 @@ pub const REPLACED_VERSIONS_KEPT: usize = 64;
 pub const PAST_POSITIONS_KEPT: usize = 64;
 
 /// How long a file that left L in a scan of part of the tree, or a file a link made at another path, waits for the
-/// other half of a move to arrive in a later scan before it counts as deleted or as created (section 5.1).
+/// other half of a move before the driver asks for a scan of the whole tree, which alone ends the wait (section 5.1).
 pub const HALF_WAIT_MS: u64 = 2_000;
 
 /// An S update of an acknowledged op that waits until S stays a valid tree with it
@@ -238,7 +238,7 @@ pub struct Trees {
     /// The nodes of `outside`, and those L held under them, that left L because another entry took their name
     /// ([`Trees::displace_local`]), each with the identity L held for it.
     displaced: TrackedMap<NodeId, FileIdentity>,
-    halves: TrackedMap<NodeId, u64>,
+    halves: TrackedMap<NodeId, Half>,
     /// False from a restore until the rules of a full scan are in force.
     rules_known: bool,
     /// The folders whose rules the last scan of each could not read, by node: a folder renamed is the same folder,
@@ -1152,30 +1152,35 @@ impl Trees {
     }
 
     /// Takes a file or folder out of L as [`Trees::remove_local`] does, after a scan of part of the tree found it gone,
-    /// and keeps it as [`Trees::displace_local`] does until [`HALF_WAIT_MS`] after `at_ms`: an entry with its identity
-    /// that a later scan finds is the node moved, and the node counts as deleted only once the wait ends
-    /// ([`Trees::release_halves`]). A node whose identity has no birth time can't be told from another, and returns
-    /// false without a change.
+    /// and keeps it as [`Trees::displace_local`] does, with the content L held, from `at_ms`: an entry with its identity that a
+    /// later scan finds is the node moved, also before its content is read, and the node counts as deleted only once a
+    /// scan of the whole tree ends the wait ([`Trees::release_halves`]). A node whose identity has no birth time can't be
+    /// told from another, and returns false without a change.
     pub fn vanish_local(&mut self, id: &str, at_ms: u64) -> bool {
         let Some(node) = self.l.get(id) else {
             return false;
         };
         let identity = node.identity;
+        let content = node.shape.content.clone();
         if node.parked || identity.birth_ns.is_none() || self.recorded_local(id) {
             return false;
         }
         self.remove_local(id);
         self.put_displaced(id, identity);
-        self.halves.insert(id.to_owned(), at_ms);
+        self.halves.insert(id.to_owned(), Half { at_ms, content });
         true
     }
 
-    /// Holds a file L just took from a scan of part of the tree as a new link of a file L holds at another path, until
-    /// [`HALF_WAIT_MS`] after `at_ms`: the other link may be the old path of a move that a later scan reports. Nothing
-    /// is planned for the file meanwhile ([`Trees::excluded`]).
+    /// Holds a file L just took from a scan of part of the tree as a new link of a file L holds at another path, from
+    /// `at_ms` until a scan of the whole tree ends the wait ([`Trees::release_halves`]): the other link may be the old path of
+    /// a move that a later scan reports. Nothing is planned for the file meanwhile ([`Trees::excluded`]).
     pub fn hold_link(&mut self, id: &str, at_ms: u64) {
         if self.l.get(id).is_some() {
-            self.halves.insert(id.to_owned(), at_ms);
+            let half = Half {
+                at_ms,
+                content: None,
+            };
+            self.halves.insert(id.to_owned(), half);
         }
     }
 
@@ -1186,13 +1191,10 @@ impl Trees {
         })
     }
 
-    /// Ends every wait of [`Trees::vanish_local`] and [`Trees::hold_link`] that ends at or before `due_ms`, the time
-    /// [`Trees::halves_due`] gave, except the waits of `kept`.
-    pub fn release_halves(&mut self, due_ms: u64, kept: &BTreeSet<NodeId>) {
-        let due: Vec<NodeId> = (self.halves.iter())
-            .filter(|(id, at)| !kept.contains(*id) && at.saturating_add(HALF_WAIT_MS) <= due_ms)
-            .map(|(id, _)| id.clone())
-            .collect();
+    /// Ends every wait of [`Trees::vanish_local`] and [`Trees::hold_link`], after a scan of the whole tree whose changes all
+    /// apply: it reported every entry L does not hold, so a node it did not pair has no other half on the disk.
+    pub fn release_halves(&mut self) {
+        let due: Vec<NodeId> = self.halves.keys().cloned().collect();
         for id in due {
             self.halves.remove(&id);
             if self.l.get(&id).is_none() {
@@ -1202,16 +1204,8 @@ impl Trees {
         }
     }
 
-    /// Starts the wait of a node that waits for the other half of its move again at `at_ms`, for a scan that found the
-    /// entry with its identity before it could read the entry's content.
-    pub fn wait_again(&mut self, id: &str, at_ms: u64) {
-        if let Some(at) = self.halves.get_mut(id) {
-            *at = at_ms;
-        }
-    }
-
-    /// The nodes that wait for the other half of a move, each with when its wait began.
-    pub fn halves(&self) -> &BTreeMap<NodeId, u64> {
+    /// The nodes that wait for the other half of a move, each with its wait.
+    pub fn halves(&self) -> &BTreeMap<NodeId, Half> {
         &self.halves
     }
 
@@ -1219,10 +1213,10 @@ impl Trees {
         self.halves.contains_key(id) && self.l.get(id).is_none()
     }
 
-    /// When the earliest wait of [`Trees::release_halves`] ends, if any is left.
+    /// When the earliest wait is [`HALF_WAIT_MS`] old, if any is left: the time to ask for a scan of the whole tree.
     pub fn halves_due(&self) -> Option<u64> {
-        self.halves
-            .values()
+        (self.halves.values())
+            .map(|half| half.at_ms)
             .min()
             .map(|at| at.saturating_add(HALF_WAIT_MS))
     }

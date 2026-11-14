@@ -615,31 +615,6 @@ impl Engine {
         Some(names.into_iter().rev().collect())
     }
 
-    pub fn held_scopes(&self) -> Vec<PathBuf> {
-        let mut scopes = BTreeSet::new();
-        for id in self.trees.halves().keys() {
-            let mut current = id.clone();
-            let mut scope = PathBuf::new();
-            for _ in 0..=self.trees.remote().len() + self.trees.synced().len() {
-                if let Some(path) = self.path_of(&current) {
-                    scope = path;
-                    break;
-                }
-                let parent = (self.trees.synced().get(&current))
-                    .map(|shape| shape.parent.clone())
-                    .or_else(|| {
-                        (self.trees.remote().get(&current)).map(|node| node.shape.parent.clone())
-                    });
-                match parent {
-                    Some(parent) => current = parent,
-                    None => break,
-                }
-            }
-            scopes.insert(scope);
-        }
-        scopes.into_iter().collect()
-    }
-
     /// Gives the trees the rules files a batch lists, before the changes of that batch. An observer's first batch
     /// follows its scan of the whole tree and lists every rules file, so from the first call on the trees know the
     /// rules, and the engine plans again (design §5.10), except below a folder that could not be read
@@ -740,7 +715,6 @@ impl Engine {
         whole: bool,
     ) -> BTreeSet<NodeId> {
         let mut touched = BTreeSet::new();
-        let mut unread = BTreeSet::new();
         let mut gone = Gone::default();
         self.take_links(changes, now_ms, &mut touched, &mut gone);
         self.vanishing = (!whole).then_some(now_ms);
@@ -936,18 +910,9 @@ impl Engine {
                     let content = match content {
                         None if *kind == EntryKind::File => {
                             let held = (self.trees.displaced_with_identity(&identity))
-                                .filter(|node| self.trees.halves().contains_key(*node))
-                                .cloned();
-                            let synced = (held.as_ref())
-                                .and_then(|node| self.trees.synced().live(node))
-                                .and_then(|synced| synced.content.clone());
-                            if synced.is_none()
-                                && let Some(node) = held
-                            {
-                                self.trees.wait_again(&node, now_ms);
-                                unread.insert(node);
-                            }
-                            match synced {
+                                .and_then(|node| self.trees.halves().get(node))
+                                .and_then(|half| half.content.clone());
+                            match held {
                                 Some(content) => Some(content),
                                 None => continue,
                             }
@@ -1007,11 +972,7 @@ impl Engine {
                 } => {
                     let Some(content) = content else { continue };
                     let identity = file_identity(*id);
-                    let node = resolve(&self.trees, path, &identity, *linked).or_else(|| {
-                        (self.trees.displaced_with_identity(&identity))
-                            .filter(|node| self.trees.halves().contains_key(*node))
-                            .cloned()
-                    });
+                    let node = resolve(&self.trees, path, &identity, *linked);
                     self.place(
                         node,
                         path,
@@ -1042,7 +1003,7 @@ impl Engine {
         }
         self.vanishing = None;
         if whole {
-            self.trees.release_halves(u64::MAX, &unread);
+            self.trees.release_halves();
         }
         touched
     }
@@ -3805,6 +3766,98 @@ mod tests {
                 prop_assert_eq!(engine.trees.check(), Ok(()), "after {:?}", batch);
                 prop_assert_eq!(in_l(&engine), on_disk(&snapshot), "after {:?}", batch);
             }
+        }
+        #[test]
+        fn a_held_file_keeps_its_node_through_any_order_of_scans_expiries_and_reads(
+            linked in any::<bool>(),
+            synced in any::<bool>(),
+            events in prop::collection::vec((0..5u8, any::<bool>()), 0..12),
+        ) {
+            let (_dir, mut engine, file) = moved_out_of_a_removed_folder(linked);
+            let identity = FileId {
+                birth_ns: Some(10),
+                ..ino(10)
+            };
+            let mut local = engine.trees.local().get(&file).unwrap().clone();
+            local.identity.birth_ns = identity.birth_ns;
+            engine.trees.set_local(file.clone(), local);
+            if !synced {
+                engine.trees.remove_remote(&file);
+                engine.trees.set_synced(file.clone(), None);
+                engine.trees.settle();
+                let commit = engine.commits.build(&mut engine.trees, &mut engine.ids, 999, "h", 1u64);
+                prop_assert!(commit.is_some());
+            }
+            let removed = Observed::Removed {
+                path: "x/d".into(),
+                kind: EntryKind::Dir,
+            };
+            engine.observe_part(&[removed], 1_000);
+            let found = |read: bool| Observed::Created {
+                path: "e/moved.txt".into(),
+                kind: EntryKind::File,
+                id: identity,
+                linked,
+                content: read.then(|| bytes(5)),
+            };
+            let read = Observed::Modified {
+                path: "e/moved.txt".into(),
+                id: identity,
+                linked,
+                content: Some(bytes(5)),
+            };
+            let (mut reported, mut was_read) = (false, false);
+            let mut now_ms = 1_000;
+            for (event, read_now) in events.iter().copied().chain([(3, true), (4, true)]) {
+                now_ms += 700;
+                match event {
+                    0 => {
+                        engine.observe_part(&[], now_ms);
+                    }
+                    1 if !reported => {
+                        engine.observe_part(&[found(read_now)], now_ms);
+                        (reported, was_read) = (true, read_now);
+                    }
+                    2 | 3 if !reported => {
+                        engine.observe(&[found(read_now)], now_ms);
+                        (reported, was_read) = (true, read_now);
+                    }
+                    2 => {
+                        engine.observe(&[], now_ms);
+                    }
+                    3 => {
+                        let unpaired = holding(&engine, "e/moved.txt").is_none();
+                        let changes: Vec<Observed> = unpaired.then(|| found(true)).into_iter().collect();
+                        engine.observe(&changes, now_ms);
+                        was_read |= unpaired;
+                    }
+                    _ if reported && !was_read => {
+                        engine.observe_part(std::slice::from_ref(&read), now_ms);
+                        was_read = true;
+                    }
+                    _ => {
+                        engine.observe_part(&[], now_ms);
+                    }
+                }
+                prop_assert_eq!(engine.trees.check(), Ok(()), "after {:?}", event);
+                if reported {
+                    prop_assert_eq!(
+                        holding(&engine, "e/moved.txt").map(|(id, _, _)| id),
+                        Some(file.clone()),
+                        "after {:?} in {:?}",
+                        event,
+                        events
+                    );
+                } else {
+                    prop_assert!(engine.trees.halves().contains_key(&file), "after {:?} in {:?}", event, events);
+                }
+            }
+            prop_assert!(was_read);
+            prop_assert!(engine.trees.halves().is_empty());
+            prop_assert_eq!(
+                engine.trees.locals_with_identity(&file_identity(identity)).count(),
+                1
+            );
         }
     }
 

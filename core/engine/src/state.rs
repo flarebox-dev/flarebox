@@ -20,6 +20,7 @@ use crate::guard::{Counted, GuardState, RemoteDeletion};
 use crate::question::{Held, Limit, Question};
 use crate::restore::{Resolved, RestoreId, RestoreIntent};
 use crate::tree::{FileIdentity, NodeId, Shape, TreeError};
+use koidrive_proto::v1::Content;
 
 /// A position L and R agreed on, with the revision of R's record that held it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,10 +77,9 @@ pub struct TreesState {
     /// identity L held for it, and the files of `halves` that left L. L holds none of them, and R holds each live
     /// unless it waits in `halves`.
     pub displaced: BTreeMap<NodeId, FileIdentity>,
-    /// The files that wait for the other half of a move, each with when the wait began (section 5.1): one a scan of
-    /// part of the tree found gone, which `displaced` keeps meanwhile, and one L holds as a new link of a file at
-    /// another path.
-    pub halves: BTreeMap<NodeId, u64>,
+    /// The files that wait for the other half of a move, each with its wait (section 5.1): one a scan of part of the
+    /// tree found gone, which `displaced` keeps meanwhile, and one L holds as a new link of a file at another path.
+    pub halves: BTreeMap<NodeId, Half>,
     /// The files whose content an edit of this device set, each with the seq of its commit, while
     /// R holds that content.
     pub edited_here: BTreeMap<NodeId, u64>,
@@ -194,6 +194,15 @@ pub type SetChanges<K> = Vec<(K, bool)>;
 /// its value now, or `None` when the map no longer holds the key.
 pub type MapChanges<K, V> = Vec<(K, Option<V>)>;
 
+/// A wait for the other half of a move (section 5.1).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Half {
+    /// When the wait began.
+    pub at_ms: u64,
+    /// The content L held for a file that left L, which a scan that finds the file before it reads its content keeps.
+    pub content: Option<Content>,
+}
+
 /// What changed in [`TreesState`] since the changes were last taken
 /// ([`Trees::take_changes`](crate::classify::Trees::take_changes)), field by field.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -211,7 +220,7 @@ pub struct TreesChanges {
     pub outside: SetChanges<NodeId>,
     pub lost: SetChanges<NodeId>,
     pub displaced: MapChanges<NodeId, FileIdentity>,
-    pub halves: MapChanges<NodeId, u64>,
+    pub halves: MapChanges<NodeId, Half>,
     pub edited_here: MapChanges<NodeId, u64>,
     pub moved_here: MapChanges<NodeId, MovedHere>,
     pub past_positions: MapChanges<NodeId, Vec<Agreed>>,

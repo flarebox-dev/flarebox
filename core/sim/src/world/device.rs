@@ -182,7 +182,7 @@ impl Engine {
         for id in gone {
             self.trees.remove_local(&id);
         }
-        self.trees.release_halves(u64::MAX, &BTreeSet::new());
+        self.trees.release_halves();
     }
 
     /// A scan of the folders entries left, before the scan of the folders they went to: a node whose entry is gone

@@ -132,7 +132,7 @@ pub(crate) struct Folder {
     /// When the [`Work::RetryAfter`] that is out ends.
     retry_at: Option<Instant>,
     halves_at: Option<u64>,
-    halves_asked: Option<(Requests, u64)>,
+    halves_asked: Option<Requests>,
     /// Tests stop the task after this many more store transactions, as a crash right after one would.
     #[cfg(test)]
     crash_after: Option<usize>,
@@ -481,14 +481,10 @@ impl Folder {
         let answered = batch.answered;
         self.disk
             .observed(batch, &mut self.engine, &mut self.store)?;
-        if let Some((asked, at_ms)) = self.halves_asked
+        if let Some(asked) = self.halves_asked
             && answered >= Some(asked)
         {
             self.halves_asked = None;
-            self.step(|engine, _| {
-                engine.trees.release_halves(at_ms, &BTreeSet::new());
-                Ok(())
-            })?;
         }
         let mut work = Vec::new();
         self.wait_for_halves(&mut work);
@@ -497,11 +493,11 @@ impl Folder {
     }
 
     pub fn halves_ended(&mut self) -> Result<Vec<Work>, Stop> {
-        let Some(due) = self.halves_at.take() else {
+        if self.halves_at.take().is_none() {
             return Ok(Vec::new());
-        };
-        let asked = self.disk.rescan(&self.engine, self.engine.held_scopes());
-        self.halves_asked = Some((asked, due));
+        }
+        let asked = self.disk.rescan(&self.engine, vec![PathBuf::new()]);
+        self.halves_asked = Some(asked);
         Ok(Vec::new())
     }
 

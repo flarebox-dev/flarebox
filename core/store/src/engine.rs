@@ -11,8 +11,8 @@ use koidrive_engine::classify::{Origin, Waiting};
 use koidrive_engine::commit::{Halt, InFlight};
 use koidrive_engine::effects::{Base, Dir, Displaced, Effect, EffectRecord, Location};
 use koidrive_engine::state::{
-    Agreed, CommitsChanges, CommitsState, EffectsChanges, EffectsState, MapChanges, MovedHere,
-    Pending, SetChanges, TreesChanges, TreesState,
+    Agreed, CommitsChanges, CommitsState, EffectsChanges, EffectsState, Half, MapChanges,
+    MovedHere, Pending, SetChanges, TreesChanges, TreesState,
 };
 use koidrive_engine::tree::{FileIdentity, Kind, NodeId, Shape};
 use koidrive_proto::v1::{Commit, CommitResult, Content, NodeKind};
@@ -219,10 +219,14 @@ impl Tx<'_> {
         }
         let mut stmt = self
             .0
-            .prepare_cached("SELECT node_id, at_ms FROM move_halves")?;
+            .prepare_cached("SELECT node_id, at_ms, content FROM move_halves")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
-            state.trees.halves.insert(row.get(0)?, row.get(1)?);
+            let half = Half {
+                at_ms: row.get(1)?,
+                content: decode(row.get(2)?)?,
+            };
+            state.trees.halves.insert(row.get(0)?, half);
         }
         let mut stmt = self
             .0
@@ -588,8 +592,14 @@ impl Tx<'_> {
         self.write_map(
             halves,
             "DELETE FROM move_halves WHERE node_id = ?1",
-            "INSERT OR REPLACE INTO move_halves (node_id, at_ms) VALUES (?1, ?2)",
-            |put, node, at| put.execute(params![node, at]),
+            "INSERT OR REPLACE INTO move_halves (node_id, at_ms, content) VALUES (?1, ?2, ?3)",
+            |put, node, half| {
+                put.execute(params![
+                    node,
+                    half.at_ms,
+                    half.content.as_ref().map(Content::encode_to_vec),
+                ])
+            },
         )?;
         self.write_map(
             edited_here,
