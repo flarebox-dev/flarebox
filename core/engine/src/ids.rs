@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! UUIDv7 identifiers (spec v0 section 2) from a deterministic generator, so that every ID an engine
-//! or the reference server mints is reproducible from its persisted state.
-
 /// `xxxxxxxx-xxxx-7xxx-yxxx-xxxxxxxxxxxx` with the Unix time in milliseconds in the first 48 bits and
 /// `random` filling the remaining 74 bits.
 pub fn uuid_v7(unix_ms: u64, random: u128) -> String {
@@ -22,7 +19,6 @@ pub fn uuid_v7(unix_ms: u64, random: u128) -> String {
     )
 }
 
-/// The Unix time in milliseconds of a UUIDv7, or `None` for anything else.
 pub fn unix_ms(value: &str) -> Option<u64> {
     is_uuid_v7(value).then(|| u64::from_str_radix(&value[..13].replace('-', ""), 16).ok())?
 }

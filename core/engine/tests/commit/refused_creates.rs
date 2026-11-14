@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-/// This device creates a lost file n again while another device does the same, and the other
-/// create comes first. R holds n when the result comes, and the server refused this create with
-/// ID_EXISTS. n is no problem, and the next commit sends L's name as a move.
 #[test]
 fn a_create_refused_because_another_device_created_the_node_again_is_no_problem() {
     let mut trees = trees(&[("n", Some(file(ROOT, "a", 1)), None, None)]);

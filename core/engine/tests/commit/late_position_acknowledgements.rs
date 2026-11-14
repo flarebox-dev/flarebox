@@ -16,9 +16,6 @@ fn a_late_acknowledgement_renamed_by_the_server_keeps_the_position_s_took_after_
     a_late_acknowledgement_keeps_the_position_s_took_after_the_commit(false, true);
 }
 
-/// n's move to b is in flight with m's move to d, which the server rejects, so m is a problem and
-/// S keeps it at c. The other device moves m to e, and both sides move n to c, so n's agreement
-/// waits behind m. The user then edits n: the edit is uploaded while the position waits.
 #[test]
 fn an_edit_of_a_node_waiting_behind_a_problem_node_is_uploaded() {
     let mut trees = trees(&[
@@ -56,8 +53,6 @@ fn an_edit_of_a_node_waiting_behind_a_problem_node_is_uploaded() {
     assert_eq!(commit.as_ref().map(ops), Some(vec![update("n", 9)]));
 }
 
-/// As in `an_edit_of_a_node_waiting_behind_a_problem_node_is_uploaded`, n's agreement waits behind the problem node m, but the other device has
-/// moved n on to x, and the user edits n at c before the effects run. The edit must be uploaded.
 #[test]
 fn an_edit_of_a_waiting_node_r_moved_on_from_is_uploaded() {
     let mut trees = trees(&[
@@ -107,10 +102,6 @@ fn an_edit_of_a_waiting_node_r_moved_on_from_is_uploaded() {
     assert!(sent.contains(&update("n", 9)), "{sent:?}");
 }
 
-/// n's move to b is in flight. The user and the other device move m from c to d with different
-/// content, so S keeps m at c, and then both move n to c. The other device then moves n on to x.
-/// S cannot take the agreed c while m holds it, so the agreement waits: n is not planned, and once
-/// the rebase moves m off c, S takes c and the other device's move to x reaches the disk.
 #[test]
 fn an_agreed_position_another_nodes_stale_s_entry_holds_waits_for_it() {
     let mut trees = trees(&[
@@ -150,11 +141,6 @@ fn an_agreed_position_another_nodes_stale_s_entry_holds_waits_for_it() {
     assert_eq!(trees.class("n"), Class::Remote);
 }
 
-/// The commit moves n to p, m to q and k to r. Before its acknowledgement, the user and the other
-/// device swap n and m, so they agree on n at q and m at p, and both move k to g, which S still
-/// gives to h, since L and R moved h to h2 with different content. The other device then moves n on
-/// to x. S cannot hold k at g yet, but the swap fits without k, so S takes it, k's agreement waits,
-/// and n is not sent back to q over the other device's move.
 #[test]
 fn agreed_positions_that_fit_together_are_taken_when_another_agreement_is_refused() {
     let mut trees = trees(&[
@@ -215,11 +201,6 @@ fn agreed_positions_that_fit_together_are_taken_when_another_agreement_is_refuse
     assert_eq!(trees.synced().live("k"), Some(&file(ROOT, "g", 3)));
 }
 
-/// n's move to b is in flight when the user and the other device both move it to c, in a commit
-/// the server applied before this one, so S takes c. A log replay then brings the commit at seq 3
-/// and the other device's move back to c at seq 4, which L and S already hold. The user moves n
-/// back to b, and the commit is acknowledged. S keeps c, which the server holds after the commit,
-/// so the user's move back to b is sent when the other device then moves n to d.
 #[test]
 fn a_late_acknowledgement_keeps_a_position_r_took_again_after_the_commit() {
     let mut trees = trees(&[(
@@ -254,10 +235,6 @@ fn a_late_acknowledgement_keeps_a_position_r_took_again_after_the_commit() {
     assert_eq!(ops(&commit), [mv("n", ROOT, "b")]);
 }
 
-/// n's move to b is in flight when the user and the other device both move it to c, in a commit
-/// the server applied before this one, so S takes c. The result then puts n at b at seq 3, since
-/// the server applies the later move. S takes the b that was sent, so the user's move to c is a
-/// local move again: the disk keeps n at c and the move is sent.
 #[test]
 fn a_late_acknowledgement_takes_the_sent_position_over_one_s_took_from_before_the_commit() {
     let mut trees = trees(&[(

@@ -32,8 +32,6 @@ fn a_late_acknowledgement_after_a_restart_keeps_the_content_s_took_back_to_what_
     a_late_acknowledgement_keeps_the_content_s_took_back(true);
 }
 
-/// n's edit to 1 is in flight when the other device writes 0 again. S never took anything after
-/// the commit was built, so it takes the 1 that was sent, and the other device's 0 is downloaded.
 #[test]
 fn a_late_acknowledgement_takes_what_was_sent_when_the_other_device_reverts_it() {
     let mut trees = trees(&[(
