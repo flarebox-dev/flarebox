@@ -56,7 +56,10 @@ jobs:
         with:
           persist-credentials: false
       - name: Verify checksums, Gatekeeper assessment, and stapled tickets
-        run: nice -n 10 python3 scripts/test-release-journeys.py --tag "$RELEASE_TAG" --scenario verify --evidence "$RUNNER_TEMP/release-journeys/verify"
+        run: |
+          printf 'Clearing runner HOMEBREW_CASK_OPTS=%s\n' "${HOMEBREW_CASK_OPTS-<unset>}"
+          unset HOMEBREW_CASK_OPTS
+          nice -n 10 python3 scripts/test-release-journeys.py --tag "$RELEASE_TAG" --scenario verify --evidence "$RUNNER_TEMP/release-journeys/verify"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:
@@ -101,7 +104,10 @@ jobs:
       - name: Exercise the published release in a fresh macOS account
         env:
           SCENARIO: ${{ matrix.scenario }}
-        run: nice -n 10 python3 scripts/test-release-journeys.py --tag "$RELEASE_TAG" --scenario "$SCENARIO" --evidence "$RUNNER_TEMP/release-journeys/$SCENARIO"
+        run: |
+          printf 'Clearing runner HOMEBREW_CASK_OPTS=%s\n' "${HOMEBREW_CASK_OPTS-<unset>}"
+          unset HOMEBREW_CASK_OPTS
+          nice -n 10 python3 scripts/test-release-journeys.py --tag "$RELEASE_TAG" --scenario "$SCENARIO" --evidence "$RUNNER_TEMP/release-journeys/$SCENARIO"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:
