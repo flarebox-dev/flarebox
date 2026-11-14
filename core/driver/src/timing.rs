@@ -11,6 +11,8 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
+
 use koidrive_engine::effects::{Effect, EffectRecord, Location};
 use koidrive_engine::tree::{RemoteNode, same};
 use koidrive_proto::v1::{
@@ -83,7 +85,7 @@ impl Live {
 struct First {
     path: PathBuf,
     linked_ms: i64,
-    install: InstallId,
+    install: String,
     session: Option<u64>,
     opened: Time,
 }
@@ -132,7 +134,7 @@ impl Timing {
                 .write(true)
                 .mode(0o600)
                 .open(&path)?;
-            write!(file, "{linked_ms} {install}")?;
+            write!(file, "{linked_ms} {}", fingerprint(&install))?;
             file.sync_all()?;
             File::open(path.parent().unwrap())?.sync_all()
         })();
@@ -146,9 +148,7 @@ impl Timing {
         let path = store.with_file_name("first-sync");
         let install = fs::read_to_string(&path).ok().and_then(|value| {
             let (linked, install) = value.split_once(' ')?;
-            (linked.parse::<i64>().ok()? == linked_ms)
-                .then(|| InstallId::try_from(install.to_owned()).ok())
-                .flatten()
+            (linked.parse::<i64>().ok()? == linked_ms).then(|| install.trim().to_owned())
         });
         Self {
             recorder: Recorder::off(),
@@ -173,7 +173,7 @@ impl Timing {
         let Some(first) = &mut self.first else { return };
         let session = self.recorder.session();
         let unbroken = session.is_some()
-            && self.recorder.install_id().as_ref() == Some(&first.install)
+            && self.recorder.install_id().as_ref().map(fingerprint) == Some(first.install.clone())
             && first.session.is_none_or(|held| Some(held) == session);
         if unbroken {
             first.session = session;
@@ -474,6 +474,13 @@ impl Timing {
     }
 }
 
+fn fingerprint(install: &InstallId) -> String {
+    Sha256::digest(install.as_str().as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 impl Drop for Timing {
     fn drop(&mut self) {
         if self.is_on() {
@@ -592,6 +599,11 @@ mod tests {
         );
 
         Timing::initialize(&store, at.unix_ms, &on);
+        let marker = fs::read_to_string(store.with_file_name("first-sync")).unwrap();
+        assert!(
+            !marker.contains(on.install_id().unwrap().as_str()),
+            "{marker}"
+        );
         assert!(!first_sync(
             &mut Timing::open_at(&store, at.unix_ms, at),
             &on

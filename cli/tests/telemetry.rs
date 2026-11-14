@@ -331,6 +331,13 @@ fn every_daemon_start_sends_the_reports_of_past_days() {
             .spawn()
             .expect("run koi");
         let body = bodies.recv_timeout(Duration::from_secs(30));
+        let queue = home.path().join("state/koidrive/telemetry/queue.json");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::fs::read_to_string(&queue).is_ok_and(|queue| queue.contains("\"out\""))
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         Command::new("kill")
             .args(["-TERM", &daemon.id().to_string()])
             .status()
