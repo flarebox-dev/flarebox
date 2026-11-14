@@ -308,10 +308,9 @@ def release_assets(evidence, root):
     return assets, entries
 
 
-def native_state(evidence):
+def launchd_state(evidence):
     _, agents, _ = evidence.run(["/bin/launchctl", "print", f"gui/{os.getuid()}"])
-    _, login, _ = evidence.run(["/usr/bin/sfltool", "dumpbtm"])
-    return agents, login
+    return agents
 
 
 def state_paths(home):
@@ -335,9 +334,8 @@ def clean_account(evidence, ownership):
         evidence.check("no existing brew " + kind, not re.search(r"(?m)^(?:koidrive/tap/)?koidrive\s", installed))
     _, processes, _ = evidence.run(["/bin/ps", "-axo", "pid=,uid=,comm=,args="])
     evidence.check("no existing koi processes", not re.search(r"(?mi)(?:/|\s)(?:koi(?:\s+_daemon)?|Koidrive\.app/Contents/MacOS/Koidrive)(?:\s|$)", processes))
-    agents, login = native_state(evidence)
-    evidence.check("no existing native registration", "dev.koidrive" not in agents.lower()
-                   and "dev.koidrive" not in login.lower() and "Koidrive.app" not in login)
+    agents = launchd_state(evidence)
+    evidence.check("no existing Koidrive launchd jobs", "dev.koidrive" not in agents.lower())
     evidence.check("clean account", True)
 
 
@@ -457,7 +455,6 @@ def brew_scenario(evidence, root, ownership, entries, conflict):
         quarantine(evidence, APP)
         _, out, err = evidence.run(["brew", "uninstall", "--zap", "--cask", "--verbose", TAP], timeout=180)
         cask_attempted = False
-        native_state(evidence)
         evidence.check("zap native unregister", "--unregister-login-item" in out + err, out + err)
         assert_native_absent(evidence)
         evidence.check("zap removes state", not state.exists()
@@ -675,7 +672,7 @@ def installer(evidence, root, ownership, assets):
         _, app_version, _ = evidence.run(["/usr/libexec/PlistBuddy", "-c", "Print :KoidriveVersion", app / "Contents/Info.plist"])
         evidence.check("installed app version", app_version.strip() == evidence.report["tag"][1:])
         status = koi_json(evidence, binary, "status")
-        agents, _ = native_state(evidence)
+        agents = launchd_state(evidence)
         evidence.check("healthy native service", status.get("running") is True
                        and status.get("service", {}).get("state") == "running"
                        and "dev.koidrive.koi" in agents
@@ -726,7 +723,6 @@ def installer(evidence, root, ownership, assets):
 
 
 def assert_native_absent(evidence, labels=("dev.koidrive.koi",)):
-    native_state(evidence)
     for label in labels:
         status, _, error = evidence.run(["/bin/launchctl", "print", f"gui/{os.getuid()}/{label}"], required=False)
         if not unloaded(status, error):

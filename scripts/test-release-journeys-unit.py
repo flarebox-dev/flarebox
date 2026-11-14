@@ -286,6 +286,24 @@ class ReleaseJourneys(unittest.TestCase):
         self.assertNotIn("ABCD12345678", persisted)
         self.assertIn("[REDACTED]", persisted)
 
+    def test_native_cleanup_probes_only_owned_labels_and_rejects_unknown_or_loaded_state(self):
+        evidence = self.evidence("installer")
+        label = "dev.koidrive.koi.abcdef12"
+        expected = ["/bin/launchctl", "print", f"gui/{os.getuid()}/{label}"]
+        with patch.object(evidence, "run", return_value=(113, "", "Could not find service")) as run:
+            DRIVER.assert_native_absent(evidence, [label])
+        run.assert_called_once_with(expected, required=False)
+        for status, output, error in ((0, "state = running", ""), (124, "", ""), (1, "", "permission denied")):
+            with self.subTest(status=status, error=error), patch.object(evidence, "run", return_value=(status, output, error)):
+                with self.assertRaisesRegex(RuntimeError, "Could not prove owned service unloaded"):
+                    DRIVER.assert_native_absent(evidence, [label])
+
+    def test_clean_account_snapshot_queries_launchd_without_a_global_btm_probe(self):
+        evidence = self.evidence("cask")
+        with patch.object(evidence, "run", return_value=(0, "GUI domain", "")) as run:
+            self.assertEqual(DRIVER.launchd_state(evidence), "GUI domain")
+        run.assert_called_once_with(["/bin/launchctl", "print", f"gui/{os.getuid()}"])
+
     def test_cask_requires_quarantine_on_the_bundle_not_only_a_nested_file(self):
         evidence = self.evidence("cask")
         app = self.root / "Koidrive.app"

@@ -2,7 +2,7 @@
 
 Run **Release journeys** in GitHub Actions and enter the published tag, such as `v0.1.0-alpha.3`. The tag must match the release offered by `koidrive/tap`.
 
-Each runtime case gets a separate GitHub-hosted macOS 26 runner. The check refuses local execution and existing Koidrive state. It uses released binaries, preserves quarantine, and does not use a test build or replace signing verification.
+Each runtime case gets a separate [GitHub-hosted macOS 26 runner](https://docs.github.com/en/actions/reference/runners/github-hosted-runners). The check refuses local execution and existing Koidrive state. It uses released binaries, preserves quarantine, and does not use a test build or replace signing verification.
 
 | Case | Required result |
 | --- | --- |
