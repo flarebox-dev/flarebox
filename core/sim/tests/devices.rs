@@ -6233,3 +6233,26 @@ fn a_removal_done_before_a_crash_stays_the_engines_when_the_user_renamed_its_fol
     ];
     converge(3, &phases).unwrap();
 }
+
+#[test]
+fn a_delete_after_a_restore_lost_its_edit_leaves_a_restored_write_its_user_never_had() {
+    use Step::*;
+    let phases = vec![
+        vec![(0, drawn(1, 0, 0, 2))],
+        vec![
+            (0, drawn(2, 0, 0, 0)),
+            (1, drawn(3, 0, 0, 3)),
+            (0, Work(0)),
+            (0, Work(0)),
+            (0, Work(0)),
+            (0, drawn(4, 0, 0, 0)),
+            (0, drawn(0, 0, 0, 0)),
+            (0, Work(0)),
+            (1, drawn(2, 0, 0, 0)),
+            (0, Backup),
+            (0, drawn(0, 0, 2953731051851081156, 0)),
+        ],
+        vec![(0, Restore), (1, drawn(4, 9116664042309670064, 0, 0))],
+    ];
+    converge(2, &phases).unwrap();
+}

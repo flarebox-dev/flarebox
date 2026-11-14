@@ -25,6 +25,9 @@ pub const SETTLE_GROUP_LIMIT: usize = 12;
 /// proven, and the file's content is kept beside R's as a conflict copy.
 pub const REPLACED_VERSIONS_KEPT: usize = 64;
 
+/// How many contents of one file [`TreesState::held_contents`] keeps.
+pub const HELD_CONTENTS_KEPT: usize = 64;
+
 /// How many of the earlier live records R held of one node [`TreesState::past_positions`] keeps.
 /// A restore that takes a node back further than that does not prove a move of this device lost,
 /// and R's position is taken as a remote move.
@@ -228,6 +231,7 @@ pub struct Trees {
     resends: TrackedSet<NodeId>,
     local_changes: TrackedSet<NodeId>,
     kept_originals: TrackedMap<NodeId, NodeId>,
+    held_contents: TrackedMap<NodeId, Vec<Vec<u8>>>,
     ignore: Matcher,
     /// Nodes whose local copy the user moved into an ignored folder that is no node. L keeps the
     /// entry each had before the move.
@@ -307,6 +311,7 @@ impl Trees {
             resends: TrackedSet::default(),
             local_changes: TrackedSet::default(),
             kept_originals: TrackedMap::default(),
+            held_contents: TrackedMap::default(),
             ignore: Matcher::new(LocalRules::default()),
             outside: TrackedSet::default(),
             lost: TrackedSet::default(),
@@ -780,6 +785,7 @@ impl Trees {
         self.displaced.remove(id);
         self.edited_here.remove(id);
         self.replaced_versions.remove(id);
+        self.held_contents.remove(id);
         self.resends.remove(id);
         self.moved_here.remove(id);
         self.past_positions.remove(id);
@@ -831,6 +837,27 @@ impl Trees {
         self.note_position(&id);
         self.record_edit_in_trash(&id);
         self.end_change_all_trees_hold(&id);
+        self.record_held_content(&id);
+    }
+
+    fn record_held_content(&mut self, id: &str) {
+        let local = self.l.live(id).and_then(|local| local.content.as_ref());
+        let Some(synced) = self.s.live(id).and_then(|synced| synced.content.as_ref()) else {
+            return;
+        };
+        if !local.is_some_and(|local| same_content(local, synced)) {
+            return;
+        }
+        let digest = synced.manifest_digest.clone();
+        let held = self
+            .held_contents
+            .get_or_insert_with(id.to_owned(), Vec::new);
+        if !held.contains(&digest) {
+            held.push(digest);
+        }
+        if held.len() > HELD_CONTENTS_KEPT {
+            held.remove(0);
+        }
     }
 
     /// Sets L as this device's user made it: from a scan of the disk, or as the copy that keeps a
@@ -1866,7 +1893,10 @@ impl Trees {
     /// from before the edit, so the edit beats it (R8): the server revives the file instead of this
     /// device moving the edit to the local trash. That also undoes a delete by a device that saw the
     /// edit before the loss, which the engine cannot tell apart: the revived file can be deleted
-    /// again, while an edit in the local trash would be missing from the server.
+    /// again, while an edit in the local trash would be missing from the server. A file L no longer
+    /// holds takes R's content only when S held those bytes while L did
+    /// ([`TreesState::held_contents`]), so a delete made after the edit removes only content this
+    /// device's user had. Otherwise S forgets the file and R's content is downloaded.
     ///
     /// A file S forgets that L and R hold may hold, or later get, an edit of this device to the
     /// bytes R now holds, such as the content the server went back to (GUN-438). So may a file of
@@ -2051,6 +2081,13 @@ impl Trees {
                 .filter(|remote| {
                     remote.content_rev <= held_through
                         || replaced.is_some_and(|versions| versions.contains(&remote.version_id))
+                })
+                .filter(|remote| {
+                    self.l.get(&id).is_some()
+                        || (remote.shape.content.as_ref()).is_some_and(|content| {
+                            (self.held_contents.get(&id))
+                                .is_some_and(|held| held.contains(&content.manifest_digest))
+                        })
                 })
                 .and_then(|remote| {
                     let s = waits_at.or(self.s.live(&id))?;
@@ -2835,6 +2872,7 @@ impl Trees {
                 self.s_names.remove(id, &old);
             }
         }
+        self.record_held_content(id);
     }
 
     /// The invariants of section 2.2 for all three trees.
@@ -2903,6 +2941,7 @@ impl Trees {
             resends: (*self.resends).clone(),
             local_changes: (*self.local_changes).clone(),
             kept_originals: (*self.kept_originals).clone(),
+            held_contents: (*self.held_contents).clone(),
         }
     }
 
@@ -2935,6 +2974,7 @@ impl Trees {
             resends,
             local_changes,
             kept_originals,
+            held_contents,
             ignore: _,
             outside,
             lost,
@@ -2974,6 +3014,7 @@ impl Trees {
             resends: resends.take_changes(),
             local_changes: local_changes.take_changes(),
             kept_originals: kept_originals.take_changes(),
+            held_contents: held_contents.take_changes(),
         }
     }
 
@@ -3084,6 +3125,7 @@ impl Trees {
             resends,
             local_changes,
             kept_originals,
+            held_contents,
         } = state;
         self.unsettled = dirty.clone();
         self.same.clear();
@@ -3110,6 +3152,7 @@ impl Trees {
         self.resends = resends.into();
         self.local_changes = local_changes.into();
         self.kept_originals = kept_originals.into();
+        self.held_contents = held_contents.into();
         self.rules_known = false;
         self.unknown_rules.clear();
         Ok(())
