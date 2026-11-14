@@ -18,7 +18,7 @@
 </p>
 
 > [!WARNING]
-> **Koidrive is in alpha.** Install the `koi` command as [Get started](#get-started) shows. The protocol and storage format may change before 0.1.0. Keep another copy of anything you sync.
+> **Koidrive is in alpha.** Install the `koi` command as [Get started](#get-started) shows, and the macOS app from the [latest release](https://github.com/koidrive/koidrive/releases/latest). The protocol and storage format may change before 0.1.0. Keep another copy of anything you sync.
 
 ## Why Koidrive
 
@@ -53,7 +53,7 @@ Dropbox does much more, and charges per person for it. Koidrive does the core of
 | **Both copies kept on a conflict** | Yes | Yes |
 | **Trash and version history** | 30 days | 30 days to 1 year |
 | **Share links** | Yes | Yes |
-| **macOS on Apple silicon** | Command line, and a menu bar app for macOS 26 or later that you build from source | Yes |
+| **macOS on Apple silicon** | Command line, and a menu bar app for macOS 26 or later | Yes |
 | **Linux** | Command line and daemon | Yes |
 
 ### Where Dropbox does more
@@ -118,7 +118,9 @@ The [user guide](docs/guide/README.md) covers conflicts, the trash, devices, lim
 
 ## The macOS app
 
-Koidrive for macOS is a menu bar app for macOS 26 or later on Apple silicon. It shows each folder's sync status, asks before a large delete reaches your other machines, links folders, adds devices and pauses sync. Build it from source as [apps/macos/README.md](apps/macos/README.md) describes.
+Koidrive for macOS is a menu bar app for macOS 26 or later on Apple silicon. It shows each folder's sync status, asks before a large delete reaches your other machines, links folders, adds devices and pauses sync.
+
+Download `Koidrive-<version>-arm64.dmg` from the [latest release](https://github.com/koidrive/koidrive/releases/latest), open it and drag Koidrive to Applications.
 
 The app runs the `koi` command it carries inside it, so the app and `koi` are one device. They share one profile and one background sync service, and a folder you link in either one shows up in both.
 
