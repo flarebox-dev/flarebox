@@ -29,7 +29,9 @@ REPO = Path(__file__).resolve().parents[1]
 RELEASE = "https://github.com/koidrive/koidrive/releases/download"
 HELD_COMMIT = "2ffddfa8472a87f858698681551cc663e4579f8d"
 HELD_SHA = "5811e418e8b896542327585e19c7f0626ee1d5b64f69ed1c88df2c5f1e1ac522"
-HELD_URL = f"https://raw.githubusercontent.com/koidrive/koidrive/{HELD_COMMIT}/install.sh"
+ORIGIN = "https://github.com/koidrive/koidrive.git"
+RAW_INSTALLER = "https://raw.githubusercontent.com/koidrive/koidrive/{}/install.sh"
+HELD_URL = RAW_INSTALLER.format(HELD_COMMIT)
 INSTALLER_SOURCES = {"held": HELD_URL, "live": "https://koidrive.com/install.sh"}
 APP = Path("/Applications/Koidrive.app")
 TAP = "koidrive/tap/koidrive"
@@ -665,12 +667,10 @@ def pipeline(script):
     return "curl -fsSL -- " + shlex.quote(Path(script).resolve().as_uri()) + " | sh"
 
 
-def attended(evidence, command, folder, timeout=360):
+def attended(evidence, command, timeout=360):
     import pty
 
-    expected = [(r"Which shared folder should sync here\?\r?\n  1\. Journey\r?\n  2\. Create a shared folder\r?\nChoose 1 to 2: ", "1\n"),
-                (re.escape("Press Enter to use this folder, or type another path: "), str(folder) + "\n"),
-                (re.escape(f"Create {folder}? [Y/n] "), "y\n")]
+    expected = [(r"Which shared folder should sync here\?\r?\n  1\. Journey\r?\n  2\. Create a shared folder\r?\nChoose 1 to 2: ", "1\n")]
     master, slave = pty.openpty()
     process = None
     transcript = ""
@@ -788,30 +788,57 @@ def stop_app(evidence, app):
         raise RuntimeError("Owned installed app did not terminate")
 
 
-def verified_installer(evidence, root, source="held", reference="accepted"):
+def resolved(evidence, ref):
+    _, listing, _ = evidence.run(["git", "ls-remote", "--exit-code", ORIGIN, ref, ref + "^{}"])
+    refs = {}
+    for line in listing.splitlines():
+        fields = line.split()
+        if (len(fields) != 2 or not re.fullmatch(r"[0-9a-f]{40}", fields[0])
+                or fields[1] not in (ref, ref + "^{}") or fields[1] in refs):
+            raise RuntimeError("Malformed ref resolution for " + ref)
+        refs[fields[1]] = fields[0]
+    return refs.get(ref + "^{}", refs.get(ref)) if ref in refs else None
+
+
+def verified_installer(evidence, root, source="held", reference="accepted", wait=600):
     url = INSTALLER_SOURCES[source]
-    expected = HELD_SHA
-    commit = HELD_COMMIT
-    if reference == "release":
-        evidence.check("live release installer", source == "live")
-        tag_ref = "refs/tags/" + evidence.report["tag"]
-        _, head, _ = evidence.run(["git", "rev-parse", "HEAD"])
-        _, listing, _ = evidence.run(["git", "ls-remote", "--exit-code", "https://github.com/koidrive/koidrive.git", tag_ref, tag_ref + "^{}"])
-        refs = {}
-        for line in listing.splitlines():
-            fields = line.split()
-            if (len(fields) != 2 or not re.fullmatch(r"[0-9a-f]{40}", fields[0])
-                    or fields[1] not in (tag_ref, tag_ref + "^{}") or fields[1] in refs):
-                raise RuntimeError("Malformed release-ref resolution")
-            refs[fields[1]] = fields[0]
-        commit = refs.get(tag_ref + "^{}", refs.get(tag_ref))
-        evidence.check("release ref checked out", tag_ref in refs and bool(commit) and head.strip() == commit)
-        expected = sha256(REPO / "install.sh")
     script = root / "install.sh"
-    download(evidence, url, script)
-    evidence.report["inputs"]["held-installer"] = {"source": source, "reference": reference, "url": url, "commit": commit,
-                                                 "sha256": sha256(script), "expected_sha256": expected, "transport": "https"}
-    evidence.check("held script verified", evidence.report["inputs"]["held-installer"]["sha256"] == expected)
+    if reference == "accepted":
+        download(evidence, url, script)
+        actual = sha256(script)
+        evidence.report["inputs"]["held-installer"] = {"source": source, "reference": reference, "url": url, "commit": HELD_COMMIT,
+                                                     "sha256": actual, "expected_sha256": HELD_SHA, "transport": "https"}
+        evidence.check("held script verified", actual == HELD_SHA, "downloaded SHA-256 " + actual)
+        return script
+    evidence.check("live release installer", source == "live")
+    _, head, _ = evidence.run(["git", "rev-parse", "HEAD"])
+    commit = resolved(evidence, "refs/tags/" + evidence.report["tag"])
+    evidence.check("release ref checked out", bool(commit) and head.strip() == commit)
+    accepted = {commit: sha256(REPO / "install.sh")}
+    main_digests = {}
+    deadline = time.monotonic() + wait
+    while True:
+        download(evidence, url, script)
+        actual = sha256(script)
+        accepted = {commit: accepted[commit]}
+        if actual != accepted[commit]:
+            main = resolved(evidence, "refs/heads/main")
+            if main and main not in main_digests:
+                copy = root / "install-main.sh"
+                download(evidence, RAW_INSTALLER.format(main), copy)
+                main_digests[main] = sha256(copy)
+            if main:
+                accepted[main] = main_digests[main]
+        matched = next((accepted_commit for accepted_commit, digest in accepted.items() if digest == actual), None)
+        if matched or time.monotonic() >= deadline:
+            break
+        time.sleep(15)
+    evidence.report["inputs"]["held-installer"] = {"source": source, "reference": reference, "url": url, "commit": matched or commit,
+                                                 "sha256": actual, "expected_sha256": accepted[matched or commit],
+                                                 "accepted": accepted, "transport": "https"}
+    evidence.check("held script verified", matched is not None,
+                   f"downloaded SHA-256 {actual} matches install.sh at none of " +
+                   ", ".join(f"{accepted_commit} ({digest})" for accepted_commit, digest in accepted.items()))
     return script
 
 
@@ -840,16 +867,16 @@ def installer(evidence, root, ownership, assets, source="held", reference="accep
                 "XDG_STATE_HOME": str(root / "peer/state"), "XDG_RUNTIME_DIR": str(root / "peer/runtime")}
     profiles = {str(home / ".local/state"), peer_env["XDG_STATE_HOME"]}
     owned_labels = {"dev.koidrive.koi"}
+    folder = ownership.claim(home / "Koidrive")
     try:
         url, claim = worker(evidence, root)
         koi_json(evidence, bootstrap / "koi", "server", "claim", url, claim, "--user", "Journey", "--name", "Journey")
         space = koi_json(evidence, bootstrap / "koi", "space", "create", "Journey")
         status = koi_json(evidence, bootstrap / "koi", "status")
         evidence.check("unlinked before setup", bool(space.get("space_id")) and not status.get("folders"))
-        folder = root / "Sync"
-        code, transcript, answers = attended(evidence, pipeline(script), folder)
-        evidence.check("attended setup", code == 0 and answers == 3
-                       and f"Done. Linked {folder} to Journey." in transcript,
+        code, transcript, answers = attended(evidence, pipeline(script))
+        evidence.check("attended setup", code == 0 and answers == 1
+                       and "~/Koidrive is linked to Journey." in transcript and "Setup complete." in transcript,
                        f"status={code}, answered={answers}")
         version(evidence, binary, "installed version")
         evidence.check("installed CLI matches released bytes", sha256(binary) == sha256(bootstrap / "koi"))
@@ -901,7 +928,7 @@ def installer(evidence, root, ownership, assets, source="held", reference="accep
         binaries = [binary, APP / "Contents/Helpers/koi", home / "Applications/Koidrive.app/Contents/Helpers/koi"]
         safe &= evidence.cleanup("owned native services", lambda: owned_labels.update(service_cleanup(evidence, profiles, binaries)))
         if safe:
-            for path in state_paths(home):
+            for path in [*state_paths(home), folder]:
                 evidence.cleanup("owned state " + str(path), lambda p=path: ownership.remove(p))
 
         def restore_profile():

@@ -162,6 +162,15 @@ class ReleaseJourneys(unittest.TestCase):
         self.assertIn("INSTALLER_SOURCE: ${{ inputs.installer_source || 'live' }}", journeys)
         self.assertIn('--installer-source "$INSTALLER_SOURCE"', journeys)
 
+    def release_downloads(self, live, mains=None):
+        live = iter(live)
+        mains = mains or {"c" * 40: b"main bytes"}
+
+        def write(_, url, path):
+            raw = re.fullmatch(r"https://raw\.githubusercontent\.com/koidrive/koidrive/([0-9a-f]{40})/install\.sh", url)
+            path.write_bytes(mains[raw[1]] if raw else next(live))
+        return write
+
     def test_release_installer_uses_live_bytes_matching_the_release_checkout(self):
         payload = b"release installer bytes\n"
         (self.root / "install.sh").write_bytes(payload)
@@ -172,8 +181,9 @@ class ReleaseJourneys(unittest.TestCase):
         for index, listing in enumerate((commit + "\t" + tag_ref + "\n",
                                         "b" * 40 + "\t" + tag_ref + "\n" + commit + "\t" + tag_ref + "^{}\n")):
             evidence = DRIVER.Evidence(self.root / str(index), "v0.1.0-alpha.3", "installer")
-            with patch.object(DRIVER, "REPO", self.root), patch.object(evidence, "run", side_effect=[(0, commit + "\n", ""), (0, listing, "")]) as run, \
-                    patch.object(DRIVER, "download", side_effect=lambda _, url, path: path.write_bytes(payload)) as download:
+            with patch.object(DRIVER, "REPO", self.root), \
+                    patch.object(evidence, "run", side_effect=[(0, commit + "\n", ""), (0, listing, "")]) as run, \
+                    patch.object(DRIVER, "download", side_effect=self.release_downloads([payload])) as download:
                 DRIVER.verified_installer(evidence, work, "live", "release")
             download.assert_called_once_with(evidence, "https://koidrive.com/install.sh", work / "install.sh")
             self.assertEqual(run.call_args_list, [unittest.mock.call(["git", "rev-parse", "HEAD"]),
@@ -183,6 +193,62 @@ class ReleaseJourneys(unittest.TestCase):
             self.assertEqual(record["commit"], commit)
             self.assertEqual(record["expected_sha256"], DRIVER.hashlib.sha256(payload).hexdigest())
             self.assertNotEqual(record["expected_sha256"], DRIVER.HELD_SHA)
+
+    def test_release_installer_accepts_live_bytes_that_main_deployed_after_the_tag(self):
+        (self.root / "install.sh").write_bytes(b"bytes at the tag")
+        work = self.root / "download"
+        work.mkdir()
+        commit, main = "a" * 40, "c" * 40
+        evidence = self.evidence()
+        with patch.object(DRIVER, "REPO", self.root), \
+                patch.object(evidence, "run", side_effect=[(0, commit, ""), (0, commit + "\trefs/tags/v0.1.0-alpha.3\n", ""),
+                                                           (0, main + "\trefs/heads/main\n", "")]), \
+                patch.object(DRIVER, "download", side_effect=self.release_downloads([b"bytes on main"], {main: b"bytes on main"})) as download, \
+                patch.object(DRIVER.time, "sleep") as sleep:
+            DRIVER.verified_installer(evidence, work, "live", "release")
+        sleep.assert_not_called()
+        self.assertEqual(download.call_args_list, [
+            unittest.mock.call(evidence, "https://koidrive.com/install.sh", work / "install.sh"),
+            unittest.mock.call(evidence, "https://raw.githubusercontent.com/koidrive/koidrive/" + main + "/install.sh", work / "install-main.sh")])
+        record = evidence.report["inputs"]["held-installer"]
+        self.assertEqual(record["commit"], main)
+        self.assertEqual(record["expected_sha256"], DRIVER.hashlib.sha256(b"bytes on main").hexdigest())
+        self.assertEqual(set(record["accepted"]), {commit, main})
+
+    def test_release_installer_waits_for_a_deploy_of_main_in_progress(self):
+        (self.root / "install.sh").write_bytes(b"bytes at the tag")
+        work = self.root / "download"
+        work.mkdir()
+        commit, main = "a" * 40, "c" * 40
+        evidence = self.evidence()
+        main_listing = (0, main + "\trefs/heads/main\n", "")
+        with patch.object(DRIVER, "REPO", self.root), \
+                patch.object(evidence, "run", side_effect=[(0, commit, ""), (0, commit + "\trefs/tags/v0.1.0-alpha.3\n", ""), main_listing, main_listing]), \
+                patch.object(DRIVER, "download", side_effect=self.release_downloads([b"previous deploy", b"bytes on main"], {main: b"bytes on main"})) as download, \
+                patch.object(DRIVER.time, "sleep") as sleep:
+            DRIVER.verified_installer(evidence, work, "live", "release")
+        sleep.assert_called_once_with(15)
+        self.assertEqual(download.call_count, 3)
+        self.assertEqual(evidence.report["inputs"]["held-installer"]["commit"], main)
+
+    def test_release_installer_accepts_only_the_current_head_of_main(self):
+        (self.root / "install.sh").write_bytes(b"bytes at the tag")
+        work = self.root / "download"
+        work.mkdir()
+        commit, earlier, later = "a" * 40, "c" * 40, "d" * 40
+        evidence = self.evidence()
+        listing = lambda main: (0, main + "\trefs/heads/main\n", "")
+        with patch.object(DRIVER, "REPO", self.root), \
+                patch.object(evidence, "run", side_effect=[(0, commit, ""), (0, commit + "\trefs/tags/v0.1.0-alpha.3\n", ""),
+                                                           listing(earlier), listing(later), listing(later)]), \
+                patch.object(DRIVER, "download", side_effect=self.release_downloads(
+                    [b"older deploy", b"earlier main", b"later main"], {earlier: b"earlier main", later: b"later main"})), \
+                patch.object(DRIVER.time, "sleep") as sleep:
+            DRIVER.verified_installer(evidence, work, "live", "release")
+        self.assertEqual(sleep.call_count, 2)
+        record = evidence.report["inputs"]["held-installer"]
+        self.assertEqual(record["commit"], later)
+        self.assertEqual(set(record["accepted"]), {commit, later})
 
     def test_release_installer_rejects_unbound_or_malformed_release_refs(self):
         commit = "a" * 40
@@ -212,13 +278,16 @@ class ReleaseJourneys(unittest.TestCase):
         (self.root / "install.sh").write_bytes(b"release bytes")
         work = self.root / "download"
         work.mkdir()
-        commit = "a" * 40
+        commit, main = "a" * 40, "c" * 40
         evidence = self.evidence()
         with patch.object(DRIVER, "REPO", self.root), \
-                patch.object(evidence, "run", side_effect=[(0, commit, ""), (0, commit + "\trefs/tags/v0.1.0-alpha.3\n", "")]), \
-                patch.object(DRIVER, "download", side_effect=lambda _, url, path: path.write_bytes(b"different live bytes")):
-            with self.assertRaisesRegex(RuntimeError, "held script verified"):
-                DRIVER.verified_installer(evidence, work, "live", "release")
+                patch.object(evidence, "run", side_effect=[(0, commit, ""), (0, commit + "\trefs/tags/v0.1.0-alpha.3\n", ""),
+                                                           (0, main + "\trefs/heads/main\n", "")]), \
+                patch.object(DRIVER, "download", side_effect=self.release_downloads([b"different live bytes"])), \
+                patch.object(DRIVER.time, "sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "held script verified: downloaded SHA-256 [0-9a-f]{64} matches install.sh at none of " + commit + " .*, " + main):
+                DRIVER.verified_installer(evidence, work, "live", "release", wait=0)
+        sleep.assert_not_called()
         self.assertFalse(evidence.report["assertions"][-1]["passed"])
 
     def test_installer_reference_rejects_arbitrary_inputs(self):
@@ -662,7 +731,6 @@ class ReleaseJourneys(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "Controlling PTYs require POSIX")
     def test_pty_keeps_installer_stdin_a_pipe_and_answers_real_tty(self):
         evidence = self.evidence("installer")
-        folder = self.root / "Sync"
         probe = self.root / "harmless-probe.sh"
         python = "\n".join([
             "import os,stat,sys",
@@ -675,25 +743,22 @@ class ReleaseJourneys(unittest.TestCase):
             "assert os.tcgetpgrp(tty.fileno())==os.getpgrp()",
             "print('Which shared folder should sync here?\\n  1. Journey\\n  2. Create a shared folder\\nChoose 1 to 2: ',end='',flush=True)",
             "assert tty.readline().strip()=='1'",
-            "print('Press Enter to use this folder, or type another path: ',end='',flush=True)",
-            "assert tty.readline().strip()==" + repr(str(folder)),
-            "print(" + repr(f"Create {folder}? [Y/n] ") + ",end='',flush=True)",
-            "assert tty.readline().strip()=='y'",
-            "print(" + repr(f"Done. Linked {folder} to Journey.") + ")",
+            "print('~/Koidrive is linked to Journey.')",
+            "print('Setup complete. Add files to ~/Koidrive.')",
         ])
         probe.write_text("exec " + shlex.quote(sys.executable) + " -c " + shlex.quote(python) + "\n")
-        code, transcript, answers = DRIVER.attended(evidence, DRIVER.pipeline(probe), folder, timeout=10)
+        code, transcript, answers = DRIVER.attended(evidence, DRIVER.pipeline(probe), timeout=10)
         self.assertEqual(code, 0, transcript)
-        self.assertEqual(answers, 3)
-        self.assertIn(f"Done. Linked {folder} to Journey.", transcript)
+        self.assertEqual(answers, 1)
+        self.assertIn("~/Koidrive is linked to Journey.", transcript)
 
     @unittest.skipUnless(os.name == "posix", "Controlling PTYs require POSIX")
     def test_pty_without_prompts_does_not_synthesize_completion(self):
         evidence = self.evidence("installer")
-        code, transcript, answers = DRIVER.attended(evidence, "printf 'no setup happened\\n'", self.root / "Sync", timeout=5)
+        code, transcript, answers = DRIVER.attended(evidence, "printf 'no setup happened\\n'", timeout=5)
         self.assertEqual(code, 0)
         self.assertEqual(answers, 0)
-        self.assertNotIn("Done. Linked", transcript)
+        self.assertNotIn("is linked to", transcript)
 
     def test_pipeline_quotes_file_url_without_options_or_setup_bypass(self):
         command = DRIVER.pipeline(self.root / "a 'b; c.sh")
