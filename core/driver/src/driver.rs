@@ -594,7 +594,7 @@ impl Driver {
             .unwrap()
             .as_ref()
             .map(Credential::account);
-        let folders = self
+        let folders: Vec<FolderStatus> = self
             .inner
             .folders
             .lock()
@@ -623,8 +623,10 @@ impl Driver {
             paused: self.inner.paused.load(Ordering::SeqCst),
             version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             update: self.inner.updates.notice(),
+            progress: (folders.iter().any(|folder| folder.progress.is_some()))
+                .then(|| self.inner.totals.lock().unwrap().totals())
+                .flatten(),
             folders,
-            progress: self.inner.totals.lock().unwrap().totals(),
         }
     }
 
@@ -929,7 +931,9 @@ impl Driver {
                     error: error.to_string(),
                 }),
             }
-            self.inner.folders.lock().unwrap().remove(&link.space_id);
+            if let Some(folder) = self.inner.folders.lock().unwrap().remove(&link.space_id) {
+                folder.progress.lock().unwrap().clear();
+            }
         }
         if failed.is_empty()
             && let Err(error) = leaving.finish()
@@ -5849,6 +5853,82 @@ mod tests {
         stop.await.unwrap();
         sign_out.await.unwrap().unwrap();
         signed_out(&driver, &paths, &root);
+    }
+
+    fn uploading(driver: &Driver, size: u64) -> Arc<crate::lifecycle::Lifecycle> {
+        let folders = driver.inner.folders.lock().unwrap();
+        let folder = folders.values().next().unwrap();
+        let item = crate::progress::Item {
+            direction: crate::progress::Direction::Upload,
+            node: "a".into(),
+            digest: b"a".to_vec(),
+        };
+        (folder.progress.lock().unwrap()).track(BTreeMap::from([(item, size)]), |_| false);
+        folder.status.clone()
+    }
+
+    #[tokio::test]
+    async fn a_paused_driver_reports_no_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Koidrive");
+        let paths = Paths::under(&base.join("profile"));
+        let (driver, gate) = paused_driver(&paths, &root).await;
+        let status = uploading(&driver, 100);
+        status.lock().unwrap().state = FolderState::CatchingUp;
+        assert_eq!(
+            driver.status().progress.map(|totals| totals.bytes_total),
+            Some(100)
+        );
+
+        let pause = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.pause().await }
+        });
+        gate.open();
+        assert!(pause.await.unwrap().unwrap());
+        let paused = driver.status();
+        assert_eq!(paused.folders[0].progress, None);
+        assert_eq!(paused.progress, None);
+    }
+
+    #[tokio::test]
+    async fn signing_out_takes_its_folders_out_of_the_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Koidrive");
+        let paths = Paths::under(&base.join("profile"));
+        let (driver, gate) = paused_driver(&paths, &root).await;
+        uploading(&driver, 100);
+        assert!(driver.inner.totals.lock().unwrap().totals().is_some());
+
+        let sign_out = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.sign_out(true).await }
+        });
+        gate.open();
+        sign_out.await.unwrap().unwrap();
+        signed_out(&driver, &paths, &root);
+        assert_eq!(driver.inner.totals.lock().unwrap().totals(), None);
+    }
+
+    #[tokio::test]
+    async fn unlinking_takes_the_folder_out_of_the_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let root = base.join("Koidrive");
+        let paths = Paths::under(&base.join("profile"));
+        let (driver, gate) = paused_driver(&paths, &root).await;
+        uploading(&driver, 100);
+
+        let unlink = tokio::spawn({
+            let driver = driver.clone();
+            let root = root.clone();
+            async move { driver.unlink(&root).await }
+        });
+        gate.open();
+        unlink.await.unwrap().unwrap();
+        assert_eq!(driver.inner.totals.lock().unwrap().totals(), None);
     }
 
     #[tokio::test]

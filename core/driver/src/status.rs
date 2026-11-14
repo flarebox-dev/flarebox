@@ -27,7 +27,7 @@ pub struct Status {
     #[serde(default)]
     pub update: Update,
     pub folders: Vec<FolderStatus>,
-    /// The folders' progress summed while any has a file left to sync.
+    /// The folders' progress summed while any folder syncs and has a file left to sync.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<Totals>,
 }

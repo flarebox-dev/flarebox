@@ -63,15 +63,16 @@ impl Sum {
         Some(totals)
     }
 
-    fn set(&mut self, space_id: &str, progress: Option<Progress>, moved: u64) {
+    fn set(&mut self, space_id: &str, progress: Option<Progress>, moved: u64) -> bool {
         self.moved += moved;
-        match progress {
+        let previous = match progress.clone() {
             Some(progress) => self.live.insert(space_id.to_owned(), progress),
             None => self.live.remove(space_id),
         };
         if self.live.is_empty() {
             self.moved = 0;
         }
+        moved != 0 || previous != progress
     }
 }
 
@@ -195,14 +196,11 @@ impl Tracker {
     fn publish(&self, moved: u64) {
         let Some(sink) = &self.sink else { return };
         let progress = self.progress();
-        let mut status = sink.status.lock().unwrap();
-        if status.progress == progress && moved == 0 {
-            return;
+        let changed = (sink.sum.lock().unwrap()).set(&sink.space_id, progress.clone(), moved);
+        sink.status.lock().unwrap().progress = progress;
+        if changed {
+            sink.progressed.send_replace(());
         }
-        status.progress = progress.clone();
-        drop(status);
-        (sink.sum.lock().unwrap()).set(&sink.space_id, progress, moved);
-        sink.progressed.send_replace(());
     }
 }
 
