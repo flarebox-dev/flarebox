@@ -1701,6 +1701,7 @@ fn a_stale_batch_does_not_undo_an_effect_and_the_rescan_reports_its_result() {
     let known = Known {
         kind: EntryKind::File,
         id: file_id(written.identity),
+        version: None,
     };
     let reset = Reset {
         scope: "report.txt".into(),
@@ -2299,7 +2300,16 @@ fn l_resets_to_the_kinds_and_identities_the_scan_saw() {
         scanned
             .iter()
             .filter(|(path, _)| path.starts_with(under))
-            .map(|(path, &Entry { kind, id, .. })| (path.clone(), Known { kind, id }))
+            .map(|(path, &Entry { kind, id, .. })| {
+                (
+                    path.clone(),
+                    Known {
+                        kind,
+                        id,
+                        version: None,
+                    },
+                )
+            })
             .collect()
     };
     let resets = running

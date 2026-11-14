@@ -76,6 +76,7 @@ const EFFECT_RETRY: Backoff = Backoff {
     initial: Duration::from_secs(1),
     max: Duration::from_secs(600),
 };
+const HALVES_RETRY_MAX_MS: u64 = 60_000;
 
 /// How long calls of one kind may fail in a row before the status shows them, unless the server asks for a wait at
 /// least this long.
@@ -133,6 +134,7 @@ pub(crate) struct Folder {
     retry_at: Option<Instant>,
     halves_at: Option<u64>,
     halves_asked: Option<Requests>,
+    halves_retry: u64,
     /// Tests stop the task after this many more store transactions, as a crash right after one would.
     #[cfg(test)]
     crash_after: Option<usize>,
@@ -329,6 +331,7 @@ impl Folder {
             retry_at: None,
             halves_at: None,
             halves_asked: None,
+            halves_retry: 0,
             #[cfg(test)]
             crash_after: None,
         })
@@ -485,6 +488,7 @@ impl Folder {
             && answered >= Some(asked)
         {
             self.halves_asked = None;
+            self.halves_retry = (self.halves_retry * 2).clamp(HALF_WAIT_MS, HALVES_RETRY_MAX_MS);
         }
         let mut work = Vec::new();
         self.wait_for_halves(&mut work);
@@ -503,6 +507,9 @@ impl Folder {
 
     fn wait_for_halves(&mut self, work: &mut Vec<Work>) {
         let due = self.engine.trees.halves_due();
+        if due.is_none() {
+            self.halves_retry = 0;
+        }
         if self.halves_asked.is_some() || due == self.halves_at {
             return;
         }
@@ -511,7 +518,7 @@ impl Folder {
             let now_ms = (SystemTime::now().duration_since(UNIX_EPOCH))
                 .map_or(0, |since| since.as_millis() as u64);
             work.push(Work::HalvesAfter(Duration::from_millis(
-                due.saturating_sub(now_ms).min(HALF_WAIT_MS),
+                (due.saturating_sub(now_ms).min(HALF_WAIT_MS)).max(self.halves_retry),
             )));
         }
     }

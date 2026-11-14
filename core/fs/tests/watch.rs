@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use koidrive_fs::{
     Change, Entry, EntryKind, Error, FileId, Known, NativeWatcher, Poll, Rescan, RescanWatcher,
-    Snapshot, Space, Watcher,
+    Snapshot, Space, Version, Watcher,
 };
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -776,7 +776,16 @@ fn tree_that_lost_a_file() -> (tempfile::TempDir, PathBuf, BTreeMap<PathBuf, Kno
         .entries
         .into_iter()
         .filter(|(path, _)| path.starts_with("d"))
-        .map(|(path, Entry { kind, id, .. })| (path, Known { kind, id }))
+        .map(|(path, Entry { kind, id, .. })| {
+            (
+                path,
+                Known {
+                    kind,
+                    id,
+                    version: None,
+                },
+            )
+        })
         .collect();
     fs::remove_file(root.join("d/gone")).unwrap();
     (dir, root, known)
@@ -838,6 +847,40 @@ fn rescan_watcher_reports_a_reset_entry_the_disk_lacks_as_removed() {
     )
     .unwrap();
     reset_entry_the_disk_lacks_is_removed(&mut watcher, &root, known, true);
+}
+
+#[test]
+fn a_reset_to_the_version_a_file_was_read_at_reports_the_file_only_once_it_changes() {
+    let dir = two_folders();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let mut snapshot = Snapshot::scan(&root).unwrap();
+    let known: BTreeMap<PathBuf, Known> = (snapshot.entries.iter())
+        .map(|(path, entry)| {
+            let version = (entry.kind == File).then_some(Version {
+                size: entry.size,
+                mtime_ns: entry.mtime_ns,
+                executable: entry.executable,
+            });
+            let known = Known {
+                kind: entry.kind,
+                id: entry.id,
+                version,
+            };
+            (path.clone(), known)
+        })
+        .collect();
+    snapshot.reset(Path::new(""), known.clone());
+    assert_eq!(
+        snapshot.rescan(&root, [PathBuf::new()]).unwrap().changes,
+        []
+    );
+
+    fs::write(root.join("d/x"), "changed").unwrap();
+    snapshot.reset(Path::new(""), known);
+    assert_eq!(
+        snapshot.rescan(&root, [PathBuf::new()]).unwrap().changes,
+        [modified("d/x")]
+    );
 }
 
 #[test]

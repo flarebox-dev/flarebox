@@ -193,6 +193,7 @@ fn a_reset_over_a_held_path_then_a_new_file_there_keeps_the_move() {
                 let known = Known {
                     kind: entry.kind,
                     id: entry.id,
+                    version: None,
                 };
                 (path.clone(), known)
             })
@@ -294,6 +295,7 @@ fn a_held_path_in_a_folder_the_scan_cannot_read_stays_unscanned() {
                 let known = Known {
                     kind: entry.kind,
                     id: entry.id,
+                    version: None,
                 };
                 (path.clone(), known)
             })
@@ -552,6 +554,7 @@ fn a_reset_to_entries_the_rules_leave_out_reports_nothing_for_them() {
                 Known {
                     kind: entry.kind,
                     id: entry.id,
+                    version: None,
                 },
             )
         })
@@ -563,6 +566,7 @@ fn a_reset_to_entries_the_rules_leave_out_reports_nothing_for_them() {
         Known {
             kind: File,
             id: moved,
+            version: None,
         },
     );
 
@@ -613,6 +617,7 @@ fn a_reset_after_a_move_into_an_ignored_folder_finds_it_again() {
             Known {
                 kind: Dir,
                 id: d.id,
+                version: None,
             },
         ),
         (
@@ -620,6 +625,7 @@ fn a_reset_after_a_move_into_an_ignored_folder_finds_it_again() {
             Known {
                 kind: File,
                 id: x.id,
+                version: None,
             },
         ),
     ]
@@ -762,6 +768,7 @@ fn a_reset_to_an_entry_the_rules_leave_out_that_is_gone_reports_it_removed() {
                 Known {
                     kind: entry.kind,
                     id: entry.id,
+                    version: None,
                 },
             )
         })
