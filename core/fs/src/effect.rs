@@ -4,15 +4,17 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use koidrive_ignore::PLATFORM_FILES;
-use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+use rustix::fs::{Access, AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::resolve::{Folder, Location, PARKED_DIR, Space, Unresolved, check_name};
-use crate::root::{Flush, Marker, flush, remove_if_present, rename_no_replace, write_marker_at};
+use crate::root::{
+    Flush, Marker, PRIVATE_DIR, flush, remove_if_present, rename_no_replace, write_marker_at,
+};
 use crate::trash::TRASH_DIR;
 use crate::{Entry, EntryKind, FileId, Stat, list, stat_at, stat_fd};
 
@@ -138,6 +140,20 @@ pub enum Reason {
     /// The folder a removal acts on holds entries other than platform files,
     /// named here in order. The folder went back as it was.
     Holds(Vec<OsString>),
+    /// The system did not allow the effect, as for a folder without write
+    /// permission, a locked file or a read-only volume. Nothing changed.
+    Denied,
+}
+
+/// Where the system would refuse a change that an action makes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// A folder the action changes cannot be written, or an entry it moves,
+    /// replaces or removes is locked.
+    Here,
+    /// Koidrive's own folder at this path, relative to the root, cannot be
+    /// written.
+    Private(PathBuf),
 }
 
 /// Effects whose steps become durable together (design §5.2), begun by
@@ -212,6 +228,60 @@ fn overtaken(placed: Outcome) -> Outcome {
     }
 }
 
+fn is_denied(outcome: &Outcome) -> bool {
+    matches!(
+        outcome,
+        Outcome::Failed {
+            reason: Reason::Denied,
+            ..
+        }
+    )
+}
+
+fn writable(folder: BorrowedFd) -> io::Result<bool> {
+    let access = Access::WRITE_OK | Access::EXEC_OK;
+    match rustix::fs::accessat(folder, c".", access, AtFlags::EACCESS) {
+        Ok(()) | Err(Errno::NOENT) => Ok(true),
+        Err(Errno::ACCESS | Errno::PERM | Errno::ROFS) => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn refused_at(unresolved: Unresolved) -> Option<PathBuf> {
+    match unresolved {
+        Unresolved::Io { path, err } if refused(&err) => Some(path),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn locked(folder: BorrowedFd, name: &OsStr) -> bool {
+    let delete = Access::from_bits_retain(1 << 12);
+    matches!(
+        rustix::fs::accessat(folder, name, delete, AtFlags::EACCESS),
+        Err(Errno::ACCESS | Errno::PERM)
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn locked(folder: BorrowedFd, name: &OsStr) -> bool {
+    rustix::fs::accessat(folder, name, Access::WRITE_OK, AtFlags::EACCESS) == Err(Errno::PERM)
+}
+
+fn refused(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+    )
+}
+
+fn denied(err: io::Error) -> io::Result<Outcome> {
+    match refused(&err) {
+        true => Ok(failed(Reason::Denied)),
+        false => Err(err),
+    }
+}
+
 fn unresolved(err: Unresolved) -> io::Result<Outcome> {
     match err {
         Unresolved::Missing(_) | Unresolved::NotAFolder(_) | Unresolved::Replaced { .. } => {
@@ -225,12 +295,62 @@ macro_rules! resolve {
     ($resolved:expr) => {
         match $resolved {
             Ok(resolved) => resolved,
+            Err(Unresolved::Io { err, .. }) if refused(&err) => return Ok(failed(Reason::Denied)),
             Err(err) => return unresolved(err),
         }
     };
 }
 
 impl Space {
+    /// Whether the system would refuse a change `action` makes, checked
+    /// without changing anything. A place that cannot be found is no refusal:
+    /// applying the action reports it.
+    pub fn refuses(&self, action: &Action) -> io::Result<Option<Refusal>> {
+        let private: &[&str] = match action {
+            Action::WriteFile { replaces: None, .. } => &[STAGING_DIR],
+            Action::WriteFile {
+                replaces: Some(_), ..
+            } => &[STAGING_DIR, QUARANTINE_DIR],
+            Action::RemoveFile { .. } | Action::RemoveDir { .. } => &[QUARANTINE_DIR],
+            Action::CreateDir { .. } | Action::Move { .. } => &[],
+        };
+        for dir in private {
+            let refused = match self.private_present(&[dir]) {
+                Ok(folder) => (!writable(folder.fd())?).then(|| Path::new(PRIVATE_DIR).join(dir)),
+                Err(Unresolved::Missing(_)) => match self.private_present(&[]) {
+                    Ok(folder) => (!writable(folder.fd())?).then(|| PathBuf::from(PRIVATE_DIR)),
+                    Err(unresolved) => refused_at(unresolved),
+                },
+                Err(unresolved) => refused_at(unresolved),
+            };
+            if let Some(path) = refused {
+                return Ok(Some(Refusal::Private(path)));
+            }
+        }
+        let changed: Vec<(&Location, bool)> = match action {
+            Action::CreateDir { at } => vec![(at, false)],
+            Action::WriteFile { at, replaces } => std::iter::once((at, false))
+                .chain(replaces.iter().map(|displaced| (&displaced.at, true)))
+                .collect(),
+            Action::Move { from, to, .. } => vec![(to, false), (from, true)],
+            Action::RemoveFile { displaced } => vec![(&displaced.at, true)],
+            Action::RemoveDir { at, .. } => vec![(at, true)],
+        };
+        for (at, displaced) in changed {
+            let (parent, name) = match self.parent_present(at) {
+                Ok(found) => found,
+                Err(unresolved) => match refused_at(unresolved) {
+                    Some(_) => return Ok(Some(Refusal::Here)),
+                    None => continue,
+                },
+            };
+            if !writable(parent.fd())? || (displaced && locked(parent.fd(), name)) {
+                return Ok(Some(Refusal::Here));
+            }
+        }
+        Ok(None)
+    }
+
     /// Creates the staged file for effect `id`, replacing a leftover one.
     pub fn stage(&self, id: &str) -> io::Result<File> {
         check_name(OsStr::new(id))?;
@@ -356,7 +476,7 @@ impl Space {
                 match rustix::fs::mkdirat(parent.fd(), name, Mode::from_raw_mode(0o755)) {
                     Ok(()) => self.flush_folder(&parent, Flush::Plain)?,
                     Err(Errno::EXIST) => return Ok(failed(Reason::Taken)),
-                    Err(err) => return Err(err.into()),
+                    Err(err) => return denied(err.into()),
                 }
                 let identity = stat_at(parent.fd(), name)?.id;
                 hook(Step::Placed);
@@ -387,10 +507,11 @@ impl Space {
             Action::Move { from, id, to } => {
                 let (source, name) = resolve!(self.parent(from));
                 let (target, new_name) = resolve!(self.parent(to));
-                match lookup(source.fd(), name)? {
-                    None => return Ok(failed(Reason::Missing)),
-                    Some(found) if found.id != *id => return Ok(failed(Reason::Changed)),
-                    Some(_) => {}
+                match lookup(source.fd(), name) {
+                    Err(err) => return denied(err),
+                    Ok(None) => return Ok(failed(Reason::Missing)),
+                    Ok(Some(found)) if found.id != *id => return Ok(failed(Reason::Changed)),
+                    Ok(Some(_)) => {}
                 }
                 hook(Step::Checked);
                 resolve!(self.recheck(&source));
@@ -403,7 +524,7 @@ impl Space {
                     Err(err) if err.kind() == io::ErrorKind::NotFound => {
                         return Ok(failed(Reason::Missing));
                     }
-                    Err(err) => return Err(err),
+                    Err(err) => return denied(err),
                 }
                 self.flush_folder(&source, Flush::Plain)?;
                 self.flush_folder(&target, Flush::Plain)?;
@@ -442,12 +563,13 @@ impl Space {
             None => None,
         };
         let quarantine = self.private(&[QUARANTINE_DIR])?;
-        match lookup(parent.fd(), name)? {
-            None => return Ok(failed(Reason::Missing)),
-            Some(found) if found.entry() != Some(displaced.entry) => {
+        match lookup(parent.fd(), name) {
+            Err(err) => return denied(err),
+            Ok(None) => return Ok(failed(Reason::Missing)),
+            Ok(Some(found)) if found.entry() != Some(displaced.entry) => {
                 return Ok(failed(Reason::Changed));
             }
-            Some(_) => {}
+            Ok(Some(_)) => {}
         }
         hook(Step::Checked);
 
@@ -459,7 +581,7 @@ impl Space {
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 return Ok(failed(Reason::Missing));
             }
-            Err(err) => return Err(err),
+            Err(err) => return denied(err),
         }
         self.flush_folder(&parent, Flush::Plain)?;
         self.flush_folder(&quarantine, Flush::Barrier)?;
@@ -474,7 +596,19 @@ impl Space {
         }
         let outcome = match target {
             Some((staging, (target, new_name))) => {
-                overtaken(self.place(&staging, &effect.id, &target, new_name, hook)?)
+                match self.place(&staging, &effect.id, &target, new_name, hook)? {
+                    placed if is_denied(&placed) => {
+                        return self.returned(
+                            &quarantine,
+                            effect,
+                            displaced,
+                            Reason::Denied,
+                            now,
+                            hook,
+                        );
+                    }
+                    placed => overtaken(placed),
+                }
             }
             None => Outcome::Done { identity: None },
         };
@@ -506,7 +640,7 @@ impl Space {
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
                 return Ok(failed(Reason::Taken));
             }
-            Err(err) => return Err(err),
+            Err(err) => return denied(err),
         }
         self.flush_folder(staging, Flush::Plain)?;
         self.flush_folder(target, Flush::Plain)?;
@@ -514,6 +648,22 @@ impl Space {
         Ok(Outcome::Done {
             identity: Some(identity),
         })
+    }
+
+    fn returned(
+        &self,
+        quarantine: &Folder,
+        effect: &Effect,
+        displaced: &Displaced,
+        reason: Reason,
+        now: SystemTime,
+        hook: &mut dyn FnMut(Step),
+    ) -> io::Result<Outcome> {
+        let id = OsStr::new(&effect.id);
+        let recovered = self.put_back(quarantine, id, &displaced.at, now)?;
+        hook(Step::Returned);
+        self.drop_staged(&effect.id)?;
+        Ok(Outcome::Failed { reason, recovered })
     }
 
     fn put_back(
@@ -590,16 +740,29 @@ impl Space {
             let differs = differs(quarantine.fd(), id, &displaced.entry, contents)?;
             hook(Step::Compared);
             if let Some(reason) = differs {
-                let recovered = self.put_back(&quarantine, id, &displaced.at, now)?;
-                hook(Step::Returned);
-                self.drop_staged(&effect.id)?;
-                return Ok(Outcome::Failed { reason, recovered });
+                return self.returned(&quarantine, effect, &displaced, reason, now, hook);
             }
             let outcome = match place {
-                Some(at) if staged => overtaken(match self.parent(at) {
-                    Ok((target, name)) => self.place(&staging, &effect.id, &target, name, hook)?,
-                    Err(err) => unresolved(err)?,
-                }),
+                Some(at) if staged => {
+                    let placed = match self.parent(at) {
+                        Ok((target, name)) => {
+                            self.place(&staging, &effect.id, &target, name, hook)?
+                        }
+                        Err(Unresolved::Io { err, .. }) if refused(&err) => failed(Reason::Denied),
+                        Err(err) => unresolved(err)?,
+                    };
+                    if is_denied(&placed) {
+                        return self.returned(
+                            &quarantine,
+                            effect,
+                            &displaced,
+                            Reason::Denied,
+                            now,
+                            hook,
+                        );
+                    }
+                    overtaken(placed)
+                }
                 Some(at) => match self.written_at(at, contents)? {
                     Some(identity) => Outcome::Done {
                         identity: Some(identity),
