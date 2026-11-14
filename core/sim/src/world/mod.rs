@@ -66,6 +66,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use koidrive_engine::classify::Trees;
 use koidrive_engine::commit::{self, Base, Reconnect};
 use koidrive_engine::effects::{BatchLimit, Effect, EffectRecord, location_of};
+use koidrive_engine::names::{nfc, same_name};
 use koidrive_engine::question::{Answer, QuestionKind, RecoveryCause, RecoveryTrigger};
 use koidrive_engine::tree::{Content, NodeId, RemoteNode, Shape, same, same_content};
 use koidrive_proto::v1::{
@@ -80,8 +81,12 @@ use self::disk::{Applied, Disk, Place, Refused};
 use crate::space::{Role, Session, SpaceDo};
 
 const NOW: i64 = 1_794_268_740_000;
-/// Names that collide by case and by case folding, so the server renames and merges often.
-pub const NAMES: &[&str] = &["a", "A", "b", "c.txt", "C.TXT", "ß", "ss"];
+/// Names that collide by case, by case folding and by normalization, so the server renames and
+/// merges often. "\u{c9}" and "E\u{301}" are one name spelled in NFC and in NFD, and "\u{e9}"
+/// collides with both by case.
+pub const NAMES: &[&str] = &[
+    "a", "A", "b", "c.txt", "C.TXT", "ß", "ss", "\u{c9}", "E\u{301}", "\u{e9}",
+];
 /// The contents a device writes. The pool is small, so separate files with the same bytes are
 /// common on one device.
 pub const TEXTS: u8 = 4;
@@ -1372,6 +1377,18 @@ impl World {
             reported.map_err(|error| {
                 Failure::Broken(format!("the effect's outcome was refused: {error:?}"))
             })?;
+            let placed =
+                (device.engine.trees.local().get(&record.node)).filter(|node| !node.parked);
+            if matches!(applied, Some(Ok(_)))
+                && let Some(node) = placed
+                && let Some(entry) = device.disk.entries().get(&node.identity.ino)
+                && entry.name != node.shape.name
+            {
+                return Err(Failure::Broken(format!(
+                    "an effect left node {} named {:?} in L while the disk names it {:?}",
+                    record.node, node.shape.name, entry.name
+                )));
+            }
         }
         device.persist()?;
         device.engine.scan(&device.disk);
@@ -1987,12 +2004,14 @@ impl World {
                             let unchanged = held.iter().any(|node| {
                                 node.node_id == moved.node_id
                                     && node.parent_id == moved.new_parent_id
-                                    && node.name == moved.new_name
+                                    && same_name(&node.name, &moved.new_name)
                             });
                             let restored = self.restored_names[d].get(&moved.node_id);
                             let asked = |name: &str| {
-                                self.named[d].contains(name)
-                                    || restored.is_some_and(|names| names.contains(name))
+                                self.named[d].iter().any(|named| same_name(named, name))
+                                    || restored.is_some_and(|names| {
+                                        names.iter().any(|restored| same_name(restored, name))
+                                    })
                             };
                             (!unchanged && !given(asked, &moved.new_name)).then_some(moved)
                         }
@@ -2708,11 +2727,15 @@ impl World {
             if !unsettled.is_empty() {
                 return fail(format!("nodes are not in sync: {unsettled:?}"));
             }
-            let disk: BTreeMap<Vec<String>, Option<Content>> = (device.disk.entries().iter())
-                .filter_map(|(ino, entry)| Some((device.disk.path(*ino)?, entry.content.clone())))
-                .collect();
-            if device.disk.entries().len() != disk.len() {
-                return fail("its parked directory is not empty".into());
+            let mut disk: BTreeMap<Vec<String>, Option<Content>> = BTreeMap::new();
+            for (ino, entry) in device.disk.entries() {
+                let Some(path) = device.disk.path(*ino) else {
+                    return fail("its parked directory is not empty".into());
+                };
+                let normal: Vec<String> = path.iter().map(|name| nfc(name)).collect();
+                if disk.insert(normal, entry.content.clone()).is_some() {
+                    return fail(format!("its disk has two entries named {path:?} in NFC"));
+                }
             }
             let paths: BTreeSet<&Vec<String>> = disk.keys().chain(server.keys()).collect();
             let equal = |here: Option<&Option<Content>>, there: Option<&Option<Content>>| match (
@@ -2756,7 +2779,9 @@ impl World {
         let named: BTreeSet<&str> = self.named.iter().flatten().copied().collect();
         let kept = (nodes.iter()).find(|(_, node)| {
             let name = node.shape.name.as_str();
-            !node.trashed && pending_stem(name).is_some() && !named.contains(name)
+            !node.trashed
+                && pending_stem(name).is_some()
+                && !named.iter().any(|named| same_name(named, name))
         });
         if let Some((id, node)) = kept {
             return Err(Failure::Diverged(format!(
