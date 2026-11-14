@@ -620,6 +620,39 @@ fn folders_named_in_nfc_and_nfd_on_two_devices_converge() {
     converge(2, &[vec![(0, folder("\u{c9}")), (1, folder("E\u{301}"))]]).unwrap();
 }
 
+#[test]
+fn a_file_named_in_nfd_and_changed_elsewhere_keeps_its_spelling() {
+    let mut overwritten = vec![(1, overwrite(0))];
+    overwritten.extend(std::iter::repeat_n((1, Step::Work(0)), 8));
+    overwritten.extend(std::iter::repeat_n((0, Step::Work(0)), 3));
+    let world = converge(2, &[vec![(0, file("E\u{301}"))], overwritten]).unwrap();
+    let names: Vec<&str> = (world.devices[0].disk.entries().values())
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert_eq!(names, ["E\u{301}"]);
+}
+
+#[test]
+fn a_file_changed_elsewhere_beside_a_folder_with_its_name_in_nfc_converges() {
+    let mut owing = vec![(0, folder("A")), (0, rename(0, 1, "a"))];
+    owing.extend(std::iter::repeat_n((0, Step::Work(0)), 5));
+    owing.extend(std::iter::repeat_n((1, Step::Work(0)), 8));
+    owing.extend([
+        (1, rename(1, 0, "b")),
+        (0, Step::Work(0)),
+        (
+            2,
+            user(3, 1322304017492565313, 10669873100036100452, "\u{c9}"),
+        ),
+        (1, user(2, 127064483901184320, 0, "a")),
+        (
+            0,
+            user(3, 15763447294144001574, 2286593307203906816, "E\u{301}"),
+        ),
+    ]);
+    converge(2, &[vec![(0, file("a"))], owing]).unwrap();
+}
+
 /// The bytes of the two files are the same, and both files stay (the planted digest
 /// deduplication of scripts/engine-mutations.sh removes one).
 #[test]

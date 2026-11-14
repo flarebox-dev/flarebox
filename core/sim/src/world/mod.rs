@@ -1377,6 +1377,18 @@ impl World {
             reported.map_err(|error| {
                 Failure::Broken(format!("the effect's outcome was refused: {error:?}"))
             })?;
+            let placed =
+                (device.engine.trees.local().get(&record.node)).filter(|node| !node.parked);
+            if matches!(applied, Some(Ok(_)))
+                && let Some(node) = placed
+                && let Some(entry) = device.disk.entries().get(&node.identity.ino)
+                && entry.name != node.shape.name
+            {
+                return Err(Failure::Broken(format!(
+                    "an effect left node {} named {:?} in L while the disk names it {:?}",
+                    record.node, node.shape.name, entry.name
+                )));
+            }
         }
         device.persist()?;
         device.engine.scan(&device.disk);
