@@ -3784,7 +3784,7 @@ mod tests {
         let driver = Driver::open(paths).unwrap();
         let wait = crate::status::Wait {
             kind: crate::status::WaitKind::Retry,
-            until_ms: i64::MAX,
+            until_ms: Some(i64::MAX),
             unreachable: None,
         };
         for folder in driver.inner.folders.lock().unwrap().values() {
