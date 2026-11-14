@@ -604,6 +604,24 @@ fn two_devices_take_each_others_files() {
     assert_eq!(world.devices[1].disk.entries().len(), 2);
 }
 
+/// The disk keeps the NFD spelling the user gave and the server holds the name in NFC (design 5.5).
+#[test]
+fn a_folder_named_in_nfd_keeps_its_spelling_on_disk() {
+    let world = converge(2, &[vec![(0, folder("E\u{301}"))]]).unwrap();
+    let names = |d: usize| -> Vec<String> {
+        let entries = world.devices[d].disk.entries();
+        entries.values().map(|entry| entry.name.clone()).collect()
+    };
+    assert_eq!(names(0), ["E\u{301}"]);
+    assert_eq!(names(1), ["\u{c9}"]);
+}
+
+/// The two folders are one name, spelled in NFC on one device and in NFD on the other.
+#[test]
+fn folders_named_in_nfc_and_nfd_on_two_devices_converge() {
+    converge(2, &[vec![(0, folder("\u{c9}")), (1, folder("E\u{301}"))]]).unwrap();
+}
+
 /// The bytes of the two files are the same, and both files stay (the planted digest
 /// deduplication of scripts/engine-mutations.sh removes one).
 #[test]
