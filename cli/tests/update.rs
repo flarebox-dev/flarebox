@@ -1083,7 +1083,7 @@ fn scripted_brew(prefix: &Path, git_status: i32, upgrade: &str) -> PathBuf {
     executable(
         &prefix.join("bin/git"),
         &format!(
-            "#!/bin/sh\nprintf '%s|%s\\n' \"$*\" \"$GIT_TERMINAL_PROMPT\" >> \"$0.calls\"\n[ {git_status} -ne 0 ] && echo 'fatal: unable to access https://github.com/koidrive/homebrew-tap/: Could not resolve host: github.com' >&2\nexit {git_status}\n"
+            "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$*\" \"$GIT_TERMINAL_PROMPT\" \"$GIT_DIR\" >> \"$0.calls\"\n[ {git_status} -ne 0 ] && echo 'fatal: unable to access https://github.com/koidrive/homebrew-tap/: Could not resolve host: github.com' >&2\nexit {git_status}\n"
         ),
     );
     executable(
@@ -1096,9 +1096,9 @@ fn scripted_brew(prefix: &Path, git_status: i32, upgrade: &str) -> PathBuf {
     prefix.join("bin/brew.calls")
 }
 
-fn replacing(koi: &Path, version: &str) -> String {
+fn replacing(koi: &Path, version: &str, report: &str) -> String {
     let script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\ncase \"$1\" in\n--version) echo 'koi {version}' ;;\n_reconcile) echo '{REPORT}' ;;\nesac\n"
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\ncase \"$1\" in\n--version) echo 'koi {version}' ;;\n_reconcile) echo '{report}' ;;\nesac\n"
     )
     .replace('\'', "'\\''");
     format!(
@@ -1121,7 +1121,7 @@ fn koi_update_through_homebrew_is_incomplete_when_the_tap_lags_or_cannot_refresh
                 git_status,
                 &format!(
                     "{}\n  echo 'Warning: koidrive/tap/koidrive {} already installed' >&2\n  exit 0",
-                    replacing(&koi, env!("CARGO_PKG_VERSION")),
+                    replacing(&koi, env!("CARGO_PKG_VERSION"), REPORT),
                     env!("CARGO_PKG_VERSION")
                 ),
             );
@@ -1133,6 +1133,7 @@ fn koi_update_through_homebrew_is_incomplete_when_the_tap_lags_or_cannot_refresh
             let output = koi_at(&link, home.path(), &github, args)
                 .env("PATH", home.path().join("empty"))
                 .env("HOMEBREW_ASK", "1")
+                .env("GIT_DIR", home.path().join("another-repository"))
                 .output()
                 .unwrap();
             if development_version() {
@@ -1173,10 +1174,81 @@ fn koi_update_through_homebrew_is_incomplete_when_the_tap_lags_or_cannot_refresh
             );
             assert_eq!(
                 std::fs::read_to_string(prefix.join("bin/git.calls")).unwrap(),
-                format!("-C {} pull --ff-only --quiet|0\n", tap.display())
+                format!("-C {} pull --ff-only --quiet|0|\n", tap.display())
             );
         }
     }
+}
+
+#[test]
+fn koi_update_through_homebrew_is_incomplete_when_the_tap_lags_and_the_service_stopped() {
+    let home = tempfile::tempdir().unwrap();
+    let github = github("v99.0.0");
+    let link = homebrew_binary(home.path(), false);
+    let koi = std::fs::canonicalize(&link).unwrap();
+    let prefix = std::fs::canonicalize(home.path().join("brew")).unwrap();
+    scripted_brew(
+        &prefix,
+        0,
+        &format!(
+            "{}\n  exit 0",
+            replacing(
+                &koi,
+                env!("CARGO_PKG_VERSION"),
+                &REPORT.replace("running", "stopped")
+            )
+        ),
+    );
+    let output = koi_at(&link, home.path(), &github, &["update", "--json"])
+        .env("PATH", home.path().join("empty"))
+        .output()
+        .unwrap();
+    if development_update(&output, home.path(), &github) {
+        return;
+    }
+    let envelope = envelope(&output);
+    assert!(!output.status.success(), "{envelope:#}");
+    assert_eq!(
+        envelope["error"]["message"],
+        format!(
+            "Koidrive update is incomplete: the newest release is 99.0.0, and Homebrew has {}. The koidrive/tap tap does not have Koidrive 99.0.0 yet. To update, run: {} upgrade koidrive",
+            env!("CARGO_PKG_VERSION"),
+            prefix.join("bin/brew").display()
+        )
+    );
+    assert_eq!(envelope["data"]["service"]["state"], "stopped");
+    assert!(!output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("is the newest release"));
+}
+
+#[test]
+fn koi_update_names_the_brew_failure_when_brew_removed_koi_before_it_failed() {
+    let home = tempfile::tempdir().unwrap();
+    let github = github("v99.0.0");
+    let link = homebrew_binary(home.path(), false);
+    let koi = std::fs::canonicalize(&link).unwrap();
+    let prefix = std::fs::canonicalize(home.path().join("brew")).unwrap();
+    scripted_brew(
+        &prefix,
+        0,
+        &format!("  /bin/rm '{}'\n  exit 1", koi.display()),
+    );
+    let output = koi_at(&link, home.path(), &github, &["update", "--json"])
+        .env("PATH", home.path().join("empty"))
+        .output()
+        .unwrap();
+    if development_update(&output, home.path(), &github) {
+        return;
+    }
+    let envelope = envelope(&output);
+    assert!(!output.status.success(), "{envelope:#}");
+    assert_eq!(
+        envelope["error"]["message"],
+        format!(
+            "brew upgrade failed (exit status 1). To update, run: {} upgrade koidrive",
+            prefix.join("bin/brew").display()
+        )
+    );
 }
 
 #[test]
@@ -1191,7 +1263,7 @@ fn koi_update_hands_the_service_to_a_koi_brew_upgraded_before_it_failed() {
         0,
         &format!(
             "{}\n  echo 'Error: The brew link step did not complete successfully' >&2\n  exit 1",
-            replacing(&koi, "99.0.0")
+            replacing(&koi, "99.0.0", REPORT)
         ),
     );
     let output = koi_at(&link, home.path(), &github, &["update", "--json"])

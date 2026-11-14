@@ -882,7 +882,7 @@ async fn homebrew(
         }
     }
     if let Some(failure) = &failure
-        && service::version_of(&koi).as_ref() == Some(&from)
+        && service::version_of(&koi).is_none_or(|version| version == from)
     {
         return Err(failed(format!("{failure}. {guidance}")));
     }
@@ -899,13 +899,29 @@ async fn homebrew(
     let (actual, report, app) =
         finish_reconciliation(paths, None, &from, reconciled, deadline).await?;
     let incomplete = actual.cmp_precedence(&to).is_lt();
-    let mut done = updated(&from, actual.clone(), Via::Homebrew, report, app, false)?;
-    let message = match (incomplete, failure) {
-        (false, None) => return Ok(done),
-        (false, Some(failure)) => {
+    let (mut done, service) =
+        match updated(&from, actual.clone(), Via::Homebrew, report, app, false) {
+            Ok(done) => (done, None),
+            Err(CliError {
+                partial: Some(partial),
+                code,
+                message,
+                ..
+            }) => (*partial, Some(CliError::new(code, message))),
+            Err(error) => return Err(error),
+        };
+    let message = match (incomplete, failure, service) {
+        (false, None, None) => return Ok(done),
+        (false, None, Some(service)) => {
+            return Err(CliError {
+                partial: Some(Box::new(done)),
+                ..service
+            });
+        }
+        (false, Some(failure), _) => {
             format!("{failure} after installing Koidrive {actual}. {guidance}")
         }
-        (true, failure) => {
+        (true, failure, _) => {
             let why = failure
                 .or(refresh)
                 .unwrap_or_else(|| format!("The {TAP} tap does not have Koidrive {to} yet"));
@@ -954,6 +970,17 @@ async fn refresh_tap(brew: &Path, echo: &mut Echo) -> Result<(), String> {
         .arg(&tap)
         .args(["pull", "--ff-only", "--quiet"])
         .env("GIT_TERMINAL_PROMPT", "0");
+    for variable in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_PREFIX",
+    ] {
+        pull.env_remove(variable);
+    }
     match echo.run(pull, TAP_REFRESH, Child::Progress).await {
         Ok(Some((status, _, _))) if status.success() => Ok(()),
         Ok(Some((status, _, _))) => Err(format!(
