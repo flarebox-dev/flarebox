@@ -371,8 +371,8 @@ jobs:
           cargo test --workspace --locked --features koidrive-cli/test-install-inventory -- --list --format terse > "$out/workspace.txt"
           {
             cargo test --workspace --exclude koidrive-driver --exclude koidrive-engine --locked --features koidrive-cli/test-install-inventory -- --list --format terse
-            cargo test -p koidrive-driver --locked --features koidrive-cli/test-install-inventory -- --list --format terse
-            cargo test -p koidrive-engine --locked --features koidrive-cli/test-install-inventory,koidrive-engine/serde -- --list --format terse
+            cargo test -p koidrive-driver --locked -- --list --format terse
+            cargo test -p koidrive-engine --locked --features serde -- --list --format terse
           } > "$out/partitioned.txt"
           LC_ALL=C sort "$out/workspace.txt" > "$out/workspace.sorted.txt"
           LC_ALL=C sort "$out/partitioned.txt" > "$out/partitioned.sorted.txt"
@@ -437,7 +437,8 @@ jobs:
       - name: Run the package tests and doctests
         env:
           SUITE: ${{ matrix.suite }}
-        run: cargo test --locked -p "koidrive-$SUITE" --features koidrive-cli/test-install-inventory,koidrive-engine/serde
+          FEATURES: ${{ matrix.suite == 'engine' && 'serde' || '' }}
+        run: cargo test --locked -p "koidrive-$SUITE" --features "$FEATURES"
       - name: Replay saved engine property regressions without random cases
         if: matrix.suite == 'engine'
         env:
