@@ -7,9 +7,9 @@ use koidrive_driver::{self as driver, FolderState as DriverFolderState, Status};
 
 use crate::helper::Helper;
 use crate::types::{
-    Account, Answer, FolderState, HeldItem, ItemDetail, LinkedFolder, MassDeleteLimit, NodeKind,
-    Notice, NoticeKind, Problem, ProblemKind, Question, QuestionKind, RecoveryCause, RecoveryGroup,
-    RecoveryTrigger, SessionState, SyncStatus,
+    Account, Answer, FolderPath, FolderState, HeldItem, ItemDetail, LinkedFolder, MassDeleteLimit,
+    NodeKind, Notice, NoticeKind, Problem, ProblemKind, Question, QuestionKind, RecoveryCause,
+    RecoveryGroup, RecoveryTrigger, SessionState, SyncProgress, SyncStatus,
 };
 
 pub(crate) type Halted = BTreeMap<String, (String, i64)>;
@@ -21,12 +21,16 @@ pub(crate) fn session_state(
     halted: &mut Halted,
     helper: &Helper,
 ) -> SessionState {
+    let shown = match started {
+        true => sync_status(status),
+        false => SyncStatus::Stopped,
+    };
     SessionState {
-        status: match started {
-            true => sync_status(status),
-            false => SyncStatus::Stopped,
+        status: shown,
+        progress: match shown {
+            SyncStatus::Syncing => progress(status),
+            _ => None,
         },
-        progress: None,
         account: status.account.as_ref().map(account),
         folders: status.folders.iter().map(folder).collect(),
         recent_changes: Vec::new(),
@@ -63,6 +67,33 @@ fn sync_status(status: &Status) -> SyncStatus {
     } else {
         SyncStatus::Idle
     }
+}
+
+fn progress(status: &Status) -> Option<SyncProgress> {
+    let mut sum: Option<SyncProgress> = None;
+    for folder in &status.folders {
+        let Some(progress) = &folder.progress else {
+            continue;
+        };
+        let sum = sum.get_or_insert(SyncProgress {
+            files_to_upload: 0,
+            files_to_download: 0,
+            bytes_done: 0,
+            bytes_total: 0,
+            current: None,
+        });
+        sum.files_to_upload += progress.files_to_upload;
+        sum.files_to_download += progress.files_to_download;
+        sum.bytes_done += progress.bytes_done;
+        sum.bytes_total += progress.bytes_total;
+        if sum.current.is_none() {
+            sum.current = (progress.current.clone()).map(|path| FolderPath {
+                space_id: folder.space_id.clone(),
+                path,
+            });
+        }
+    }
+    sum
 }
 
 fn account(account: &driver::Account) -> Account {
@@ -441,6 +472,7 @@ mod tests {
             local_entries: None,
             questions: 0,
             problem: problem.map(str::to_owned),
+            progress: None,
         }
     }
 

@@ -487,6 +487,20 @@ pub struct FolderData {
     pub questions: u64,
     pub problem: Option<String>,
     pub wait: Option<WaitData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<ProgressData>,
+}
+
+/// The files the folder still sends to the server or fetches from it, while it syncs. The bytes are those of every
+/// file counted since the folder last had none left, the synced ones included, so `bytes_done` never decreases.
+/// `current` is the file whose content moved last, relative to the folder.
+#[derive(Debug, PartialEq, Serialize, JsonSchema)]
+pub struct ProgressData {
+    pub files_to_upload: u64,
+    pub files_to_download: u64,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub current: Option<String>,
 }
 
 /// A call the folder puts off: `quota` when the server refused it for a used-up limit or full storage, `retry` when
@@ -532,6 +546,13 @@ impl FolderData {
             questions: folder.questions,
             problem: folder.problem.clone(),
             wait: folder.wait.map(WaitData::of),
+            progress: (folder.progress.as_ref()).map(|progress| ProgressData {
+                files_to_upload: progress.files_to_upload,
+                files_to_download: progress.files_to_download,
+                bytes_done: progress.bytes_done,
+                bytes_total: progress.bytes_total,
+                current: progress.current.clone(),
+            }),
         }
     }
 }
@@ -1279,6 +1300,7 @@ mod tests {
             local_entries: None,
             questions: 0,
             problem: None,
+            progress: None,
             wait: None,
         }
     }

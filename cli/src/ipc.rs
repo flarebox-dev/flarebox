@@ -7,7 +7,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use koidrive_driver::{
-    Answered, Driver, DriverError, FolderState, FolderStatus, Linked, Paths, Status, Update,
+    Answered, Change, Driver, DriverError, FolderState, FolderStatus, Linked, Paths, Question,
+    Status, Update,
 };
 use koidrive_engine::commit::Lift;
 use koidrive_ipc::{Blocked, Key, Request, RequestId, Response, read_line, write_json, write_line};
@@ -290,21 +291,30 @@ async fn watch(
     mut writer: OwnedWriteHalf,
     driver: &Driver,
 ) -> io::Result<()> {
-    let mut changes = driver.watch();
+    let mut changes = driver.changes();
     let mut closed = [0; 1];
+    let mut asked: Option<Vec<Question>> = None;
+    let mut change = Change::State;
     loop {
-        let state = match driver.questions() {
-            Ok(questions) => Response::State {
-                status: driver.status(),
-                questions,
-            },
+        let questions = match asked.take().filter(|_| change == Change::Progress) {
+            Some(questions) => Ok(questions),
+            None => driver.questions(),
+        };
+        let state = match questions {
+            Ok(questions) => {
+                asked = Some(questions.clone());
+                Response::State {
+                    status: driver.status(),
+                    questions,
+                }
+            }
             Err(error) => Response::from(CliError::from(error)),
         };
         write_json(&mut writer, &state).await?;
-        tokio::select! {
-            changed = changes.changed() => changed.map_err(io::Error::other)?,
+        change = tokio::select! {
+            change = changes.next() => change.map_err(io::Error::other)?,
             _ = reader.read(&mut closed) => return Ok(()),
-        }
+        };
     }
 }
 

@@ -116,6 +116,9 @@ impl Remote {
                 plan.hash == chunk.hash && plan.action == chunk_plan::Action::Upload as i32
             })
         };
+        for chunk in chunks.iter().filter(|chunk| !wanted(chunk)) {
+            upload.credit.chunk(&chunk.hash);
+        }
         let mut receipts = Vec::new();
         for chunk in chunks.iter().filter(|chunk| wanted(chunk)) {
             let bytes = upload.read(chunk).unwrap();
@@ -125,6 +128,7 @@ impl Remote {
                 .insert(chunk.hash.clone(), bytes.to_vec());
             receipts.push(self.space.put_chunk(&chunk.hash, chunk.size, self.now_ms));
             crate::timing::add_bytes(&upload.timing_bytes, u64::from(chunk.size));
+            upload.credit.chunk(&chunk.hash);
         }
         receipts
     }
@@ -291,6 +295,7 @@ impl Device {
     fn take(&mut self, step: Result<Vec<Work>, Stop>) -> Result<(), Stop> {
         self.work.extend(step?);
         let folder = &mut self.folder;
+        folder.track_progress(folder.view().state);
         if folder.timing.is_on() || folder.timing.has_first() {
             folder.record_status(folder.view().state);
         }

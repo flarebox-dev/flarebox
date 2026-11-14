@@ -68,6 +68,9 @@ pub struct FolderStatus {
     /// Why the folder is recovering (design §6.4), while it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery: Option<RecoveryCause>,
+    /// How far the folder's transfers have got, while it has files to send or fetch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<Progress>,
 }
 
 /// What a person reads about `cause`.
@@ -93,6 +96,29 @@ pub fn describe(cause: &RecoveryCause) -> String {
             "the folder's sync state is older than the files on disk".into()
         }
     }
+}
+
+/// The files a folder still sends to the server or fetches from it, and how far their content has got
+/// (docs/design/driver.md, "Progress counts the files left to sync").
+///
+/// A file counts once its content differs between the folder and the server and no rule, question or problem keeps
+/// it out of sync, until both hold the same content. A file found while others sync counts at once. The progress ends
+/// when no file is left, and the next starts from zero.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Progress {
+    /// Files whose content still goes to the server, the ones being sent included.
+    pub files_to_upload: u64,
+    /// Files whose content still comes from the server, the ones being fetched included.
+    pub files_to_download: u64,
+    /// Bytes of the content that the folder and the server both hold: each chunk once it is stored or fetched, or
+    /// found on the server already, and the whole content of a file once it is in sync. It never decreases.
+    pub bytes_done: u64,
+    /// Bytes of the content of every file counted, the synced ones included. A file found later adds its size at
+    /// once. A file that leaves without syncing, because it was edited again or removed, takes its bytes not done
+    /// out of it.
+    pub bytes_total: u64,
+    /// The file whose content moved last, relative to the folder.
+    pub current: Option<String>,
 }
 
 /// A call a folder sends again later, after the server put it off or it kept failing.

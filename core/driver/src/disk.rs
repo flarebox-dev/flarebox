@@ -66,6 +66,7 @@ use crate::engine::{Engine, file_id, file_identity};
 use crate::failures::{self, Failure};
 use crate::observe::{FsObserver, Observation, Observed, Observer, Reset};
 use crate::policy::{self, Disposition};
+use crate::progress::{Credit, Direction, Item};
 use crate::status::WaitKind;
 
 /// How many effect sections [`Disk`] remembers for batches that span them. A batch older than all of them is dropped
@@ -263,6 +264,7 @@ pub(crate) struct Disk {
 /// A planned batch of effects the store holds, in the order they were planned.
 pub(crate) struct Pending {
     pub timing_bytes: crate::timing::Bytes,
+    pub credit: Credit,
     space: Arc<Space>,
     effects: Vec<Planned>,
 }
@@ -513,6 +515,7 @@ impl Disk {
             hook(Cut::BeforePlan);
             Ok(Some(Pending {
                 timing_bytes: None,
+                credit: Credit::default(),
                 space: space.clone(),
                 effects,
             }))
@@ -724,6 +727,7 @@ impl Disk {
     pub fn upload(&self, commit: &Commit, engine: &Engine) -> Upload {
         let mut upload = Upload {
             timing_bytes: None,
+            credit: Credit::default(),
             space: self.space.clone(),
             chunks: Vec::new(),
             sources: HashMap::new(),
@@ -777,6 +781,7 @@ impl Disk {
 /// The chunks a commit adds to the server and where the bytes of each are in the folder.
 pub(crate) struct Upload {
     pub timing_bytes: crate::timing::Bytes,
+    pub credit: Credit,
     space: Arc<Space>,
     /// Every chunk of every content the commit creates or updates, in the order of its ops.
     pub chunks: Vec<ChunkRef>,
@@ -869,6 +874,13 @@ impl Pending {
                 Err(why) => unfetchable[index] = Some(why),
             }
         }
+        let items: Vec<Item> = (writes.iter())
+            .map(|(index, content, _)| Item {
+                direction: Direction::Download,
+                node: self.effects[*index].record.node.clone(),
+                digest: content.manifest_digest.clone(),
+            })
+            .collect();
         let mut targets: HashMap<ChunkKey, Vec<(usize, &[u64])>> = HashMap::new();
         let mut distinct: Vec<&ChunkRef> = Vec::new();
         for (write, (_, _, manifest)) in writes.iter().enumerate() {
@@ -929,6 +941,8 @@ impl Pending {
                         for offset in *offsets {
                             file.write_all_at(bytes, *offset)?;
                         }
+                        let written = bytes.len() as u64 * offsets.len() as u64;
+                        self.credit.item(&items[*write], &chunk.0, written);
                         missing[*write] -= 1;
                         if missing[*write] == 0 {
                             match finish_file(&file, content) {

@@ -579,6 +579,7 @@ mod tests {
             local_entries: None,
             questions: 0,
             problem: None,
+            progress: None,
             wait: None,
         };
         let status = Status {

@@ -7,7 +7,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use koidrive_engine::commit::{Commits, Lift, LiftError};
 use koidrive_engine::guard::Window;
@@ -297,6 +297,7 @@ struct Inner {
     startup_blocked: AtomicBool,
     startup_pending: AtomicBool,
     changed: Arc<watch::Sender<()>>,
+    progressed: Arc<watch::Sender<()>>,
     #[cfg(test)]
     observe_fault: Option<Arc<crate::folder::ObserveFault>>,
     #[cfg(test)]
@@ -395,6 +396,56 @@ impl Running {
 
     fn ended(&self) -> bool {
         self.done.has_changed().is_err()
+    }
+}
+
+/// How often [`Changes::next`] reports a change of progress alone at most.
+pub const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+
+/// What [`Changes::next`] waited for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// [`Driver::watch`] was marked: anything [`Driver::status`], [`Driver::questions`] or [`Driver::restores`]
+    /// return may differ, progress included.
+    State,
+    /// Only the progress of a folder in [`Driver::status`] may differ.
+    Progress,
+}
+
+/// The changes of a driver, from [`Driver::changes`].
+pub struct Changes {
+    changed: watch::Receiver<()>,
+    progressed: watch::Receiver<()>,
+    last: Option<Instant>,
+}
+
+impl Changes {
+    /// Waits for the next change. A [`Change::State`] returns at once. A [`Change::Progress`] returns no sooner than
+    /// [`PROGRESS_INTERVAL`] after the previous change this returned, and a state change meanwhile returns instead.
+    /// Fails once the driver is gone.
+    pub async fn next(&mut self) -> Result<Change, watch::error::RecvError> {
+        let change = tokio::select! {
+            biased;
+            changed = self.changed.changed() => changed.map(|()| Change::State)?,
+            progressed = self.progressed.changed() => {
+                progressed?;
+                let due = self.last.map(|last| last + PROGRESS_INTERVAL);
+                match due {
+                    Some(due) => tokio::select! {
+                        biased;
+                        changed = self.changed.changed() => changed.map(|()| Change::State)?,
+                        () = tokio::time::sleep_until(due.into()) => Change::Progress,
+                    },
+                    None => Change::Progress,
+                }
+            }
+        };
+        self.progressed.mark_unchanged();
+        if change == Change::State {
+            self.changed.mark_unchanged();
+        }
+        self.last = Some(Instant::now());
+        Ok(change)
     }
 }
 
@@ -510,6 +561,7 @@ impl Driver {
                 startup_blocked: AtomicBool::new(false),
                 startup_pending: AtomicBool::new(false),
                 changed: Arc::new(watch::Sender::new(())),
+                progressed: Arc::new(watch::Sender::new(())),
                 #[cfg(test)]
                 observe_fault: None,
                 #[cfg(test)]
@@ -544,6 +596,12 @@ impl Driver {
                         "unlinking the folder did not finish; unlink it again to finish".into(),
                     );
                 }
+                if !matches!(
+                    status.state,
+                    FolderState::Bootstrapping | FolderState::CatchingUp
+                ) {
+                    status.progress = None;
+                }
                 status
             })
             .collect();
@@ -559,9 +617,18 @@ impl Driver {
 
     /// A receiver that is marked changed whenever [`Driver::status`], [`Driver::questions`] or [`Driver::restores`]
     /// may have changed, so the app can wait for a change instead of polling. A change may be signalled without a
-    /// visible difference.
+    /// visible difference. A change of a folder's progress alone does not mark it, unless the progress began or ended.
     pub fn watch(&self) -> watch::Receiver<()> {
         self.inner.changed.subscribe()
+    }
+
+    /// The changes [`Driver::watch`] marks and those of every folder's progress, at a bounded rate.
+    pub fn changes(&self) -> Changes {
+        Changes {
+            changed: self.inner.changed.subscribe(),
+            progressed: self.inner.progressed.subscribe(),
+            last: None,
+        }
     }
 
     fn changed(&self) {
@@ -1741,6 +1808,7 @@ impl Driver {
             },
             observer: Mutex::default(),
             changed: self.inner.changed.clone(),
+            progressed: self.inner.progressed.clone(),
             requests: Arc::default(),
             #[cfg(test)]
             observe_fault: self.inner.observe_fault.clone(),
@@ -1919,6 +1987,7 @@ fn folder_status(
         questions,
         problem: None,
         wait: None,
+        progress: None,
     }
 }
 
@@ -3777,6 +3846,53 @@ mod tests {
         watch.borrow_and_update();
         driver.stop().await;
         assert!(watch.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn progress_alone_wakes_a_watcher_at_most_once_an_interval_and_a_state_change_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Driver::open(Paths::under(dir.path())).unwrap();
+        let mut changes = driver.changes();
+        let idle = tokio::time::timeout(Duration::from_secs(1), changes.next()).await;
+        assert!(idle.is_err(), "an idle driver wakes no watcher");
+
+        let progressed = driver.inner.progressed.clone();
+        let marking = tokio::spawn(async move {
+            let started = Instant::now();
+            let mut marks = 0;
+            while started.elapsed() < Duration::from_secs(1) {
+                progressed.send_replace(());
+                marks += 1;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            marks
+        });
+        let started = Instant::now();
+        let mut wakes: u128 = 0;
+        while started.elapsed() < Duration::from_secs(1) {
+            assert_eq!(changes.next().await.unwrap(), Change::Progress);
+            wakes += 1;
+        }
+        let elapsed = started.elapsed();
+        let marks = marking.await.unwrap();
+        let most = 1 + elapsed.as_millis() / PROGRESS_INTERVAL.as_millis();
+        assert!(marks > 100, "{marks} marks");
+        assert!(
+            (3..=most).contains(&wakes),
+            "{wakes} wakes for {marks} marks in {elapsed:?}"
+        );
+
+        driver.inner.progressed.send_replace(());
+        let changed = driver.inner.changed.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            changed.send_replace(());
+        });
+        let asked = Instant::now();
+        assert_eq!(changes.next().await.unwrap(), Change::State);
+        assert!(asked.elapsed() < PROGRESS_INTERVAL, "{:?}", asked.elapsed());
+        let after = tokio::time::timeout(Duration::from_secs(1), changes.next()).await;
+        assert!(after.is_err(), "the state change took the progress with it");
     }
 
     #[tokio::test(flavor = "multi_thread")]

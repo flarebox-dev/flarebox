@@ -37,7 +37,7 @@ use clap::error::ErrorKind;
 use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use koidrive_driver::{
     Answer, Credential, Driver, DriverError, FolderState, FolderStatus, Limit, MAX_DELETIONS,
-    Paths, Question, QuestionKind, RecoveryGroup, Status,
+    Paths, Progress, Question, QuestionKind, RecoveryGroup, Status,
 };
 use koidrive_ipc::{Code, Key, Request, RequestId, Response};
 use koidrive_net::{ApiError, Auth, Reload};
@@ -2006,12 +2006,20 @@ fn folder_text(folder: &FolderStatus) -> String {
         (Some(last), None) => format!("seq {last}"),
         _ => "not read yet".to_owned(),
     };
+    let state = match folder.state {
+        FolderState::Stopped => "Stopped",
+        FolderState::Connecting => "Connecting",
+        FolderState::Bootstrapping => "Bootstrapping",
+        FolderState::CatchingUp => "Syncing",
+        FolderState::UpToDate => "UpToDate",
+        FolderState::Offline => "Offline",
+        FolderState::Halted => "Halted",
+    };
     let mut text = format!(
-        "{}  space {} ({})  {:?}  {seq}, {} remote nodes{}, {}\n",
+        "{}  space {} ({})  {state}  {seq}, {} remote nodes{}, {}\n",
         printable(&folder.path),
         printable(&folder.space_name),
         printable(&folder.space_id),
-        folder.state,
         folder.remote_nodes,
         folder
             .local_entries
@@ -2019,6 +2027,9 @@ fn folder_text(folder: &FolderStatus) -> String {
             .unwrap_or_default(),
         need_you(folder.questions)
     );
+    if let Some(progress) = &folder.progress {
+        text.push_str(&format!("  {}\n", progress_text(progress)));
+    }
     if let Some(problem) = &folder.problem {
         text.push_str(&format!("  {}\n", printable(problem)));
     }
@@ -2029,6 +2040,30 @@ fn folder_text(folder: &FolderStatus) -> String {
         }
     }
     text
+}
+
+fn progress_text(progress: &Progress) -> String {
+    let files = |count: u64, way: &str| match count {
+        0 => None,
+        1 => Some(format!("1 file to {way}")),
+        count => Some(format!("{count} files to {way}")),
+    };
+    let mut parts: Vec<String> = [
+        files(progress.files_to_upload, "upload"),
+        files(progress.files_to_download, "download"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    parts.push(format!(
+        "{} of {}",
+        size(progress.bytes_done),
+        size(progress.bytes_total)
+    ));
+    if let Some(current) = &progress.current {
+        parts.push(format!("now {}", printable(current)));
+    }
+    parts.join("; ")
 }
 
 fn questions_text(questions: &[Question]) -> String {
@@ -2558,6 +2593,7 @@ mod tests {
             local_entries: None,
             questions: 0,
             problem: Some("cannot read \u{1b}[31mred\u{9b}31m".into()),
+            progress: None,
             wait: None,
         };
         let status = Status {
@@ -2593,6 +2629,7 @@ mod tests {
                 7,
                 1_794_442_424_000,
             )),
+            progress: None,
             space_id: "s1".into(),
             space_name: "Home".into(),
             path: "/home/ada/Docs".into(),
@@ -2622,6 +2659,7 @@ mod tests {
             "the space was rewound on the server to seq 7 (requested 2026-11-12 00:13 UTC)";
         let folder = |problem: &str| FolderStatus {
             recovery: Some(cause),
+            progress: None,
             space_id: "s1".into(),
             space_name: "Home".into(),
             path: "/home/ada/Docs".into(),
@@ -2667,6 +2705,7 @@ mod tests {
             local_entries: None,
             questions: 0,
             problem: problem.map(str::to_owned),
+            progress: None,
             wait: None,
         };
         for state in [FolderState::Stopped, FolderState::CatchingUp] {

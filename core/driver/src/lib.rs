@@ -32,6 +32,7 @@ mod lifecycle;
 mod observe;
 mod paths;
 pub mod policy;
+mod progress;
 mod question;
 mod restore;
 #[cfg(test)]
@@ -45,7 +46,10 @@ mod volume;
 pub use claim::{Flock, Identity as DirectoryIdentity};
 pub use config::{BackgroundService, Config, ConfigError, LocalTrash, SyncRules, UpdateCheck};
 pub use credential::{Credential, CredentialError, SET_UP_AGAIN, api_for};
-pub use driver::{Answered, CleanupFailure, Driver, DriverError, LinkApproval, Linked};
+pub use driver::{
+    Answered, Change, Changes, CleanupFailure, Driver, DriverError, LinkApproval, Linked,
+    PROGRESS_INTERVAL,
+};
 pub use failures::{Failure, failures};
 pub use folder::MAX_FORMAT;
 pub use koidrive_engine::guard::MAX_DELETIONS;
@@ -56,6 +60,6 @@ pub use question::{
 };
 pub use restore::{RestoreRejection, RestoreRequest, RestoreState, RestoreStatus, RestoreWait};
 pub use share::{Expiry, LinkState, Revoked, Secret, SharedLink, Target, TargetKind};
-pub use status::{Account, FolderState, FolderStatus, Status, Wait, WaitKind, describe};
+pub use status::{Account, FolderState, FolderStatus, Progress, Status, Wait, WaitKind, describe};
 pub use update::Update;
 pub use volume::{Volume, volume};

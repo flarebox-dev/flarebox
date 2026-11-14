@@ -703,6 +703,7 @@ mod tests {
             problem: None,
             wait: None,
             recovery: None,
+            progress: None,
         }
     }
 

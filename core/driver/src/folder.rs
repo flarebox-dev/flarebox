@@ -23,10 +23,11 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use koidrive_engine::classify::Class;
 use koidrive_engine::commit::{Base, Failure, Halt as CommitHalt, Reconnect};
-use koidrive_engine::effects::{self, Stuck};
+use koidrive_engine::effects::{self, Effect as EngineEffect, Stuck};
 use koidrive_engine::ignore::LocalRules;
-use koidrive_engine::tree::{RemoteNode, Tree};
+use koidrive_engine::tree::{Content, Kind, RemoteNode, Shape, Tree, same_content};
 use koidrive_fs::{Snapshot, check_root};
 use koidrive_net::{
     Auth, Backoff, CallError, ChunkError, Event, NotResent, ServerError, Session, SessionConfig,
@@ -50,6 +51,7 @@ use crate::failures::{self, Halted};
 use crate::ignore::Matcher;
 use crate::observe::{FsObserver, Observer};
 use crate::policy::{self, Disposition};
+use crate::progress::{Credit, Direction, Item, Tracker};
 use crate::status::{FolderState, Wait, WaitKind, describe};
 use crate::timing::{Time, Timing};
 use koidrive_engine::question::{RecoveryCause, RecoveryTrigger};
@@ -131,6 +133,7 @@ pub(crate) struct Folder {
     /// Why the server did not take a change of each node, for the nodes it may have left out of commits.
     refused_nodes: BTreeMap<String, String>,
     asked: BTreeSet<String>,
+    progress: Arc<Mutex<Tracker>>,
     /// When the [`Work::RetryAfter`] that is out ends.
     retry_at: Option<Instant>,
     /// Tests stop the task after this many more store transactions, as a crash right after one would.
@@ -328,6 +331,7 @@ impl Folder {
             stuck_effects: BTreeSet::new(),
             refused_nodes: BTreeMap::new(),
             asked,
+            progress: Arc::default(),
             retry_at: None,
             #[cfg(test)]
             crash_after: None,
@@ -836,13 +840,7 @@ impl Folder {
     /// The folder's status as the task knows it.
     pub fn view(&self) -> View {
         let trees = &self.engine.trees;
-        let held = match (
-            self.engine.effects.in_flight(),
-            self.engine.commits.in_flight(),
-        ) {
-            ([], None) => effects::stuck(trees, &self.engine.effects, None),
-            _ => BTreeMap::new(),
-        };
+        let held = self.held();
         let state = match &self.stream {
             _ if self.offline => FolderState::Offline,
             Stream::Connecting => FolderState::Connecting,
@@ -970,6 +968,71 @@ impl Folder {
         }
     }
 
+    fn held(&self) -> BTreeMap<String, Stuck> {
+        match (
+            self.engine.effects.in_flight(),
+            self.engine.commits.in_flight(),
+        ) {
+            ([], None) => effects::stuck(&self.engine.trees, &self.engine.effects, None),
+            _ => BTreeMap::new(),
+        }
+    }
+
+    pub fn track_progress(&mut self, state: FolderState) -> bool {
+        match state {
+            FolderState::Bootstrapping | FolderState::CatchingUp => {}
+            FolderState::Connecting | FolderState::Offline => return false,
+            FolderState::Stopped | FolderState::UpToDate | FolderState::Halted => {
+                return self.progress.lock().unwrap().clear();
+            }
+        }
+        let trees = &self.engine.trees;
+        let held = self.held();
+        let stays_out = self.stays_out(&held);
+        fn file(shape: Option<&Shape>) -> Option<&Content> {
+            (shape.filter(|shape| shape.kind == Kind::File))
+                .and_then(|shape| shape.content.as_ref())
+        }
+        let other = |a: &Content, b: Option<&Content>| b.is_none_or(|b| !same_content(a, b));
+        let mut wanted = BTreeMap::new();
+        let mut want = |direction, id: &String, content: &Content| {
+            let item = Item {
+                direction,
+                node: id.clone(),
+                digest: content.manifest_digest.clone(),
+            };
+            wanted.insert(item, content.size);
+        };
+        for id in (trees.dirty().iter()).filter(|id| !stays_out(id) && !trees.held(id)) {
+            let local = file(trees.local().live(id));
+            let synced = file(trees.synced().live(id));
+            let remote = file(trees.remote().live(id));
+            let class = trees.class(id);
+            if let Some(local) = local
+                && matches!(class, Class::Local | Class::Concurrent)
+                && other(local, remote)
+                && (other(local, synced) || trees.unsent_edits().contains(id))
+            {
+                want(Direction::Upload, id, local);
+            }
+            if let Some(remote) = remote
+                && matches!(class, Class::Remote | Class::Concurrent)
+                && other(remote, synced)
+                && other(remote, local)
+            {
+                want(Direction::Download, id, remote);
+            }
+        }
+        let synced = |item: &Item| {
+            let holds = match item.direction {
+                Direction::Upload => file(trees.synced().live(&item.node)),
+                Direction::Download => file(trees.local().live(&item.node)),
+            };
+            holds.is_some_and(|content| content.manifest_digest == item.digest)
+        };
+        self.progress.lock().unwrap().track(wanted, synced)
+    }
+
     /// The path of a node relative to the root: where L holds it, or else where R does, as for a file whose download
     /// failed or that this device deleted.
     fn item_path(&self, id: &str) -> Option<PathBuf> {
@@ -983,6 +1046,19 @@ impl Folder {
     /// this device's rules keep from its place or from S ([`effects::stuck`]), and so is the node of every restore
     /// that waits.
     fn settled(&self, held: &BTreeMap<String, Stuck>) -> bool {
+        let stuck = self.stays_out(held);
+        let commits = &self.engine.commits;
+        self.caught_up()
+            && self.scanned
+            && !self.disk.awaits_rules()
+            && self.engine.effects.in_flight().is_empty()
+            && matches!(self.flight, Flight::Idle)
+            && self.engine.commits.in_flight().is_none()
+            && self.engine.trees.dirty().iter().all(stuck)
+            && commits.held_restores().count() == commits.restores().len()
+    }
+
+    fn stays_out<'a>(&'a self, held: &'a BTreeMap<String, Stuck>) -> impl Fn(&String) -> bool + 'a {
         let trees = &self.engine.trees;
         let mut above_blocked = BTreeSet::new();
         for node in (self.engine.effects.blocked().keys()).chain(held.keys()) {
@@ -997,23 +1073,14 @@ impl Folder {
                 }
             }
         }
-        let stuck = |id: &String| {
+        move |id: &String| {
             self.engine.effects.blocked().contains_key(id)
                 || self.engine.commits.problems().contains(id)
                 || trees.excluded(id)
                 || trees.kept_for_excluded(id)
                 || (above_blocked.contains(id.as_str()) && trees.remote().live(id).is_none())
                 || held.contains_key(id)
-        };
-        let commits = &self.engine.commits;
-        self.caught_up()
-            && self.scanned
-            && !self.disk.awaits_rules()
-            && self.engine.effects.in_flight().is_empty()
-            && matches!(self.flight, Flight::Idle)
-            && self.engine.commits.in_flight().is_none()
-            && self.engine.trees.dirty().iter().all(stuck)
-            && commits.held_restores().count() == commits.restores().len()
+        }
     }
 
     /// True once R holds everything the server had at the last `CaughtUp` of this connection (design §4.4).
@@ -1477,6 +1544,7 @@ impl Folder {
     /// Starts the upload of what `commit` adds, or its send when it adds no content.
     fn start(&mut self, commit: Commit, work: &mut Vec<Work>) {
         let mut upload = self.disk.upload(&commit, &self.engine);
+        upload.credit = Credit::upload(&self.progress, &commit, |node| self.engine.path_of(node));
         if self.timing.is_on() {
             upload.timing_bytes = self.timing.uploading(&commit, Time::now());
         }
@@ -1539,6 +1607,11 @@ impl Folder {
         let Some(mut pending) = self.disk.next(&mut self.engine, &mut self.store)? else {
             return Ok(false);
         };
+        let remote = self.engine.trees.remote();
+        let writes = (self.engine.effects.in_flight().iter())
+            .filter(|record| matches!(record.effect, EngineEffect::WriteFile { .. }))
+            .filter_map(|record| Some((record.node.as_str(), remote_path(remote, &record.node)?)));
+        pending.credit = Credit::download(&self.progress, writes);
         if self.timing.is_on() {
             let at = Time::now();
             for record in self.engine.effects.in_flight() {
@@ -1619,6 +1692,7 @@ pub(crate) struct FolderTask {
     pub observer: Mutex<Option<JoinHandle<()>>>,
     /// Marked whenever the folder's status changes (`Driver::watch`).
     pub changed: Arc<watch::Sender<()>>,
+    pub progressed: Arc<watch::Sender<()>>,
     /// Notified when `Driver::restore` has recorded a request in the folder's store.
     pub requests: Arc<Notify>,
     #[cfg(test)]
@@ -1785,6 +1859,9 @@ impl FolderTask {
                 halted = self.sync(&mut locked) => Some(halted),
                 _ = stop.wait_for(|stop| *stop) => None,
             };
+            if self.status.lock().unwrap().progress.take().is_some() {
+                self.changed.send_replace(());
+            }
             let Some(halted) = halted else {
                 self.join_observer().await;
                 return;
@@ -1862,6 +1939,7 @@ impl FolderTask {
         };
         folder.timing.linked(self.linked_started);
         folder.timing.enable(self.telemetry.clone());
+        (folder.progress.lock().unwrap()).publish_to(self.status.clone(), self.progressed.clone());
         let mut from_disk = self.observe(lock.clone(), folder.sections(), folder.snapshot());
         let mut config = SessionConfig::new(
             &self.link.space_id,
@@ -2133,6 +2211,7 @@ impl FolderTask {
     fn publish(&self, folder: &mut Folder) {
         let view = folder.view();
         folder.record_status(view.state);
+        let began_or_ended = folder.track_progress(view.state);
         let asked = folder.take_questions_changed();
         let mut status = self.status.lock().unwrap();
         let shown = View {
@@ -2147,7 +2226,7 @@ impl FolderTask {
             questions: status.questions,
             recovery: status.recovery,
         };
-        if shown == view && !asked {
+        if shown == view && !asked && !began_or_ended {
             return;
         }
         status.state = view.state;
@@ -2296,8 +2375,13 @@ async fn upload_counted(
                 .map_err(io::Error::other)?
         }
     };
-    let stored = |chunk: &ChunkRef| stored(u64::from(chunk.size));
-    (transfer.upload_observed(session, &upload.chunks, read, stored)).await
+    let credit = upload.credit.clone();
+    let stored = |chunk: &ChunkRef| {
+        stored(u64::from(chunk.size));
+        credit.chunk(&chunk.hash);
+    };
+    let present = |chunk: &ChunkRef| credit.chunk(&chunk.hash);
+    (transfer.upload_observed(session, &upload.chunks, read, stored, present)).await
 }
 
 #[cfg(test)]

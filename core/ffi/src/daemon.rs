@@ -188,6 +188,11 @@ impl DaemonCore {
                 status: next.status,
             });
         }
+        if next.progress != sent.progress {
+            events.push(SessionEvent::Progress {
+                progress: next.progress.clone(),
+            });
+        }
         inner.sent = next;
         for event in events {
             self.events.send(event);
