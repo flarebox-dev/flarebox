@@ -3027,6 +3027,12 @@ fn plan(
         }
     }
 
+    scratch.creating = (wants.iter())
+        .filter_map(|want| match want {
+            Want::Create { id, shape } => Some((id.clone(), shape.parent.clone())),
+            _ => None,
+        })
+        .collect();
     let restored: BTreeSet<&str> = restores.values().map(RestoreIntent::node).collect();
     for node in wants.iter().flat_map(Want::nodes) {
         if restored.contains(node.as_str()) {
@@ -3578,6 +3584,7 @@ struct Scratch {
     restoring: BTreeSet<NodeId>,
     trashed: BTreeMap<NodeId, Vec<NodeId>>,
     owed: BTreeSet<NodeId>,
+    creating: BTreeMap<NodeId, NodeId>,
 }
 
 impl Scratch {
@@ -3592,6 +3599,7 @@ impl Scratch {
             restoring: BTreeSet::new(),
             trashed: BTreeMap::new(),
             owed: BTreeSet::new(),
+            creating: BTreeMap::new(),
         };
         for (id, node) in trees.remote().iter() {
             let entry = Entry {
@@ -3724,11 +3732,11 @@ impl Scratch {
                 .nodes
                 .get(parent)
                 .is_some_and(|entry| entry.kind == Kind::Dir);
-        if !is_dir {
-            return Fit::Wait;
-        }
         if self.inside(parent, id) {
             return Fit::Cycle;
+        }
+        if !is_dir {
+            return Fit::Wait;
         }
         let taken = self
             .children
@@ -3741,13 +3749,14 @@ impl Scratch {
     /// True when `ancestor` is `id` or holds it.
     fn inside(&self, id: &str, ancestor: &str) -> bool {
         let mut current = id;
-        for _ in 0..=self.nodes.len() {
+        for _ in 0..=self.nodes.len() + self.creating.len() {
             if current == ancestor {
                 return true;
             }
-            match self.nodes.get(current) {
-                Some(entry) => current = &entry.parent,
-                None => return false,
+            match (self.nodes.get(current), self.creating.get(current)) {
+                (Some(entry), _) => current = &entry.parent,
+                (None, Some(parent)) => current = parent,
+                (None, None) => return false,
             }
         }
         false
