@@ -774,15 +774,8 @@ impl Trees {
     /// moved by the user, and is no longer reverted: that move is committed instead.
     pub fn set_local(&mut self, id: NodeId, node: LocalNode) {
         if let Some(old) = self.l.get(&id) {
-            if !old.shape.same(&node.shape) && self.resends.remove(&id) {
-                let restored = (self
-                    .acknowledged(&id)
-                    .and_then(|shape| shape.content.as_ref()))
-                .zip(node.shape.content.as_ref())
-                .is_some_and(|(synced, local)| same_content(synced, local));
-                if restored {
-                    self.unsent_edits.insert(id.clone());
-                }
+            if !old.shape.same(&node.shape) {
+                self.resends.remove(&id);
             }
             let moved = !old.parked && !node.parked && !old.shape.same_position(&node.shape);
             let to_remote =
@@ -820,9 +813,14 @@ impl Trees {
     /// Sets L as this device's user made it: from a scan of the disk, or as the copy that keeps a
     /// change of the user. A shape other than the one L holds is recorded as a change of the user
     /// ([`TreesState::local_changes`]), and a change back to the shape S holds ends the record unless
-    /// an update of S waits.
+    /// an update of S waits. A change to a file this device sends again after a server loss
+    /// ([`TreesState::resends`]) is an edit the server does not have ([`Trees::unsent_edits`]), even
+    /// when it ends at the bytes S holds.
     pub fn set_local_changed(&mut self, id: NodeId, node: LocalNode) {
         if !(self.l.get(&id)).is_some_and(|old| old.shape.same(&node.shape)) {
+            if node.shape.content.is_some() && self.resends.contains(&id) {
+                self.unsent_edits.insert(id.clone());
+            }
             if !self.waiting.contains_key(&id) && same(Some(&node.shape), self.s.live(&id)) {
                 self.local_changes.remove(&id);
             } else {

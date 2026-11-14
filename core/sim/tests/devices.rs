@@ -2982,6 +2982,32 @@ fn an_edit_back_to_the_restored_bytes_beats_another_devices_resend() {
     keep(3, &phases).unwrap();
 }
 
+#[test]
+fn an_edit_back_to_the_restored_bytes_after_another_edit_of_a_resend_beats_the_authors_resend() {
+    let write = |kind, text| {
+        Step::User(Action {
+            kind,
+            target: 0,
+            parent: 0,
+            name: 0,
+            text,
+        })
+    };
+    let phases = [
+        vec![(0, write(1, 3))],
+        vec![(0, BACKUP), (1, write(2, 0))],
+        vec![
+            (0, write(2, 0)),
+            (0, RESTORE),
+            (0, Step::Connect),
+            (0, DELIVER),
+            (0, Step::Scan),
+            (0, write(2, 3)),
+        ],
+    ];
+    converge(3, &phases).unwrap();
+}
+
 fn send_a_lost_write_again_from_two_devices_after_a_later_edit(author_first: bool) {
     let edit = |device, text| {
         let action = Action {

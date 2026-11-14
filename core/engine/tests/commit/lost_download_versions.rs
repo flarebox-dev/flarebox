@@ -14,6 +14,39 @@ fn a_download_the_server_lost_is_sent_again_over_the_version_it_replaced() {
 }
 
 #[test]
+fn an_edit_of_a_resend_back_to_the_restored_bytes_through_another_edit_is_sent() {
+    let (mut commits, mut trees, mut ids) = downloaded_at_5();
+    list_after_a_loss(
+        &mut trees,
+        &commits,
+        version(remote(file(ROOT, "a", 1)), "v1"),
+    );
+    for digest in [3, 1] {
+        trees.set_local_changed("a".into(), local(file(ROOT, "a", digest), 1));
+        trees.settle();
+    }
+    assert_eq!(trees.class("a"), Class::Local);
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert_eq!(ops(&commit), [update("a", 1)]);
+}
+
+#[test]
+fn an_edit_of_a_renamed_resend_to_the_restored_bytes_is_sent() {
+    let (mut commits, mut trees, mut ids) = downloaded_at_5();
+    list_after_a_loss(
+        &mut trees,
+        &commits,
+        version(remote(file(ROOT, "a", 1)), "v1"),
+    );
+    for digest in [2, 1] {
+        trees.set_local_changed("a".into(), local(file(ROOT, "b", digest), 1));
+        trees.settle();
+    }
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(uploads(&ops(&commit), 1), "{:?}", ops(&commit));
+}
+
+#[test]
 fn a_download_the_server_lost_with_the_delete_after_it_is_sent_again_as_a_resend() {
     let (mut commits, mut trees, mut ids) = downloaded_then_deleted();
     list_after_a_loss(
