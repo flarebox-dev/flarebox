@@ -7102,3 +7102,50 @@ fn a_folder_a_restore_loses_and_another_device_resends_at_its_pending_name_takes
     )
     .unwrap();
 }
+
+#[test]
+fn a_rename_back_to_the_pending_name_after_a_rename_to_the_owed_name_is_kept() {
+    let mut steps = vec![
+        (0, folder("A")),
+        (0, rename(0, 1, "a")),
+        (0, SCAN),
+        (0, COMMIT),
+        (0, COMMIT),
+        (0, DELIVER),
+    ];
+    steps.extend(std::iter::repeat_n((1, Step::Work(0)), 5));
+    steps.extend([(1, rename(1, 0, "A")), (1, SCAN), (1, Step::Work(0))]);
+    steps.extend([(1, rename(1, 0, PENDING_NAME)), (1, SCAN)]);
+    steps.extend(std::iter::repeat_n((1, Step::Work(0)), 8));
+    steps.push((0, Step::Connect));
+    steps.extend(std::iter::repeat_n((0, Step::Work(0)), 16));
+    steps.extend(std::iter::repeat_n((1, Step::Work(0)), 8));
+    let world = converge(2, &[vec![(0, file("a"))], steps]).unwrap();
+    for device in &world.devices {
+        let dirs: Vec<&str> = (device.disk.entries().values())
+            .filter(|entry| entry.content.is_none())
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(dirs, [PENDING_NAME]);
+    }
+}
+
+#[test]
+fn a_rename_back_to_the_pending_name_racing_a_delete_does_not_bring_back_the_folders_files() {
+    let mut steps = vec![(0, folder("A")), (0, rename(0, 1, "a"))];
+    steps.extend(std::iter::repeat_n((0, Step::Work(0)), 4));
+    steps.extend([(0, rename(1, 0, PENDING_NAME)), (0, SCAN)]);
+    steps.extend(std::iter::repeat_n((1, Step::Work(0)), 5));
+    steps.extend([(1, delete(1)), (1, SCAN)]);
+    steps.extend(std::iter::repeat_n((0, Step::Work(0)), 3));
+    steps.extend(std::iter::repeat_n((1, Step::Work(0)), 3));
+    steps.extend(std::iter::repeat_n((0, Step::Work(0)), 12));
+    let world = converge(2, &[vec![(0, file("a"))], steps]).unwrap();
+    for device in &world.devices {
+        assert!(
+            device.disk.entries().is_empty(),
+            "{:?}",
+            device.disk.entries()
+        );
+    }
+}
