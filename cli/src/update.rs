@@ -837,38 +837,54 @@ async fn homebrew(
         _ => install.binary.clone(),
     };
     let from = service::version_of(&koi).unwrap_or_else(service::this_version);
-    if !fs::metadata(brew)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-    {
-        return Err(failed(format!(
-            "Homebrew is not at {}. {guidance}",
-            brew.display()
-        )));
-    }
+    let release = update::check_now(paths)
+        .await
+        .map_err(|error| CliError::new(Code::Unavailable, error.to_string()))?
+        .ok_or_else(|| failed("GitHub lists no Koidrive release for this system".to_owned()))?;
+    let to = Version::parse(&release.version).map_err(|_| {
+        failed(format!(
+            "GitHub names the release {}, which is not a version",
+            release.version
+        ))
+    })?;
     let mut echo = Echo::open(&log_path(paths), json);
-    refresh_tap(brew, &mut echo).await;
-    let mut upgrade = Command::new(brew);
-    upgrade
-        .args(&command[1..])
-        .env("HOMEBREW_NO_AUTO_UPDATE", "1");
-    let (status, _, _) = (echo.run(upgrade, INSTALLER, Child::Progress).await)
-        .map_err(|error| {
-            failed(format!(
-                "{} did not run: {error}. {guidance}",
+    let (mut refresh, mut failure) = (None, None);
+    if to.cmp_precedence(&from).is_gt() {
+        if !fs::metadata(brew)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        {
+            return Err(failed(format!(
+                "Homebrew is not at {}. {guidance}",
                 brew.display()
-            ))
-        })?
-        .ok_or_else(|| {
-            failed(format!(
-                "brew upgrade did not finish within {} minutes. {guidance}",
-                minutes(INSTALLER)
-            ))
-        })?;
-    if !status.success() {
-        return Err(failed(format!(
-            "brew upgrade failed ({}). {guidance}",
-            exit(status)
-        )));
+            )));
+        }
+        if let Err(why) = refresh_tap(brew, &mut echo).await {
+            echo.line(&why, true);
+            refresh = Some(why);
+        }
+        let mut upgrade = Command::new(brew);
+        upgrade
+            .args(&command[1..])
+            .env("HOMEBREW_NO_AUTO_UPDATE", "1")
+            .env_remove("HOMEBREW_ASK");
+        match echo.run(upgrade, INSTALLER, Child::Progress).await {
+            Ok(Some((status, _, _))) if status.success() => (),
+            Ok(Some((status, _, _))) => {
+                failure = Some(format!("brew upgrade failed ({})", exit(status)))
+            }
+            Ok(None) => {
+                failure = Some(format!(
+                    "brew upgrade did not finish within {} minutes",
+                    minutes(INSTALLER)
+                ))
+            }
+            Err(error) => failure = Some(format!("{} did not run: {error}", brew.display())),
+        }
+    }
+    if let Some(failure) = &failure
+        && service::version_of(&koi).as_ref() == Some(&from)
+    {
+        return Err(failed(format!("{failure}. {guidance}")));
     }
     let deadline = tokio::time::Instant::now() + RECONCILE;
     let reconciled = reconcile_updated(
@@ -882,10 +898,33 @@ async fn homebrew(
     .await;
     let (actual, report, app) =
         finish_reconciliation(paths, None, &from, reconciled, deadline).await?;
-    updated(&from, actual, Via::Homebrew, report, app, false)
+    let incomplete = actual.cmp_precedence(&to).is_lt();
+    let mut done = updated(&from, actual.clone(), Via::Homebrew, report, app, false)?;
+    let message = match (incomplete, failure) {
+        (false, None) => return Ok(done),
+        (false, Some(failure)) => {
+            format!("{failure} after installing Koidrive {actual}. {guidance}")
+        }
+        (true, failure) => {
+            let why = failure
+                .or(refresh)
+                .unwrap_or_else(|| format!("The {TAP} tap does not have Koidrive {to} yet"));
+            let service = done.text.split_once('\n').map_or("", |(_, rest)| rest);
+            done.text = format!(
+                "Koidrive update is incomplete: Homebrew has {actual}, and the newest release is {to}.\n{service}"
+            );
+            format!(
+                "Koidrive update is incomplete: the newest release is {to}, and Homebrew has {actual}. {why}. {guidance}"
+            )
+        }
+    };
+    Err(CliError {
+        partial: Some(Box::new(done)),
+        ..failed(message)
+    })
 }
 
-async fn refresh_tap(brew: &Path, echo: &mut Echo) {
+async fn refresh_tap(brew: &Path, echo: &mut Echo) -> Result<(), String> {
     let mut repository = Command::new(brew);
     repository
         .args(["--repository", TAP])
@@ -893,20 +932,17 @@ async fn refresh_tap(brew: &Path, echo: &mut Echo) {
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    let tap = match tokio::time::timeout(TAP_REFRESH, repository.output()).await {
-        Ok(Ok(output))
-            if output.status.success()
-                && Path::new(String::from_utf8_lossy(&output.stdout).trim()).is_absolute() =>
-        {
+    let output = tokio::time::timeout(TAP_REFRESH, repository.output()).await;
+    let tap = match &output {
+        Ok(Ok(output)) if output.status.success() => {
             PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
         }
-        _ => {
-            echo.line(&format!("Could not find the {TAP} Homebrew tap."), true);
-            return;
-        }
+        _ => PathBuf::new(),
     };
-    if !tap.join(".git").exists() {
-        return;
+    if !tap.is_absolute() || !tap.join(".git").exists() {
+        return Err(format!(
+            "Homebrew did not name a git checkout of the {TAP} tap"
+        ));
     }
     let homebrew_git = brew.with_file_name("git");
     let git = match homebrew_git.is_file() {
@@ -916,13 +952,24 @@ async fn refresh_tap(brew: &Path, echo: &mut Echo) {
     let mut pull = Command::new(git);
     pull.arg("-C")
         .arg(&tap)
-        .args(["pull", "--ff-only", "--quiet"]);
+        .args(["pull", "--ff-only", "--quiet"])
+        .env("GIT_TERMINAL_PROMPT", "0");
     match echo.run(pull, TAP_REFRESH, Child::Progress).await {
-        Ok(Some((status, _, _))) if status.success() => (),
-        _ => echo.line(
-            &format!("Could not refresh the {TAP} Homebrew tap; upgrading from it as it is."),
-            true,
-        ),
+        Ok(Some((status, _, _))) if status.success() => Ok(()),
+        Ok(Some((status, _, _))) => Err(format!(
+            "Could not refresh the {TAP} tap at {} (git {})",
+            tap.display(),
+            exit(status)
+        )),
+        Ok(None) => Err(format!(
+            "Could not refresh the {TAP} tap at {} within {} seconds",
+            tap.display(),
+            TAP_REFRESH.as_secs()
+        )),
+        Err(error) => Err(format!(
+            "Could not refresh the {TAP} tap at {}: {error}",
+            tap.display()
+        )),
     }
 }
 
