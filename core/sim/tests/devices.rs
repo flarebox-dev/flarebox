@@ -19,6 +19,9 @@ use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
 
+#[path = "devices/restore_write_history.rs"]
+mod restore_write_history;
+
 fn action() -> impl Strategy<Value = Action> {
     (
         prop_oneof![1 => Just(0u8), 3 => Just(1u8), 2 => Just(2u8), 2 => Just(3u8), 1 => Just(4u8)],

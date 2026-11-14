@@ -415,7 +415,6 @@ impl RecoveryCopy {
 struct Backup {
     space: SpaceDo,
     held_commits: Vec<BTreeSet<u64>>,
-    held: Held,
     in_history: Held,
     spent: Vec<Spent>,
     placements: Vec<BTreeSet<Placement>>,
@@ -665,7 +664,6 @@ impl World {
                 self.earlier_backup = self.backup.replace(Backup {
                     space: self.space.clone(),
                     held_commits: self.held_commits.clone(),
-                    held: self.held.clone(),
                     in_history: self.in_history.clone(),
                     spent: self.spent.clone(),
                     placements: self.placements.clone(),
@@ -930,6 +928,12 @@ impl World {
         };
         let before = shapes(&self.space);
         let held_before = writes(&self.space);
+        let lost_history: BTreeSet<i64> = (self.writers.keys())
+            .filter(|write| {
+                stored(&self.in_history, **write) && !stored(&backup.in_history, **write)
+            })
+            .copied()
+            .collect();
         self.space.restore(&backup.space);
         self.pending_authors = backup.pending_authors.clone();
         self.held_commits = backup.held_commits.clone();
@@ -975,7 +979,7 @@ impl World {
         }
         for write in self.writers.keys() {
             let taken = (held_before.difference(&held_after)).any(|(_, held)| held == write);
-            if !taken && (!stored(&self.held, *write) || stored(&backup.held, *write)) {
+            if !taken && !lost_history.contains(write) {
                 continue;
             }
             if self.devices.iter().any(|device| device.disk.holds(*write)) {
@@ -2566,6 +2570,37 @@ mod tests {
     use koidrive_engine::tree::{Kind, Shape};
 
     use super::*;
+
+    #[test]
+    fn a_restore_does_not_reopen_a_write_already_missing_from_retained_history() {
+        let mut world = World::new(2);
+        world.step(0, &Step::Backup).unwrap();
+        world
+            .phase(
+                0,
+                &[(
+                    0,
+                    Step::User(Action {
+                        kind: 1,
+                        target: 0,
+                        parent: 0,
+                        name: 0,
+                        text: 0,
+                    }),
+                )],
+            )
+            .unwrap();
+        world.restore(false);
+        let exposed = world.exposed[&1].nodes.clone();
+        world.devices[1]
+            .disk
+            .create(Place::Root, "b", Some(content(0, 0, 1)))
+            .unwrap();
+        world.step(0, &Step::Backup).unwrap();
+        world.restore(false);
+        assert!(world.exposed[&1].nodes == exposed);
+        assert_eq!(world.exposed[&1].loose, 0);
+    }
 
     #[test]
     fn a_rejected_move_with_an_applied_edit_does_not_record_a_placement() {
