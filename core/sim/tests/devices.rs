@@ -5934,3 +5934,51 @@ fn a_file_removed_for_a_trashed_folder_after_its_user_renamed_it_is_downloaded_w
     ];
     converge(3, &phases).unwrap();
 }
+
+#[test]
+fn a_removal_done_before_a_crash_stays_the_engines_when_the_user_renamed_its_file_away_and_back_since_the_plan()
+ {
+    let phases = vec![
+        vec![(0, folder("A")), (0, user(1, 0, 1, "a"))],
+        vec![
+            (2, delete(0)),
+            (2, SCAN),
+            (2, COMMIT),
+            (2, COMMIT),
+            (1, DELIVER),
+            (1, DELIVER),
+            (1, DELIVER),
+            (1, EFFECT),
+            (1, rename(1, 1, "c.txt")),
+            (1, SCAN),
+            (1, rename(1, 1, "a")),
+            (1, CRASH),
+            (1, rename(0, 0, "b")),
+        ],
+    ];
+    converge(3, &phases).unwrap();
+}
+
+#[test]
+fn a_removal_done_before_a_crash_stays_the_engines_when_the_user_renamed_its_folder_away_and_back_since_the_plan()
+ {
+    let phases = vec![
+        vec![(0, folder("A")), (0, user(1, 0, 1, "a"))],
+        vec![
+            (2, delete(0)),
+            (2, SCAN),
+            (2, COMMIT),
+            (2, COMMIT),
+            (1, DELIVER),
+            (1, DELIVER),
+            (1, DELIVER),
+            (1, EFFECT),
+            (1, rename(0, 0, "c.txt")),
+            (1, SCAN),
+            (1, rename(0, 0, "A")),
+            (1, CRASH),
+            (1, rename(0, 0, "b")),
+        ],
+    ];
+    converge(3, &phases).unwrap();
+}
