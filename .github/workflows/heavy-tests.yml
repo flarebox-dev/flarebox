@@ -157,7 +157,7 @@ jobs:
             echo
             echo "| Run | Seed | Result | Passed | Failed | Ignored | Minutes |"
             echo "|---|---|---|---|---|---|---|"
-          } >> "$GITHUB_STEP_SUMMARY"
+          } >> "$out/summary.md"
           green=0 red=0 broken=0 total_passed=0 total_failed=0
           : > "$out/failed-tests.txt"
           for run in $(seq 1 "$REPEAT"); do
@@ -191,7 +191,7 @@ jobs:
               result="error: exit $code, $results of $binaries test binaries finished"
               broken=$((broken + 1))
             fi
-            echo "| $run | $seed | $result | $passed | $failed | $ignored | $minutes |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| $run | $seed | $result | $passed | $failed | $ignored | $minutes |" >> "$out/summary.md"
             if [ "$result" != pass ]; then
               echo "::error title=Run $run: $result::Reproduce: ${repro/<seed>/$seed}"
             fi
@@ -213,9 +213,10 @@ jobs:
               echo "$repro"
               echo '```'
               echo
-              echo "The heavy-tests-$RUNNER_OS artifact holds each run's log and any new proptest case files."
+              echo "The heavy-tests-$RUNNER_OS artifact holds this summary, each run's log and any new proptest case files."
             fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          } >> "$out/summary.md"
+          tee -a "$GITHUB_STEP_SUMMARY" < "$out/summary.md"
           git status --porcelain --untracked-files=all -- '*.proptest-regressions' '*/proptest-regressions/*.txt' '*.cases/*.txt' | cut -c4- | while read -r file; do
             mkdir -p "$out/regressions/$(dirname "$file")"
             cp "$file" "$out/regressions/$file"
