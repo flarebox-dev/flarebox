@@ -21,7 +21,7 @@ mkdir -p "$macos_dir/build"
 cp "$target_dir/release/koi" "$macos_dir/build/koi"
 
 rm -rf "$work_dir"
-bindgen=(cargo run --locked --quiet -p koidrive-ffi --features bindgen --bin uniffi-bindgen-swift
+bindgen=(cargo run --locked -p uniffi-bindgen-swift
   --target-dir "$target_dir/uniffi-bindgen" --)
 "${bindgen[@]}" "$lib" "$work_dir/swift" --swift-sources
 "${bindgen[@]}" "$lib" "$work_dir/include" --headers

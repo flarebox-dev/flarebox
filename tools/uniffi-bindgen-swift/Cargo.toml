@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "uniffi-bindgen-swift"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+uniffi = { version = "0.32", features = ["cli"] }
