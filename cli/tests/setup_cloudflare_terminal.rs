@@ -521,20 +521,21 @@ fn daemon(mut stream: UnixStream, paths: &Paths, state: &Mutex<State>) {
                 .iter()
                 .find(|space| space.space_id == id)
                 .unwrap();
-            let status = FolderStatus {
-                space_id: id.clone(),
-                space_name: space.name.clone(),
-                path: folder.display().to_string(),
-                state: FolderState::Connecting,
-                history_id: None,
-                last_seq: None,
-                head_seq: None,
-                remote_nodes: 0,
-                local_entries: None,
-                questions: 0,
-                problem: None,
-                wait: None,
-            };
+            let status: FolderStatus = serde_json::from_value(json!({
+                "space_id": id,
+                "space_name": space.name,
+                "path": folder.display().to_string(),
+                "state": FolderState::Connecting,
+                "history_id": null,
+                "last_seq": null,
+                "head_seq": null,
+                "remote_nodes": 0,
+                "local_entries": null,
+                "questions": 0,
+                "problem": null,
+                "wait": null
+            }))
+            .unwrap();
             state.links.push((folder, id));
             state.linked.push(status.clone());
             json!({"response":"linked","folder":status})

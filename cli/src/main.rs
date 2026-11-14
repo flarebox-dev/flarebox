@@ -3152,20 +3152,23 @@ mod tests {
             ));
             let status = Status {
                 running: true,
-                folders: vec![FolderStatus {
-                    space_id: "s1".into(),
-                    space_name: "Koidrive".into(),
-                    path: "/fixture/Koidrive".into(),
-                    state,
-                    history_id: None,
-                    last_seq: None,
-                    head_seq: None,
-                    remote_nodes: 0,
-                    local_entries: None,
-                    questions: 1,
-                    problem: None,
-                    wait: None,
-                }],
+                folders: vec![
+                    serde_json::from_value(serde_json::json!({
+                        "space_id": "s1",
+                        "space_name": "Koidrive",
+                        "path": "/fixture/Koidrive",
+                        "state": state,
+                        "history_id": null,
+                        "last_seq": null,
+                        "head_seq": null,
+                        "remote_nodes": 0,
+                        "local_entries": null,
+                        "questions": 1,
+                        "problem": null,
+                        "wait": null
+                    }))
+                    .unwrap(),
+                ],
                 ..Status::default()
             };
             koidrive_ipc::write_line(&mut stream, &Response::Status { status })
@@ -3245,20 +3248,23 @@ mod tests {
             ));
             let status = Status {
                 running: true,
-                folders: vec![FolderStatus {
-                    space_id: "s1".into(),
-                    space_name: "Koidrive".into(),
-                    path: "/fixture/Koidrive".into(),
-                    state: FolderState::UpToDate,
-                    history_id: None,
-                    last_seq: None,
-                    head_seq: None,
-                    remote_nodes: 0,
-                    local_entries: None,
-                    questions: 0,
-                    problem: None,
-                    wait: None,
-                }],
+                folders: vec![
+                    serde_json::from_value(serde_json::json!({
+                        "space_id": "s1",
+                        "space_name": "Koidrive",
+                        "path": "/fixture/Koidrive",
+                        "state": FolderState::UpToDate,
+                        "history_id": null,
+                        "last_seq": null,
+                        "head_seq": null,
+                        "remote_nodes": 0,
+                        "local_entries": null,
+                        "questions": 0,
+                        "problem": null,
+                        "wait": null
+                    }))
+                    .unwrap(),
+                ],
                 ..Status::default()
             };
             koidrive_ipc::write_line(&mut stream, &Response::Status { status })
