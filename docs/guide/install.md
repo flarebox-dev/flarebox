@@ -1,6 +1,10 @@
 # Install
 
-Install the `koi` command on Linux (x86_64 or arm64) or on a Mac with Apple silicon:
+On macOS 26 or later with Apple silicon, [install and set up the Mac app](macos.md#install-and-set-up-this-mac). It includes `koi` and shares the CLI's device, folders and background sync service.
+
+## Install the CLI
+
+For Linux, servers and scripts, install the `koi` command on Linux (x86_64 or arm64) or a Mac with Apple silicon:
 
 ```sh
 curl -fsSL https://koidrive.com/install.sh | sh

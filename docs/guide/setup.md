@@ -2,6 +2,8 @@
 
 You need one server, in a Cloudflare account you own, and at least one device signed in to it. The first device claims the server and becomes its owner's device. Every other device joins with a pairing code.
 
+On a Mac, follow [Install and set up this Mac](macos.md#install-and-set-up-this-mac) to sign in and link a folder in the app. The steps below use the CLI.
+
 ## Deploy a server and claim it
 
 You need a Cloudflare account with R2 turned on ([R2 pricing](https://developers.cloudflare.com/r2/pricing/)) and the [`koi` command](install.md).

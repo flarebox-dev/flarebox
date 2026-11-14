@@ -18,7 +18,7 @@
 </p>
 
 > [!WARNING]
-> **Koidrive is in alpha.** Install the `koi` command as [Get started](#get-started) shows, and the macOS app from the [latest release](https://github.com/koidrive/koidrive/releases/latest). The protocol and storage format may change before 0.1.0. Keep another copy of anything you sync.
+> **Koidrive is in alpha.** [Get started](#get-started) with the Mac app or the `koi` command. The protocol and storage format may change before 0.1.0. Keep another copy of anything you sync.
 
 ## Why Koidrive
 
@@ -53,7 +53,7 @@ Dropbox does much more, and charges per person for it. Koidrive does the core of
 | **Both copies kept on a conflict** | Yes | Yes |
 | **Trash and version history** | 30 days | 30 days to 1 year |
 | **Share links** | Yes | Yes |
-| **macOS on Apple silicon** | Command line, and a menu bar app for macOS 26 or later | Yes |
+| **macOS** | Yes, for macOS 26+ | Yes |
 | **Linux** | Command line and daemon | Yes |
 
 ### Where Dropbox does more
@@ -86,6 +86,27 @@ Files in the trash and old versions count as storage for the 30 days Koidrive ke
 
 You need a Cloudflare account with R2 turned on, and a Mac with Apple silicon or a Linux machine.
 
+### The macOS app
+
+Koidrive for Mac is the full sync client for macOS 26 or later on Apple silicon. Set up this Mac, link folders and manage sync in the app. The menu bar shows sync status and notices, opens your folders in Finder and lets you pause or resume sync. **Needs You** asks before a large delete reaches your other machines.
+
+1. Download `Koidrive-<version>-arm64.dmg` from the [latest release](https://github.com/koidrive/koidrive/releases/latest), open it and drag Koidrive to Applications.
+
+   With [Homebrew](https://brew.sh), one command installs the app and puts its `koi` on your `PATH`. If the `koidrive` formula is installed, first run `brew uninstall --formula koidrive/tap/koidrive`, as [Install with Homebrew](docs/guide/install.md#install-with-homebrew) explains. Install the cask with:
+
+   ```sh
+   brew install --cask koidrive/tap/koidrive
+   ```
+
+2. If you have no server, [deploy one](docs/deploy.md#deploy) in your Cloudflare account. Open `<your server>/setup` and find the claim code in the Worker's logs. For an existing account, skip this step.
+3. Open Koidrive. The **Set Up Koidrive** window connects to your server, signs in this Mac and links a folder. For an existing account, use a pairing code from a signed-in device.
+
+**Settings** has **Folders**, **Account**, **Storage**, **Problems** and **General** tabs for managing folders, devices, storage use, problems and app preferences. The [Mac app guide](docs/guide/macos.md) walks through setup and everyday use, including adding another Mac.
+
+### The CLI for Linux, servers and scripts
+
+The `koi` command works on Linux and Macs with Apple silicon. The Mac app includes `koi` and shares its device, profile and background sync service. Folders linked in either appear in both.
+
 1. **Install the `koi` command.**
 
    ```sh
@@ -115,20 +136,6 @@ You need a Cloudflare account with R2 turned on, and a Mac with Apple silicon or
 4. **Add your other machines.** On a machine that is signed in, run `koi device invite`. It prints a command with a pairing code. Run that command on the new machine, then link a folder there too.
 
 The [user guide](docs/guide/README.md) covers conflicts, the trash, devices, limits and how to remove everything.
-
-## The macOS app
-
-Koidrive for macOS is a menu bar app for macOS 26 or later on Apple silicon. It shows each folder's sync status, asks before a large delete reaches your other machines, links folders, adds devices and pauses sync.
-
-Download `Koidrive-<version>-arm64.dmg` from the [latest release](https://github.com/koidrive/koidrive/releases/latest), open it and drag Koidrive to Applications. With [Homebrew](https://brew.sh), one command installs the app and puts its `koi` on your `PATH`. If the `koidrive` formula is installed, first run `brew uninstall --formula koidrive/tap/koidrive`, as [Install with Homebrew](docs/guide/install.md#install-with-homebrew) explains. Install the cask with:
-
-```sh
-brew install --cask koidrive/tap/koidrive
-```
-
-Then open Koidrive. On a Mac where `koi` isn't set up, the Set Up Koidrive window asks for your server, signs in this Mac and links a folder.
-
-The app runs the `koi` command it carries inside it, so the app and `koi` are one device. They share one profile and one background sync service, and a folder you link in either one shows up in both.
 
 ## Repository layout
 

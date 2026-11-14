@@ -7,7 +7,7 @@ This page deploys the server to your own Cloudflare account with the deploy butt
 - A Cloudflare account with R2 activated. If you have never used R2, open the dashboard, go to **Storage & databases**, **R2**, **Overview**, and complete the checkout there. R2 includes free monthly usage and bills usage beyond it ([R2 get started](https://developers.cloudflare.com/r2/get-started/#before-you-begin)). Neither the deploy button nor Wrangler can activate R2, and without it the bucket cannot be created ([workers-sdk#15468](https://github.com/cloudflare/workers-sdk/issues/15468)).
 - For the deploy button, a GitHub or GitLab account. The button copies the server into a new repository there.
 - For the command line, Node.js and pnpm.
-- The `koi` command, to claim the server ([Install](guide/install.md)).
+- The [Mac app](guide/macos.md) or the [`koi` command](guide/install.md), to claim the server.
 
 ## Deploy
 

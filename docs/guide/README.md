@@ -2,7 +2,7 @@
 
 Koidrive keeps folders in sync between your computers through a server that you deploy to your own Cloudflare account. File contents are stored as chunks in an R2 bucket in that account. A Durable Object for each space keeps its file tree, its trash and the old versions of its files.
 
-This guide covers the `koi` command on Macs with Apple silicon and on Linux, version 0.1.0. To start, [install](install.md) the command and [set up](setup.md) a server.
+Start with the [Mac app](macos.md) on macOS 26 or later with Apple silicon. For Linux, servers and scripts, [install](install.md) the `koi` command and [set up](setup.md) a server. This guide covers both clients, version 0.1.0.
 
 ## Words this guide uses
 
@@ -12,6 +12,8 @@ This guide covers the `koi` command on Macs with Apple silicon and on Linux, ver
 - **Linked folder.** A folder on a device that syncs one space. A device links each space to at most one folder.
 
 ## Do a task
+
+For setup and everyday sync on a Mac, use the [Mac app guide](macos.md). The following pages cover the CLI:
 
 1. [Install](install.md): install or update the command, or build it from source.
 2. [Set up](setup.md): deploy a server and claim it, add devices, create spaces and upgrade the server.
