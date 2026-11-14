@@ -486,7 +486,7 @@ impl Folder {
         {
             self.halves_asked = None;
             self.step(|engine, _| {
-                engine.trees.release_halves(at_ms);
+                engine.trees.release_halves(at_ms, &BTreeSet::new());
                 Ok(())
             })?;
         }

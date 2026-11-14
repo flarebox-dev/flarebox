@@ -740,6 +740,7 @@ impl Engine {
         whole: bool,
     ) -> BTreeSet<NodeId> {
         let mut touched = BTreeSet::new();
+        let mut unread = BTreeSet::new();
         let mut gone = Gone::default();
         self.take_links(changes, now_ms, &mut touched, &mut gone);
         self.vanishing = (!whole).then_some(now_ms);
@@ -935,10 +936,20 @@ impl Engine {
                     let content = match content {
                         None if *kind == EntryKind::File => {
                             let held = (self.trees.displaced_with_identity(&identity))
-                                .filter(|node| self.trees.halves().contains_key(*node));
-                            match held.and_then(|node| self.trees.synced().live(node)) {
-                                Some(synced) if synced.content.is_some() => synced.content.clone(),
-                                _ => continue,
+                                .filter(|node| self.trees.halves().contains_key(*node))
+                                .cloned();
+                            let synced = (held.as_ref())
+                                .and_then(|node| self.trees.synced().live(node))
+                                .and_then(|synced| synced.content.clone());
+                            if synced.is_none()
+                                && let Some(node) = held
+                            {
+                                self.trees.wait_again(&node, now_ms);
+                                unread.insert(node);
+                            }
+                            match synced {
+                                Some(content) => Some(content),
+                                None => continue,
                             }
                         }
                         content => content.clone(),
@@ -996,7 +1007,11 @@ impl Engine {
                 } => {
                     let Some(content) = content else { continue };
                     let identity = file_identity(*id);
-                    let node = resolve(&self.trees, path, &identity, *linked);
+                    let node = resolve(&self.trees, path, &identity, *linked).or_else(|| {
+                        (self.trees.displaced_with_identity(&identity))
+                            .filter(|node| self.trees.halves().contains_key(*node))
+                            .cloned()
+                    });
                     self.place(
                         node,
                         path,
@@ -1027,7 +1042,7 @@ impl Engine {
         }
         self.vanishing = None;
         if whole {
-            self.trees.release_halves(u64::MAX);
+            self.trees.release_halves(u64::MAX, &unread);
         }
         touched
     }
@@ -2919,6 +2934,60 @@ mod tests {
             let mut local = engine.trees.local().get(&file).unwrap().clone();
             local.identity.birth_ns = identity.birth_ns;
             engine.trees.set_local(file.clone(), local);
+            engine.observe_part(
+                &[Observed::Removed {
+                    path: "x/d".into(),
+                    kind: EntryKind::Dir,
+                }],
+                1_000,
+            );
+            engine.observe(
+                &[Observed::Created {
+                    path: "e/moved.txt".into(),
+                    kind: EntryKind::File,
+                    id: identity,
+                    linked,
+                    content: None,
+                }],
+                3_001,
+            );
+            engine.observe_part(
+                &[Observed::Modified {
+                    path: "e/moved.txt".into(),
+                    id: identity,
+                    linked,
+                    content: Some(bytes(5)),
+                }],
+                3_002,
+            );
+            assert_eq!(
+                holding(&engine, "e/moved.txt").map(|(id, _, _)| id),
+                Some(file),
+                "linked: {linked}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_held_file_a_whole_scan_finds_before_reading_its_content_keeps_its_node_before_it_was_synced()
+     {
+        for linked in [false, true] {
+            let (_dir, mut engine) = mapper();
+            let identity = FileId {
+                birth_ns: Some(10),
+                ..ino(10)
+            };
+            let folder = |path: &str, id: u64| Observed::Created {
+                path: path.into(),
+                kind: EntryKind::Dir,
+                id: ino(id),
+                linked: false,
+                content: None,
+            };
+            engine.observe(&[folder("x", 1), folder("x/d", 2), folder("e", 3)], 0);
+            synced_everywhere(&mut engine);
+            engine.observe(&[created("x/d/g.txt", identity, linked, 5)], 1);
+            let (file, _, _) = holding(&engine, "x/d/g.txt").unwrap();
             engine.observe_part(
                 &[Observed::Removed {
                     path: "x/d".into(),

@@ -1187,10 +1187,10 @@ impl Trees {
     }
 
     /// Ends every wait of [`Trees::vanish_local`] and [`Trees::hold_link`] that ends at or before `due_ms`, the time
-    /// [`Trees::halves_due`] gave.
-    pub fn release_halves(&mut self, due_ms: u64) {
+    /// [`Trees::halves_due`] gave, except the waits of `kept`.
+    pub fn release_halves(&mut self, due_ms: u64, kept: &BTreeSet<NodeId>) {
         let due: Vec<NodeId> = (self.halves.iter())
-            .filter(|(_, at)| at.saturating_add(HALF_WAIT_MS) <= due_ms)
+            .filter(|(id, at)| !kept.contains(*id) && at.saturating_add(HALF_WAIT_MS) <= due_ms)
             .map(|(id, _)| id.clone())
             .collect();
         for id in due {
@@ -1199,6 +1199,14 @@ impl Trees {
                 self.drop_displaced(&id);
             }
             self.mark(&id);
+        }
+    }
+
+    /// Starts the wait of a node that waits for the other half of its move again at `at_ms`, for a scan that found the
+    /// entry with its identity before it could read the entry's content.
+    pub fn wait_again(&mut self, id: &str, at_ms: u64) {
+        if let Some(at) = self.halves.get_mut(id) {
+            *at = at_ms;
         }
     }
 
