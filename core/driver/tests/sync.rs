@@ -71,6 +71,7 @@ async fn claim() -> Credentials {
         device_name: "owner".into(),
         platform: "test".into(),
         setup_attempt: String::new(),
+        request_id: String::new(),
     };
     Credentials::from(&api().claim(&request).await.expect("the claim succeeds"))
 }
@@ -104,7 +105,10 @@ fn log() {
 
 /// A new space of the owner. Each test syncs a space of its own.
 async fn new_space(owner: &Arc<Auth>, name: &str) -> SpaceInfo {
-    let request = CreateSpaceRequest { name: name.into() };
+    let request = CreateSpaceRequest {
+        name: name.into(),
+        request_id: String::new(),
+    };
     owner.api().create_space(owner, &request).await.unwrap()
 }
 

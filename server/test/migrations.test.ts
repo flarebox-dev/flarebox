@@ -35,6 +35,7 @@ const ACCOUNT_SCHEMA_DIGESTS = [
   "c8f022a3869613f651320f6d5d56c8d67398f2703761a4a4e99af009badfb090",
   "9b588dbfc49e370ed9f83bfe686d334d291250b3b818f61493eb9b6e9ad652d7",
   "aaec735e7ef47b5644e1f838dab896941f056da73eca6c6dcb65c3fd67cabac3",
+  "6b5b1959385d6b4431dc9dd381a45519e6af594b2561538767c8a46a1a6f6e63",
 ];
 
 type Stub = DurableObjectStub<SpaceDO> | DurableObjectStub<AccountDO>;

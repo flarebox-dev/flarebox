@@ -15,6 +15,7 @@ bytes = "1.12.1"
 fastrand = "2"
 koidrive-proto = { path = "../proto" }
 futures-util = { version = "0.3.31", default-features = false, features = ["sink", "std"] }
+getrandom = "0.4.3"
 http-body-util = "0.1.5"
 hyper = { version = "1.12.0", features = ["client", "http1"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }

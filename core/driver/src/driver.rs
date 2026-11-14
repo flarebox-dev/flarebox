@@ -667,13 +667,13 @@ impl Driver {
         let file = NewCredentialFile::create(&self.inner.paths.credential())?;
         self.unlink_folders_of_lost_credential().await?;
         let api = api_for(server)?;
-        let issued = api
-            .pair_complete(&PairCompleteRequest {
-                code: code.to_owned(),
-                device_name: device_name.to_owned(),
-                platform: std::env::consts::OS.to_owned(),
-            })
-            .await?;
+        let request = PairCompleteRequest {
+            code: code.to_owned(),
+            device_name: device_name.to_owned(),
+            platform: std::env::consts::OS.to_owned(),
+            request_id: koidrive_net::request_id(),
+        };
+        let issued = koidrive_net::resend_lost(|| api.pair_complete(&request)).await?;
         self.adopt(
             file,
             api.base().to_string(),
@@ -704,15 +704,15 @@ impl Driver {
         let file = NewCredentialFile::create(&self.inner.paths.credential())?;
         self.unlink_folders_of_lost_credential().await?;
         let api = api_for(server)?;
-        let issued = api
-            .claim(&ClaimRequest {
-                code: code.to_owned(),
-                user_name: user_name.to_owned(),
-                device_name: device_name.to_owned(),
-                platform: std::env::consts::OS.to_owned(),
-                setup_attempt: String::new(),
-            })
-            .await?;
+        let request = ClaimRequest {
+            code: code.to_owned(),
+            user_name: user_name.to_owned(),
+            device_name: device_name.to_owned(),
+            platform: std::env::consts::OS.to_owned(),
+            setup_attempt: String::new(),
+            request_id: koidrive_net::request_id(),
+        };
+        let issued = koidrive_net::resend_lost(|| api.claim(&request)).await?;
         self.adopt(
             file,
             api.base().to_string(),

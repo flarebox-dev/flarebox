@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -14,7 +15,9 @@ use std::time::{Duration, Instant};
 
 use koidrive_driver::{Credential, FolderState, FolderStatus, Paths};
 use koidrive_ipc::{Code, Response};
-use koidrive_proto::v1::{AccessToken, CreateSpaceRequest, SpaceInfo, SpaceList};
+use koidrive_proto::v1::{
+    AccessToken, CreateSpaceRequest, Error as ProtoError, SpaceInfo, SpaceList, error,
+};
 use prost::Message;
 
 mod schema;
@@ -118,6 +121,8 @@ struct Home {
     linked: Arc<Mutex<Vec<FolderStatus>>>,
     requests: Arc<Mutex<Vec<String>>>,
     lose_create: Arc<AtomicBool>,
+    collide_create: Arc<AtomicBool>,
+    created_by: Arc<Mutex<HashMap<String, SpaceInfo>>>,
     request_hook: RequestHook,
 }
 
@@ -146,17 +151,26 @@ impl Home {
             linked: Arc::new(Mutex::new(Vec::new())),
             requests: Arc::new(Mutex::new(Vec::new())),
             lose_create: Arc::new(AtomicBool::new(false)),
+            collide_create: Arc::new(AtomicBool::new(false)),
+            created_by: Arc::new(Mutex::new(HashMap::new())),
             request_hook: Arc::new(Mutex::new(None)),
         };
-        let (spaces, requests, lose) = (
+        let (spaces, requests, lose, collide, created_by) = (
             home.spaces.clone(),
             home.requests.clone(),
             home.lose_create.clone(),
+            home.collide_create.clone(),
+            home.created_by.clone(),
         );
         let hook = home.request_hook.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
-                serve(stream.unwrap(), &spaces, &requests, &lose, &hook);
+                let creates = Creates {
+                    lose: &lose,
+                    collide: &collide,
+                    created_by: &created_by,
+                };
+                serve(stream.unwrap(), &spaces, &requests, &creates, &hook);
             }
         });
         home
@@ -428,11 +442,17 @@ fn folder_status(folder: &Path, space: &SpaceInfo) -> FolderStatus {
     }
 }
 
+struct Creates<'a> {
+    lose: &'a AtomicBool,
+    collide: &'a AtomicBool,
+    created_by: &'a Mutex<HashMap<String, SpaceInfo>>,
+}
+
 fn serve(
     mut stream: TcpStream,
     spaces: &Mutex<Vec<SpaceInfo>>,
     requests: &Mutex<Vec<String>>,
-    lose_create: &AtomicBool,
+    creates: &Creates,
     hook: &RequestHook,
 ) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -459,6 +479,7 @@ fn serve(
     if let Some(hook) = hook.lock().unwrap().as_mut() {
         hook(&format!("{method} {path}"));
     }
+    let mut status = "200 OK";
     let answer = match (method, path) {
         ("POST", "/v1/token") => AccessToken {
             token: "token".into(),
@@ -474,17 +495,35 @@ fn serve(
         ("POST", "/v1/spaces") => {
             let request = CreateSpaceRequest::decode(body.as_slice()).unwrap();
             let mut spaces = spaces.lock().unwrap();
-            let created = space(spaces.len(), &request.name);
-            spaces.push(created.clone());
-            if lose_create.swap(false, Ordering::Relaxed) {
-                return;
+            if creates.collide.swap(false, Ordering::Relaxed) {
+                let taken = space(spaces.len(), &request.name);
+                spaces.push(taken);
+                status = "409 Conflict";
+                ProtoError {
+                    code: error::Code::InvalidArgument.into(),
+                    message: "you already have a space with this name".into(),
+                    ..Default::default()
+                }
+                .encode_to_vec()
+            } else {
+                let mut created_by = creates.created_by.lock().unwrap();
+                let created = (created_by.entry(request.request_id))
+                    .or_insert_with(|| {
+                        let made = space(spaces.len(), &request.name);
+                        spaces.push(made.clone());
+                        made
+                    })
+                    .clone();
+                if creates.lose.swap(false, Ordering::Relaxed) {
+                    return;
+                }
+                created.encode_to_vec()
             }
-            created.encode_to_vec()
         }
         other => panic!("unexpected server request {other:?}"),
     };
     let head = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\ncontent-type: application/x-protobuf\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         answer.len()
     );
     stream.write_all(head.as_bytes()).unwrap();
@@ -1393,17 +1432,48 @@ fn a_lost_create_answer_links_the_shared_folder_it_made_once() {
     let home = Home::new(&[]);
     home.lose_create.store(true, Ordering::Relaxed);
     let mut steps = pairing(false);
-    steps.extend([step(SPACE, choose(false, 0)), step(TELEMETRY, "n\n")]);
+    steps.push(step(TELEMETRY, "n\n"));
     let output = home.setup(&steps, &[], &[], true, false, None);
     let text = shown(output.clone());
     assert!(output.status.success(), "{text}");
     let created = (home.requests().iter())
         .filter(|request| *request == "POST /v1/spaces")
         .count();
-    assert_eq!(created, 1);
+    assert_eq!(created, 2);
     assert_eq!(home.spaces.lock().unwrap().len(), 1);
     assert_eq!(home.links().len(), 1);
     assert!(home.links()[0].ends_with(&home.space_id("Koidrive")));
+}
+
+#[test]
+fn a_lost_create_answer_links_the_named_shared_folder_it_made_once() {
+    for rich in [false, true] {
+        let home = Home::new(&["Koidrive"]);
+        home.lose_create.store(true, Ordering::Relaxed);
+        let mut steps = pairing(rich);
+        steps.extend([
+            step(SPACE, choose(rich, 1)),
+            step(NAME, line("Photos")),
+            step(TELEMETRY, no(rich)),
+        ]);
+        let output = home.setup(&steps, &[], &[], true, rich, None);
+        let text = shown(output.clone());
+        assert!(output.status.success(), "{text}");
+        assert!(!text.contains("already exists"), "{text}");
+        let names: Vec<String> = (home.spaces.lock().unwrap().iter())
+            .map(|space| space.name.clone())
+            .collect();
+        assert_eq!(names, ["Koidrive", "Photos"]);
+        let folder = home.path().join("Koidrive");
+        assert_eq!(
+            home.links(),
+            [format!(
+                "link {} {}",
+                folder.display(),
+                home.space_id("Photos")
+            )]
+        );
+    }
 }
 
 #[test]
@@ -1411,7 +1481,7 @@ fn a_default_collision_choice_can_be_cancelled_without_linking_local_files() {
     for rich in [false, true] {
         let home = Home::new(&[]);
         home.connect();
-        home.lose_create.store(true, Ordering::Relaxed);
+        home.collide_create.store(true, Ordering::Relaxed);
         let folder = home.path().join("Koidrive");
         fs::create_dir(&folder).unwrap();
         fs::write(folder.join("report.docx"), b"draft").unwrap();
@@ -1876,11 +1946,11 @@ fn replacing_an_approved_directory_during_the_link_server_call_is_refused() {
 }
 
 #[test]
-fn a_lost_create_response_does_not_choose_between_duplicate_names() {
+fn a_name_clash_does_not_choose_between_duplicate_names() {
     for rich in [false, true] {
         let home = Home::new(&[]);
         home.connect();
-        home.lose_create.store(true, Ordering::Relaxed);
+        home.collide_create.store(true, Ordering::Relaxed);
         let spaces = home.spaces.clone();
         *home.request_hook.lock().unwrap() = Some(Box::new(move |request| {
             if request == "POST /v1/spaces" {

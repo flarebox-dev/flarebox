@@ -20,6 +20,7 @@ export const DEFAULT_EXPIRY_MS = 7 * DAY_MS;
 export const MAX_EXPIRY_MS = 365 * DAY_MS;
 const MIN_EXPIRY_MS = 60_000;
 export const MAX_ACTIVE_LINKS = 1000;
+export const MAX_REQUEST_ID_LENGTH = 64;
 const LIST_PAGE = 100;
 const PASSWORD_MIN = 8;
 const PASSWORD_MAX = 256;
@@ -120,14 +121,14 @@ export class ShareLinks {
 
   private insert(
     linkId: string,
-    args: { spaceId: string; nodeId: string; createdBy: string; expiresAtMs?: number | null },
+    args: { spaceId: string; nodeId: string; createdBy: string; expiresAtMs?: number | null; requestId?: string },
     createdAtMs: number,
     salt: Uint8Array | undefined,
     hash: ArrayBuffer | null,
   ): void {
     this.sql.exec(
       `INSERT INTO share_links (link_id, space_id, node_id, created_by, created_at_ms, expires_at_ms, password_kdf,
-         password_hash, password_salt, password_iterations) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         password_hash, password_salt, password_iterations, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       linkId,
       args.spaceId,
       args.nodeId,
@@ -138,6 +139,7 @@ export class ShareLinks {
       hash,
       salt ? (salt.buffer as ArrayBuffer) : null,
       salt ? SHARE_PASSWORD_ITERATIONS : null,
+      args.requestId || null,
     );
   }
 
@@ -186,11 +188,16 @@ export class ShareLinks {
   }
 
   async ownerCreate(
-    args: { userId: string; spaceId: string; nodeId: string; expiresAtMs: number; noExpiry: boolean; password: string; origin: string },
+    args: { userId: string; spaceId: string; nodeId: string; expiresAtMs: number; noExpiry: boolean; password: string; origin: string; requestId?: string },
     checkNode: () => Promise<ShareOutcome<null>>,
   ): Promise<ShareOutcome<ShareLink>> {
     const nowMs = this.deps.clock();
+    const requestId = args.requestId ?? "";
     if (!this.ownsSpace(args.userId, args.spaceId)) return notOwner();
+    if (requestId.length > MAX_REQUEST_ID_LENGTH) return invalid(`request_id is longer than ${MAX_REQUEST_ID_LENGTH} characters`);
+    const made = () => (requestId ? this.requestedLink(args.spaceId, requestId) : undefined);
+    const earlier = made();
+    if (earlier) return this.resent(earlier, args);
     if (!isUuidV7(args.nodeId)) return invalid("node_id must be a UUIDv7");
     if (args.noExpiry && args.expiresAtMs !== 0) return invalid("no_expiry cannot be combined with expires_at_ms");
     if (args.expiresAtMs !== 0 && (args.expiresAtMs <= nowMs + MIN_EXPIRY_MS || args.expiresAtMs > nowMs + MAX_EXPIRY_MS)) {
@@ -208,13 +215,33 @@ export class ShareLinks {
     const salt = args.password ? crypto.getRandomValues(new Uint8Array(16)) : undefined;
     const hash = salt ? await passwordHash(args.password, salt, SHARE_PASSWORD_ITERATIONS) : null;
     const createdMs = this.deps.clock();
+    const meanwhile = made();
+    if (meanwhile) return this.resent(meanwhile, args);
     if (this.activeCount(args.spaceId, createdMs) >= MAX_ACTIVE_LINKS) {
       return failure(Error_Code.LIMIT_EXCEEDED, `a space has at most ${MAX_ACTIVE_LINKS} active links`, 413);
     }
     const linkId = base64url(crypto.getRandomValues(new Uint8Array(16)));
     const expiresAtMs = args.noExpiry ? null : args.expiresAtMs || createdMs + DEFAULT_EXPIRY_MS;
-    this.insert(linkId, { spaceId: args.spaceId, nodeId: args.nodeId, createdBy: args.userId, expiresAtMs }, createdMs, salt, hash);
+    this.insert(linkId, { spaceId: args.spaceId, nodeId: args.nodeId, createdBy: args.userId, expiresAtMs, requestId }, createdMs, salt, hash);
     return ok(this.message(this.row(linkId)!, args.origin));
+  }
+
+  private requestedLink(spaceId: string, requestId: string): ShareLinkRow | undefined {
+    return this.sql.exec("SELECT * FROM share_links WHERE space_id = ? AND request_id = ?", spaceId, requestId).toArray()[0] as unknown as ShareLinkRow | undefined;
+  }
+
+  private async resent(
+    link: ShareLinkRow,
+    args: { nodeId: string; expiresAtMs: number; noExpiry: boolean; password: string; origin: string },
+  ): Promise<ShareOutcome<ShareLink>> {
+    const expiresAtMs = args.noExpiry ? null : args.expiresAtMs || link.created_at_ms + DEFAULT_EXPIRY_MS;
+    const samePassword =
+      args.password === ""
+        ? link.password_hash === null
+        : link.password_hash !== null &&
+          sameHash(await passwordHash(args.password, new Uint8Array(link.password_salt!), link.password_iterations!), link.password_hash);
+    if (link.node_id !== args.nodeId || link.expires_at_ms !== expiresAtMs || !samePassword) return invalid("this request_id was used with other fields");
+    return ok(this.message(link, args.origin));
   }
 
   ownerList(args: { userId: string; spaceId: string; cursor: string; origin: string }): ShareOutcome<ShareLinkList> {

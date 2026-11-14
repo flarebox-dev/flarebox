@@ -37,6 +37,9 @@ message ClaimRequest {
   // characters. Such a claim revokes the earlier devices of the same attempt that never refreshed a token, so claims
   // whose responses were lost leave one device in the end.
   string setup_attempt = 5;
+  // A random value, at most 64 characters, that the client chooses once per intended claim and sends with every
+  // resend of it. A resend returns what the first request created (RFC 0024).
+  string request_id = 6;
 }
 
 // Response of POST /v1/pair/start, called by an already paired device.
@@ -51,6 +54,9 @@ message PairCompleteRequest {
   string code = 1;
   string device_name = 2;
   string platform = 3;
+  // A random value, at most 64 characters, that the client chooses once per intended pairing and sends with every
+  // resend of it. A resend returns what the first request created (RFC 0024).
+  string request_id = 4;
 }
 
 // Response of POST /v1/claim and POST /v1/pair/complete.
@@ -100,6 +106,9 @@ message SpaceInfo {
 // POST /v1/spaces. name is at most 255 bytes of UTF-8 (RFC 0007 section 1).
 message CreateSpaceRequest {
   string name = 1;
+  // A random value, at most 64 characters, that the client chooses once per intended space and sends with every
+  // resend of it. A resend returns what the first request created (RFC 0024).
+  string request_id = 2;
 }
 
 // Response of GET /v1/spaces?cursor=, at most 100 spaces per page (RFC 0007 section 2).

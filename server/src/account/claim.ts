@@ -12,7 +12,7 @@ export const MIN_RECOVERY_KEY_LENGTH = 32;
 export const MAX_SETUP_ATTEMPT_LENGTH = 64;
 const UNUSED_OF_ATTEMPT = "setup_attempt = ? AND user_id = ? AND last_seen_ms IS NULL AND revoked_at_ms IS NULL";
 
-export type ClaimOutcome = { ok: true; revoke: string[] } | { ok: false; code: Error_Code; message: string };
+export type ClaimOutcome = { ok: true; revoke: string[] } | { ok: true; earlierDevice: string } | { ok: false; code: Error_Code; message: string };
 
 export interface ClaimAttempt {
   codeHash: ArrayBuffer;
@@ -25,6 +25,7 @@ export interface ClaimAttempt {
   userName: string;
   deviceId: string;
   setupAttempt: string;
+  requestId: string;
   storeDevice(): void;
 }
 
@@ -95,12 +96,15 @@ export function redeemClaim(sql: Sql, attempt: ClaimAttempt): ClaimOutcome {
   if (key) {
     const spent = spendKey(sql, key, attempt.nowMs);
     if (spent) return spent;
+    sql.exec("DELETE FROM claim_codes");
   } else {
     const live = sql.exec("SELECT code_hash FROM claim_codes WHERE expires_at_ms > ?", attempt.nowMs).toArray();
     if (live.length === 0) return refused("no valid claim code; open /setup to issue one");
-    if (!live.some((row) => sameDigest(row.code_hash as ArrayBuffer, attempt.codeHash))) return wrongCode(sql, "claim", attempt.client, attempt.nowMs, "wrong claim code");
+    const redeemed = live.find((row) => sameDigest(row.code_hash as ArrayBuffer, attempt.codeHash))?.code_hash;
+    if (!redeemed) return wrongCode(sql, "claim", attempt.client, attempt.nowMs, "wrong claim code");
+    sql.exec("DELETE FROM claim_codes WHERE code_hash != ?", redeemed);
+    sql.exec("UPDATE claim_codes SET request_id = ?, claimed_device_id = ? WHERE code_hash = ?", attempt.requestId || null, attempt.deviceId, redeemed);
   }
-  sql.exec("DELETE FROM claim_codes");
   sql.exec("DELETE FROM claim_failures WHERE scope = 'claim'");
   sql.exec("INSERT INTO users (user_id, name, created_at_ms) VALUES (?, ?, ?)", attempt.userId, attempt.userName || "Owner", attempt.nowMs);
   attempt.storeDevice();
@@ -109,11 +113,20 @@ export function redeemClaim(sql: Sql, attempt: ClaimAttempt): ClaimOutcome {
 
 function recover(sql: Sql, attempt: ClaimAttempt): ClaimOutcome {
   const key = presentedKey(attempt);
-  if (!key) return wrongCode(sql, "recovery", attempt.client, attempt.nowMs, "this deployment already has an owner");
+  if (!key) return repeatedClaim(sql, attempt) ?? wrongCode(sql, "recovery", attempt.client, attempt.nowMs, "this deployment already has an owner");
   const spent = spendKey(sql, key, attempt.nowMs);
   if (spent) return spent;
   attempt.storeDevice();
   return { ok: true, revoke: joinAttempt(sql, attempt) };
+}
+
+function repeatedClaim(sql: Sql, attempt: ClaimAttempt): ClaimOutcome | undefined {
+  if (!attempt.requestId) return undefined;
+  const row = sql
+    .exec("SELECT code_hash, claimed_device_id FROM claim_codes WHERE request_id = ? AND expires_at_ms > ?", attempt.requestId, attempt.nowMs)
+    .toArray()[0];
+  if (!row || !sameDigest(row.code_hash as ArrayBuffer, attempt.codeHash)) return undefined;
+  return { ok: true, earlierDevice: String(row.claimed_device_id) };
 }
 
 function joinAttempt(sql: Sql, attempt: ClaimAttempt): string[] {

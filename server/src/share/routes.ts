@@ -224,6 +224,7 @@ async function ownerApi(request: Request, env: Env, spaceId: string, linkId: str
       noExpiry: body.noExpiry,
       password: body.password,
       origin: url.origin,
+      requestId: body.requestId,
     });
     return answer(request, ShareLinkSchema, outcome, 201);
   }

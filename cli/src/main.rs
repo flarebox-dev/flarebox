@@ -1810,23 +1810,25 @@ async fn named_space(auth: &Auth, spaces: &[SpaceInfo], name: &str) -> Result<Na
     if let Some(space) = existing_space(spaces, name)? {
         return Ok(Named::Existing(space));
     }
-    let request = CreateSpaceRequest {
-        name: name.to_owned(),
-    };
-    match auth.api().create_space(auth, &request).await {
+    match create_space(auth, name).await {
         Ok(created) => Ok(Named::Created(created)),
-        Err(error) => {
-            let now = auth.api().list_spaces(auth).await.ok();
-            let existing = match now {
-                Some(list) => existing_space(&list.spaces, name)?,
-                None => None,
-            };
-            match existing {
+        Err(error) if error.status() == Some(409) => {
+            let now = auth.api().list_spaces(auth).await?;
+            match existing_space(&now.spaces, name)? {
                 Some(space) => Ok(Named::Existing(space)),
                 None => Err(error.into()),
             }
         }
+        Err(error) => Err(error.into()),
     }
+}
+
+async fn create_space(auth: &Auth, name: &str) -> Result<SpaceInfo, ApiError> {
+    let request = CreateSpaceRequest {
+        name: name.to_owned(),
+        request_id: koidrive_net::request_id(),
+    };
+    koidrive_net::resend_lost(|| auth.api().create_space(auth, &request)).await
 }
 
 fn existing_space(spaces: &[SpaceInfo], name: &str) -> Result<Option<SpaceInfo>, CliError> {
@@ -2634,7 +2636,7 @@ mod tests {
         let (server, served) = serve(vec![
             token(),
             list(Vec::new()),
-            (400, prost::Message::encode_to_vec(&taken)),
+            (409, prost::Message::encode_to_vec(&taken)),
             list(vec![notes]),
         ])
         .await;

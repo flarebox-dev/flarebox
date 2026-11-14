@@ -31,7 +31,7 @@ use koidrive_cloudflare::{
 use koidrive_driver::{Credential, DirectoryIdentity, DriverError, LinkApproval, Paths};
 use koidrive_ipc::{Code, Next, Request, Response};
 use koidrive_net::{Api, ApiError};
-use koidrive_proto::v1::{CreateSpaceRequest, ServerInfo, SpaceInfo};
+use koidrive_proto::v1::{ServerInfo, SpaceInfo};
 use tokio::signal::unix::{SignalKind, signal};
 use url::Url;
 
@@ -410,24 +410,22 @@ async fn onboard(paths: &Paths, terminal: &Terminal) -> Result<Done, CliError> {
                     target = shared_folder(terminal, &now.spaces).await?;
                 }
             },
-            Target::New(name) => {
-                let request = CreateSpaceRequest { name: name.clone() };
-                match auth.api().create_space(&auth, &request).await {
-                    Ok(space) => break crate::Named::Created(space),
-                    Err(error) => {
-                        let now = auth.api().list_spaces(&auth).await?;
-                        if !now.spaces.iter().any(|space| space.name == name) {
-                            return Err(error.into());
-                        }
-                        drop(progress.take());
-                        terminal.message(&format!(
-                            "A shared folder named {} already exists. Choose another name.",
-                            printable(&name)
-                        ));
-                        target = new_shared_folder(terminal, &now.spaces).await?;
+            Target::New(name) => match crate::create_space(&auth, &name).await {
+                Ok(space) => break crate::Named::Created(space),
+                Err(error) if error.status() != Some(409) => return Err(error.into()),
+                Err(error) => {
+                    let now = auth.api().list_spaces(&auth).await?;
+                    if !now.spaces.iter().any(|space| space.name == name) {
+                        return Err(error.into());
                     }
+                    drop(progress.take());
+                    terminal.message(&format!(
+                        "A shared folder named {} already exists. Choose another name.",
+                        printable(&name)
+                    ));
+                    target = new_shared_folder(terminal, &now.spaces).await?;
                 }
-            }
+            },
         }
     };
     let SelectedFolder {

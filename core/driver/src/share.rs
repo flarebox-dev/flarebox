@@ -163,10 +163,12 @@ impl Driver {
             },
             no_expiry: expiry == Expiry::Never,
             password: password.map(|password| password.0).unwrap_or_default(),
+            request_id: koidrive_net::request_id(),
         };
-        let link = (auth.api())
-            .create_share_link(&auth, &folder.space_id, &request)
-            .await?;
+        let link = koidrive_net::resend_lost(|| {
+            (auth.api()).create_share_link(&auth, &folder.space_id, &request)
+        })
+        .await?;
         Ok(described(
             link,
             &folder.space_name,
