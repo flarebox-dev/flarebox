@@ -4,22 +4,23 @@ use crate::{Recorder, schema::Counter};
 
 #[derive(Default)]
 pub struct Cpu {
-    previous: Option<(u32, u64)>,
+    previous: Option<(u64, u32, u64)>,
 }
 
 impl Cpu {
     pub fn sample(&mut self, recorder: &Recorder) {
-        if !recorder.is_on() {
+        let Some(session) = recorder.session() else {
             return;
-        }
-        self.record(recorder, crate::today(), process_nanoseconds());
+        };
+        self.record(recorder, session, crate::today(), process_nanoseconds());
     }
 
-    fn record(&mut self, recorder: &Recorder, day: u32, nanos: Option<u64>) {
+    fn record(&mut self, recorder: &Recorder, session: u64, day: u32, nanos: Option<u64>) {
         let previous = self.previous.take();
         let Some(nanos) = nanos else { return };
-        self.previous = Some((day, nanos));
-        if let Some((before_day, before)) = previous
+        self.previous = Some((session, day, nanos));
+        if let Some((before_session, before_day, before)) = previous
+            && before_session == session
             && before_day == day
             && nanos >= before
         {
@@ -66,11 +67,22 @@ mod tests {
             (2, Some(903_000_000)),
             (2, Some(1)),
         ] {
-            cpu.record(&recorder, day, nanos);
+            cpu.record(&recorder, 1, day, nanos);
         }
         let value = serde_json::to_value(recorder.take().days).unwrap();
         assert_eq!(value["1"]["counters"]["process"]["cpu_ms"], 5);
         assert_eq!(value["2"]["counters"]["process"]["cpu_ms"], 10);
+    }
+
+    #[test]
+    fn cpu_time_spent_while_reports_were_off_is_not_counted() {
+        let recorder = Recorder::on();
+        let mut cpu = Cpu::default();
+        for (session, nanos) in [(1, 0), (1, 4_000_000), (2, 90_000_000), (2, 93_000_000)] {
+            cpu.record(&recorder, session, 1, Some(nanos));
+        }
+        let value = serde_json::to_value(recorder.take().days).unwrap();
+        assert_eq!(value["1"]["counters"]["process"]["cpu_ms"], 7);
     }
 
     #[test]
@@ -91,7 +103,7 @@ mod tests {
             (4, 900_000_000),
             (4, 902_000_000),
         ] {
-            cpu.record(&recorder, day, Some(nanos));
+            cpu.record(&recorder, 1, day, Some(nanos));
         }
         let value = serde_json::to_value(recorder.take().days).unwrap();
         assert_eq!(value["1"]["counters"]["process"]["cpu_ms"], 1);

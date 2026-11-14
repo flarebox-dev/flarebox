@@ -354,7 +354,8 @@ pub async fn run(paths: &Paths, request: Request) -> Result<Response, CliError> 
             Response::NotPaused
         }
         None => {
-            let driver = Driver::open(paths.clone()).map_err(|error| match error {
+            let driver = Driver::open_with_telemetry(paths.clone(), crate::telemetry::recorder())
+                .map_err(|error| match error {
                 DriverError::Busy(_) => CliError::from(busy(paths)),
                 other => CliError::from(other),
             })?;

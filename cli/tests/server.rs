@@ -1454,6 +1454,50 @@ async fn a_device_creates_a_space_and_links_a_folder_to_it() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs the Worker; run cli/scripts/integration-test.sh"]
+async fn a_folder_linked_with_reports_on_before_the_daemon_runs_waits_for_its_first_sync_time() {
+    let owner = Arc::new(Auth::new(api(), owner().await));
+    let pairing = owner.api().pair_start(&owner).await.unwrap();
+    let server = server_url().to_string();
+    let machine = Machine::new();
+    let run = |args: &[&str]| {
+        let output = machine
+            .command(args)
+            .env_remove("CI")
+            .env_remove("DO_NOT_TRACK")
+            .env_remove("KOIDRIVE_TELEMETRY")
+            .env("KOIDRIVE_TELEMETRY_URL", "http://127.0.0.1:9")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "koi {args:?} failed: {output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    run(&["join", &pairing.code, "--server", &server, "--name", "desk"]);
+    run(&["telemetry", "on"]);
+    let name = format!("notes {}", uuidv7());
+    let space_id = run(&["space", "create", &name]).trim().to_owned();
+    let folder = machine.path("Notes");
+    fs::create_dir_all(&folder).unwrap();
+    run(&["folder", "link", folder.to_str().unwrap(), "--space", &name]);
+
+    let settings: Value = serde_json::from_str(
+        &fs::read_to_string(machine.path("state/koidrive/telemetry/settings.json")).unwrap(),
+    )
+    .unwrap();
+    let install = settings["install_id"].as_str().unwrap();
+    let digest: String = <sha2::Sha256 as sha2::Digest>::digest(install.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let marker =
+        fs::read_to_string(machine.path(&format!("state/koidrive/spaces/{space_id}/first-sync")))
+            .expect("the link left no first-sync marker for the daemon");
+    let (linked, fingerprint) = marker.split_once(' ').unwrap();
+    assert!(linked.parse::<i64>().is_ok(), "{marker}");
+    assert_eq!(fingerprint, digest, "{marker}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the Worker; run cli/scripts/integration-test.sh"]
 async fn two_creates_of_one_name_at_once_make_one_space() {
     use http_body_util::{BodyExt, Full};
     use hyper::{Request, Response, body::Incoming, service::service_fn};

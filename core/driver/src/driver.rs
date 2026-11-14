@@ -1279,7 +1279,7 @@ impl Driver {
         Store::open(&store_path)
             .and_then(|mut store| store.transaction(|tx| tx.set_link(&link)))
             .map_err(store_error(&store_path))?;
-        crate::timing::Timing::initialize(&store_path, link.linked_at_ms);
+        crate::timing::Timing::initialize(&store_path, link.linked_at_ms, &self.inner.telemetry);
         tracing::info!(space_id = link.space_id, path = %koidrive_fs::quoted(&link.root), "linked a folder");
         let status = Arc::new(
             crate::lifecycle::Lifecycle::open(&store_path, folder_status(&link, None, 0, 0))

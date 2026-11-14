@@ -1,14 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::schema::{Counter, DailyReport, Event, Level, Measure};
+use crate::schema::{Counter, DailyReport, Event, InstallId, Level, Measure};
 
-/// A cheap handle that code passes around to record. One made with [`Recorder::off`] records nothing and costs one
-/// branch per call. Recording takes a short lock on the sums and does no I/O.
+/// A cheap handle that code passes around to record. Clones share one switch and one set of sums. While it is off it
+/// records nothing and costs one branch per call. Recording takes a short lock on the sums and does no I/O.
 #[derive(Clone, Debug, Default)]
-pub struct Recorder(Option<Arc<Mutex<Pending>>>);
+pub struct Recorder(Arc<Shared>);
+
+#[derive(Debug, Default)]
+struct Shared {
+    switches: AtomicU64,
+    install: Mutex<Option<InstallId>>,
+    pending: Mutex<Pending>,
+}
 
 /// What a recorder holds and [`Recorder::take`] hands over.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -19,15 +27,59 @@ pub struct Pending {
 
 impl Recorder {
     pub fn off() -> Self {
-        Recorder(None)
+        Recorder::default()
     }
 
     pub fn on() -> Self {
-        Recorder(Some(Arc::default()))
+        let recorder = Recorder::default();
+        recorder.switch(true);
+        recorder
     }
 
     pub fn is_on(&self) -> bool {
-        self.0.is_some()
+        self.session().is_some()
+    }
+
+    /// Starts recording for a new install id, unless it is already on, or stops recording.
+    pub fn switch(&self, on: bool) {
+        match on {
+            true if self.is_on() => {}
+            true => self.record_for(Some(&InstallId::generate())),
+            false => self.record_for(None),
+        }
+    }
+
+    /// Records for `id`, or stops recording without one, for every clone. Stopping, and moving to another id, drops
+    /// what is held and starts a new [`session`](Recorder::session).
+    pub fn record_for(&self, id: Option<&InstallId>) {
+        let (Ok(mut pending), Ok(mut install)) = (self.0.pending.lock(), self.0.install.lock())
+        else {
+            return;
+        };
+        if self.is_on() && install.as_ref() == id {
+            return;
+        }
+        if self.is_on() {
+            self.0.switches.fetch_add(1, Ordering::Relaxed);
+            *pending = Pending::default();
+        }
+        *install = id.cloned();
+        if id.is_some() {
+            self.0.switches.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The install id this recorder records for, while it is on.
+    pub fn install_id(&self) -> Option<InstallId> {
+        let install = self.0.install.lock().ok()?;
+        self.is_on().then(|| install.clone()).flatten()
+    }
+
+    /// Names the current stretch of recording for one install id, or none while off. A collector that measures across
+    /// calls, such as a duration, keeps a start only while the session is the same.
+    pub fn session(&self) -> Option<u64> {
+        let switches = self.0.switches.load(Ordering::Relaxed);
+        (switches % 2 == 1).then_some(switches)
     }
 
     pub fn count(&self, counter: Counter, by: u64) {
@@ -137,8 +189,9 @@ impl Recorder {
     }
 
     fn with(&self, update: impl FnOnce(&mut Pending)) {
-        if let Some(pending) = &self.0
-            && let Ok(mut pending) = pending.lock()
+        if self.is_on()
+            && let Ok(mut pending) = self.0.pending.lock()
+            && self.is_on()
         {
             update(&mut pending);
         }
@@ -164,6 +217,47 @@ mod tests {
         recorder.count(Counter::Command(Command::Status), 1);
         recorder.event(panic_on(1));
         assert_eq!(recorder.take(), Pending::default());
+    }
+
+    #[test]
+    fn a_switch_reaches_every_clone_and_stopping_drops_the_sums() {
+        let recorder = Recorder::off();
+        let clone = recorder.clone();
+        clone.count_on(1, Counter::Command(Command::Status), 1);
+        recorder.switch(true);
+        assert!(clone.is_on());
+        clone.count_on(1, Counter::Command(Command::Folder), 1);
+        assert_eq!(
+            recorder.take().days[&1].counters["command"],
+            BTreeMap::from([("folder".to_owned(), 1)])
+        );
+        clone.event(panic_on(1));
+        recorder.switch(false);
+        clone.count_on(1, Counter::Command(Command::Status), 1);
+        recorder.switch(true);
+        assert_eq!(recorder.take(), Pending::default());
+    }
+
+    #[test]
+    fn each_stretch_of_recording_is_its_own_session() {
+        let recorder = Recorder::off();
+        assert_eq!(recorder.session(), None);
+        recorder.switch(true);
+        let first = recorder.session().unwrap();
+        recorder.switch(true);
+        assert_eq!(recorder.clone().session(), Some(first));
+        recorder.switch(false);
+        assert_eq!(recorder.session(), None);
+        recorder.switch(true);
+        assert_ne!(recorder.session(), Some(first));
+        let id = InstallId::generate();
+        recorder.record_for(Some(&id));
+        let second = recorder.session();
+        recorder.record_for(Some(&id));
+        assert_eq!(recorder.session(), second);
+        assert_eq!(recorder.install_id(), Some(id));
+        recorder.record_for(Some(&InstallId::generate()));
+        assert_ne!(recorder.session(), second);
     }
 
     #[test]
