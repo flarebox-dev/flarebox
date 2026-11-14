@@ -241,16 +241,29 @@ main() {
             printf 'Warning: koi is installed, but the background service %s did not restart. Run: %s\n' "$service" "$*" >&2
         fi
     }
+    runs_this_koi() {
+        daemon=$(ps -ww -o args= -p "$1" 2>/dev/null) || return 1
+        daemon=${daemon% _daemon}
+        case "$daemon" in
+            */*) ;;
+            *) daemon=$(readlink "/proc/$1/exe" 2>/dev/null) || return 1; daemon=${daemon% (deleted)} ;;
+        esac
+        [ "$daemon" -ef "$install_dir/koi" ]
+    }
     if [ "$os" = apple-darwin ] && agents=$(launchctl print "gui/$(id -u)" 2>/dev/null); then
-        for label in $(printf '%s\n' "$agents" | awk '$1 == "services" && $2 == "=" {inside = 1; next} inside && $1 == "}" {inside = 0} inside && $1 != "0" && ($3 == "dev.koidrive.koi" || $3 ~ /^dev\.koidrive\.koi\.[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$/) {print $3}'); do
-            restart "$label" launchctl kickstart -k "gui/$(id -u)/$label"
-        done
+        printf '%s\n' "$agents" | awk '$1 == "services" && $2 == "=" {inside = 1; next} inside && $1 == "}" {inside = 0} inside && $1 ~ /^[1-9][0-9]*$/ && ($3 == "dev.koidrive.koi" || $3 ~ /^dev\.koidrive\.koi\.[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$/) {print $1, $3}' |
+            while read -r pid label; do
+                runs_this_koi "$pid" || continue
+                restart "$label" launchctl kickstart -k "gui/$(id -u)/$label"
+            done
     elif [ "$os" = unknown-linux-musl ] && units=$(systemctl --user list-units --type=service --state=active --plain --no-legend 'koidrive.service' 'koidrive-*.service' 2>/dev/null); then
         for unit in $(printf '%s\n' "$units" | awk '$1 == "koidrive.service" || $1 ~ /^koidrive-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]\.service$/ {print $1}'); do
+            runs_this_koi "$(systemctl --user show --property=MainPID --value "$unit" 2>/dev/null)" || continue
             restart "$unit" systemctl --user restart "$unit"
         done
     else
         for pid in $(ps -ww -u "$(id -u)" -o pid= -o args= 2>/dev/null | awk '{pid = $1; sub(/^ *[0-9]+ +/, "")} $0 == "koi _daemon" || $0 ~ /\/koi _daemon$/ {print pid}'); do
+            runs_this_koi "$pid" || continue
             unit=$(ps -ww -o cgroup= -p "$pid" 2>/dev/null | tr ';' '\n' | sed -n 's|.*/\(koidrive[-0-9a-f]*\.service\)$|\1|p' | head -n 1)
             if [ -n "$unit" ]; then
                 printf 'Warning: koi is installed, but the background service %s still runs the old koi, because this shell cannot reach the systemd user manager. Log in as %s and run: systemctl --user restart %s\n' "$unit" "$(id -un)" "$unit" >&2

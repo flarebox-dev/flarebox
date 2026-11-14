@@ -4,6 +4,7 @@ import errno
 import hashlib
 import os
 import platform
+import plistlib
 from pathlib import Path
 import pty
 import select
@@ -547,6 +548,34 @@ exec /bin/mv "$@"''')
             with self.subTest(koi=koi.name):
                 self.publish(koi)
                 self.refused_install("not signed with Koidrive's Developer ID")
+
+    @unittest.skipUnless(platform.system() == "Darwin", "launchd runs only on macOS")
+    def test_install_leaves_a_running_launch_agent_of_another_koi_alone(self):
+        domain = f"gui/{os.getuid()}"
+        if subprocess.run(["launchctl", "print", domain], capture_output=True).returncode != 0:
+            self.skipTest("this session has no launchd GUI domain")
+        other = self.dir / "other install"
+        other.mkdir()
+        (other / "koi").symlink_to("/bin/sleep")
+        label = f"dev.koidrive.koi.{os.urandom(4).hex()}"
+        plist = self.dir / f"{label}.plist"
+        plist.write_bytes(plistlib.dumps({"Label": label, "ProgramArguments": [str(other / "koi"), "600"], "RunAtLoad": True}))
+        subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True, capture_output=True)
+        self.addCleanup(subprocess.run, ["launchctl", "bootout", f"{domain}/{label}"], capture_output=True)
+
+        def agent_pid():
+            listing = subprocess.run(["launchctl", "print", f"{domain}/{label}"], capture_output=True, text=True).stdout
+            return next((line.split("=", 1)[1].strip() for line in listing.splitlines() if line.strip().startswith("pid =")), None)
+
+        deadline = time.monotonic() + 10
+        while (pid := agent_pid()) is None and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertIsNotNone(pid, "the launch agent did not start")
+        for tool in ("launchctl", "ps"):
+            (self.bin / tool).unlink()
+        output = self.successful_install(terminal=False)
+        self.assertNotIn(label, output)
+        self.assertEqual(agent_pid(), pid)
 
     def test_update_style_captured_child_never_starts_setup(self):
         self.successful_install(terminal=False, piped=False)
