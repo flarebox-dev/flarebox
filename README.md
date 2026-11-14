@@ -113,9 +113,11 @@ The `koi` command works on Linux and Macs with Apple silicon. The Mac app includ
    curl -fsSL https://koidrive.com/install.sh | sh
    ```
 
-   Then `koi --version` prints the version. [Install](docs/guide/install.md) covers `PATH` warnings and building from source.
+   On macOS, the installer continues into guided setup, which installs and verifies the app and connects this machine. In an attended terminal, it configures `PATH` for zsh, bash, or fish. Start a new login shell to run `koi` by name. [Install](docs/guide/install.md) covers opting out and building from source.
 
-2. **Deploy your server and sign in this machine.** Deploy the server with the deploy button, open `<your server>/setup` to get a claim code, and claim the server:
+   Skip steps 2 and 3 if guided setup has connected this machine and linked a folder. Otherwise, complete the steps that remain.
+
+2. **Deploy your server and sign in this machine if you skipped guided setup.** Deploy the server with the deploy button, open `<your server>/setup` to get a claim code, and claim the server:
 
    ```sh
    koi server claim koidrive.alice.workers.dev ABCD-EFGH-JKLM --user "Alice Park"
@@ -123,7 +125,7 @@ The `koi` command works on Linux and Macs with Apple silicon. The Mac app includ
 
    [Set up](docs/guide/setup.md#deploy-a-server-and-claim-it) walks through each step.
 
-3. **Link a folder.**
+3. **Link a folder if setup has not linked one.**
 
    ```sh
    mkdir -p ~/Koidrive
