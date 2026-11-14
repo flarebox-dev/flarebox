@@ -1693,6 +1693,7 @@ pub(crate) struct FolderTask {
     /// Marked whenever the folder's status changes (`Driver::watch`).
     pub changed: Arc<watch::Sender<()>>,
     pub progressed: Arc<watch::Sender<()>>,
+    pub totals: Arc<Mutex<crate::progress::Sum>>,
     /// Notified when `Driver::restore` has recorded a request in the folder's store.
     pub requests: Arc<Notify>,
     #[cfg(test)]
@@ -1859,6 +1860,7 @@ impl FolderTask {
                 halted = self.sync(&mut locked) => Some(halted),
                 _ = stop.wait_for(|stop| *stop) => None,
             };
+            self.totals.lock().unwrap().end(&self.link.space_id);
             if self.status.lock().unwrap().progress.take().is_some() {
                 self.changed.send_replace(());
             }
@@ -1939,7 +1941,12 @@ impl FolderTask {
         };
         folder.timing.linked(self.linked_started);
         folder.timing.enable(self.telemetry.clone());
-        (folder.progress.lock().unwrap()).publish_to(self.status.clone(), self.progressed.clone());
+        (folder.progress.lock().unwrap()).publish_to(
+            self.status.clone(),
+            self.progressed.clone(),
+            self.totals.clone(),
+            self.link.space_id.clone(),
+        );
         let mut from_disk = self.observe(lock.clone(), folder.sections(), folder.snapshot());
         let mut config = SessionConfig::new(
             &self.link.space_id,

@@ -27,6 +27,9 @@ pub struct Status {
     #[serde(default)]
     pub update: Update,
     pub folders: Vec<FolderStatus>,
+    /// The folders' progress summed while any has a file left to sync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<Totals>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +123,18 @@ pub struct Progress {
     pub bytes_total: u64,
     /// The file whose content moved last, relative to the folder.
     pub current: Option<String>,
+}
+
+/// The files every folder still sends or fetches and the bytes they moved, summed while any folder has a file left
+/// (docs/design/driver.md, "Progress counts the files left to sync"). A folder that finishes, abandons a file, goes
+/// offline or stops keeps the bytes it moved in the sum until no folder has a file left, so `bytes_done` never
+/// decreases until then, and `bytes_total` grows only when new work arrives.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Totals {
+    pub files_to_upload: u64,
+    pub files_to_download: u64,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
 }
 
 /// A call a folder sends again later, after the server put it off or it kept failing.

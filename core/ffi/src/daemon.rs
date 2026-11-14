@@ -18,7 +18,7 @@ use crate::helper::{
     SpaceData, SpacesData, UsagesData,
 };
 use crate::profile::Profile;
-use crate::state::{self, Carried, Halted};
+use crate::state::{self, Halted};
 use crate::types::{
     Account, Answer, Device, LinkedFolder, PairingCode, ServerInfo, SessionError, SessionEvent,
     SessionState, Space, SpaceUsage, SyncStatus, TelemetrySetting,
@@ -47,7 +47,6 @@ struct Inner {
     status: Status,
     questions: Vec<driver::Question>,
     halted: Halted,
-    carried: Carried,
     sent: SessionState,
 }
 
@@ -90,7 +89,6 @@ impl DaemonCore {
                 status: Status::default(),
                 questions: Vec::new(),
                 halted: Halted::new(),
-                carried: Carried::default(),
                 sent: SessionState {
                     status: SyncStatus::Stopped,
                     progress: None,
@@ -156,7 +154,6 @@ impl DaemonCore {
             &inner.questions,
             inner.started,
             &mut inner.halted,
-            &mut inner.carried,
             &self.helper,
         );
         let sent = &inner.sent;

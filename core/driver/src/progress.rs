@@ -9,7 +9,7 @@ use koidrive_proto::v1::{Commit, op};
 use tokio::sync::watch;
 
 use crate::lifecycle::Lifecycle;
-use crate::status::Progress;
+use crate::status::{Progress, Totals};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Direction {
@@ -34,6 +34,53 @@ struct Entry {
 struct Sink {
     status: Arc<Lifecycle>,
     progressed: Arc<watch::Sender<()>>,
+    sum: Arc<Mutex<Sum>>,
+    space_id: String,
+}
+
+#[derive(Default)]
+pub(crate) struct Sum {
+    live: BTreeMap<String, Progress>,
+    moved: u64,
+}
+
+impl Sum {
+    pub fn totals(&self) -> Option<Totals> {
+        if self.live.is_empty() {
+            return None;
+        }
+        let mut totals = Totals {
+            bytes_done: self.moved,
+            bytes_total: self.moved,
+            ..Totals::default()
+        };
+        for progress in self.live.values() {
+            totals.files_to_upload += progress.files_to_upload;
+            totals.files_to_download += progress.files_to_download;
+            totals.bytes_done += progress.bytes_done;
+            totals.bytes_total += progress.bytes_total;
+        }
+        Some(totals)
+    }
+
+    pub fn end(&mut self, space_id: &str) {
+        let moved = self
+            .live
+            .remove(space_id)
+            .map_or(0, |progress| progress.bytes_done);
+        self.set(space_id, None, moved);
+    }
+
+    fn set(&mut self, space_id: &str, progress: Option<Progress>, moved: u64) {
+        self.moved += moved;
+        match progress {
+            Some(progress) => self.live.insert(space_id.to_owned(), progress),
+            None => self.live.remove(space_id),
+        };
+        if self.live.is_empty() {
+            self.moved = 0;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -49,9 +96,20 @@ pub(crate) struct Tracker {
 }
 
 impl Tracker {
-    pub fn publish_to(&mut self, status: Arc<Lifecycle>, progressed: Arc<watch::Sender<()>>) {
-        self.sink = Some(Sink { status, progressed });
-        self.publish();
+    pub fn publish_to(
+        &mut self,
+        status: Arc<Lifecycle>,
+        progressed: Arc<watch::Sender<()>>,
+        sum: Arc<Mutex<Sum>>,
+        space_id: String,
+    ) {
+        self.sink = Some(Sink {
+            status,
+            progressed,
+            sum,
+            space_id,
+        });
+        self.publish(0);
     }
 
     pub fn progress(&self) -> Option<Progress> {
@@ -99,10 +157,11 @@ impl Tracker {
             };
             self.entries.insert(item, entry);
         }
-        if self.entries.is_empty() {
-            self.finished = 0;
-        }
-        self.publish();
+        let moved = match self.entries.is_empty() {
+            true => std::mem::take(&mut self.finished),
+            false => 0,
+        };
+        self.publish(moved);
         shown != !self.entries.is_empty()
     }
 
@@ -138,18 +197,20 @@ impl Tracker {
         self.done += done - entry.done;
         entry.done = done;
         self.current = Some(item.clone());
-        self.publish();
+        self.publish(0);
     }
 
-    fn publish(&self) {
+    fn publish(&self, moved: u64) {
         let Some(sink) = &self.sink else { return };
         let progress = self.progress();
         let mut status = sink.status.lock().unwrap();
-        if status.progress != progress {
-            status.progress = progress;
-            drop(status);
-            sink.progressed.send_replace(());
+        if status.progress == progress && moved == 0 {
+            return;
         }
+        status.progress = progress.clone();
+        drop(status);
+        (sink.sum.lock().unwrap()).set(&sink.space_id, progress, moved);
+        sink.progressed.send_replace(());
     }
 }
 
@@ -220,5 +281,138 @@ impl Credit {
         let Some(tracker) = &self.tracker else { return };
         let path = self.paths.get(&item.node);
         tracker.lock().unwrap().credit(item, hash, bytes, path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::status::FolderStatus;
+
+    struct Folder {
+        _dir: tempfile::TempDir,
+        tracker: Tracker,
+    }
+
+    fn folder(space: &str, sum: &Arc<Mutex<Sum>>) -> Folder {
+        let dir = tempfile::tempdir().unwrap();
+        let status: FolderStatus = serde_json::from_value(serde_json::json!({
+            "space_id": space, "space_name": space, "path": "/folder", "state": "catching_up",
+            "history_id": null, "last_seq": null, "head_seq": null, "remote_nodes": 0,
+            "local_entries": null, "questions": 0, "problem": null,
+        }))
+        .unwrap();
+        let status = Lifecycle::open(&dir.path().join("store.sqlite"), status).unwrap();
+        let mut tracker = Tracker::default();
+        let progressed = Arc::new(watch::Sender::new(()));
+        tracker.publish_to(Arc::new(status), progressed, sum.clone(), space.into());
+        Folder { _dir: dir, tracker }
+    }
+
+    fn item(node: &str) -> Item {
+        Item {
+            direction: Direction::Upload,
+            node: node.into(),
+            digest: node.as_bytes().to_vec(),
+        }
+    }
+
+    impl Folder {
+        fn want(&mut self, files: &[(&str, u64)], synced: &[&str]) {
+            let wanted = (files.iter())
+                .map(|(node, size)| (item(node), *size))
+                .collect();
+            (self.tracker).track(wanted, |item| synced.contains(&item.node.as_str()));
+        }
+
+        fn credit(&mut self, node: &str, chunk: &str, bytes: u64) {
+            (self.tracker).credit(&item(node), chunk.as_bytes(), bytes, None);
+        }
+    }
+
+    fn shown(sum: &Arc<Mutex<Sum>>) -> Option<(u64, u64)> {
+        let totals = sum.lock().unwrap().totals();
+        totals.map(|totals| (totals.bytes_done, totals.bytes_total))
+    }
+
+    #[test]
+    fn a_folder_that_finishes_keeps_its_whole_content_in_the_sum_while_another_syncs() {
+        let sum = Arc::default();
+        let (mut a, mut b) = (folder("a", &sum), folder("b", &sum));
+        a.want(&[("a", 100)], &[]);
+        a.credit("a", "1", 90);
+        b.want(&[("b", 100)], &[]);
+        b.credit("b", "1", 1);
+        assert_eq!(shown(&sum), Some((91, 200)));
+        a.want(&[], &["a"]);
+        assert_eq!(shown(&sum), Some((101, 200)));
+        b.credit("b", "2", 59);
+        assert_eq!(shown(&sum), Some((160, 200)));
+        b.want(&[], &["b"]);
+        assert_eq!(shown(&sum), None);
+    }
+
+    #[test]
+    fn a_file_abandoned_part_way_keeps_only_the_bytes_it_moved() {
+        let sum = Arc::default();
+        let (mut a, mut b) = (folder("a", &sum), folder("b", &sum));
+        a.want(&[("a", 20_971_520)], &[]);
+        a.credit("a", "1", 8_267_018);
+        b.want(&[("b", 100)], &[]);
+        b.credit("b", "1", 1);
+        assert_eq!(shown(&sum), Some((8_267_019, 20_971_620)));
+        a.want(&[], &[]);
+        assert_eq!(shown(&sum), Some((8_267_019, 8_267_118)));
+    }
+
+    #[test]
+    fn a_stopped_folder_keeps_the_bytes_it_moved_and_counts_again_from_zero() {
+        let sum = Arc::default();
+        let (mut a, mut b) = (folder("a", &sum), folder("b", &sum));
+        a.want(&[("a", 100)], &[]);
+        a.credit("a", "1", 30);
+        b.want(&[("b", 10)], &[]);
+        b.credit("b", "1", 1);
+        assert_eq!(shown(&sum), Some((31, 110)));
+        drop(a);
+        sum.lock().unwrap().end("a");
+        assert_eq!(shown(&sum), Some((31, 40)));
+        let mut a = folder("a", &sum);
+        a.want(&[("a", 100)], &[]);
+        assert_eq!(shown(&sum), Some((31, 140)));
+    }
+
+    #[test]
+    fn new_work_grows_the_total_and_keeps_the_bytes_done() {
+        let sum = Arc::default();
+        let mut a = folder("a", &sum);
+        a.want(&[("a", 100)], &[]);
+        a.credit("a", "1", 50);
+        assert_eq!(shown(&sum), Some((50, 100)));
+        a.want(&[("a", 100), ("late", 50)], &[]);
+        assert_eq!(shown(&sum), Some((50, 150)));
+    }
+
+    #[test]
+    fn a_file_edited_while_it_syncs_keeps_the_bytes_its_old_content_moved() {
+        let sum = Arc::default();
+        let mut a = folder("a", &sum);
+        a.want(&[("old", 100)], &[]);
+        a.credit("old", "1", 40);
+        a.want(&[("new", 80)], &[]);
+        assert_eq!(shown(&sum), Some((40, 120)));
+    }
+
+    #[test]
+    fn the_sum_counts_from_zero_once_no_folder_has_a_file_left() {
+        let sum = Arc::default();
+        let (mut a, mut b) = (folder("a", &sum), folder("b", &sum));
+        a.want(&[("a", 100)], &[]);
+        b.want(&[("b", 10)], &[]);
+        a.want(&[], &["a"]);
+        b.want(&[], &["b"]);
+        assert_eq!(shown(&sum), None);
+        b.want(&[("b2", 10)], &[]);
+        assert_eq!(shown(&sum), Some((0, 10)));
     }
 }

@@ -274,6 +274,7 @@ impl Done {
             version: None,
             update: driver::Update::Unknown,
             folders: status.folders.into_iter().map(FolderData::driver).collect(),
+            progress: None,
         };
         let questions = self
             .decisions

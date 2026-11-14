@@ -298,6 +298,7 @@ struct Inner {
     startup_pending: AtomicBool,
     changed: Arc<watch::Sender<()>>,
     progressed: Arc<watch::Sender<()>>,
+    totals: Arc<Mutex<crate::progress::Sum>>,
     #[cfg(test)]
     observe_fault: Option<Arc<crate::folder::ObserveFault>>,
     #[cfg(test)]
@@ -571,6 +572,7 @@ impl Driver {
                 startup_pending: AtomicBool::new(false),
                 changed: Arc::new(watch::Sender::new(())),
                 progressed: Arc::new(watch::Sender::new(())),
+                totals: Arc::default(),
                 #[cfg(test)]
                 observe_fault: None,
                 #[cfg(test)]
@@ -621,6 +623,7 @@ impl Driver {
             version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             update: self.inner.updates.notice(),
             folders,
+            progress: self.inner.totals.lock().unwrap().totals(),
         }
     }
 
@@ -1819,6 +1822,7 @@ impl Driver {
             observer: Mutex::default(),
             changed: self.inner.changed.clone(),
             progressed: self.inner.progressed.clone(),
+            totals: self.inner.totals.clone(),
             requests: Arc::default(),
             #[cfg(test)]
             observe_fault: self.inner.observe_fault.clone(),

@@ -811,27 +811,34 @@ fn the_session_sends_the_progress_the_daemon_reports_while_it_syncs_and_none_aft
             "progress": progress,
         })
     };
-    let status = |folders: Vec<Value>| -> Status {
+    let status = |folders: Vec<Value>, progress: Value| -> Status {
         let mut status = signed_in(true);
         status["folders"] = Value::Array(folders);
+        status["progress"] = progress;
         serde_json::from_value(status).unwrap()
     };
-    let syncing = status(vec![
-        folder(
-            "s1",
-            "catching_up",
-            json!({"files_to_upload": 2, "files_to_download": 1, "bytes_done": 10, "bytes_total": 100, "current": "a.txt"}),
-        ),
-        folder(
-            "s2",
-            "catching_up",
-            json!({"files_to_upload": 0, "files_to_download": 1, "bytes_done": 5, "bytes_total": 50, "current": "b.txt"}),
-        ),
-    ]);
-    let done = status(vec![
-        folder("s1", "up_to_date", Value::Null),
-        folder("s2", "up_to_date", Value::Null),
-    ]);
+    let syncing = status(
+        vec![
+            folder(
+                "s1",
+                "catching_up",
+                json!({"files_to_upload": 2, "files_to_download": 1, "bytes_done": 10, "bytes_total": 100, "current": "a.txt"}),
+            ),
+            folder(
+                "s2",
+                "catching_up",
+                json!({"files_to_upload": 0, "files_to_download": 1, "bytes_done": 5, "bytes_total": 50, "current": "b.txt"}),
+            ),
+        ],
+        json!({"files_to_upload": 2, "files_to_download": 2, "bytes_done": 15, "bytes_total": 150}),
+    );
+    let done = status(
+        vec![
+            folder("s1", "up_to_date", Value::Null),
+            folder("s2", "up_to_date", Value::Null),
+        ],
+        Value::Null,
+    );
 
     let seen = Arc::new(Mutex::new(Vec::new()));
     let koi = Koi::with_listener(signed_in(true), Box::new(Progresses(seen.clone())));

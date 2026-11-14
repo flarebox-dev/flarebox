@@ -14,31 +14,23 @@ use crate::types::{
 
 pub(crate) type Halted = BTreeMap<String, (String, i64)>;
 
-#[derive(Default)]
-pub(crate) struct Carried {
-    seen: BTreeMap<String, (u64, u64)>,
-    done: u64,
-}
-
 pub(crate) fn session_state(
     status: &Status,
     questions: &[driver::Question],
     started: bool,
     halted: &mut Halted,
-    carried: &mut Carried,
     helper: &Helper,
 ) -> SessionState {
     let shown = match started {
         true => sync_status(status),
         false => SyncStatus::Stopped,
     };
-    let progress = progress(status, carried).filter(|_| shown == SyncStatus::Syncing);
-    if progress.is_none() {
-        *carried = Carried::default();
-    }
     SessionState {
         status: shown,
-        progress,
+        progress: match shown {
+            SyncStatus::Syncing => progress(status),
+            _ => None,
+        },
         account: status.account.as_ref().map(account),
         folders: status.folders.iter().map(folder).collect(),
         recent_changes: Vec::new(),
@@ -77,62 +69,20 @@ fn sync_status(status: &Status) -> SyncStatus {
     }
 }
 
-fn progress(status: &Status, carried: &mut Carried) -> Option<SyncProgress> {
-    let mut sum = SyncProgress {
-        files_to_upload: 0,
-        files_to_download: 0,
-        bytes_done: 0,
-        bytes_total: 0,
-        current: None,
-    };
-    let mut seen = BTreeMap::new();
-    for folder in &status.folders {
-        let before = carried.seen.remove(&folder.space_id);
-        let Some(progress) = &folder.progress else {
-            let Some((done, total)) = before else {
-                continue;
-            };
-            match folder.state {
-                DriverFolderState::Offline | DriverFolderState::Connecting => {
-                    seen.insert(folder.space_id.clone(), (done, total));
-                    sum.bytes_done += done;
-                    sum.bytes_total += total;
-                }
-                DriverFolderState::Bootstrapping
-                | DriverFolderState::CatchingUp
-                | DriverFolderState::UpToDate => carried.done += total,
-                DriverFolderState::Stopped | DriverFolderState::Halted => carried.done += done,
-            }
-            continue;
-        };
-        if let Some((done, _)) = before
-            && progress.bytes_done < done
-        {
-            carried.done += done;
-        }
-        seen.insert(
-            folder.space_id.clone(),
-            (progress.bytes_done, progress.bytes_total),
-        );
-        sum.files_to_upload += progress.files_to_upload;
-        sum.files_to_download += progress.files_to_download;
-        sum.bytes_done += progress.bytes_done;
-        sum.bytes_total += progress.bytes_total;
-        if sum.current.is_none() {
-            sum.current = (progress.current.clone()).map(|path| FolderPath {
+fn progress(status: &Status) -> Option<SyncProgress> {
+    let totals = status.progress.as_ref()?;
+    Some(SyncProgress {
+        files_to_upload: totals.files_to_upload,
+        files_to_download: totals.files_to_download,
+        bytes_done: totals.bytes_done,
+        bytes_total: totals.bytes_total,
+        current: status.folders.iter().find_map(|folder| {
+            Some(FolderPath {
                 space_id: folder.space_id.clone(),
-                path,
-            });
-        }
-    }
-    carried.done += carried.seen.values().map(|(done, _)| done).sum::<u64>();
-    carried.seen = seen;
-    if carried.seen.is_empty() {
-        return None;
-    }
-    sum.bytes_done += carried.done;
-    sum.bytes_total += carried.done;
-    Some(sum)
+                path: folder.progress.as_ref()?.current.clone()?,
+            })
+        }),
+    })
 }
 
 fn account(account: &driver::Account) -> Account {
@@ -461,14 +411,7 @@ mod tests {
         };
         let status = status_of(&[DriverFolderState::Halted]);
         let mut halted = Halted::new();
-        let state = session_state(
-            &status,
-            &[asked],
-            true,
-            &mut halted,
-            &mut Carried::default(),
-            &helper,
-        );
+        let state = session_state(&status, &[asked], true, &mut halted, &helper);
         assert!(state.questions.is_empty());
         assert_eq!(state.problems.len(), 2);
         let problem = state
@@ -495,14 +438,7 @@ mod tests {
             String::from_utf8(parsed.stdout).unwrap(),
             "1\nresolve\n/Users/Ada's home\n/private/other $(false) profile\nunset\nunset\n"
         );
-        let resolved = session_state(
-            &status,
-            &[],
-            true,
-            &mut halted,
-            &mut Carried::default(),
-            &helper,
-        );
+        let resolved = session_state(&status, &[], true, &mut halted, &helper);
         assert_eq!(resolved.problems.len(), 1);
         assert!(matches!(
             resolved.problems[0].kind,
@@ -543,6 +479,7 @@ mod tests {
             version: None,
             update: driver::Update::Unknown,
             folders: states.iter().map(|state| folder_in(*state, None)).collect(),
+            progress: None,
         }
     }
 
@@ -550,15 +487,7 @@ mod tests {
     fn the_session_status_follows_its_folders_and_the_daemon() {
         use DriverFolderState::*;
         let status = |status: &Status, started| {
-            session_state(
-                status,
-                &[],
-                started,
-                &mut Default::default(),
-                &mut Carried::default(),
-                &helper(),
-            )
-            .status
+            session_state(status, &[], started, &mut Default::default(), &helper()).status
         };
         let up = status_of(&[UpToDate]);
         assert_eq!(status(&up, false), SyncStatus::Stopped);
@@ -693,7 +622,6 @@ mod tests {
             &questions,
             true,
             &mut Halted::new(),
-            &mut Carried::default(),
             &helper(),
         );
         let limits = vec![
@@ -744,262 +672,6 @@ mod tests {
             (Answer::Cancel, "cancel"),
         ] {
             assert_eq!(word(answer), expected);
-        }
-    }
-
-    #[test]
-    fn a_folder_keeps_its_bytes_in_the_sum_through_every_change_until_no_folder_syncs() {
-        use DriverFolderState::*;
-        type Folder = (&'static str, DriverFolderState, Option<(u64, u64)>);
-        type Step = (Vec<Folder>, Option<(u64, u64)>);
-        let status = |folders: &[Folder]| {
-            let mut status = status_of(&[]);
-            status.folders = (folders.iter())
-                .map(|&(space, state, progress)| driver::FolderStatus {
-                    space_id: space.into(),
-                    progress: progress.map(|(done, total)| driver::Progress {
-                        files_to_upload: 1,
-                        files_to_download: 0,
-                        bytes_done: done,
-                        bytes_total: total,
-                        current: None,
-                    }),
-                    ..folder_in(state, None)
-                })
-                .collect();
-            status
-        };
-        let syncing = |done, total| Some((done, total));
-        let cases: [(&str, Vec<Step>); 10] = [
-            (
-                "a folder finishes while the other syncs",
-                vec![
-                    (
-                        vec![
-                            ("a", CatchingUp, syncing(90, 100)),
-                            ("b", CatchingUp, syncing(1, 100)),
-                        ],
-                        Some((91, 200)),
-                    ),
-                    (
-                        vec![("a", UpToDate, None), ("b", CatchingUp, syncing(1, 100))],
-                        Some((101, 200)),
-                    ),
-                    (
-                        vec![("a", UpToDate, None), ("b", CatchingUp, syncing(1, 100))],
-                        Some((101, 200)),
-                    ),
-                    (
-                        vec![("a", UpToDate, None), ("b", CatchingUp, syncing(60, 100))],
-                        Some((160, 200)),
-                    ),
-                    (vec![("a", UpToDate, None), ("b", UpToDate, None)], None),
-                ],
-            ),
-            (
-                "new work grows the total and keeps the bytes done",
-                vec![
-                    (
-                        vec![
-                            ("a", CatchingUp, syncing(50, 100)),
-                            ("b", CatchingUp, syncing(1, 10)),
-                        ],
-                        Some((51, 110)),
-                    ),
-                    (
-                        vec![
-                            ("a", CatchingUp, syncing(50, 150)),
-                            ("b", CatchingUp, syncing(1, 10)),
-                        ],
-                        Some((51, 160)),
-                    ),
-                ],
-            ),
-            (
-                "a folder ends its files while it still catches up",
-                vec![
-                    (
-                        vec![
-                            ("a", CatchingUp, syncing(90, 100)),
-                            ("b", CatchingUp, syncing(1, 100)),
-                        ],
-                        Some((91, 200)),
-                    ),
-                    (
-                        vec![("a", CatchingUp, None), ("b", CatchingUp, syncing(1, 100))],
-                        Some((101, 200)),
-                    ),
-                ],
-            ),
-            (
-                "an offline folder comes back with the same count",
-                vec![
-                    (
-                        vec![
-                            ("a", CatchingUp, syncing(40, 100)),
-                            ("b", CatchingUp, syncing(1, 100)),
-                        ],
-                        Some((41, 200)),
-                    ),
-                    (
-                        vec![("a", Offline, None), ("b", CatchingUp, syncing(1, 100))],
-                        Some((41, 200)),
-                    ),
-                    (
-                        vec![("a", Connecting, None), ("b", CatchingUp, syncing(1, 100))],
-                        Some((41, 200)),
-                    ),
-                    (
-                        vec![
-                            ("a", CatchingUp, syncing(40, 100)),
-                            ("b", CatchingUp, syncing(2, 100)),
-                        ],
-                        Some((42, 200)),
-                    ),
-                ],
-            ),
-            (
-                "an offline folder finishes before it shows progress again",
-                vec![
-                    (
-                        vec![
-                            ("a", CatchingUp, syncing(50, 100)),
-                            ("b", CatchingUp, syncing(1, 100)),
-                        ],
-                        Some((51, 200)),
-                    ),
-                    (
-                        vec![("a", Offline, None), ("b", CatchingUp, syncing(1, 100))],
-                        Some((51, 200)),
-                    ),
-                    (
-                        vec![("a", UpToDate, None), ("b", CatchingUp, syncing(1, 100))],
-                        Some((101, 200)),
-                    ),
-                ],
-            ),
-            (
-                "an offline folder comes back with counts started again",
-                vec![
-                    (
-                        vec![
-                            ("a", CatchingUp, syncing(50, 50)),
-                            ("b", CatchingUp, syncing(1, 10)),
-                        ],
-                        Some((51, 60)),
-                    ),
-                    (
-                        vec![("a", Offline, None), ("b", CatchingUp, syncing(1, 10))],
-                        Some((51, 60)),
-                    ),
-                    (
-                        vec![
-                            ("a", CatchingUp, syncing(0, 5)),
-                            ("b", CatchingUp, syncing(2, 10)),
-                        ],
-                        Some((52, 65)),
-                    ),
-                ],
-            ),
-            (
-                "a folder's counts start again while it shows progress",
-                vec![
-                    (
-                        vec![
-                            ("a", CatchingUp, syncing(50, 50)),
-                            ("b", CatchingUp, syncing(1, 10)),
-                        ],
-                        Some((51, 60)),
-                    ),
-                    (
-                        vec![
-                            ("a", CatchingUp, syncing(0, 5)),
-                            ("b", CatchingUp, syncing(2, 10)),
-                        ],
-                        Some((52, 65)),
-                    ),
-                ],
-            ),
-            (
-                "a stopped folder keeps the bytes it moved",
-                vec![
-                    (
-                        vec![
-                            ("a", CatchingUp, syncing(30, 100)),
-                            ("b", CatchingUp, syncing(1, 10)),
-                        ],
-                        Some((31, 110)),
-                    ),
-                    (
-                        vec![("a", Stopped, None), ("b", CatchingUp, syncing(1, 10))],
-                        Some((31, 40)),
-                    ),
-                    (
-                        vec![
-                            ("a", CatchingUp, syncing(5, 100)),
-                            ("b", CatchingUp, syncing(1, 10)),
-                        ],
-                        Some((36, 140)),
-                    ),
-                ],
-            ),
-            (
-                "an unlinked folder keeps the bytes it moved",
-                vec![
-                    (
-                        vec![
-                            ("a", CatchingUp, syncing(30, 100)),
-                            ("b", CatchingUp, syncing(1, 10)),
-                        ],
-                        Some((31, 110)),
-                    ),
-                    (vec![("b", CatchingUp, syncing(1, 10))], Some((31, 40))),
-                ],
-            ),
-            (
-                "the sum starts again once the session stops syncing",
-                vec![
-                    (
-                        vec![
-                            ("a", CatchingUp, syncing(30, 100)),
-                            ("b", CatchingUp, syncing(1, 10)),
-                        ],
-                        Some((31, 110)),
-                    ),
-                    (
-                        vec![("a", Halted, None), ("b", CatchingUp, syncing(1, 10))],
-                        None,
-                    ),
-                    (
-                        vec![
-                            ("a", CatchingUp, syncing(10, 100)),
-                            ("b", CatchingUp, syncing(1, 10)),
-                        ],
-                        Some((11, 110)),
-                    ),
-                ],
-            ),
-        ];
-        for (case, steps) in cases {
-            let mut carried = Carried::default();
-            let mut done = 0;
-            for (step, (folders, expected)) in steps.into_iter().enumerate() {
-                let state = session_state(
-                    &status(&folders),
-                    &[],
-                    true,
-                    &mut Default::default(),
-                    &mut carried,
-                    &helper(),
-                );
-                let shown =
-                    (state.progress).map(|progress| (progress.bytes_done, progress.bytes_total));
-                assert_eq!(shown, expected, "{case}, step {step}");
-                if let Some((now, _)) = shown {
-                    assert!(now >= done, "{case}, step {step}: done fell from {done}");
-                }
-                done = shown.map_or(0, |(now, _)| now);
-            }
         }
     }
 }

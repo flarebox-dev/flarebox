@@ -269,3 +269,21 @@ fn a_file_found_while_others_sync_adds_its_bytes_at_once() {
     assert_eq!(remote.names(), ["big.bin", "late.txt"]);
     assert_eq!(progress(&a), None);
 }
+
+#[test]
+fn an_offline_folder_keeps_its_progress_until_it_connects_again() {
+    let mut remote = Remote::new();
+    let (site, mut a) = linked(&mut remote, "a");
+    let big = noise(9, 20 * MIB);
+    let size = big.len() as u64;
+    fs::write(site.root.join("big.bin"), &big).unwrap();
+    a.scan_until(|a| !a.work.is_empty());
+    let upload = next_upload(&mut a);
+    let stored = store_first_chunk(&mut remote, &a.caller, &upload);
+    upload.credit.chunk(&upload.chunks[0].hash);
+    assert_eq!(counts(&a), Some((1, 0, stored, size)));
+    for state in [FolderState::Offline, FolderState::Connecting, FolderState::CatchingUp] {
+        a.folder.track_progress(state);
+        assert_eq!(counts(&a), Some((1, 0, stored, size)), "{state:?}");
+    }
+}
