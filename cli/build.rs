@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Embeds the server bundle in the `KOIDRIVE_SERVER_BUNDLE` directory, which `server/scripts/pack-bundle.mjs` writes,
-//! so that `koi setup` deploys the server of its own release (docs/design/cli-setup.md section 4.2). Without the
-//! variable the binary embeds nothing, and deploy and upgrade say so.
-
 #[path = "src/setup/bundle_files.rs"]
 mod bundle_files;
 

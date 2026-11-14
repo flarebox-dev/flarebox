@@ -202,7 +202,6 @@ fn info(command: &clap::Command, path: &str) -> CommandInfo {
     }
 }
 
-/// Every command at `path` and below it, from the CLI's own definition.
 pub fn commands(path: &str) -> Vec<CommandInfo> {
     fn walk(command: &clap::Command, path: &str, all: &mut Vec<CommandInfo>) {
         all.push(info(command, path));

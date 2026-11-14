@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The JSON envelope and the exit statuses of commands that need no server: each prints exactly one envelope on
-//! stdout, and nothing asks a question without a terminal.
-
 use std::process::{Command, Output, Stdio};
 
 use serde_json::Value;
@@ -39,7 +36,6 @@ impl Profile {
         self.command(args).output().expect("run koi")
     }
 
-    /// The exit status and the one JSON object on stdout.
     fn json(&self, args: &[&str]) -> (i32, Value) {
         let output = self.output(args);
         let envelope: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {

@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! A local HTTP server for tests that answers each request with the first unused reply for its method and path, and
-//! records every request.
-
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
@@ -27,7 +24,6 @@ pub struct Reply {
     pub body: Vec<u8>,
 }
 
-/// A request the fake received: method, path with query, its `cf-r2-jurisdiction` header and its body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Seen {
     pub method: String,
@@ -64,7 +60,6 @@ impl Fake {
         self.seen.lock().unwrap().clone()
     }
 
-    /// Whether any request used one of `methods`.
     pub fn sent(&self, methods: &[&str]) -> bool {
         self.seen()
             .iter()
@@ -72,10 +67,8 @@ impl Fake {
     }
 }
 
-/// The account the Cloudflare replies below belong to.
 pub const ACCOUNT: &str = "0123456789abcdef";
 
-/// A successful Cloudflare API answer to `method` on `path` under [`ACCOUNT`].
 pub fn cf(method: &'static str, path: &str, result: serde_json::Value) -> Reply {
     Reply {
         method,
@@ -88,7 +81,6 @@ pub fn cf(method: &'static str, path: &str, result: serde_json::Value) -> Reply 
     }
 }
 
-/// A Koidrive server's protobuf answer to `method` on `path`.
 pub fn proto(method: &'static str, path: &str, message: impl prost::Message) -> Reply {
     Reply {
         method,
@@ -99,7 +91,6 @@ pub fn proto(method: &'static str, path: &str, message: impl prost::Message) -> 
     }
 }
 
-/// The token endpoint's answer to a code exchange.
 pub fn tokens() -> Reply {
     Reply {
         method: "POST",
@@ -117,7 +108,6 @@ pub fn tokens() -> Reply {
     }
 }
 
-/// The revocation endpoint's answer.
 pub fn revoked() -> Reply {
     Reply {
         method: "POST",
@@ -128,8 +118,6 @@ pub fn revoked() -> Reply {
     }
 }
 
-/// A session whose grant came from `oauth`'s token endpoint and whose Cloudflare API is `api`. Its account is the
-/// empty one `Session::login` returns.
 pub(super) async fn login(oauth: &Fake, api: Url) -> Session {
     let endpoint = |path: &str| oauth.base.join(path).unwrap();
     let endpoints = Endpoints {
@@ -161,7 +149,6 @@ pub(super) async fn login(oauth: &Fake, api: Url) -> Session {
     }
 }
 
-/// A session logged in to [`ACCOUNT`] with `fake` as both its OAuth endpoints and its Cloudflare API.
 pub(super) async fn session(fake: &Fake) -> Session {
     let mut session = login(fake, fake.base.join("client/v4/").unwrap()).await;
     session.account = Account {

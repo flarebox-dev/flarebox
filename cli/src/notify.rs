@@ -1,14 +1,8 @@
-//! Desktop notifications from the daemon: one for each decision that opens while it runs.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use koidrive_driver::{Driver, Question};
 
-/// Sends a desktop notification for each decision that opens while the daemon runs. A decision that replaces an open
-/// one, as when more deletions join a held set and the guard asks again under a new id, continues its lineage and gets
-/// none: the person was told about it already. Decisions open when the daemon starts get none either; `koi status`
-/// and the banner of every command show them. Each notification is sent from a task of its own, so the loop never waits
-/// on one. The decisions open when it is called are the baseline, so call it before the folders start.
+/// The decisions open when it is called are the baseline, so call it before the folders start.
 pub fn decisions(driver: Driver) -> impl Future<Output = ()> {
     let mut watch = driver.watch();
     let mut open = driver.questions().unwrap_or_default();
@@ -33,9 +27,6 @@ pub fn decisions(driver: Driver) -> impl Future<Output = ()> {
     }
 }
 
-/// The decisions of `questions` whose lineage `before` does not hold: each opened since `before`, and none of them took
-/// the place of a decision of `before` (see `Question::lineage`). A decision that replaced one in between two looks
-/// carries the lineage of the one it replaced, and an answered decision starts no lineage that a later one continues.
 fn opened<'a>(before: &[Question], questions: &'a [Question]) -> Vec<&'a Question> {
     let lines: BTreeSet<&str> = before
         .iter()
@@ -46,8 +37,6 @@ fn opened<'a>(before: &[Question], questions: &'a [Question]) -> Vec<&'a Questio
         .collect()
 }
 
-/// Shows a notification through the system's notification center. A failure is logged and is not an error: the
-/// decision still shows in `koi status`.
 #[cfg(target_os = "macos")]
 async fn send(title: &str, body: &str) {
     let script = [
@@ -70,8 +59,6 @@ async fn send(title: &str, body: &str) {
     }
 }
 
-/// Shows a notification through the freedesktop notification service on the session bus. Without a session bus,
-/// as in a service started at boot or over SSH, nothing is shown.
 #[cfg(target_os = "linux")]
 async fn send(title: &str, body: &str) {
     use std::collections::HashMap;
