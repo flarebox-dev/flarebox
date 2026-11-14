@@ -51,7 +51,15 @@ EOF
 cat > "$tmp/services/launchctl" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >> "$HOME/services.log"
-[ "$*" = "print gui/$(id -u)" ] || exit 0
+case "$*" in
+    "print gui/$(id -u)/"*)
+        label=${2#gui/*/}
+        [ ! -e "$HOME/running" ] || awk -v label="$label" '$1 == label && NF > 2 { sub(/^[^ ]+ [^ ]+ /, ""); print "\tprogram = " $0 }' "$HOME/running"
+        exit 0
+        ;;
+    "print gui/$(id -u)") ;;
+    *) exit 0 ;;
+esac
 [ ! -e "$HOME/unreachable" ] || exit 113
 printf 'gui/%s = {\n\ttype = login\n\tservices = {\n' "$(id -u)"
 printf '\t\t%8s %6s \t%s\n' 101 - com.example.other 102 - dev.koidrive.koiz 104 - dev.koidrive.koi.backup 0 0 dev.koidrive.koi.0badf00d
@@ -234,7 +242,7 @@ start_daemon() {
     fi
     (cd "$tmp/daemons" && exec perl -e 'my $program = shift; exec { $program } @ARGV' "$program" "$1" _daemon) &
     printf '%s\n' "$!" >> "$tmp/daemon.pids"
-    [ -z "${2:-}" ] || printf '%s %s\n' "$2" "$!" >> "$HOME/running"
+    [ -z "${2:-}" ] || printf '%s %s %s\n' "$2" "$!" "$1" >> "$HOME/running"
 }
 expect_restarts() {
     if [ "$(cat "$tmp/restarted")" != "$2" ]; then
@@ -261,14 +269,14 @@ expect_restarts 'an upgrade restarts the running service of every profile that r
 if grep -F 'could not tell' "$tmp/restart.log"; then exit 1; fi
 rm "$HOME/running"
 
-nonascii="$tmp/내 앱"
+nonascii="$tmp/내 앱 👨‍💻 می‌خواهم"
 mkdir "$nonascii"
 cp "$HOME/.local/bin/koi" "$nonascii/koi"
 start_daemon "$nonascii/koi" "$1"
 rm -f "$HOME/services.log"
 LC_ALL=C KOIDRIVE_INSTALL_DIR="$nonascii" sh "$installer" > "$tmp/restart.log" 2>&1
 grep -E -e '--user restart|kickstart' "$HOME/services.log" > "$tmp/restarted" || true
-expect_restarts 'an upgrade under LC_ALL=C restarts the service of a koi in a non-ASCII folder' "$(printf '%s\n' "$restarts" | head -n 1)"
+expect_restarts 'an upgrade under LC_ALL=C restarts the service of a koi in a folder with Hangul, a ZWJ emoji and a ZWNJ' "$(printf '%s\n' "$restarts" | head -n 1)"
 rm "$HOME/running"
 
 true &
@@ -286,6 +294,23 @@ if ! grep -F "koi could not tell which koi the background service $2 runs, so it
 fi
 pass 'an upgrade names a service whose koi it cannot tell'
 rm "$HOME/running"
+
+if [ "$(uname -s)" = Darwin ]; then
+    start_daemon "$HOME/.local/bin/koi"
+    daemon=$!
+    start_daemon "$nonascii/koi"
+    mangled=$!
+    touch "$HOME/unreachable"
+    sh "$installer" 2> "$tmp/nogui.log"
+    rm "$HOME/unreachable"
+    if ! grep -F "the koi daemon with process ID $daemon still runs the old koi" "$tmp/nogui.log" ||
+        ! grep -F "koi could not tell which koi the daemon with process ID $mangled runs" "$tmp/nogui.log"; then
+        cat "$tmp/nogui.log"
+        printf 'Expected an upgrade without a launchd GUI domain to name the daemon that runs the old koi and the one it cannot tell\n' >&2
+        exit 1
+    fi
+    pass 'an upgrade without a launchd GUI domain names the daemon that runs the old koi and the one it cannot tell'
+fi
 
 if [ "$(uname -s)" = Linux ]; then
     mkdir "$tmp/nops"
