@@ -74,7 +74,7 @@ ssh-keygen -q -t ed25519 -N '' -C koidrive-release -f "$tmp/release-key"
 ssh-keygen -q -t ed25519 -N '' -C other -f "$tmp/other-key"
 printf 'koidrive namespaces="koidrive-release" %s\n' "$(cut -d' ' -f1,2 "$tmp/release-key.pub")" > "$tmp/allowed-signers"
 RELEASE_SIGNING_KEY=$(cat "$tmp/release-key")
-unset PRERELEASE PRERELEASE_TAGS_PUBLISH_AS
+unset PRERELEASE PRERELEASE_TAGS_PUBLISH_AS prerelease mode
 export PATH="$tmp/bin:$PATH" GH_REPO=koidrive/koidrive GH_STUB_DIR="$tmp/db"
 export RELEASE_ALLOWED_SIGNERS="$tmp/allowed-signers" RELEASE_SIGNING_KEY
 passed=0
