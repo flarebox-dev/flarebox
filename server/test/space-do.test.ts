@@ -473,6 +473,73 @@ describe("conflict rules", () => {
   });
 });
 
+describe("RFC 0023 deletion time and device in ListTrash", () => {
+  function setClock(space: { stub: Awaited<ReturnType<typeof newSpace>>["stub"] }, atMs: number) {
+    return runInDurableObject(space.stub, (instance: SpaceDO) => {
+      instance.clock = () => atMs;
+    });
+  }
+
+  async function trash(c: TestClient) {
+    const entries = new Map<string, { trashedAtMs: bigint; deviceId: string }>();
+    let cursor = "";
+    do {
+      const page = await c.call({ case: "listTrash", value: { cursor, limit: 1 } });
+      if (page.case !== "trash") throw new Error("listTrash failed");
+      expect(page.value.trashed.map((t) => t.nodeId)).toEqual(page.value.nodes.map((n) => n.nodeId));
+      for (const { nodeId, trashedAtMs, deviceId } of page.value.trashed) entries.set(nodeId, { trashedAtMs, deviceId });
+      cursor = page.value.nextCursor;
+    } while (cursor);
+    return entries;
+  }
+
+  it("lists the commit time and the device that deleted a file, not the device that created it", async () => {
+    const space = await setup();
+    const { nodeId: file } = await createFile(space.b, space.root, "report.docx", "draft");
+    space.a.baseSeq = space.b.baseSeq;
+    const deleted = await space.a.commit([op.delete(file)]);
+    expect(await trash(space.a)).toEqual(new Map([[file, { trashedAtMs: deleted.committedAtMs, deviceId: space.a.session.deviceId }]]));
+  });
+
+  it("lists every node of a deleted folder, and keeps the earlier deletion of a child trashed before it", async () => {
+    const space = await setup();
+    const { a, b, root } = space;
+    const [dir, sub] = [uuidv7(), uuidv7()];
+    await a.commit([op.mkdir(dir, root, "Project"), op.mkdir(sub, dir, "slides")]);
+    const { nodeId: deck } = await createFile(a, sub, "pitch.key", "deck");
+    const { nodeId: old } = await createFile(a, dir, "old.xlsx", "old");
+    await setClock(space, 1_000_000);
+    await a.commit([op.delete(old)]);
+    b.baseSeq = a.baseSeq;
+    await setClock(space, 2_000_000);
+    await b.commit([op.delete(dir)]);
+    const byB = { trashedAtMs: 2_000_000n, deviceId: b.session.deviceId };
+    expect(await trash(a)).toEqual(
+      new Map([
+        [dir, byB],
+        [sub, byB],
+        [deck, byB],
+        [old, { trashedAtMs: 1_000_000n, deviceId: a.session.deviceId }],
+      ]),
+    );
+  });
+
+  it("reports the second deletion of a node that was restored and deleted again", async () => {
+    const space = await setup();
+    const { a, b, root } = space;
+    const { nodeId: file } = await createFile(a, root, "notes.pages", "notes");
+    await setClock(space, 1_000_000);
+    await a.commit([op.delete(file)]);
+    await setClock(space, 2_000_000);
+    await a.commit([op.restore(file)]);
+    expect(await trash(a)).toEqual(new Map());
+    b.baseSeq = a.baseSeq;
+    await setClock(space, 3_000_000);
+    await b.commit([op.delete(file)]);
+    expect(await trash(a)).toEqual(new Map([[file, { trashedAtMs: 3_000_000n, deviceId: b.session.deviceId }]]));
+  });
+});
+
 describe("names", () => {
   it("formats conflict names", () => {
     const at = Date.UTC(2026, 10, 9, 23, 59);

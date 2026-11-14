@@ -1120,7 +1120,11 @@ impl SpaceDo {
     pub fn list_trash(&self, request: &ListTrash) -> TrashPage {
         let (nodes, next_cursor) =
             self.node_page(NodeStatus::Trashed, &request.cursor, request.limit);
-        TrashPage { nodes, next_cursor }
+        TrashPage {
+            nodes,
+            next_cursor,
+            ..TrashPage::default()
+        }
     }
 }
 

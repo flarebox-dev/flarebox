@@ -997,6 +997,22 @@ pub struct TrashPage {
     pub nodes: ::prost::alloc::vec::Vec<NodeState>,
     #[prost(string, tag="2")]
     pub next_cursor: ::prost::alloc::string::String,
+    /// One entry for each node in nodes that the server knows the deletion of (RFC 0023). A server before RFC 0023
+    /// sends none.
+    #[prost(message, repeated, tag="3")]
+    pub trashed: ::prost::alloc::vec::Vec<Trashed>,
+}
+/// The deletion that put a node in the trash (RFC 0023).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Trashed {
+    #[prost(string, tag="1")]
+    pub node_id: ::prost::alloc::string::String,
+    /// committed_at_ms of the commit whose Delete trashed the node.
+    #[prost(int64, tag="2")]
+    pub trashed_at_ms: i64,
+    /// The device that sent that commit.
+    #[prost(string, tag="3")]
+    pub device_id: ::prost::alloc::string::String,
 }
 /// A binary WebSocket frame from client to server.
 #[derive(Clone, PartialEq, ::prost::Message)]
