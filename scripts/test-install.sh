@@ -6,10 +6,10 @@ binary=${1:?Usage: test-install.sh <binary> <target>}
 target=${2:?Usage: test-install.sh <binary> <target>}
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+server=
+trap 'if [ -n "$server" ]; then kill "$server"; fi; rm -rf "$tmp"' EXIT
 trap 'exit 1' HUP INT TERM
 export HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config"
-export KOIDRIVE_RELEASE_BASE_URL="file://$tmp/releases"
 export KOIDRIVE_VERSION=v0.0.0
 unset KOIDRIVE_INSTALL_DIR
 mkdir -p "$HOME" "$tmp/package" "$tmp/releases/download/v0.0.0" "$tmp/releases/latest" "$tmp/bin" "$tmp/services"
@@ -54,6 +54,10 @@ printf '\t\t%8s %6s \t%s\n' 101 - com.example.other 102 - dev.koidrive.koiz 104 
 [ ! -e "$HOME/running" ] || sed 's/^/\t\t     103      - \t/' "$HOME/running"
 printf '\t}\n\n\tunmanaged processes = {\n\t\t     105      - \tdev.koidrive.koi.1a2b3c4e\n\t}\n}\n'
 EOF
+cat > "$tmp/services/codesign" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
 cat > "$tmp/services/ps" <<'EOF'
 #!/bin/sh
 if [ "$1 $2 $3" = '-ww -o cgroup=' ] && [ -e "$HOME/cgroup" ]; then
@@ -62,7 +66,7 @@ if [ "$1 $2 $3" = '-ww -o cgroup=' ] && [ -e "$HOME/cgroup" ]; then
 fi
 exec /bin/ps "$@"
 EOF
-chmod +x "$tmp/services/systemctl" "$tmp/services/launchctl" "$tmp/services/ps"
+chmod +x "$tmp/services/systemctl" "$tmp/services/launchctl" "$tmp/services/codesign" "$tmp/services/ps"
 cp "$binary" "$tmp/package/koi"
 archive=koidrive-$target.tar.gz
 release=$tmp/releases/download/v0.0.0
@@ -74,6 +78,19 @@ else
 fi
 cp "$release/SHA256SUMS" "$tmp/good-sums"
 ln -s ../download/v0.0.0 "$tmp/releases/latest/download"
+python3 "$root/scripts/release-fixture-server.py" "$tmp/releases" "$tmp/server" --tls "$tmp/tls" &
+server=$!
+waited=0
+until [ -s "$tmp/server/origin" ]; do
+    if ! kill -0 "$server" 2>/dev/null || [ "$waited" -ge 200 ]; then
+        printf 'The HTTPS release server did not start\n' >&2
+        exit 1
+    fi
+    waited=$((waited + 1))
+    sleep 0.05
+done
+KOIDRIVE_RELEASE_BASE_URL=$(cat "$tmp/server/origin")
+export KOIDRIVE_RELEASE_BASE_URL CURL_CA_BUNDLE="$tmp/tls/cert.pem"
 
 passed=0
 pass() { printf 'PASS %s\n' "$1"; passed=$((passed + 1)); }

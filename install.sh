@@ -47,7 +47,9 @@ main() {
         arch=aarch64
     fi
 
-    for command in curl tar mktemp awk grep sed; do
+    required="curl tar mktemp awk grep sed"
+    if [ "$os" = apple-darwin ]; then required="$required codesign"; fi
+    for command in $required; do
         command -v "$command" >/dev/null 2>&1 || fail "Required command not found: $command"
     done
     if command -v sha256sum >/dev/null 2>&1; then
@@ -59,13 +61,14 @@ main() {
     fi
 
     base=${KOIDRIVE_RELEASE_BASE_URL:-https://github.com/koidrive/koidrive/releases}
+    case "$base" in https://*) ;; *) fail 'KOIDRIVE_RELEASE_BASE_URL must be an https:// URL' ;; esac
     base=${base%/}
     version=${KOIDRIVE_VERSION:-latest}
     if [ "$version" = latest ]; then
         download=$base/latest/download
     else
         version=${version#v}
-        printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' || fail 'KOIDRIVE_VERSION must be a version such as v0.1.0'
+        version=$version awk 'BEGIN { exit ENVIRON["version"] !~ /^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$/ }' || fail 'KOIDRIVE_VERSION must be a version such as v0.1.0'
         download=$base/download/v$version
     fi
 
@@ -74,9 +77,12 @@ main() {
     staged=
     trap 'rm -rf "$tmp"; if [ -n "$staged" ]; then rm -f "$staged"; fi' EXIT
     trap 'exit 1' HUP INT TERM
+    fetch() {
+        curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$tmp/$1" -- "$download/$1"
+    }
     printf 'Downloading %s (%s)\n' "$archive" "$version"
-    curl -fsSL --retry 3 -o "$tmp/$archive" -- "$download/$archive"
-    curl -fsSL --retry 3 -o "$tmp/SHA256SUMS" -- "$download/SHA256SUMS"
+    fetch "$archive"
+    fetch SHA256SUMS
     expected=$(awk -v name="$archive" '$2 == name { count++; hash = $1 } END { if (count == 1) print hash; else exit 1 }' "$tmp/SHA256SUMS") || fail 'SHA256SUMS must contain exactly one entry for the tarball'
     [ "${#expected}" -eq 64 ] || fail 'Invalid SHA256SUMS entry'
     case "$expected" in *[!0-9a-f]*) fail 'Invalid SHA256SUMS entry' ;; esac
@@ -89,6 +95,10 @@ main() {
     printf 'SHA256 verified for %s\n' "$archive"
     tar -xzOf "$tmp/$archive" koi > "$tmp/koi"
     [ -s "$tmp/koi" ] || fail 'The tarball contains no koi binary'
+    if [ "$os" = apple-darwin ]; then
+        codesign --verify --strict -R '=identifier "koi" and anchor apple generic and certificate leaf[subject.OU] = "656SPP5XR8" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists' "$tmp/koi" ||
+            fail "The downloaded koi is not signed with Koidrive's Developer ID; the existing installation has not changed"
+    fi
 
     install_dir=${KOIDRIVE_INSTALL_DIR:-$HOME/.local/bin}
     case "$install_dir" in /*) ;; *) fail 'KOIDRIVE_INSTALL_DIR must be an absolute path' ;; esac

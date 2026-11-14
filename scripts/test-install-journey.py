@@ -11,6 +11,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import tarfile
 import tempfile
 import textwrap
@@ -21,6 +22,15 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 class InstallJourney(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.certificates = tempfile.TemporaryDirectory(prefix="koidrive-install-tls-")
+        cls.tls = Path(cls.certificates.name)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.certificates.cleanup()
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="koidrive-install-journey-")
         self.addCleanup(self.temp.cleanup)
@@ -34,12 +44,14 @@ class InstallJourney(unittest.TestCase):
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "SHELL": "/bin/zsh",
             "KOIDRIVE_VERSION": "0.0.0",
-            "KOIDRIVE_RELEASE_BASE_URL": (self.dir / "releases").as_uri(),
+            "KOIDRIVE_RELEASE_BASE_URL": self.serve("releases", "--tls", str(self.tls)) + "/releases",
+            "CURL_CA_BUNDLE": str(self.tls / "cert.pem"),
             "TERM": "xterm",
         }
         self.tool("uname", 'case "$1" in -s) echo "${TEST_OS:-Darwin}";; -m) echo arm64;; esac')
         for tool in ("launchctl", "systemctl", "ps"):
             self.tool(tool, f'printf "%s\\n" "{tool} $*" >> "$HOME/services.log"\nexit 1')
+        self.tool("codesign", 'printf "%s\\n" "$*" >> "$HOME/codesign.log"')
         self.fixture = self.dir / "koi"
         self.fixture.write_text(textwrap.dedent("""\
             #!/bin/sh
@@ -56,13 +68,31 @@ class InstallJourney(unittest.TestCase):
             exit "${TEST_SETUP_EXIT:-0}"
         """))
         self.fixture.chmod(0o755)
+        self.publish(self.fixture)
+
+    def serve(self, name, *options):
+        state = self.dir / "servers" / name
+        server = subprocess.Popen([sys.executable, str(ROOT / "scripts/release-fixture-server.py"), str(self.dir), str(state), *options])
+        self.addCleanup(server.wait)
+        self.addCleanup(server.kill)
+        deadline = time.monotonic() + 10
+        while not (state / "origin").exists():
+            self.assertIsNone(server.poll(), f"release server {name} exited")
+            self.assertLess(time.monotonic(), deadline, f"release server {name} did not start")
+            time.sleep(0.02)
+        return (state / "origin").read_text()
+
+    def requests(self, name):
+        return (self.dir / "servers" / name / "requests").read_text().splitlines()
+
+    def publish(self, koi):
         release = self.dir / "releases/download/v0.0.0"
-        release.mkdir(parents=True)
+        release.mkdir(parents=True, exist_ok=True)
         sums = []
         for platform in ("aarch64-apple-darwin", "aarch64-unknown-linux-musl"):
             archive = release / f"koidrive-{platform}.tar.gz"
             with tarfile.open(archive, "w:gz") as tar:
-                tar.add(self.fixture, arcname="koi")
+                tar.add(koi, arcname="koi")
             sums.append(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n")
         self.sums = release / "SHA256SUMS"
         self.sums.write_text("".join(sums))
@@ -122,6 +152,18 @@ class InstallJourney(unittest.TestCase):
         code, output = self.install(*args, **kwargs)
         self.assertEqual(code, 0, output)
         self.assertEqual((self.home / ".local/bin/koi").read_bytes(), self.fixture.read_bytes())
+        return output
+
+    def refused_install(self, message, *args, **kwargs):
+        installed = self.home / ".local/bin/koi"
+        installed.parent.mkdir(parents=True, exist_ok=True)
+        installed.write_text("old Koidrive sync client")
+        code, output = self.install(*args, **kwargs)
+        self.assertNotEqual(code, 0, output)
+        self.assertIn(message, output)
+        self.assertEqual(installed.read_text(), "old Koidrive sync client")
+        self.assertFalse((self.home / "setup.args").exists())
+        self.assertFalse((self.home / ".zprofile").exists())
         return output
 
     def test_piped_mac_installer_enters_setup_with_terminal_stdin(self):
@@ -383,6 +425,61 @@ exec /bin/mv "$@"''')
         self.assertEqual(installed.read_text(), "old Koidrive sync client")
         self.assertFalse((self.home / "setup.args").exists())
         self.assertFalse((self.home / ".zprofile").exists())
+
+    def test_release_base_must_be_https(self):
+        plain = self.serve("plain")
+        for base in (plain + "/releases", (self.dir / "releases").as_uri()):
+            with self.subTest(base=base):
+                self.refused_install("KOIDRIVE_RELEASE_BASE_URL must be an https:// URL", env={"KOIDRIVE_RELEASE_BASE_URL": base})
+        self.assertEqual(self.requests("plain"), [])
+        self.assertEqual(self.requests("releases"), [])
+
+    def test_https_to_http_redirect_of_either_download_is_refused(self):
+        plain = self.serve("plain")
+        for name in ("koidrive-aarch64-apple-darwin.tar.gz", "SHA256SUMS"):
+            with self.subTest(redirected=name):
+                origin = self.serve(f"redirect-{name}", "--tls", str(self.tls), "--redirect", plain, "--only", name)
+                self.refused_install("curl: (1)", env={"KOIDRIVE_RELEASE_BASE_URL": origin + "/releases"})
+                self.assertIn(f"/releases/download/v0.0.0/{name}", self.requests(f"redirect-{name}"))
+        self.assertEqual(self.requests("plain"), [])
+
+    def test_https_redirects_are_followed(self):
+        mirror = self.serve("mirror", "--tls", str(self.tls))
+        origin = self.serve("redirect", "--tls", str(self.tls), "--redirect", mirror)
+        self.successful_install("--no-setup", env={"KOIDRIVE_RELEASE_BASE_URL": origin + "/releases"})
+        self.assertEqual(sorted(self.requests("mirror")), ["/releases/download/v0.0.0/SHA256SUMS", "/releases/download/v0.0.0/koidrive-aarch64-apple-darwin.tar.gz"])
+
+    def test_version_must_be_one_whole_version(self):
+        for version in ("0.0.0\n../..", "0.0.0\n", "\n0.0.0", "../../bad", "0.0", "0.0.0 ", "0.0.0/../x"):
+            with self.subTest(version=version):
+                self.refused_install("KOIDRIVE_VERSION must be a version such as v0.1.0", env={"KOIDRIVE_VERSION": version})
+        self.assertEqual(self.requests("releases"), [])
+        for version in ("v0.0.0", "0.0.0"):
+            with self.subTest(version=version):
+                self.successful_install("--no-setup", env={"KOIDRIVE_VERSION": version})
+
+    def test_mac_refuses_koi_that_fails_the_signature_check(self):
+        self.tool("codesign", 'printf "%s\\n" "$*" >> "$HOME/codesign.log"\nexit 1')
+        self.refused_install("not signed with Koidrive's Developer ID")
+        self.assertTrue((self.home / "codesign.log").read_text().startswith("--verify --strict -R ="))
+
+    def test_linux_install_does_not_run_codesign(self):
+        self.tool("codesign", 'echo CODESIGN_RAN; exit 1')
+        output = self.successful_install(env={"TEST_OS": "Linux"})
+        self.assertNotIn("CODESIGN_RAN", output)
+
+    @unittest.skipUnless(platform.system() == "Darwin", "codesign runs only on macOS")
+    def test_mac_refuses_koi_without_the_koidrive_developer_id(self):
+        (self.bin / "codesign").unlink()
+        apple = self.dir / "apple-signed"
+        shutil.copy("/usr/bin/true", apple)
+        ad_hoc = self.dir / "ad-hoc"
+        shutil.copy("/usr/bin/true", ad_hoc)
+        subprocess.run(["codesign", "--force", "--sign", "-", str(ad_hoc)], check=True, capture_output=True)
+        for koi in (ad_hoc, apple, self.fixture):
+            with self.subTest(koi=koi.name):
+                self.publish(koi)
+                self.refused_install("not signed with Koidrive's Developer ID")
 
     def test_update_style_captured_child_never_starts_setup(self):
         self.successful_install(terminal=False, piped=False)
