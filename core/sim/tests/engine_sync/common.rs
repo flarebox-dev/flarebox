@@ -1288,6 +1288,7 @@ fn run_ignoring_answering_after(
     let mut discarded: BTreeMap<String, koidrive_engine::tree::Shape> = BTreeMap::new();
     let mut kept_with: BTreeMap<String, koidrive_engine::tree::Shape> = BTreeMap::new();
     let mut revived: BTreeSet<String> = BTreeSet::new();
+    let mut revived_once: BTreeSet<String> = BTreeSet::new();
     let mut sent_nodes: BTreeSet<String> = BTreeSet::new();
     let mut pending: Option<Question> = None;
     let mut during = during.iter();
@@ -1346,6 +1347,7 @@ fn run_ignoring_answering_after(
         (device.trees, commits, effects) =
             reload(&device.trees, &commits, &effects, &device.rules)?;
         revive(&device, &discarded, &kept_with, &mut revived);
+        revived_once.extend(revived.iter().cloned());
         let reverted = device.trees.reverted();
         parked_reverted = parked_reverted.max(
             device
@@ -1464,6 +1466,7 @@ fn run_ignoring_answering_after(
             for id in shown.keys() {
                 device.touched.remove(id);
                 revived.remove(id);
+                revived_once.remove(id);
             }
             let answered_again: Vec<String> = (kept_with.iter())
                 .filter(|(_, shape)| {
@@ -1493,6 +1496,7 @@ fn run_ignoring_answering_after(
             discarded.extend(shown);
         }
         revive(&device, &discarded, &kept_with, &mut revived);
+        revived_once.extend(revived.iter().cloned());
         let guarded = (commits.questions().iter())
             .find(|question| !matches!(question.kind, QuestionKind::Conflict { .. }))
             .cloned();
@@ -1517,6 +1521,7 @@ fn run_ignoring_answering_after(
             quiet = device.trees == before && during.len() == 0;
             continue;
         };
+        let mut sending = Vec::new();
         for op in &commit.ops {
             let id = match &op.op {
                 Some(op::Op::Delete(delete)) => &delete.node_id,
@@ -1526,11 +1531,11 @@ fn run_ignoring_answering_after(
                 Some(op::Op::UpdateContent(update)) => &update.node_id,
                 _ => continue,
             };
-            sent_nodes.insert(id.clone());
+            sending.push(id.clone());
             // A discarded entry the user changed, or a discarded folder the user put an entry in,
             // before the effects moved it to the local trash is the user's new change, which syncs
             // like any other from then on (section 5.2).
-            let changed = revived.contains(id) || device.touched.contains(id);
+            let changed = revived_once.contains(id) || device.touched.contains(id);
             if held_once.contains(id) && !confirmed.contains(id) {
                 prop_assert!(
                     discarded.contains_key(id) && changed,
@@ -1572,6 +1577,7 @@ fn run_ignoring_answering_after(
         let bringing = restorable(&space, &commit);
         let before = stored(&space);
         let mut committed = space.commit(&me, NOW, &request).map_err(failed)?;
+        sent_nodes.extend(sending);
         let after = stored(&space);
         if cut == Cut::Applied {
             // The response is lost. The server counts the commit, so the device sends the same
