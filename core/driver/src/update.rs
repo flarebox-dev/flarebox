@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Whether a newer Koidrive release is out. The sync host asks GitHub's release list at most once a day and keeps
+//! Whether a newer Koidrive release is out. The sync host asks GitHub's release list and keeps
 //! the answer in the profile's `update-check.json`. Every reader turns that file into an [`Update`] for the version
 //! it runs, with no request of its own. `koi update` asks again at once with [`check_now`].
 

@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! A scripted server for tests that run real chunk uploads: a session whose every `PrepareUpload` gets an `UPLOAD` plan
-//! for each chunk, and a relay that holds each upload until a given number are open before it answers with a receipt.
-
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -19,32 +16,21 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-/// How long the relay holds an upload at most while it waits for more to arrive.
 const HOLD_LIMIT: Duration = Duration::from_secs(5);
-/// How long the relay keeps holding its uploads once enough are open, so that any upload beyond the expected number
-/// arrives while they are still open and counts towards the peak.
 const SETTLE: Duration = Duration::from_millis(100);
 
-/// What the relay saw.
 #[derive(Default)]
 pub(crate) struct Seen {
-    /// The most uploads it held at once.
     pub peak: usize,
-    /// The hash of each upload, in the order they arrived.
     pub hashes: Vec<Vec<u8>>,
-    /// A hash whose every upload it answers with 403.
     pub refuse: Option<Vec<u8>>,
-    /// The hash of each upload it answered with a receipt.
     pub stored: Vec<Vec<u8>>,
 }
 
-/// A relay that holds each upload until `expected` uploads are open at once, or for at most [`HOLD_LIMIT`], then
-/// for [`SETTLE`] more, and answers it with a receipt. The ticket of an upload is its chunk's hash in hex.
 pub(crate) async fn relay(expected: usize) -> (SocketAddr, Arc<Mutex<Seen>>) {
     relay_refusing(expected, 0).await
 }
 
-/// [`relay`], answering its first `refused` uploads with 403, as for an expired ticket.
 pub(crate) async fn relay_refusing(
     expected: usize,
     refused: usize,
@@ -103,7 +89,6 @@ pub(crate) async fn relay_refusing(
     (address, seen)
 }
 
-/// Reads one upload and returns its ticket and the length of its body, or None if the client hung up first.
 async fn read_upload(socket: &mut TcpStream) -> Option<(String, usize)> {
     let mut request = Vec::new();
     let mut buffer = [0u8; 4096];
@@ -142,7 +127,6 @@ fn unhex(text: &str) -> Vec<u8> {
         .collect()
 }
 
-/// A session whose server sends every chunk a `PrepareUpload` asks for to the relay at `relay`, and the API it uses.
 pub(crate) async fn session(relay: SocketAddr) -> (Session, Events, Api) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());

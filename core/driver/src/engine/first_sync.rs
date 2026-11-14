@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! How the work of a first sync grows with its files: the driver's loop, which plans a batch of effects, does it, and ends
-//! each step with [`Engine::checkpoint`] in a store transaction, run until every remote file is on an empty disk.
-
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
@@ -76,8 +73,6 @@ fn remote(id: String, parent: &str, name: String, kind: NodeKind, size: u64) -> 
     }
 }
 
-/// Downloads `files` remote files of `size` bytes, `per_dir` to a folder, onto an empty disk in batches of `limit`, in
-/// one transaction of a store on disk.
 fn first_sync(files: usize, per_dir: usize, size: u64, limit: BatchLimit) -> u64 {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(dir.path().join("store.sqlite")).unwrap();

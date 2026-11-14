@@ -1,15 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Which profile may sync a linked folder. Both facts belong to the physical folder, whatever path, symbolic link or
-//! mount reaches it:
-//!
-//! - `.koidrive/device.json` names the device that linked the folder. Another device's profile refuses to link or
-//!   sync it until it is unlinked there.
-//! - The process that syncs the folder holds an `flock` on the folder itself for as long as its task and observer
-//!   run, so two processes never sync one folder at once. Deleting or replacing `.koidrive/` cannot split the lock,
-//!   and the task checks that its path still names the locked folder. The last holder unlocks the folder
-//!   ([`Flock`]), so the folder is free as soon as the task and the observer have ended.
-
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::ops::Deref;
@@ -26,14 +16,12 @@ use serde::{Deserialize, Serialize};
 const OWNER: &str = "device.json";
 const OWNER_TEMP: &str = "device.json.tmp";
 
-/// The device that linked a folder.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Owner {
     pub server: String,
     pub device_id: String,
 }
 
-/// The folder's private directory, opened without following a symbolic link.
 fn private_dir(root: &Path) -> io::Result<OwnedFd> {
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
     let root = rustix::fs::open(root, flags, Mode::empty())?;
@@ -59,8 +47,6 @@ impl Flock {
         Self::lock(file, FlockOperation::NonBlockingLockExclusive)
     }
 
-    /// Takes a shared lock on `file` without waiting, which other readers can hold at the same time. Returns `None`
-    /// while an exclusive lock is held.
     pub fn share(file: File) -> io::Result<Option<Self>> {
         Self::lock(file, FlockOperation::NonBlockingLockShared)
     }
@@ -90,8 +76,6 @@ impl Drop for Flock {
     }
 }
 
-/// Takes the folder's lock without waiting. Returns `None` while another process, or another open of the folder in
-/// this one, holds it. Dropping the returned lock releases it.
 pub(crate) fn lock(root: &Path) -> io::Result<Option<Flock>> {
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
     Flock::take(File::from(rustix::fs::open(root, flags, Mode::empty())?))
@@ -116,7 +100,6 @@ impl Identity {
     }
 }
 
-/// Whether `root` still names the folder `lock` was taken on. A folder that was moved, replaced or removed is not.
 pub(crate) fn still_locked(lock: &File, root: &Path) -> bool {
     match (lock.metadata(), fs::metadata(root)) {
         (Ok(held), Ok(now)) => held.dev() == now.dev() && held.ino() == now.ino(),
@@ -124,7 +107,6 @@ pub(crate) fn still_locked(lock: &File, root: &Path) -> bool {
     }
 }
 
-/// The device that linked the folder, or `None` if none is recorded.
 pub(crate) fn owner(root: &Path) -> io::Result<Option<Owner>> {
     let dir = private_dir(root)?;
     let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
@@ -140,7 +122,6 @@ pub(crate) fn owner(root: &Path) -> io::Result<Option<Owner>> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-/// Records `owner` as the device that linked the folder, replacing the record in one rename and flushing it.
 pub(crate) fn set_owner(root: &Path, owner: &Owner) -> io::Result<()> {
     let dir = private_dir(root)?;
     match rustix::fs::unlinkat(&dir, OWNER_TEMP, rustix::fs::AtFlags::empty()) {
@@ -175,7 +156,6 @@ pub(crate) fn check_release(root: &Path, owner: &Owner) -> io::Result<()> {
     Ok(())
 }
 
-/// Removes the record if it names `owner`, so another device may link the folder.
 pub(crate) fn release(root: &Path, owner: &Owner) -> io::Result<()> {
     let current = match self::owner(root) {
         Ok(current) => current,

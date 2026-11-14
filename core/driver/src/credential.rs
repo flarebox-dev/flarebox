@@ -188,8 +188,6 @@ impl Credential {
         NewCredentialFile::create(path)?.write(self)
     }
 
-    /// Checks that the credential file at `path` is excluded from backups, and excludes it again if a write dropped
-    /// the exclusion. The driver calls it each time it opens the profile, and does not use a credential it fails for.
     pub fn keep_out_of_backups(path: &Path) -> Result<(), CredentialError> {
         let file = File::open(path).map_err(|source| CredentialError::Io {
             path: path.to_path_buf(),
@@ -212,9 +210,6 @@ impl Credential {
     }
 }
 
-/// A credential file that is ready before the credential exists: a hidden temporary file, readable only by its owner
-/// and excluded from backups. Pairing and claiming create it before they ask the server for a credential, so a profile
-/// that cannot hold a credential fails before the server uses up the code. Dropping it removes the temporary file.
 pub(crate) struct NewCredentialFile {
     path: PathBuf,
     temp: PathBuf,
@@ -222,7 +217,6 @@ pub(crate) struct NewCredentialFile {
 }
 
 impl NewCredentialFile {
-    /// Creates the temporary file for the credential file at `path`, creating the directory with mode 0700.
     pub fn create(path: &Path) -> Result<Self, CredentialError> {
         let dir = path.parent().unwrap_or(Path::new("."));
         DirBuilder::new()
@@ -246,14 +240,11 @@ impl NewCredentialFile {
         })
     }
 
-    /// Writes `credential` and moves it into place. Fails with [`CredentialError::Exists`] instead of replacing a
-    /// credential. The file appears whole or not at all.
     pub fn write(self, credential: &Credential) -> Result<(), CredentialError> {
         let bytes = serde_json::to_vec_pretty(credential).map_err(io::Error::from);
         self.finish(bytes, false)
     }
 
-    /// Writes `bytes` and renames the file over the one at its path, which may exist.
     fn replace(self, bytes: Vec<u8>) -> Result<(), CredentialError> {
         self.finish(Ok(bytes), true)
     }
@@ -292,11 +283,8 @@ impl Drop for NewCredentialFile {
     }
 }
 
-/// How often [`Credential::load_stored`] reads the two files before it gives up on a writer that keeps changing them.
 const READ_ATTEMPTS: usize = 10;
 
-/// The staged slot: the file beside the credential file that holds a proposed credential while a rotation's outcome
-/// is unknown. A build from before rotation ignores it and keeps reading `credential.json`, whose format is unchanged.
 pub fn next_path(path: &Path) -> PathBuf {
     path.with_file_name("credential.next")
 }
@@ -326,8 +314,6 @@ impl StoredCredential {
     }
 }
 
-/// Reads a file of the profile's state that only its owner may read, with the metadata of the file it opened, or
-/// `None` when there is none. A file that another user owns or may read is refused rather than used.
 fn read_private(path: &Path) -> Result<Option<(String, fs::Metadata)>, CredentialError> {
     let io = |source| CredentialError::Io {
         path: path.to_path_buf(),
@@ -383,12 +369,6 @@ fn identity_at(path: &Path) -> Result<Option<Identity>, CredentialError> {
     }
 }
 
-/// The two credential files of a profile, written by the one process that holds the profile lock (RFC 0011 section 2).
-/// Each write goes to a new file excluded from backups, is synced and renamed into place, and the directory is synced.
-/// Promoting writes `credential.json` first and removes `credential.next` second, so a crash in between leaves both
-/// files with the same credential, which the next refresh settles. A write goes ahead only while `credential.json` still
-/// holds this device's credential, checked under `writes`, which a sign-out holds while it removes the files. So a
-/// refresh that ends after a sign-out, or after the profile paired as another device, writes nothing.
 pub struct CredentialFiles {
     path: PathBuf,
     credential: Mutex<Credential>,
@@ -404,7 +384,6 @@ impl CredentialFiles {
         }
     }
 
-    /// Fails unless `credential.json` holds this device's credential.
     fn still_signed_in(&self, credential: &Credential) -> io::Result<()> {
         let stored = Credential::load(&self.path).map_err(io::Error::other)?;
         if stored.is_some_and(|stored| {
@@ -476,8 +455,6 @@ pub(crate) const BACKUP_EXCLUSION: (&str, &[u8]) = (
     b"bplist00_\x10\x11com.apple.backupd\x08\x00\x00\x00\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x1c",
 );
 
-/// Creates the empty file `temp`, readable only by its owner, and excludes it from backups before anything is written
-/// to it, so that no backup can hold a copy of the credential. Errors name `path`, the credential file it becomes.
 fn create_excluded(temp: &Path, path: &Path) -> Result<File, CredentialError> {
     let file = OpenOptions::new()
         .write(true)
@@ -496,8 +473,6 @@ fn create_excluded(temp: &Path, path: &Path) -> Result<File, CredentialError> {
     Ok(file)
 }
 
-/// Keeps the credential file out of Time Machine, so that a Mac restored from a backup has no credential and pairs as
-/// a new device. Nothing to do on other systems.
 fn exclude_from_backups(file: &File) -> io::Result<()> {
     #[cfg(test)]
     if tests::REFUSE_EXCLUSION.get() {
@@ -535,9 +510,7 @@ pub(crate) mod tests {
     use super::*;
 
     thread_local! {
-        /// Makes this thread's backup exclusions fail, as on storage without extended attributes.
         pub(crate) static REFUSE_EXCLUSION: Cell<bool> = const { Cell::new(false) };
-        /// Changes to make between the two reads of [`Credential::load_stored`], one per pass, in order.
         static BETWEEN_READS: RefCell<VecDeque<Box<dyn FnOnce()>>> = RefCell::default();
     }
 
@@ -547,8 +520,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Whether `tmutil isexcluded` reports that Time Machine leaves `path` out. The temporary directory is excluded
-    /// as a whole, so the tests that call it work under the home directory.
     #[cfg(target_os = "macos")]
     pub(crate) fn time_machine_excludes(path: &Path) -> bool {
         let out = std::process::Command::new("tmutil")
@@ -679,7 +650,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// What the two files hold, as `load_stored` reads them.
     fn slots(path: &Path) -> (String, Option<String>) {
         let stored = Credential::load_stored(path).unwrap().unwrap();
         (
