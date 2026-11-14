@@ -41,47 +41,47 @@ if $count_only; then
   exit 0
 fi
 
-if [ -n "$(git status --porcelain --untracked-files=no)" ] || [ -n "$(git ls-files --others --exclude-standard -- '*.proptest-regressions')" ]; then
-  echo "The checkout has uncommitted changes or untracked .proptest-regressions files. Commit or move them first: this script restores files with git." >&2
+if [ -n "$(git status --porcelain --untracked-files=no)" ] || [ -n "$(git ls-files --others --exclude-standard -- '*.proptest-regressions' '*.cases/*.txt')" ]; then
+  echo "The checkout has uncommitted changes or untracked regression case files. Commit or move them first: this script restores files with git." >&2
+  exit 2
+fi
+
+export PROPTEST_CASES=${MUTATION_CASES:-4096}
+export PROPTEST_RNG_SEED=${MUTATION_SEED:-0}
+if ! python3 -c 'import sys; s = sys.argv[1]; sys.exit(not (s.isascii() and s.isdigit() and int(s) < 2**64))' "$PROPTEST_RNG_SEED"; then
+  echo "MUTATION_SEED must be an unsigned 64-bit integer" >&2
   exit 2
 fi
 
 bash scripts/test-engine-mutations.sh
 
+log=$(mktemp)
 restore() {
   git checkout -q -- .
-  git ls-files -z --others --exclude-standard -- '*.proptest-regressions' | xargs -0 rm -f --
+  git ls-files -z --others --exclude-standard -- '*.proptest-regressions' '*.cases/*.txt' | xargs -0 rm -f --
+  if [ -f "${file:-}" ]; then
+    touch "$file"
+  fi
 }
-trap restore EXIT
+trap 'restore; rm -f "$log"' EXIT
 
-cases=${MUTATION_CASES:-4096}
-log=$(mktemp)
-first_failure() { grep -m1 -oE 'Test failed: .{0,90}|panicked at [^ ]+' "$log" || echo "no panic message"; }
-
-property_runs() {
-  local i=$1 attempt
-  shift
-  for attempt in 0 1 2; do
-    if [ -n "${MUTATION_SEED:-}" ]; then
-      export PROPTEST_RNG_SEED=$((MUTATION_SEED + 3 * i + attempt))
-    fi
-    if ! PROPTEST_CASES=$cases "$@" > "$log" 2>&1; then
-      caught="property tests (run $((attempt + 1))${PROPTEST_RNG_SEED:+, seed $PROPTEST_RNG_SEED})"
-      return
-    fi
-    git ls-files -z --others --exclude-standard -- '*.proptest-regressions' | xargs -0 rm -f --
-  done
+failure_output() {
+  local path
+  cat "$log"
+  while IFS= read -r -d '' path; do
+    printf '\nRegression case: %s\n' "$path"
+    cat "$path"
+  done < <(git ls-files -z --modified --others --exclude-standard -- '*.proptest-regressions' '*.cases/*.txt')
 }
 
-echo "Baseline: building and running the unit, property and device tests without mutations"
+echo "Baseline: building and running the unit, property and device tests without mutations (seed $PROPTEST_RNG_SEED)"
 caught=""
 if ! "${unit[@]}" > "$log" 2>&1; then caught="unit tests"; fi
-if [ -n "${MUTATION_SEED:-}" ]; then export PROPTEST_RNG_SEED=$MUTATION_SEED; fi
-if [ -z "$caught" ] && ! PROPTEST_CASES=$cases "${property[@]}" > "$log" 2>&1; then caught="property tests"; fi
-if [ -z "$caught" ] && ! PROPTEST_CASES=$cases "${devices[@]}" > "$log" 2>&1; then caught="device tests"; fi
+if [ -z "$caught" ] && ! "${property[@]}" > "$log" 2>&1; then caught="property tests"; fi
+if [ -z "$caught" ] && ! "${devices[@]}" > "$log" 2>&1; then caught="device tests"; fi
 if [ -n "$caught" ]; then
-  tail -n 40 "$log"
-  echo "Baseline: the $caught fail without any mutation ($(first_failure)). Fix that before running mutations."
+  echo "Baseline: the $caught fail without any mutation. Fix that before running mutations."
+  failure_output
   exit 1
 fi
 echo "Baseline: unit, property and device tests pass"
@@ -103,6 +103,7 @@ for i in "${!names[@]}"; do
   fi
   if ! { "${unit[@]}" --no-run && "${property[@]}" --no-run && "${devices[@]}" --no-run; } > "$log" 2>&1; then
     echo "$name: BROKEN (the mutated $file does not compile: $(grep -m1 -E '^error' "$log" || echo "see the cargo output"))"
+    failure_output
     restore
     status=1
     continue
@@ -112,14 +113,18 @@ for i in "${!names[@]}"; do
     if ! "${unit[@]}" > "$log" 2>&1; then caught="unit tests"; fi
   fi
   if [ -z "$caught" ] && { [ "$kind" = prop ] || [ "$kind" = both ]; }; then
-    property_runs "$i" "${property[@]}"
+    if ! "${property[@]}" > "$log" 2>&1; then caught="property tests"; fi
   fi
   if [ "$kind" = devices ]; then
-    property_runs "$i" "${devices[@]}"
+    if ! "${devices[@]}" > "$log" 2>&1; then caught="device tests"; fi
+  fi
+  if [ -n "$caught" ]; then
+    echo "$name: failure output from $caught (seed $PROPTEST_RNG_SEED)"
+    failure_output
   fi
   restore
   if [ -n "$caught" ]; then
-    echo "$name: caught by $caught: $(first_failure)"
+    echo "$name: caught by $caught (seed $PROPTEST_RNG_SEED)"
   else
     echo "$name: SURVIVED (no $kind test failed with $file mutated)"
     status=1

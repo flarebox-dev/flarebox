@@ -47,6 +47,7 @@ for i in "${!names[@]}"; do
   fi
 done
 [ "$status" -eq 0 ] || exit "$status"
+python3 scripts/test-mutations.py -v
 $targeted || exit 0
 
 git archive HEAD | tar -x -C "$scratch"

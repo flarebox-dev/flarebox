@@ -106,7 +106,7 @@ The command reproduces the failure locally. The `failure-shard-<k>` artifact hol
 
 ## The mutation set
 
-`scripts/engine-mutations.sh` lists mutations of the engine's commit and effects code that the tests must catch, each a perl substitution in one file. `scripts/mutations.sh` applies them one at a time, runs the tests each mutation names, and restores the file. Those tests are the commit tests (`cargo test -p koidrive-engine --test commit`), the interleaving property (`cargo test -p koidrive-sim --test engine_sync`, up to three runs of 4096 cases), both, or the tests of several devices (`cargo test -p koidrive-sim --test devices`, up to three runs). The script first checks that the tests pass without mutations. A mutation fails the run when:
+`scripts/engine-mutations.sh` lists mutations of the engine's commit and effects code that the tests must catch, each a perl substitution in one file. `scripts/mutations.sh` checks every selector, then runs an unmodified baseline before applying mutations one at a time. Each mutation runs the commit tests (`cargo test -p koidrive-engine --test commit`), the interleaving property (`cargo test -p koidrive-sim --test engine_sync`), both, or the tests of several devices (`cargo test -p koidrive-sim --test devices`). Each selected suite runs once, with the same fixed seed and checked-in case files as the baseline. The default property case count is 4096. The script restores the source and fixtures after each mutation and prints failure logs and generated cc cases before cleanup. A mutation fails the run when:
 
 - no test catches it (`SURVIVED`),
 - its pattern no longer matches the source (`STALE`), or
@@ -121,4 +121,4 @@ scripts/mutations.sh               # every mutation
 scripts/mutations.sh --shard 0/4   # every fourth mutation, starting with the first
 ```
 
-`MUTATION_CASES` sets the property case count, and `MUTATION_SEED` fixes the seeds.
+`MUTATION_CASES` sets the property case count. `MUTATION_SEED` sets one unsigned 64-bit seed for the baseline and every mutation, defaulting to `0`. The hosted mutation jobs use seed `0` too; shard numbers do not change it.
