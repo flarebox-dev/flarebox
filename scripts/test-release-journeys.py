@@ -815,15 +815,20 @@ def verified_installer(evidence, root, source="held", reference="accepted", wait
     commit = resolved(evidence, "refs/tags/" + evidence.report["tag"])
     evidence.check("release ref checked out", bool(commit) and head.strip() == commit)
     accepted = {commit: sha256(REPO / "install.sh")}
+    main_digests = {}
     deadline = time.monotonic() + wait
     while True:
-        main = resolved(evidence, "refs/heads/main")
-        if main and main not in accepted:
-            copy = root / "install-main.sh"
-            download(evidence, RAW_INSTALLER.format(main), copy)
-            accepted[main] = sha256(copy)
         download(evidence, url, script)
         actual = sha256(script)
+        accepted = {commit: accepted[commit]}
+        if actual != accepted[commit]:
+            main = resolved(evidence, "refs/heads/main")
+            if main and main not in main_digests:
+                copy = root / "install-main.sh"
+                download(evidence, RAW_INSTALLER.format(main), copy)
+                main_digests[main] = sha256(copy)
+            if main:
+                accepted[main] = main_digests[main]
         matched = next((accepted_commit for accepted_commit, digest in accepted.items() if digest == actual), None)
         if matched or time.monotonic() >= deadline:
             break
