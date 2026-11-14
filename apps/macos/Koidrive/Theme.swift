@@ -168,6 +168,70 @@ struct RowGroup<Content: View>: View {
     }
 }
 
+struct ProgressArc: NSViewRepresentable {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func makeNSView(context: Context) -> ArcView {
+        ArcView()
+    }
+
+    func updateNSView(_ view: ArcView, context: Context) {
+        view.spins = !reduceMotion
+    }
+
+    final class ArcView: NSView {
+        private let arc = CAShapeLayer()
+        private static let spinKey = "spin"
+
+        var spins = false {
+            didSet { updateSpin() }
+        }
+
+        override init(frame: NSRect) {
+            super.init(frame: frame)
+            wantsLayer = true
+            arc.fillColor = nil
+            arc.strokeColor = NSColor(Color.koi).cgColor
+            arc.lineWidth = 1.5
+            arc.lineCap = .round
+            layer?.addSublayer(arc)
+        }
+
+        required init?(coder: NSCoder) {
+            nil
+        }
+
+        override func layout() {
+            super.layout()
+            arc.frame = bounds
+            let radius = (min(bounds.width, bounds.height) - arc.lineWidth) / 2
+            let path = CGMutablePath()
+            path.addArc(center: CGPoint(x: bounds.midX, y: bounds.midY), radius: radius, startAngle: .pi / 2, endAngle: .pi / 2 - 0.7 * 2 * .pi, clockwise: true)
+            arc.path = path
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            updateSpin()
+        }
+
+        private func updateSpin() {
+            guard spins, window != nil else {
+                arc.removeAnimation(forKey: Self.spinKey)
+                return
+            }
+            guard arc.animation(forKey: Self.spinKey) == nil else { return }
+            let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+            spin.fromValue = 0
+            spin.toValue = -2 * Double.pi
+            spin.duration = 1
+            spin.repeatCount = .infinity
+            spin.isRemovedOnCompletion = false
+            arc.add(spin, forKey: Self.spinKey)
+        }
+    }
+}
+
 struct StatusPill: View {
     enum Mark {
         case dot(Color)
@@ -183,10 +247,7 @@ struct StatusPill: View {
             case .dot(let color):
                 Circle().fill(color).frame(width: 6, height: 6)
             case .progress:
-                Circle()
-                    .trim(from: 0, to: 0.7)
-                    .stroke(Color.koi, style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
-                    .rotationEffect(.degrees(-90))
+                ProgressArc()
                     .frame(width: 8, height: 8)
             }
             Text(verbatim: title)
