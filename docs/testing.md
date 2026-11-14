@@ -45,6 +45,13 @@ The property tests use [proptest](https://docs.rs/proptest/1.12.0/proptest/). Th
 - `PROPTEST_CASES`: the number of cases each property runs.
 - `PROPTEST_RNG_SEED`: a fixed seed, a whole number. The same seed, case count and commit give the same cases. Without it, each run picks a random seed.
 
+The properties run in one of two modes, set by `KOIDRIVE_PROPTEST_DETERMINISTIC` (`true` or `false`, unset means `false`):
+
+- Exploring (`false`): each run picks a random seed, so every run tries new cases. Pull requests, pushes to `main`, the property battery and local runs use this mode.
+- Deterministic (`true`): every property starts from seed 0, so the same commit runs the same cases on every run. The merge queue uses this mode, so a known bug on `main` that a random seed happens to reach does not remove an unrelated pull request from the queue.
+
+Both modes replay the saved cases first. `PROPTEST_RNG_SEED` overrides seed 0, and `PROPTEST_CASES` overrides the case count in both modes. `ci.yml` sets the variable once for the whole workflow, to `true` only for `merge_group` events.
+
 When a property fails, proptest prints the shrunk input. The shared configuration saves its `cc` line and a single-line `# shrinks to` description in a `<suite>.cases/cc-<seed>.txt` file, for example under `core/sim/tests/engine_sync.cases/`. Later runs replay saved cases first. Replay a failure by its `cc` line rather than by `PROPTEST_RNG_SEED`. Commit the case file with the fix so it keeps being checked.
 
 Every property block uses `koidrive_test_support::regression_config`. CI checks this with:

@@ -11,6 +11,9 @@ on:
 permissions:
   contents: read
 
+env:
+  KOIDRIVE_PROPTEST_DETERMINISTIC: ${{ github.event_name == 'merge_group' }}
+
 concurrency:
   group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: true
