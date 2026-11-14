@@ -748,12 +748,12 @@
           "$ref": "#/$defs/TelemetrySource",
           "description": "What decided the mode."
         },
-        "waiting_days": {
+        "waiting_events": {
           "format": "uint",
           "minimum": 0,
           "type": "integer"
         },
-        "waiting_events": {
+        "waiting_hours": {
           "format": "uint",
           "minimum": 0,
           "type": "integer"
@@ -763,7 +763,7 @@
         "mode",
         "source",
         "install_id",
-        "waiting_days",
+        "waiting_hours",
         "waiting_events",
         "sends"
       ],

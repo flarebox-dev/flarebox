@@ -5,7 +5,7 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[test]
 fn preview_round_trips_every_timing_field_and_drops_private_fixture_fields() {
@@ -31,30 +31,31 @@ fn preview_round_trips_every_timing_field_and_drops_private_fixture_fields() {
     }
     recorder.count(Counter::CpuMilliseconds, 4567);
     let pending = recorder.take();
-    let expected = serde_json::to_value(&pending.days[&koidrive_telemetry::today()]).unwrap();
+    let hour = *pending.hours.keys().next().unwrap();
+    let expected = serde_json::to_value(&pending.hours[&hour]).unwrap();
     let store = Store::new(&home.path().join("state/koidrive"));
     store.absorb(pending).unwrap();
     let queue = home.path().join("state/koidrive/telemetry/queue.json");
     let mut value: Value = serde_json::from_slice(&std::fs::read(&queue).unwrap()).unwrap();
-    let day = &mut value["days"][koidrive_telemetry::today().to_string()];
+    let report = &mut value["hours"][hour.to_string()];
     let secrets = [
         home.path().display().to_string(),
         "private-name.txt".into(),
         "private-space-id".into(),
         "1794527123456".into(),
     ];
-    day["path"] = json!(secrets[0]);
-    day["name"] = json!(secrets[1]);
-    day["id"] = json!(secrets[2]);
-    day["committed_at_ms"] = json!(1794527123456u64);
-    day["counters"]["private-space-id"] = json!({ "private-name.txt": 1794527123456u64 });
-    day["counters"]["sync"]["unfinished"] = json!(2);
-    day["histograms"]["first_sync_ms"]["private-space-id"] =
+    report["path"] = json!(secrets[0]);
+    report["name"] = json!(secrets[1]);
+    report["id"] = json!(secrets[2]);
+    report["committed_at_ms"] = json!(1794527123456u64);
+    report["counters"]["private-space-id"] = json!({ "private-name.txt": 1794527123456u64 });
+    report["counters"]["sync"]["unfinished"] = json!(2);
+    report["histograms"]["first_sync_ms"]["private-space-id"] =
         json!({"shift": 10, "buckets": vec![0;16], "count": 1, "sum": 1794527123456u64});
-    day["histograms"]["syncing_ms"]["active_age"] =
+    report["histograms"]["syncing_ms"]["active_age"] =
         json!({"shift": 10, "buckets": vec![0;16], "count": 1, "sum": 1794527123456u64});
     for metric in ["first_sync_ms", "remote_apply_ms", "syncing_ms"] {
-        for histogram in day["histograms"][metric]
+        for histogram in report["histograms"][metric]
             .as_object_mut()
             .unwrap()
             .values_mut()
@@ -183,7 +184,7 @@ fn a_command_run_with_reports_on_is_counted_by_name_only() {
     let preview = stdout(&koi(home.path(), &["telemetry", "preview"], &[]));
     let body: serde_json::Value = serde_json::from_str(&preview).unwrap();
     let report = &body["batch"][0];
-    assert_eq!(report["event"], "daily_report");
+    assert_eq!(report["event"], "hourly_report");
     assert_eq!(report["properties"]["c.command.telemetry"], 1);
     assert!(
         !preview.contains(&home.path().display().to_string()),
@@ -305,21 +306,21 @@ fn reset_draws_a_new_id() {
 }
 
 #[test]
-fn every_daemon_start_sends_the_reports_of_past_days() {
+fn every_daemon_start_sends_the_reports_of_past_hours() {
     use koidrive_telemetry::schema::{Command as Name, Counter};
     use koidrive_telemetry::{Recorder, Store};
 
     let home = tempfile::tempdir().unwrap();
     stdout(&koi(home.path(), &["telemetry", "on"], &[]));
     let store = Store::new(&home.path().join("state/koidrive"));
-    let (url, bodies) = posthog();
-    let today = koidrive_telemetry::today();
-    for (day, name, property) in [
-        (today - 1, Name::Folder, "c.command.folder"),
-        (today - 2, Name::Space, "c.command.space"),
+    let (url, bodies) = posthog(0);
+    let hour = koidrive_telemetry::this_hour();
+    for (hour, name, property) in [
+        (hour - 1, Name::Folder, "c.command.folder"),
+        (hour - 2, Name::Space, "c.command.space"),
     ] {
         let recorder = Recorder::on();
-        recorder.count_on(day, Counter::Command(name), 1);
+        recorder.count_on(hour, Counter::Command(name), 1);
         store.absorb(recorder.take()).unwrap();
         let vars = [
             ("KOIDRIVE_TELEMETRY_URL", url.as_str()),
@@ -346,18 +347,92 @@ fn every_daemon_start_sends_the_reports_of_past_days() {
         let body = body.expect("the daemon sent nothing as it started");
         let events = body["batch"].as_array().unwrap();
         assert_eq!(events.len(), 1, "{body}");
-        assert_eq!(events[0]["event"], "daily_report", "{body}");
+        assert_eq!(events[0]["event"], "hourly_report", "{body}");
         assert_eq!(events[0]["properties"][property], 1, "{body}");
         assert_eq!(events[0]["properties"]["client"], "cli_daemon", "{body}");
     }
 }
 
-fn posthog() -> (String, mpsc::Receiver<serde_json::Value>) {
+#[test]
+fn a_daemon_sends_again_a_tick_after_the_network_returns_and_sends_as_it_stops() {
+    use koidrive_telemetry::schema::{Event, SourceFile};
+    use koidrive_telemetry::{Pending, Store};
+
+    let home = tempfile::tempdir().unwrap();
+    stdout(&koi(home.path(), &["telemetry", "on"], &[]));
+    let store = Store::new(&home.path().join("state/koidrive"));
+    let today = koidrive_telemetry::now() / 86_400 * 86_400;
+    let happen = |at: u64, line: u32| {
+        let event = Event::Panic {
+            at,
+            file: SourceFile::from_location("cli/src/main.rs"),
+            line,
+        };
+        let pending = Pending {
+            events: vec![event],
+            ..Pending::default()
+        };
+        store.absorb(pending).unwrap();
+    };
+    let queue = home.path().join("state/koidrive/telemetry/queue.json");
+    let settled = || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while std::fs::read_to_string(&queue).is_ok_and(|queue| queue.contains("\"out\""))
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let (url, bodies) = posthog(1);
+    happen(today + 3_725, 1);
+    let vars = [
+        ("KOIDRIVE_TELEMETRY_URL", url.as_str()),
+        ("KOIDRIVE_TELEMETRY_TOKEN", "phc_test"),
+    ];
+    let mut daemon = command(home.path(), &["_daemon"], &vars)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("run koi");
+    let started = Instant::now();
+    let body = bodies.recv_timeout(Duration::from_secs(90));
+    let waited = started.elapsed();
+    settled();
+    happen(today + 3_726, 2);
+    Command::new("kill")
+        .args(["-TERM", &daemon.id().to_string()])
+        .status()
+        .unwrap();
+    let stopping = bodies.recv_timeout(Duration::from_secs(30));
+    daemon.wait().unwrap();
+
+    let body = body.expect("the daemon did not send again after its first send failed");
+    assert!(waited <= Duration::from_secs(75), "it waited {waited:?}");
+    let panics = |body: &serde_json::Value| {
+        (body["batch"].as_array().unwrap().iter())
+            .filter(|event| event["event"] == "panic")
+            .map(|event| {
+                let line = event["properties"]["line"].as_u64().unwrap();
+                let at = event["timestamp"].as_str().unwrap();
+                (line, at[at.len() - 10..].to_owned())
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(panics(&body), [(1, "T01:02:05Z".to_owned())], "{body}");
+    let stopping = stopping.expect("the daemon did not send as it stopped");
+    assert_eq!(
+        panics(&stopping),
+        [(2, "T01:02:06Z".to_owned())],
+        "{stopping}"
+    );
+}
+
+fn posthog(dropped: usize) -> (String, mpsc::Receiver<serde_json::Value>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let (sender, bodies) = mpsc::channel();
     std::thread::spawn(move || {
-        for stream in listener.incoming() {
+        for stream in listener.incoming().skip(dropped) {
             let mut stream = stream.unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut length = 0;
