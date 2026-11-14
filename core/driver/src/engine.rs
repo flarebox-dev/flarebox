@@ -937,9 +937,7 @@ impl Engine {
                             let held = (self.trees.displaced_with_identity(&identity))
                                 .filter(|node| self.trees.halves().contains_key(*node));
                             match held.and_then(|node| self.trees.synced().live(node)) {
-                                Some(synced) if !linked && synced.content.is_some() => {
-                                    synced.content.clone()
-                                }
+                                Some(synced) if synced.content.is_some() => synced.content.clone(),
                                 _ => continue,
                             }
                         }
@@ -2912,44 +2910,47 @@ mod tests {
 
     #[test]
     fn a_held_file_a_whole_scan_finds_before_reading_its_content_keeps_its_node() {
-        let (_dir, mut engine, file) = moved_out_of_a_removed_folder(false);
-        let identity = FileId {
-            birth_ns: Some(10),
-            ..ino(10)
-        };
-        let mut local = engine.trees.local().get(&file).unwrap().clone();
-        local.identity.birth_ns = identity.birth_ns;
-        engine.trees.set_local(file.clone(), local);
-        engine.observe_part(
-            &[Observed::Removed {
-                path: "x/d".into(),
-                kind: EntryKind::Dir,
-            }],
-            1_000,
-        );
-        engine.observe(
-            &[Observed::Created {
-                path: "e/moved.txt".into(),
-                kind: EntryKind::File,
-                id: identity,
-                linked: false,
-                content: None,
-            }],
-            3_001,
-        );
-        engine.observe_part(
-            &[Observed::Modified {
-                path: "e/moved.txt".into(),
-                id: identity,
-                linked: false,
-                content: Some(bytes(5)),
-            }],
-            3_002,
-        );
-        assert_eq!(
-            holding(&engine, "e/moved.txt").map(|(id, _, _)| id),
-            Some(file)
-        );
+        for linked in [false, true] {
+            let (_dir, mut engine, file) = moved_out_of_a_removed_folder(linked);
+            let identity = FileId {
+                birth_ns: Some(10),
+                ..ino(10)
+            };
+            let mut local = engine.trees.local().get(&file).unwrap().clone();
+            local.identity.birth_ns = identity.birth_ns;
+            engine.trees.set_local(file.clone(), local);
+            engine.observe_part(
+                &[Observed::Removed {
+                    path: "x/d".into(),
+                    kind: EntryKind::Dir,
+                }],
+                1_000,
+            );
+            engine.observe(
+                &[Observed::Created {
+                    path: "e/moved.txt".into(),
+                    kind: EntryKind::File,
+                    id: identity,
+                    linked,
+                    content: None,
+                }],
+                3_001,
+            );
+            engine.observe_part(
+                &[Observed::Modified {
+                    path: "e/moved.txt".into(),
+                    id: identity,
+                    linked,
+                    content: Some(bytes(5)),
+                }],
+                3_002,
+            );
+            assert_eq!(
+                holding(&engine, "e/moved.txt").map(|(id, _, _)| id),
+                Some(file),
+                "linked: {linked}"
+            );
+        }
     }
 
     fn moved_out_of_a_removed_folder(linked: bool) -> (tempfile::TempDir, Engine, NodeId) {
