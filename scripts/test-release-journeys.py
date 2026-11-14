@@ -1021,8 +1021,9 @@ def homebrew_update(evidence, root, ownership, entries):
         evidence.report["koi_update"] = {"status": status, "outcome": envelope.get("outcome"), "data": data,
                                          "next_commands": envelope.get("next_commands")}
         if release_order(previous) < release_order(HOMEBREW_UPDATE_SINCE):
+            upgrade = [{"argv": [str(Path(prefix.strip()) / "bin/brew"), "upgrade", "--cask", "koidrive"]}]
             evidence.check("koi update through Homebrew", status == 0 and data.get("via") == "homebrew"
-                           and envelope.get("next_commands"), out + err)
+                           and envelope.get("next_commands") == upgrade, out + err)
             evidence.report["coverage"]["homebrew_update"] = (
                 f"Koidrive {previous} predates koi update through Homebrew and printed the brew command; "
                 f"the upgrade is asserted from a previous release of {HOMEBREW_UPDATE_SINCE} or later.")
