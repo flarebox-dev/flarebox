@@ -128,6 +128,7 @@ fn migrations_apply_from_empty() {
             "removed_here",
             "replaced_versions",
             "resends",
+            "resent_edits",
             "restore_asked",
             "restore_intents",
             "restore_requests",
@@ -1295,6 +1296,7 @@ fn engine_state() -> EngineState {
             unsent_edits: nodes(["u"]),
             dropped_edits: nodes(["d"]),
             resends: nodes(["u"]),
+            resent_edits: nodes(["u"]),
             local_changes: nodes(["u"]),
             replaced_versions: BTreeMap::from([(
                 "e".into(),
@@ -1508,7 +1510,7 @@ fn engine_state_survives_a_reopen() {
 }
 
 /// The tables of the engine state besides the nodes of R, L and S.
-const ENGINE_TABLES: [&str; 37] = [
+const ENGINE_TABLES: [&str; 38] = [
     "node_sets",
     "node_maps",
     "waiting_updates",
@@ -1525,6 +1527,7 @@ const ENGINE_TABLES: [&str; 37] = [
     "edited_here",
     "replaced_versions",
     "resends",
+    "resent_edits",
     "local_changes",
     "kept_originals",
     "effect_state",

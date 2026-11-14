@@ -111,6 +111,12 @@ pub struct TreesState {
     /// edit the server does not have ([`TreesState::unsent_edits`]). A folder S holds and R lacks
     /// that L holds such a change under is sent again as a resend.
     pub resends: BTreeSet<NodeId>,
+    /// The files of [\`TreesState::unsent_edits\`] whose content another device wrote and a server
+    /// loss dropped. This device sends the content again as a resend (section 4.4), also when the
+    /// node holds a change of this device's user in its position. The content is no change of this
+    /// device's user, so a delete R holds of the file at the position L holds beats it. The record
+    /// ends with the unsent edit, when L takes other content, or when R holds L's content live.
+    pub resent_edits: BTreeSet<NodeId>,
     /// The nodes L holds a change of this device's user in: a scan found L's shape changed, a
     /// rekey made L's copy, L holds a shape other than the one the server took from a commit of
     /// this device, or a commit of this device that the server lost made it. A node leaves once S
@@ -214,6 +220,7 @@ pub struct TreesChanges {
     pub dropped_edits: SetChanges<NodeId>,
     pub replaced_versions: MapChanges<NodeId, Vec<String>>,
     pub resends: SetChanges<NodeId>,
+    pub resent_edits: SetChanges<NodeId>,
     pub local_changes: SetChanges<NodeId>,
     pub kept_originals: MapChanges<NodeId, NodeId>,
 }
@@ -242,6 +249,7 @@ impl TreesChanges {
             dropped_edits,
             replaced_versions,
             resends,
+            resent_edits,
             local_changes,
             kept_originals,
         } = after;
@@ -266,6 +274,7 @@ impl TreesChanges {
             dropped_edits: set_changes(&before.dropped_edits, dropped_edits),
             replaced_versions: map_changes(&before.replaced_versions, replaced_versions),
             resends: set_changes(&before.resends, resends),
+            resent_edits: set_changes(&before.resent_edits, resent_edits),
             local_changes: set_changes(&before.local_changes, local_changes),
             kept_originals: map_changes(&before.kept_originals, kept_originals),
         }

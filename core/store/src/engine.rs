@@ -281,6 +281,11 @@ impl Tx<'_> {
         while let Some(row) = rows.next()? {
             state.trees.resends.insert(row.get(0)?);
         }
+        let mut stmt = self.0.prepare_cached("SELECT node_id FROM resent_edits")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            state.trees.resent_edits.insert(row.get(0)?);
+        }
         let mut stmt = self.0.prepare_cached("SELECT node_id FROM local_changes")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
@@ -392,6 +397,7 @@ impl Tx<'_> {
             "dropped_edits",
             "replaced_versions",
             "resends",
+            "resent_edits",
             "local_changes",
             "kept_originals",
             "effect_state",
@@ -451,6 +457,7 @@ impl Tx<'_> {
             dropped_edits,
             replaced_versions,
             resends,
+            resent_edits,
             local_changes,
             kept_originals,
         } = trees;
@@ -639,6 +646,11 @@ impl Tx<'_> {
             resends,
             "DELETE FROM resends WHERE node_id = ?1",
             "INSERT OR IGNORE INTO resends (node_id) VALUES (?1)",
+        )?;
+        self.write_set(
+            resent_edits,
+            "DELETE FROM resent_edits WHERE node_id = ?1",
+            "INSERT OR IGNORE INTO resent_edits (node_id) VALUES (?1)",
         )?;
         self.write_set(
             local_changes,

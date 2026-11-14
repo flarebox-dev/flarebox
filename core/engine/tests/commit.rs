@@ -16,6 +16,7 @@ include!("commit/lost_download_versions.rs");
 include!("commit/lost_waiting_changes.rs");
 include!("commit/own_records_after_loss.rs");
 include!("commit/parked_edits_and_pending_names.rs");
+include!("commit/partial_commits_after_loss.rs");
 include!("commit/refusal_and_reconnect.rs");
 include!("commit/refused_creates.rs");
 include!("commit/revived_trash_groups.rs");

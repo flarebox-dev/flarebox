@@ -11,7 +11,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use koidrive_engine::commit::Commits;
 use koidrive_engine::restore::RestoreIntent;
+use koidrive_engine::state::CommitsState;
 use koidrive_engine::tree::Content;
 use koidrive_proto::v1::error;
 use koidrive_sim::world::disk::Place;
@@ -204,8 +206,28 @@ fn run(
     phases: &[Vec<(usize, Step)>],
     stops: fn(&Failure) -> bool,
 ) -> Result<World, Failure> {
+    run_capped(devices, None, phases, stops)
+}
+
+fn run_capped(
+    devices: usize,
+    cap: Option<usize>,
+    phases: &[Vec<(usize, Step)>],
+    stops: fn(&Failure) -> bool,
+) -> Result<World, Failure> {
     let mut world = world(devices);
     for (phase, schedule) in phases.iter().enumerate() {
+        if cap.is_some() {
+            for device in &mut world.devices {
+                for engine in [&mut device.engine, &mut device.store] {
+                    let state = CommitsState {
+                        cap,
+                        ..engine.commits.state()
+                    };
+                    engine.commits = Commits::from_state(state).expect("a cap below MAX_OPS");
+                }
+            }
+        }
         match world.phase(phase, schedule) {
             Err(failure) if stops(&failure) => return Err(failure),
             _ => {}
@@ -309,6 +331,18 @@ proptest! {
     #[test]
     fn devices_converge_across_server_restores(devices in 2..=3usize, phases in phases(Losses::Restores)) {
         converge(devices, &phases).map_err(|failure| TestCaseError::fail(failure.to_string()))?;
+    }
+
+    #[test]
+    fn devices_lose_no_write_with_partial_commits_across_server_restores(devices in 2..=3usize, cap in 1..=2usize, phases in phases(Losses::Restores)) {
+        run_capped(devices, Some(cap), &phases, |failure| matches!(failure, Failure::Broken(_)))
+            .map_err(|failure| TestCaseError::fail(failure.to_string()))?;
+    }
+
+    #[test]
+    fn devices_converge_with_partial_commits_across_server_restores(devices in 2..=3usize, cap in 1..=2usize, phases in phases(Losses::Restores)) {
+        run_capped(devices, Some(cap), &phases, |_| true)
+            .map_err(|failure| TestCaseError::fail(failure.to_string()))?;
     }
 }
 
@@ -489,13 +523,38 @@ fn the_rewind_schedules_reach_every_recovery() {
     );
 }
 
+#[test]
+fn capped_schedules_reach_commits_at_their_cap_and_restores() {
+    reaches_capped(
+        Some(1),
+        phases(Losses::Restores),
+        &[
+            "commit holds as many ops as its cap",
+            "commit applied",
+            "server restored, commits lost",
+            "reconnect finds the server lost commits",
+        ],
+    );
+}
+
 fn reaches(phases: impl Strategy<Value = Vec<Vec<(usize, Step)>>>, events: &[&str]) {
+    reaches_capped(None, phases, events);
+}
+
+fn reaches_capped(
+    cap: Option<usize>,
+    phases: impl Strategy<Value = Vec<Vec<(usize, Step)>>>,
+    events: &[&str],
+) {
     let mut runner = TestRunner::deterministic();
     let strategy = (2..=3usize, phases);
     let mut seen: BTreeMap<&str, u64> = BTreeMap::new();
     for _ in 0..256 {
         let (devices, phases) = strategy.new_tree(&mut runner).unwrap().current();
-        let world = keep(devices, &phases).unwrap();
+        let world = run_capped(devices, cap, &phases, |failure| {
+            matches!(failure, Failure::Broken(_))
+        })
+        .unwrap();
         for (what, count) in world.seen {
             *seen.entry(what).or_default() += count;
         }
@@ -8542,6 +8601,148 @@ fn a_lost_move_gives_way_to_a_delete_by_a_user_who_saw_it() {
                 (2, Work(0)),
                 (2, Work(12987620630431271609)),
                 (2, Work(677365974987200861)),
+            ],
+        ],
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_lost_rename_another_device_sent_again_gives_way_to_a_later_delete() {
+    use koidrive_sim::world::Step::*;
+    keep(
+        3,
+        &[
+            vec![(
+                0,
+                User(Action {
+                    kind: 1,
+                    target: 0,
+                    parent: 0,
+                    name: 0,
+                    text: 0,
+                }),
+            )],
+            vec![
+                (
+                    0,
+                    User(Action {
+                        kind: 0,
+                        target: 0,
+                        parent: 0,
+                        name: 1,
+                        text: 0,
+                    }),
+                ),
+                (
+                    0,
+                    User(Action {
+                        kind: 3,
+                        target: 0,
+                        parent: 1,
+                        name: 0,
+                        text: 0,
+                    }),
+                ),
+                (0, Work(0)),
+                (0, Work(0)),
+                (0, Work(0)),
+                (0, Work(0)),
+                (0, Work(0)),
+                (1, Work(0)),
+                (1, Work(0)),
+                (1, Work(0)),
+                (1, Work(0)),
+                (1, Work(0)),
+                (1, Work(0)),
+                (1, Work(0)),
+                (1, Work(0)),
+                (
+                    1,
+                    User(Action {
+                        kind: 4,
+                        target: 1,
+                        parent: 0,
+                        name: 0,
+                        text: 0,
+                    }),
+                ),
+                (
+                    2,
+                    User(Action {
+                        kind: 3,
+                        target: 0,
+                        parent: 0,
+                        name: 1,
+                        text: 0,
+                    }),
+                ),
+                (0, Backup),
+            ],
+            vec![
+                (
+                    1,
+                    User(Action {
+                        kind: 2,
+                        target: 0,
+                        parent: 0,
+                        name: 0,
+                        text: 0,
+                    }),
+                ),
+                (
+                    1,
+                    User(Action {
+                        kind: 0,
+                        target: 0,
+                        parent: 0,
+                        name: 2,
+                        text: 0,
+                    }),
+                ),
+                (
+                    2,
+                    User(Action {
+                        kind: 2,
+                        target: 0,
+                        parent: 0,
+                        name: 0,
+                        text: 0,
+                    }),
+                ),
+                (
+                    1,
+                    User(Action {
+                        kind: 0,
+                        target: 0,
+                        parent: 0,
+                        name: 3,
+                        text: 0,
+                    }),
+                ),
+            ],
+            vec![
+                (
+                    1,
+                    User(Action {
+                        kind: 4,
+                        target: 8813971463875209164,
+                        parent: 0,
+                        name: 0,
+                        text: 0,
+                    }),
+                ),
+                (0, Restore),
+                (
+                    0,
+                    User(Action {
+                        kind: 2,
+                        target: 7230846765291740688,
+                        parent: 0,
+                        name: 0,
+                        text: 0,
+                    }),
+                ),
             ],
         ],
     )
