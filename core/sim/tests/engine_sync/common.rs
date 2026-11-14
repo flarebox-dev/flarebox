@@ -192,6 +192,7 @@ fn remote_action(space: &mut SpaceDo, ids: &mut IdGen, device: u8, action: &Acti
                 node_id,
                 new_parent_id: parent,
                 new_name: name,
+                from: None,
             }),
             None => return,
         },

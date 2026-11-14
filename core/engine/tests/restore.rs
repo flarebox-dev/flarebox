@@ -58,6 +58,7 @@ fn remote(shape: Shape) -> RemoteNode {
         trashed: false,
         content_rev: 1,
         meta_rev: 1,
+        meta_edit_rev: 1,
         trash_group: String::new(),
         version_id: String::new(),
         edit_rev: 1,
@@ -1059,6 +1060,7 @@ fn a_restore_into_a_trashed_folder_is_sent_after_the_folders_own_move() {
         node_id: a.clone(),
         new_parent_id: root(),
         new_name: "b".into(),
+        from: None,
     });
     assert_eq!(ops(&commit), [moved, restore_op(&intent)]);
 }
@@ -1118,6 +1120,7 @@ fn a_move_onto_the_name_of_a_folder_moving_into_a_folder_restored_into_it_goes_t
             node_id: node.into(),
             new_parent_id: parent.into(),
             new_name: name.into(),
+            from: None,
         })
     };
     assert_eq!(
@@ -1161,6 +1164,7 @@ fn a_folder_renamed_onto_a_held_name_and_restored_into_a_folder_restored_into_it
         node_id: x.clone(),
         new_parent_id: root(),
         new_name: "n".into(),
+        from: None,
     });
     assert_eq!(
         ops(&commit),

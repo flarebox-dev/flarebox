@@ -983,6 +983,7 @@ fn three_trees_round_trip() {
         status: NodeStatus::Trashed as i32,
         content_rev: 4,
         meta_rev: 3,
+        meta_edit_rev: 2,
         trash_group: "4:0".into(),
         current: Some(VersionInfo {
             version_id: "v1".into(),
@@ -2475,6 +2476,7 @@ fn an_own_move_acknowledged_before_the_upgrade_is_sent_again_after_a_later_loss(
         trashed: false,
         content_rev: 1,
         meta_rev,
+        meta_edit_rev: meta_rev,
         edit_rev: 0,
         trash_group: String::new(),
         version_id: String::new(),
@@ -2864,6 +2866,7 @@ fn a_discarded_file_that_s_no_longer_holds_is_asked_about_again(edited: bool) {
             shape: engine_shape("root", "other.txt"),
             trashed: false,
             meta_rev: 1,
+            meta_edit_rev: 1,
             content_rev: 1,
             trash_group: String::new(),
             version_id: String::new(),
@@ -3368,6 +3371,7 @@ fn a_discarded_folder_is_not_sent_while_a_question_asks_again_about_what_it_hold
                 shape: engine_shape("root", "other.txt"),
                 trashed: false,
                 meta_rev: 1,
+                meta_edit_rev: 1,
                 content_rev: 1,
                 trash_group: String::new(),
                 version_id: String::new(),
@@ -3532,6 +3536,41 @@ fn a_store_from_before_local_changes_were_recorded_records_each_local_node_s_hol
     assert_eq!(applied(&path), all_migrations());
     let state = store.transaction(|tx| tx.engine_state()).unwrap();
     assert_eq!(state.trees.local_changes, nodes(["moved", "new"]));
+}
+
+#[test]
+fn a_store_from_before_meta_edit_revisions_reads_each_remote_node_without_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let node = NodeState {
+        node_id: "n".into(),
+        parent_id: "root".into(),
+        name: "a".into(),
+        kind: NodeKind::Dir as i32,
+        status: NodeStatus::Live as i32,
+        content_rev: 1,
+        meta_rev: 3,
+        meta_edit_rev: 2,
+        ..Default::default()
+    };
+    Store::open(&path)
+        .unwrap()
+        .transaction(|tx| tx.put_remote_node(&node))
+        .unwrap();
+    store_before(&path, "remote_nodes_meta_edit_rev");
+
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(applied(&path), all_migrations());
+    let read = store.transaction(|tx| tx.remote_nodes()).unwrap();
+    assert_eq!(
+        read,
+        [NodeState {
+            meta_edit_rev: 0,
+            ..node.clone()
+        }]
+    );
+    store.transaction(|tx| tx.put_remote_node(&node)).unwrap();
+    assert_eq!(store.transaction(|tx| tx.remote_nodes()).unwrap(), [node]);
 }
 
 #[test]

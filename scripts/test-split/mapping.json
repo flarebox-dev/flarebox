@@ -609,7 +609,12 @@
     "fn:reparent_a_folder_at_its_pending_name": "common",
     "fn:a_folder_another_device_moves_takes_that_place_once_the_node_on_its_owed_name_stays": "parked_edits_and_pending_names",
     "fn:a_folder_another_device_deletes_is_deleted_once_the_node_on_its_owed_name_stays": "parked_edits_and_pending_names",
-    "fn:a_folder_another_device_deletes_keeps_its_owed_name_while_a_parked_file_in_it_holds_an_edit": "parked_edits_and_pending_names"
+    "fn:a_folder_another_device_deletes_keeps_its_owed_name_while_a_parked_file_in_it_holds_an_edit": "parked_edits_and_pending_names",
+    "fn:owed_mv": "common",
+    "fn:a_delete_made_after_a_move_was_sent_goes_out_after_the_moves_own_record": "commit_moves_and_conflicts",
+    "fn:a_superseded_owed_rename_ends_the_debt_and_leaves_the_change_it_met_to_reach_the_disk": "parked_edits_and_pending_names",
+    "fn:a_superseded_owed_rename_of_a_node_another_device_deleted_keeps_the_debt": "parked_edits_and_pending_names",
+    "fn:another_devices_resend_of_a_place_and_its_content_sends_nothing_back": "commit_moves_and_conflicts"
   },
   "core/sim/tests/engine_sync.rs": {
     "use:std :: collections :: { BTreeMap , BTreeSet }": "common",

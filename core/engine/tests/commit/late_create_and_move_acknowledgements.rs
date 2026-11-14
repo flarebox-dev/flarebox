@@ -385,6 +385,7 @@ fn a_late_create_acknowledgement_follows_a_purge_after_l_and_r_agreed_on_a_posit
         "n".into(),
         RemoteNode {
             meta_rev: 10,
+            meta_edit_rev: 10,
             trashed: true,
             trash_group: "10:0".into(),
             ..edited
@@ -490,6 +491,7 @@ fn a_late_acknowledgement_takes_an_agreed_position_only_where_s_can_hold_it() {
                     "n".into(),
                     RemoteNode {
                         meta_rev: 5,
+                        meta_edit_rev: 5,
                         ..remote_at(file(ROOT, "x", 3), 5)
                     },
                 );
@@ -506,6 +508,7 @@ fn a_late_acknowledgement_takes_an_agreed_position_only_where_s_can_hold_it() {
                         "n".into(),
                         RemoteNode {
                             meta_rev: 7,
+                            meta_edit_rev: 7,
                             trashed: true,
                             trash_group: "7:0".into(),
                             ..remote_at(file(ROOT, "x", 3), 7)

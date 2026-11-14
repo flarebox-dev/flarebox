@@ -1305,6 +1305,14 @@ pub(crate) struct Staging {
     nodes: BTreeMap<String, NodeState>,
 }
 
+fn edit_revs(node: &NodeState) -> (u64, u64) {
+    let or = |rev, before| if rev == 0 { before } else { rev };
+    (
+        or(node.edit_rev, node.content_rev),
+        or(node.meta_edit_rev, node.meta_rev),
+    )
+}
+
 impl Staging {
     /// The listing of a bootstrap. The log is replayed from the first page's `head_seq` (spec v0 section 7.5). The
     /// pages of the trash, read after the tree when the server lost commits, carry no `head_seq`: a trashed node
@@ -1335,9 +1343,12 @@ impl Staging {
     /// Holds `state` unless the node it holds is as new.
     fn take(&mut self, state: NodeState) {
         let newer = self.nodes.get(&state.node_id).is_none_or(|held| {
+            let ((edit, meta_edit), (held_edit, held_meta_edit)) =
+                (edit_revs(&state), edit_revs(held));
             state.content_rev > held.content_rev
                 || state.meta_rev > held.meta_rev
-                || state.edit_rev > held.edit_rev
+                || edit > held_edit
+                || meta_edit > held_meta_edit
         });
         if newer {
             self.nodes.insert(state.node_id.clone(), state);
@@ -1889,6 +1900,7 @@ mod tests {
                     trashed: false,
                     content_rev: 1,
                     meta_rev: 1,
+                    meta_edit_rev: 1,
                     trash_group: String::new(),
                     version_id: String::new(),
                     edit_rev: 1,
@@ -2131,6 +2143,7 @@ mod tests {
                     node_id: "n".into(),
                     new_parent_id: ROOT.into(),
                     new_name: "x".into(),
+                    from: None,
                 }),
             ),
             sending(
@@ -2180,6 +2193,7 @@ mod tests {
                         trashed: false,
                         content_rev: 1,
                         meta_rev: 2,
+                        meta_edit_rev: 2,
                         trash_group: String::new(),
                         version_id: String::new(),
                         edit_rev: 1,
@@ -3534,5 +3548,47 @@ mod tests {
                 Ok::<_, Stop>(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn a_listed_node_from_a_server_before_meta_edit_revisions_outranks_an_older_trashed_one() {
+        let at = |meta_rev, meta_edit_rev, status: NodeStatus| NodeState {
+            meta_rev,
+            meta_edit_rev,
+            status: status as i32,
+            ..node("d", "d")
+        };
+        let page = TreePage {
+            nodes: vec![at(10, 0, NodeStatus::Live)],
+            head_seq: 10,
+            ..Default::default()
+        };
+        let trash = TrashPage {
+            nodes: vec![at(8, 8, NodeStatus::Trashed)],
+            ..Default::default()
+        };
+        let staging = Staging::new("h".into(), vec![page], vec![trash]);
+        assert_eq!(staging.nodes.get("d").map(|d| d.meta_rev), Some(10));
+    }
+
+    #[test]
+    fn a_listed_node_from_a_server_before_edit_revisions_outranks_an_older_trashed_one() {
+        let at = |content_rev, edit_rev, status: NodeStatus| NodeState {
+            content_rev,
+            edit_rev,
+            status: status as i32,
+            ..node("d", "d")
+        };
+        let page = TreePage {
+            nodes: vec![at(10, 0, NodeStatus::Live)],
+            head_seq: 10,
+            ..Default::default()
+        };
+        let trash = TrashPage {
+            nodes: vec![at(8, 8, NodeStatus::Trashed)],
+            ..Default::default()
+        };
+        let staging = Staging::new("h".into(), vec![page], vec![trash]);
+        assert_eq!(staging.nodes.get("d").map(|d| d.content_rev), Some(10));
     }
 }

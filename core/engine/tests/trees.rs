@@ -47,6 +47,7 @@ fn remote(shape: Shape) -> RemoteNode {
         trashed: false,
         content_rev: 1,
         meta_rev: 1,
+        meta_edit_rev: 1,
         trash_group: String::new(),
         version_id: String::new(),
         edit_rev: 1,
@@ -179,6 +180,7 @@ fn reads_node_states_and_refuses_kinds_this_version_does_not_sync() {
         status: NodeStatus::Trashed as i32,
         content_rev: 4,
         meta_rev: 6,
+        meta_edit_rev: 0,
         trash_group: "g".into(),
         current: Some(VersionInfo {
             content: Some(content(1, 3)),
@@ -189,8 +191,16 @@ fn reads_node_states_and_refuses_kinds_this_version_does_not_sync() {
     let (id, node) = RemoteNode::from_state(&state).unwrap();
     assert_eq!(id, "n");
     assert!(node.trashed);
-    assert_eq!((node.content_rev, node.meta_rev), (4, 6));
+    assert_eq!(
+        (node.content_rev, node.meta_rev, node.meta_edit_rev),
+        (4, 6, 6)
+    );
     assert_eq!(node.shape, file(ROOT, "f", 1));
+    let placed = NodeState {
+        meta_edit_rev: 5,
+        ..state.clone()
+    };
+    assert_eq!(RemoteNode::from_state(&placed).unwrap().1.meta_edit_rev, 5);
 
     let symlink = NodeState {
         kind: NodeKind::Symlink as i32,

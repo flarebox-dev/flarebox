@@ -51,6 +51,7 @@ fn remote(shape: Shape) -> RemoteNode {
         trashed: false,
         content_rev: 1,
         meta_rev: 1,
+        meta_edit_rev: 1,
         trash_group: String::new(),
         version_id: String::new(),
         edit_rev: 1,
@@ -428,6 +429,7 @@ fn a_file_moved_into_an_ignored_folder_that_is_no_node_stays_on_the_server_as_it
         node_id: "a".into(),
         new_parent_id: ROOT.into(),
         new_name: "back.txt".into(),
+        from: None,
     });
     assert_eq!(
         ops(&mut trees),
@@ -447,6 +449,7 @@ fn a_node_the_user_moves_out_of_an_ignored_path_is_moved_on_the_server() {
         node_id: "a".into(),
         new_parent_id: ROOT.into(),
         new_name: "a.txt".into(),
+        from: None,
     });
     assert_eq!(ops(&mut trees), [moved]);
 }
@@ -1106,4 +1109,23 @@ fn a_folder_renamed_here_keeps_planning_below_it_fast() {
         "planning took {took:?}"
     );
     assert!(!trees.excluded("g0"));
+}
+
+#[test]
+fn a_file_another_device_owed_a_rename_to_an_ignored_name_stays_where_it_is() {
+    let mut trees = trees(&[synced("a", file(ROOT, "a.txt", 1))]);
+    trees.set_rules(&AT_ROOT, rules("*.log\n"));
+    trees.set_remote(
+        "a".into(),
+        RemoteNode {
+            meta_rev: 2,
+            ..remote(file(ROOT, "a.log", 1))
+        },
+    );
+    assert_eq!(effects(&mut trees), []);
+    assert_eq!(ops(&mut trees), []);
+    assert_eq!(
+        trees.local().get("a").map(|node| node.shape.name.as_str()),
+        Some("a.txt")
+    );
 }

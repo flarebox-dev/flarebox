@@ -142,6 +142,7 @@ fn a_policy_halt_takes_a_server_loss_once() {
         content_rev: 4,
         edit_rev: 4,
         meta_rev: 4,
+        meta_edit_rev: 4,
         ..remote(file(ROOT, "x", 1))
     };
     trees.set_remote("a".into(), a);

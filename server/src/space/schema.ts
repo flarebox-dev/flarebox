@@ -93,6 +93,11 @@ export const MIGRATIONS: readonly Migration[] = [
       if (!held.includes("digest_version")) sql.exec(`ALTER TABLE ${table} ADD COLUMN digest_version INTEGER NOT NULL DEFAULT 1`);
     }
   },
+  (sql) => {
+    const columns = sql.exec("SELECT name FROM pragma_table_info('nodes')").toArray().map((row) => row.name);
+    if (!columns.includes("meta_edit_rev")) sql.exec("ALTER TABLE nodes ADD COLUMN meta_edit_rev INTEGER");
+    if (!columns.includes("meta_edit_dev")) sql.exec("ALTER TABLE nodes ADD COLUMN meta_edit_dev TEXT");
+  },
 ];
 
 export function migrate(sql: Sql): void {

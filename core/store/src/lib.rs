@@ -426,7 +426,7 @@ impl Tx<'_> {
     pub fn remote_nodes(&self) -> Result<Vec<NodeState>> {
         let mut stmt = self.0.prepare_cached(
             "SELECT node_id, parent_id, name, kind, status, content_rev, meta_rev, trash_group, current,
-                    edit_rev
+                    edit_rev, meta_edit_rev
              FROM remote_nodes ORDER BY node_id",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -442,6 +442,7 @@ impl Tx<'_> {
                     trash_group: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
                     current: None,
                     edit_rev: row.get(9)?,
+                    meta_edit_rev: row.get::<_, Option<u64>>(10)?.unwrap_or_default(),
                 },
                 row.get::<_, Option<Vec<u8>>>(8)?,
             ))
@@ -460,8 +461,8 @@ impl Tx<'_> {
             .prepare_cached(
                 "INSERT OR REPLACE INTO remote_nodes
                  (node_id, parent_id, name, kind, status, content_rev, meta_rev, trash_group, current,
-                  edit_rev)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                  edit_rev, meta_edit_rev)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )?
             .execute(params![
                 node.node_id,
@@ -474,6 +475,7 @@ impl Tx<'_> {
                 non_empty(&node.trash_group),
                 node.current.as_ref().map(VersionInfo::encode_to_vec),
                 node.edit_rev,
+                node.meta_edit_rev,
             ])?;
         Ok(())
     }

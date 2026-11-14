@@ -2050,6 +2050,20 @@ impl World {
                                     },
                                 );
                             }
+                            for (op, outcome) in sent.ops.iter().zip(&committed.result.results) {
+                                let answer = match op_result::Code::try_from(outcome.code) {
+                                    Ok(
+                                        op_result::Code::Applied | op_result::Code::AppliedRenamed,
+                                    ) => "move with from applied",
+                                    Ok(op_result::Code::Superseded) => "move with from superseded",
+                                    _ => continue,
+                                };
+                                if let Some(op::Op::Move(moved)) = &op.op
+                                    && moved.from.is_some()
+                                {
+                                    note(&mut self.seen, answer);
+                                }
+                            }
                             for (other, device) in self.devices.iter_mut().enumerate() {
                                 if let Some(link) = device.link.as_mut().filter(|_| other != d) {
                                     link.inbox.push(Message::Records(vec![record.clone()]));

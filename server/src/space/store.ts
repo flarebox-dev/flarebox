@@ -32,6 +32,8 @@ export interface NodeRow {
   edit_dev: string;
   meta_rev: number;
   meta_dev: string;
+  meta_edit_rev: number | null;
+  meta_edit_dev: string | null;
   parent_rev: number;
   parent_dev: string;
   cur_version_id: string | null;
@@ -149,6 +151,14 @@ export function versionInfo(sql: Sql, version: VersionRow, complete = false): Ve
   });
 }
 
+export function metaEditRev(node: NodeRow): number {
+  return node.meta_edit_rev ?? node.meta_rev;
+}
+
+export function metaEditDev(node: NodeRow): string {
+  return node.meta_edit_dev ?? node.meta_dev;
+}
+
 export function nodeState(sql: Sql, node: NodeRow, complete = false): NodeState {
   const version = node.cur_version_id ? getVersion(sql, node.cur_version_id) : undefined;
   return create(NodeStateSchema, {
@@ -160,6 +170,7 @@ export function nodeState(sql: Sql, node: NodeRow, complete = false): NodeState 
     contentRev: BigInt(node.content_rev),
     editRev: BigInt(node.edit_rev),
     metaRev: BigInt(node.meta_rev),
+    metaEditRev: BigInt(metaEditRev(node)),
     trashGroup: node.trash_group ?? "",
     current: version ? versionInfo(sql, version, complete) : undefined,
   });

@@ -215,6 +215,7 @@ fn mv(id: &str, parent: &str, name: &str) -> Op {
         node_id: id.into(),
         new_parent_id: parent.into(),
         new_name: name.into(),
+        from: None,
     }))
 }
 

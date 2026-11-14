@@ -247,6 +247,7 @@ fn an_unsent_edit_with_the_bytes_of_a_download_the_server_lost_beats_a_later_del
     );
     let deleted = RemoteNode {
         meta_rev: 6,
+        meta_edit_rev: 6,
         ..trashed(file(ROOT, "a", 1))
     };
     trees.set_remote("a".into(), deleted);
@@ -262,6 +263,7 @@ fn a_lost_create_under_a_folder_deleted_after_the_loss_is_not_sent_again() {
     let synced = trees.taken_from_others(|_| false);
     let deleted = RemoteNode {
         meta_rev: 3,
+        meta_edit_rev: 3,
         ..trashed(dir(ROOT, "f"))
     };
     trees.set_listed_remote("f".into(), deleted);

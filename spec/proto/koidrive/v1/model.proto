@@ -64,6 +64,10 @@ message NodeState {
   // The seq of the newest commit that created the node, changed its content other than by a resend, or carried a user's
   // edit of content a resend brought (RFC 0018). 0 from a server before RFC 0018, read as content_rev.
   uint64 edit_rev = 12;
+  // The seq of the newest commit that changed the node's parent, name or status other than by a Move with from, or
+  // that carried a user's move to the place such a move gave it (RFC 0019). 0 from a server before RFC 0019, read as
+  // meta_rev.
+  uint64 meta_edit_rev = 13;
 }
 
 message ChangeRecord {

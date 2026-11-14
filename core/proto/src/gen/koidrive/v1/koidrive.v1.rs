@@ -376,6 +376,11 @@ pub struct NodeState {
     /// edit of content a resend brought (RFC 0018). 0 from a server before RFC 0018, read as content_rev.
     #[prost(uint64, tag="12")]
     pub edit_rev: u64,
+    /// The seq of the newest commit that changed the node's parent, name or status other than by a Move with from, or
+    /// that carried a user's move to the place such a move gave it (RFC 0019). 0 from a server before RFC 0019, read as
+    /// meta_rev.
+    #[prost(uint64, tag="13")]
+    pub meta_edit_rev: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ChangeRecord {
@@ -552,6 +557,18 @@ pub struct Move {
     pub new_parent_id: ::prost::alloc::string::String,
     #[prost(string, tag="3")]
     pub new_name: ::prost::alloc::string::String,
+    /// When set, the move applies only while the node is live at this place and the new parent is live; otherwise it is
+    /// answered with CODE_SUPERSEDED and changes nothing (RFC 0019).
+    #[prost(message, optional, tag="5")]
+    pub from: ::core::option::Option<Place>,
+}
+/// A place in the tree: a parent folder and a name in it.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Place {
+    #[prost(string, tag="1")]
+    pub parent_id: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub name: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Delete {
