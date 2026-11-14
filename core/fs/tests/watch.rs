@@ -26,6 +26,10 @@ fn modified(path: &str) -> Change {
     Change::Modified { path: path.into() }
 }
 
+fn reidentified(path: &str) -> Change {
+    Change::Reidentified { path: path.into() }
+}
+
 fn renamed(from: &str, to: &str, kind: EntryKind) -> Change {
     Change::Renamed {
         from: from.into(),
@@ -902,7 +906,7 @@ fn a_folder_that_held_entries_is_not_replaced() {
     fs::create_dir(root.join("d")).unwrap();
     fs::rename(root.join("x"), root.join("d/x")).unwrap();
     let changes = snapshot.rescan(&root, [PathBuf::new()]).unwrap().changes;
-    assert_eq!(changes, []);
+    assert_eq!(changes, [reidentified("d")]);
     assert_eq!(snapshot, Snapshot::scan(&root).unwrap());
 
     let root = outer.path().join("moved");
@@ -913,7 +917,7 @@ fn a_folder_that_held_entries_is_not_replaced() {
     fs::create_dir(root.join("d")).unwrap();
     fs::rename(root.join("d.old/x"), root.join("d/x")).unwrap();
     let changes = snapshot.rescan(&root, [PathBuf::new()]).unwrap().changes;
-    assert_eq!(changes, [created("d.old", Dir)]);
+    assert_eq!(changes, [created("d.old", Dir), reidentified("d")]);
     assert_eq!(snapshot, Snapshot::scan(&root).unwrap());
 }
 
@@ -988,7 +992,11 @@ fn a_folder_on_another_device_number_is_not_replaced() {
             entry.id.ino += ino;
         }
         let changes = snapshot.rescan(root, [PathBuf::new()]).unwrap().changes;
-        assert_eq!(changes, [modified("kept/a.txt")], "inode moved by {ino}");
+        assert_eq!(
+            changes,
+            [modified("kept/a.txt"), reidentified("kept")],
+            "inode moved by {ino}"
+        );
         assert_eq!(snapshot, scanned, "inode moved by {ino}");
     }
 }
