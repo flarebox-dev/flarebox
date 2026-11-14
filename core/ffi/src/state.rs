@@ -14,23 +14,32 @@ use crate::types::{
 
 pub(crate) type Halted = BTreeMap<String, (String, i64)>;
 
+#[derive(Default)]
+pub(crate) struct Carried {
+    last: BTreeMap<String, (u64, u64)>,
+    done: u64,
+    total: u64,
+}
+
 pub(crate) fn session_state(
     status: &Status,
     questions: &[driver::Question],
     started: bool,
     halted: &mut Halted,
+    carried: &mut Carried,
     helper: &Helper,
 ) -> SessionState {
     let shown = match started {
         true => sync_status(status),
         false => SyncStatus::Stopped,
     };
+    let progress = progress(status, carried).filter(|_| shown == SyncStatus::Syncing);
+    if progress.is_none() {
+        *carried = Carried::default();
+    }
     SessionState {
         status: shown,
-        progress: match shown {
-            SyncStatus::Syncing => progress(status),
-            _ => None,
-        },
+        progress,
         account: status.account.as_ref().map(account),
         folders: status.folders.iter().map(folder).collect(),
         recent_changes: Vec::new(),
@@ -69,12 +78,23 @@ fn sync_status(status: &Status) -> SyncStatus {
     }
 }
 
-fn progress(status: &Status) -> Option<SyncProgress> {
+fn progress(status: &Status, carried: &mut Carried) -> Option<SyncProgress> {
     let mut sum: Option<SyncProgress> = None;
+    let mut last = BTreeMap::new();
     for folder in &status.folders {
         let Some(progress) = &folder.progress else {
             continue;
         };
+        if let Some(&(done, _)) = carried.last.get(&folder.space_id)
+            && progress.bytes_done < done
+        {
+            carried.done += done;
+            carried.total += done;
+        }
+        last.insert(
+            folder.space_id.clone(),
+            (progress.bytes_done, progress.bytes_total),
+        );
         let sum = sum.get_or_insert(SyncProgress {
             files_to_upload: 0,
             files_to_download: 0,
@@ -93,7 +113,20 @@ fn progress(status: &Status) -> Option<SyncProgress> {
             });
         }
     }
-    sum
+    for (space, (done, total)) in std::mem::replace(&mut carried.last, last) {
+        if carried.last.contains_key(&space) {
+            continue;
+        }
+        let synced = (status.folders.iter())
+            .any(|folder| folder.space_id == space && folder.state == DriverFolderState::UpToDate);
+        let credit = if synced { total } else { done };
+        carried.done += credit;
+        carried.total += credit;
+    }
+    let mut sum = sum?;
+    sum.bytes_done += carried.done;
+    sum.bytes_total += carried.total;
+    Some(sum)
 }
 
 fn account(account: &driver::Account) -> Account {
@@ -422,7 +455,14 @@ mod tests {
         };
         let status = status_of(&[DriverFolderState::Halted]);
         let mut halted = Halted::new();
-        let state = session_state(&status, &[asked], true, &mut halted, &helper);
+        let state = session_state(
+            &status,
+            &[asked],
+            true,
+            &mut halted,
+            &mut Carried::default(),
+            &helper,
+        );
         assert!(state.questions.is_empty());
         assert_eq!(state.problems.len(), 2);
         let problem = state
@@ -449,7 +489,14 @@ mod tests {
             String::from_utf8(parsed.stdout).unwrap(),
             "1\nresolve\n/Users/Ada's home\n/private/other $(false) profile\nunset\nunset\n"
         );
-        let resolved = session_state(&status, &[], true, &mut halted, &helper);
+        let resolved = session_state(
+            &status,
+            &[],
+            true,
+            &mut halted,
+            &mut Carried::default(),
+            &helper,
+        );
         assert_eq!(resolved.problems.len(), 1);
         assert!(matches!(
             resolved.problems[0].kind,
@@ -497,7 +544,15 @@ mod tests {
     fn the_session_status_follows_its_folders_and_the_daemon() {
         use DriverFolderState::*;
         let status = |status: &Status, started| {
-            session_state(status, &[], started, &mut Default::default(), &helper()).status
+            session_state(
+                status,
+                &[],
+                started,
+                &mut Default::default(),
+                &mut Carried::default(),
+                &helper(),
+            )
+            .status
         };
         let up = status_of(&[UpToDate]);
         assert_eq!(status(&up, false), SyncStatus::Stopped);
@@ -632,6 +687,7 @@ mod tests {
             &questions,
             true,
             &mut Halted::new(),
+            &mut Carried::default(),
             &helper(),
         );
         let limits = vec![
@@ -683,5 +739,67 @@ mod tests {
         ] {
             assert_eq!(word(answer), expected);
         }
+    }
+
+    #[test]
+    fn a_folder_that_finishes_keeps_its_bytes_in_the_sum_until_every_folder_is_done() {
+        use DriverFolderState::*;
+        let progress = |done, total| {
+            Some(driver::Progress {
+                files_to_upload: 1,
+                files_to_download: 0,
+                bytes_done: done,
+                bytes_total: total,
+                current: None,
+            })
+        };
+        let status = |folders: [(DriverFolderState, Option<driver::Progress>); 2]| {
+            let mut status = status_of(&[]);
+            status.folders = (folders.into_iter().enumerate())
+                .map(|(index, (state, progress))| driver::FolderStatus {
+                    space_id: format!("s{index}"),
+                    progress,
+                    ..folder_in(state, None)
+                })
+                .collect();
+            status
+        };
+        let mut carried = Carried::default();
+        let mut shown = |folders| {
+            let state = session_state(
+                &status(folders),
+                &[],
+                true,
+                &mut Default::default(),
+                &mut carried,
+                &helper(),
+            );
+            (state.progress).map(|progress| (progress.bytes_done, progress.bytes_total))
+        };
+        let both = [
+            (CatchingUp, progress(90, 100)),
+            (CatchingUp, progress(1, 100)),
+        ];
+        assert_eq!(shown(both), Some((91, 200)));
+        let one = [(UpToDate, None), (CatchingUp, progress(1, 100))];
+        assert_eq!(shown(one.clone()), Some((101, 200)));
+        assert_eq!(shown(one), Some((101, 200)));
+        assert_eq!(
+            shown([(UpToDate, None), (CatchingUp, progress(60, 100))]),
+            Some((160, 200))
+        );
+        assert_eq!(shown([(UpToDate, None), (UpToDate, None)]), None);
+
+        assert_eq!(
+            shown([
+                (CatchingUp, progress(50, 50)),
+                (CatchingUp, progress(1, 10))
+            ]),
+            Some((51, 60))
+        );
+        assert_eq!(
+            shown([(CatchingUp, progress(0, 5)), (CatchingUp, progress(2, 10))]),
+            Some((52, 65))
+        );
     }
 }

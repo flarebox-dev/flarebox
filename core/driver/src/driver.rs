@@ -417,6 +417,7 @@ pub struct Changes {
     changed: watch::Receiver<()>,
     progressed: watch::Receiver<()>,
     last: Option<Instant>,
+    pending: bool,
 }
 
 impl Changes {
@@ -424,28 +425,36 @@ impl Changes {
     /// [`PROGRESS_INTERVAL`] after the previous change this returned, and a state change meanwhile returns instead.
     /// Fails once the driver is gone.
     pub async fn next(&mut self) -> Result<Change, watch::error::RecvError> {
-        let change = tokio::select! {
-            biased;
-            changed = self.changed.changed() => changed.map(|()| Change::State)?,
-            progressed = self.progressed.changed() => {
-                progressed?;
-                let due = self.last.map(|last| last + PROGRESS_INTERVAL);
-                match due {
-                    Some(due) => tokio::select! {
-                        biased;
-                        changed = self.changed.changed() => changed.map(|()| Change::State)?,
-                        () = tokio::time::sleep_until(due.into()) => Change::Progress,
-                    },
-                    None => Change::Progress,
-                }
+        if !self.pending {
+            let state = tokio::select! {
+                biased;
+                changed = self.changed.changed() => changed.map(|()| true)?,
+                progressed = self.progressed.changed() => progressed.map(|()| false)?,
+            };
+            if state {
+                return Ok(self.returned(Change::State));
             }
-        };
-        self.progressed.mark_unchanged();
-        if change == Change::State {
-            self.changed.mark_unchanged();
+            self.pending = true;
         }
+        if let Some(last) = self.last {
+            let due = last + PROGRESS_INTERVAL;
+            let state = tokio::select! {
+                biased;
+                changed = self.changed.changed() => changed.map(|()| true)?,
+                () = tokio::time::sleep_until(due.into()) => false,
+            };
+            if state {
+                return Ok(self.returned(Change::State));
+            }
+        }
+        Ok(self.returned(Change::Progress))
+    }
+
+    fn returned(&mut self, change: Change) -> Change {
+        self.pending = false;
+        self.progressed.mark_unchanged();
         self.last = Some(Instant::now());
-        Ok(change)
+        change
     }
 }
 
@@ -628,6 +637,7 @@ impl Driver {
             changed: self.inner.changed.subscribe(),
             progressed: self.inner.progressed.subscribe(),
             last: None,
+            pending: false,
         }
     }
 
@@ -3893,6 +3903,21 @@ mod tests {
         assert!(asked.elapsed() < PROGRESS_INTERVAL, "{:?}", asked.elapsed());
         let after = tokio::time::timeout(Duration::from_secs(1), changes.next()).await;
         assert!(after.is_err(), "the state change took the progress with it");
+    }
+
+    #[tokio::test]
+    async fn a_progress_change_waiting_out_the_interval_survives_a_dropped_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let driver = Driver::open(Paths::under(dir.path())).unwrap();
+        let mut changes = driver.changes();
+        driver.inner.progressed.send_replace(());
+        assert_eq!(changes.next().await.unwrap(), Change::Progress);
+
+        driver.inner.progressed.send_replace(());
+        let dropped = tokio::time::timeout(PROGRESS_INTERVAL / 5, changes.next()).await;
+        assert!(dropped.is_err(), "the interval holds the change back");
+        let kept = tokio::time::timeout(PROGRESS_INTERVAL * 2, changes.next()).await;
+        assert_eq!(kept.ok().map(Result::unwrap), Some(Change::Progress));
     }
 
     #[tokio::test(flavor = "multi_thread")]

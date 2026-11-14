@@ -48,7 +48,7 @@ A folder counts each file whose content differs between the folder and the serve
 
 `bytes_done` counts the content that both sides hold: each chunk once it is stored or fetched, or once the server reports it present already, and the whole content of a file once it is in sync. A chunk sent again after a cut-off upload or a restart counts once, so `bytes_done` never decreases. A file that leaves without syncing, because it was edited again or removed, takes its bytes not done out of `bytes_total`. `current` is the file whose content moved last.
 
-`status()` reports progress while a folder bootstraps or catches up, and none otherwise. A change of progress alone marks no `watch()` receiver unless progress begins or ends. `changes()` reports it at most once every 250 ms (`PROGRESS_INTERVAL`), so the daemon's `watch` socket, `koi status` and the app's `SessionEvent::Progress` carry the same numbers at a bounded rate, and an idle folder sends nothing. The app sums them over its folders.
+`status()` reports progress while a folder bootstraps or catches up, and none otherwise. A change of progress alone marks no `watch()` receiver unless progress begins or ends. `changes()` reports it at most once every 250 ms (`PROGRESS_INTERVAL`), so the daemon's `watch` socket, `koi status` and the app's `SessionEvent::Progress` carry the same numbers at a bounded rate, and an idle folder sends nothing. The app sums them over its folders and keeps a finished folder's bytes in the sum until every folder is done.
 
 ## A rewound space halts its folders
 
