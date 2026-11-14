@@ -72,13 +72,21 @@ class InstallJourney(unittest.TestCase):
 
     def serve(self, name, *options):
         state = self.dir / "servers" / name
-        server = subprocess.Popen([sys.executable, str(ROOT / "scripts/release-fixture-server.py"), str(self.dir), str(state), *options])
+        state.mkdir(parents=True)
+        with (state / "stderr").open("wb") as stderr:
+            server = subprocess.Popen(
+                [sys.executable, "-X", "faulthandler", str(ROOT / "scripts/release-fixture-server.py"), str(self.dir), str(state), *options],
+                stdin=subprocess.DEVNULL, stderr=stderr,
+            )
         self.addCleanup(server.wait)
         self.addCleanup(server.kill)
         deadline = time.monotonic() + 10
         while not (state / "origin").exists():
-            self.assertIsNone(server.poll(), f"release server {name} exited")
-            self.assertLess(time.monotonic(), deadline, f"release server {name} did not start")
+            if server.poll() is None and time.monotonic() > deadline:
+                server.send_signal(signal.SIGABRT)
+                server.wait()
+            if server.poll() is not None:
+                self.fail(f"release server {name} did not start:\n{(state / 'stderr').read_text()}")
             time.sleep(0.02)
         return (state / "origin").read_text()
 
