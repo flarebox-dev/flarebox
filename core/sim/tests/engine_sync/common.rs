@@ -1186,7 +1186,7 @@ fn run_ignoring(
                 .unwrap();
             continue;
         }
-        let before = device.trees.clone();
+        let before = (device.trees.clone(), commits.clone());
         let built = commits.build(
             &mut device.trees,
             &mut device.ids,
@@ -1252,7 +1252,7 @@ fn run_ignoring(
                 asked += 1;
                 continue;
             }
-            quiet = device.trees == before && during.len() == 0;
+            quiet = device.trees == before.0 && commits == before.1 && during.len() == 0;
             continue;
         };
         for op in &commit.ops {
