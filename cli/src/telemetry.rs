@@ -215,8 +215,6 @@ pub async fn finish() {
     }
 }
 
-/// Moves what this run recorded to disk, now, under the install id it was recorded under, and makes the recorder
-/// follow the current choice. A command calls it before it exits on a signal.
 pub fn flush() {
     let Some(run) = RUN.get() else { return };
     run.flush(
@@ -262,10 +260,6 @@ async fn send(store: &Store, client: Client) -> Option<Sent> {
     .ok()
 }
 
-/// The daemon's loop: as it starts and then every ten minutes it records what `driver` synced, moves the sums to disk
-/// and sends the reports of past days. When it stops it records and moves them to disk only, so that stopping never
-/// waits on the network; a later run sends them. It reads the choice again each time, so `koi telemetry on` and
-/// `off` take effect without a restart.
 pub async fn run_daemon(stop: tokio::sync::oneshot::Receiver<()>, driver: Driver) {
     let Some(run) = RUN.get() else { return };
     let mut last = Volume::default();
@@ -345,8 +339,6 @@ pub fn failed(failure: Failure) {
     }
 }
 
-/// Runs `tick` and then `work` at once and then every `period` until `stop` fires, and `tick` once more then. A
-/// `work` still running when `stop` fires is dropped, so stopping never waits on it.
 async fn every<W: Future>(
     period: Duration,
     mut stop: tokio::sync::oneshot::Receiver<()>,
