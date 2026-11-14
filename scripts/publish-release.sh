@@ -7,7 +7,7 @@ files=${2:?usage: publish-release.sh <tag> <directory>}
 : "${GH_REPO:?is not set}" "${PRERELEASE:?is not set}" "${PRERELEASE_TAGS_PUBLISH_AS:?is not set}" "${RELEASE_ALLOWED_SIGNERS:?is not set}"
 
 version_key() {
-    [[ $1 =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-(alpha|rc)\.([0-9]+))?$ ]] || return 1
+    [[ $1 =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|rc)\.(0|[1-9][0-9]*))?$ ]] || return 1
     local stage=2
     case ${BASH_REMATCH[5]} in alpha) stage=0 ;; rc) stage=1 ;; esac
     printf '%010d.%010d.%010d.%d.%010d\n' "$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[2]}))" \
