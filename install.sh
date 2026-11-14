@@ -242,28 +242,50 @@ main() {
         fi
     }
     runs_this_koi() {
-        daemon=$(ps -ww -o args= -p "$1" 2>/dev/null) || return 1
-        daemon=${daemon% _daemon}
-        case "$daemon" in
-            */*) ;;
-            *) daemon=$(readlink "/proc/$1/exe" 2>/dev/null) || return 1; daemon=${daemon% (deleted)} ;;
-        esac
-        [ "$daemon" -ef "$install_dir/koi" ]
+        case "$os" in
+            apple-darwin) daemon=$(LC_ALL=en_US.UTF-8 ps -ww -o args= -p "$1" 2>/dev/null) && daemon=${daemon% _daemon} ;;
+            *) daemon=$(readlink "/proc/$1/exe" 2>/dev/null) && daemon=${daemon% (deleted)} ;;
+        esac || return 2
+        case "$daemon" in /*) ;; *) return 2 ;; esac
+        [ "$daemon" -ef "$install_dir/koi" ] || return 1
+    }
+    unknown() {
+        printf 'Warning: koi could not tell which koi the background service %s runs, so it did not restart it. If it runs %s/koi, run: %s\n' "$1" "$install_dir" "$2" >&2
     }
     if [ "$os" = apple-darwin ] && agents=$(launchctl print "gui/$(id -u)" 2>/dev/null); then
         printf '%s\n' "$agents" | awk '$1 == "services" && $2 == "=" {inside = 1; next} inside && $1 == "}" {inside = 0} inside && $1 ~ /^[1-9][0-9]*$/ && ($3 == "dev.koidrive.koi" || $3 ~ /^dev\.koidrive\.koi\.[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$/) {print $1, $3}' |
             while read -r pid label; do
-                runs_this_koi "$pid" || continue
-                restart "$label" launchctl kickstart -k "gui/$(id -u)/$label"
+                if runs_this_koi "$pid"; then
+                    restart "$label" launchctl kickstart -k "gui/$(id -u)/$label"
+                elif [ $? = 2 ]; then
+                    unknown "$label" "launchctl kickstart -k gui/$(id -u)/$label"
+                fi
             done
     elif [ "$os" = unknown-linux-musl ] && units=$(systemctl --user list-units --type=service --state=active --plain --no-legend 'koidrive.service' 'koidrive-*.service' 2>/dev/null); then
         for unit in $(printf '%s\n' "$units" | awk '$1 == "koidrive.service" || $1 ~ /^koidrive-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]\.service$/ {print $1}'); do
-            runs_this_koi "$(systemctl --user show --property=MainPID --value "$unit" 2>/dev/null)" || continue
-            restart "$unit" systemctl --user restart "$unit"
+            if runs_this_koi "$(systemctl --user show --property=MainPID --value "$unit" 2>/dev/null)"; then
+                restart "$unit" systemctl --user restart "$unit"
+            elif [ $? = 2 ]; then
+                unknown "$unit" "systemctl --user restart $unit"
+            fi
         done
     else
-        for pid in $(ps -ww -u "$(id -u)" -o pid= -o args= 2>/dev/null | awk '{pid = $1; sub(/^ *[0-9]+ +/, "")} $0 == "koi _daemon" || $0 ~ /\/koi _daemon$/ {print pid}'); do
-            runs_this_koi "$pid" || continue
+        if [ "$os" = apple-darwin ]; then
+            daemons=$(LC_ALL=en_US.UTF-8 ps -ww -u "$(id -u)" -o pid= -o args= 2>/dev/null | awk '{pid = $1; sub(/^ *[0-9]+ +/, "")} $0 == "koi _daemon" || $0 ~ /\/koi _daemon$/ {print pid}')
+        else
+            daemons=$(for cmdline in /proc/[0-9]*/cmdline; do
+                [ "$(tr '\000' '\n' < "$cmdline" 2>/dev/null | sed -n '2p;3q')" = _daemon ] && printf '%s\n' "${cmdline%/cmdline}"
+            done | sed 's|^/proc/||')
+        fi
+        for pid in $daemons; do
+            if runs_this_koi "$pid"; then
+                :
+            elif [ $? = 2 ] && [ "$os" = apple-darwin ]; then
+                printf 'Warning: koi is installed, but koi could not tell which koi the daemon with process ID %s runs. If it runs the old koi, restart it with the service manager that started it.\n' "$pid" >&2
+                continue
+            else
+                continue
+            fi
             unit=$(ps -ww -o cgroup= -p "$pid" 2>/dev/null | tr ';' '\n' | sed -n 's|.*/\(koidrive[-0-9a-f]*\.service\)$|\1|p' | head -n 1)
             if [ -n "$unit" ]; then
                 printf 'Warning: koi is installed, but the background service %s still runs the old koi, because this shell cannot reach the systemd user manager. Log in as %s and run: systemctl --user restart %s\n' "$unit" "$(id -un)" "$unit" >&2

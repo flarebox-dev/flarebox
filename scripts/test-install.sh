@@ -223,9 +223,26 @@ fi
 mkdir "$tmp/daemons"
 mkfifo "$tmp/daemons/_daemon"
 start_daemon() {
-    (cd "$tmp/daemons" && exec perl -e 'exec { "cat" } @ARGV' "$1" _daemon) &
+    program='cat'
+    if [ "$(uname -s)" = Linux ]; then
+        program=$1
+        if [ ! -h "$1" ]; then
+            { cat "$(command -v cat)"; printf '\nKoidrive sync client\n'; } > "$1.new"
+            chmod 755 "$1.new"
+            mv -f "$1.new" "$1"
+        fi
+    fi
+    (cd "$tmp/daemons" && exec perl -e 'my $program = shift; exec { $program } @ARGV' "$program" "$1" _daemon) &
     printf '%s\n' "$!" >> "$tmp/daemon.pids"
     [ -z "${2:-}" ] || printf '%s %s\n' "$2" "$!" >> "$HOME/running"
+}
+expect_restarts() {
+    if [ "$(cat "$tmp/restarted")" != "$2" ]; then
+        cat "$HOME/services.log" "$tmp/restart.log"
+        printf 'Expected %s\n' "$1" >&2
+        exit 1
+    fi
+    pass "$1"
 }
 rm -f "$HOME/services.log"
 sh "$installer"
@@ -238,18 +255,49 @@ start_daemon "$HOME/.local/bin/koi" "$1"
 start_daemon "$tmp/linked/koi" "$2"
 start_daemon "$tmp/other/koi" "$3"
 rm -f "$HOME/services.log"
-sh "$installer" > "$tmp/restart.log"
-grep -E -e '--user restart|kickstart' "$HOME/services.log" > "$tmp/restarted"
-if [ "$(cat "$tmp/restarted")" != "$restarts" ] || [ "$(grep -c -F 'Restarted the background service' "$tmp/restart.log")" != 2 ]; then
-    cat "$HOME/services.log" "$tmp/restart.log"
-    printf 'Expected an upgrade to restart exactly the running services of this koi in every profile\n' >&2
+sh "$installer" > "$tmp/restart.log" 2>&1
+grep -E -e '--user restart|kickstart' "$HOME/services.log" > "$tmp/restarted" || true
+expect_restarts 'an upgrade restarts the running service of every profile that runs this koi, and leaves another koi alone' "$restarts"
+if grep -F 'could not tell' "$tmp/restart.log"; then exit 1; fi
+rm "$HOME/running"
+
+nonascii="$tmp/내 앱"
+mkdir "$nonascii"
+cp "$HOME/.local/bin/koi" "$nonascii/koi"
+start_daemon "$nonascii/koi" "$1"
+rm -f "$HOME/services.log"
+LC_ALL=C KOIDRIVE_INSTALL_DIR="$nonascii" sh "$installer" > "$tmp/restart.log" 2>&1
+grep -E -e '--user restart|kickstart' "$HOME/services.log" > "$tmp/restarted" || true
+expect_restarts 'an upgrade under LC_ALL=C restarts the service of a koi in a non-ASCII folder' "$(printf '%s\n' "$restarts" | head -n 1)"
+rm "$HOME/running"
+
+true &
+gone=$!
+wait "$gone"
+printf '%s %s\n' "$2" "$gone" > "$HOME/running"
+rm -f "$HOME/services.log"
+sh "$installer" > "$tmp/restart.log" 2>&1
+grep -E -e '--user restart|kickstart' "$HOME/services.log" > "$tmp/restarted" || true
+expect_restarts 'an upgrade does not restart a service whose koi it cannot tell' ''
+if ! grep -F "koi could not tell which koi the background service $2 runs, so it did not restart it" "$tmp/restart.log"; then
+    cat "$tmp/restart.log"
+    printf 'Expected an upgrade to say which service it could not check\n' >&2
     exit 1
 fi
+pass 'an upgrade names a service whose koi it cannot tell'
 rm "$HOME/running"
-pass 'an upgrade restarts the running background service of every profile that runs this koi'
-pass 'an upgrade leaves the running service of another koi alone'
 
 if [ "$(uname -s)" = Linux ]; then
+    mkdir "$tmp/nops"
+    printf '#!/bin/sh\nexit 127\n' > "$tmp/nops/ps"
+    chmod +x "$tmp/nops/ps"
+    start_daemon "$HOME/.local/bin/koi" "$1"
+    rm -f "$HOME/services.log"
+    PATH="$tmp/nops:$PATH" sh "$installer" > "$tmp/restart.log" 2>&1
+    grep -E -e '--user restart' "$HOME/services.log" > "$tmp/restarted" || true
+    expect_restarts 'an upgrade on a systemd host without ps restarts this koi' "$(printf '%s\n' "$restarts" | head -n 1)"
+    rm "$HOME/running"
+
     xargs kill < "$tmp/daemon.pids"
     rm "$tmp/daemon.pids"
     start_daemon "$HOME/.local/bin/koi"
@@ -264,6 +312,13 @@ if [ "$(uname -s)" = Linux ]; then
         exit 1
     fi
     pass 'an upgrade without a systemd user manager names only the daemon that still runs the old koi'
+    PATH="$tmp/nops:$PATH" sh "$installer" 2> "$tmp/nobus.log"
+    if ! grep -F "the koi daemon with process ID $daemon still runs the old koi" "$tmp/nobus.log"; then
+        cat "$tmp/nobus.log"
+        printf 'Expected an upgrade without a systemd user manager or ps to name the daemon that still runs the old koi\n' >&2
+        exit 1
+    fi
+    pass 'an upgrade without a systemd user manager or ps names the daemon that still runs the old koi'
     printf '0::/user.slice/user-%s.slice/user@%s.service/app.slice/koidrive-1a2b3c4d.service\n' "$(id -u)" "$(id -u)" > "$HOME/cgroup"
     sh "$installer" 2> "$tmp/nobus.log"
     rm "$HOME/unreachable" "$HOME/cgroup"
