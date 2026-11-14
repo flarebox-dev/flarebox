@@ -4,10 +4,12 @@ from pathlib import Path
 import argparse
 import re
 import shlex
+import subprocess
 import unittest
 
 
 WORKFLOW = Path(__file__).resolve().parent.parent / ".github/workflows/ci.yml"
+TARGETS = ("aarch64-apple-darwin", "x86_64-unknown-linux-gnu")
 
 
 def job(workflow, name):
@@ -25,6 +27,23 @@ def test_arguments(body, marker):
     if listing[:listing.index("--")] != execution:
         raise ValueError("Inventory and execution must use identical Cargo arguments")
     return execution
+
+
+def suite_features(expression, suite):
+    body = re.fullmatch(r"\$\{\{\s*(.*?)\s*\}\}", expression)
+    if body is None:
+        raise ValueError("Expected a Rust suite feature expression")
+    for clause in body[1].split("||"):
+        conditional = re.fullmatch(r"matrix\.suite == '([^']+)' && '([^']*)'", clause.strip())
+        if conditional:
+            if conditional[1] == suite:
+                return conditional[2]
+        else:
+            fallback = re.fullmatch(r"'([^']*)'", clause.strip())
+            if fallback:
+                return fallback[1]
+            raise ValueError("Unsupported Rust suite feature expression")
+    raise ValueError("Rust suite features need a fallback")
 
 
 def check_partitions(workflow):
@@ -59,6 +78,40 @@ def check_partitions(workflow):
     features = re.findall(r"(?m)^          FEATURES: (.+)$", shards)
     if len(features) != 2 or features[0] != features[1]:
         raise ValueError("Inventory and execution must use identical feature expressions")
+    partitions = {"remainder": remainder}
+    for package in packages:
+        suite = package.removeprefix("koidrive-")
+        values = {"koidrive-$SUITE": package, "$FEATURES": suite_features(features[0], suite)}
+        partitions[suite] = [values.get(arg, arg) for arg in command]
+    return partitions
+
+
+def cargo_features(arguments, target, roots_only=False):
+    command = ["cargo", "tree", *arguments, "--target", target,
+               "--prefix", "none", "--format", "{p}\t{f}", "--color", "never"]
+    if roots_only:
+        command.extend(["--depth", "0"])
+    output = subprocess.check_output(command, cwd=WORKFLOW.parent.parent, text=True)
+    features = {}
+    for line in output.splitlines():
+        if "\t" not in line:
+            continue
+        package, enabled = line.split("\t", 1)
+        name = package.split()[0]
+        enabled = enabled.removesuffix(" (*)")
+        features.setdefault(name, set()).add(frozenset(filter(None, enabled.split(","))))
+    return features
+
+
+def check_features(workflow, target):
+    expected = cargo_features(["--locked", "--workspace", "--features",
+                               "koidrive-cli/test-install-inventory"], target, roots_only=True)
+    for partition, command in check_partitions(workflow).items():
+        actual = cargo_features(command[2:], target)
+        for package in expected.keys() & actual.keys():
+            if expected[package] != actual[package]:
+                raise ValueError(f"{target} {partition}: {package} features differ from workspace: "
+                                 f"expected {expected[package]}, got {actual[package]}")
 
 
 class RustPartitions(unittest.TestCase):
@@ -107,6 +160,25 @@ class RustPartitions(unittest.TestCase):
         changed = self.workflow.replace("FEATURES: ${{ matrix.suite", "FEATURES: changed ${{ matrix.suite", 1)
         with self.assertRaisesRegex(ValueError, "identical feature expressions"):
             check_partitions(changed)
+
+class FeatureParity(unittest.TestCase):
+    def setUp(self):
+        self.workflow = WORKFLOW.read_text()
+
+    def test_features_match_workspace_on_both_platforms(self):
+        for target in TARGETS:
+            with self.subTest(target=target):
+                check_features(self.workflow, target)
+
+    def test_missing_engine_serde_is_rejected(self):
+        changed = self.workflow.replace("matrix.suite == 'engine' && 'serde' || ", "")
+        with self.assertRaisesRegex(ValueError, "engine: koidrive-engine features differ"):
+            check_features(changed, TARGETS[0])
+
+    def test_missing_sim_engine_serde_is_rejected(self):
+        changed = self.workflow.replace("matrix.suite == 'sim' && 'koidrive-engine/serde' || ", "")
+        with self.assertRaisesRegex(ValueError, "sim: koidrive-engine features differ"):
+            check_features(changed, TARGETS[0])
 
 
 if __name__ == "__main__":

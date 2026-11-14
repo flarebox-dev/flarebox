@@ -183,7 +183,7 @@ jobs:
       - name: Test the macOS runner picker
         run: python3 scripts/test-pick-macos.py -v
       - name: Test Rust partition coverage
-        run: python3 scripts/test-ci-rust-partitions.py -v
+        run: python3 scripts/test-ci-rust-partitions.py RustPartitions -v
       - name: Pick a runner for each macOS job
         id: pick
         env:
@@ -350,6 +350,8 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: runner.environment != 'self-hosted'
+      - name: Verify Rust workspace feature parity
+        run: python3 scripts/test-ci-rust-partitions.py FeatureParity -v
       - name: List the remaining test inventory
         run: |
           out="$RUNNER_TEMP/test-inventory"
