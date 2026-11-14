@@ -358,6 +358,55 @@ fn rewinds_converge_from_the_saved_gun_551_cases() {
     );
 }
 
+fn two_rewinds_around_a_rolled_back_store() -> Vec<Vec<(usize, Step)>> {
+    let act = |kind, target, parent, name| {
+        Step::User(Action {
+            kind,
+            target,
+            parent,
+            name,
+            text: 0,
+        })
+    };
+    vec![
+        vec![
+            (0, Step::Backup),
+            (2, Step::CopyStore),
+            (2, act(0, 0, 0, 0)),
+            (1, act(0, 0, 0, 2)),
+            (0, Step::Rewind),
+        ],
+        vec![
+            (1, act(0, 0, 0, 0)),
+            (0, act(3, 0, 3423204570637552068, 0)),
+            (0, Step::Work(0)),
+            (0, Step::Backup),
+            (2, Step::RollBack),
+            (0, Step::Work(0)),
+            (1, act(2, 0, 0, 0)),
+            (0, Step::Commit(Reply::Served)),
+        ],
+        vec![
+            (0, Step::Rewind),
+            (2, act(1, 0, 18832373481938867, 0)),
+            (2, act(3, 5290765141707611353, 8942541845889857281, 0)),
+            (0, act(0, 0, 0, 3)),
+            (0, act(4, 1966063831828710265, 0, 0)),
+        ],
+    ]
+}
+
+#[test]
+fn two_rewinds_around_a_rolled_back_store_lose_no_write() {
+    keep(3, &two_rewinds_around_a_rolled_back_store()).unwrap();
+}
+
+#[test]
+#[ignore = "the devices are not quiet after two rewinds around a rolled-back store (GUN-551)"]
+fn two_rewinds_around_a_rolled_back_store_converge() {
+    converge(3, &two_rewinds_around_a_rolled_back_store()).unwrap();
+}
+
 /// A fixed sample of the schedules reaches every fault and every way back from one that the
 /// harness counts, so a change to the strategies cannot drop one without this test failing.
 #[test]
