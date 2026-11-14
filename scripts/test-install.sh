@@ -242,6 +242,15 @@ start_daemon() {
     fi
     (cd "$tmp/daemons" && exec perl -e 'my $program = shift; exec { $program } @ARGV' "$program" "$1" _daemon) &
     printf '%s\n' "$!" >> "$tmp/daemon.pids"
+    waited=0
+    until if [ "$(uname -s)" = Linux ]; then [ "/proc/$!/exe" -ef "$1" ]; else case "$(ps -ww -o args= -p "$!")" in "perl "*) false ;; *" _daemon") true ;; *) false ;; esac; fi; do
+        if [ "$waited" -ge 200 ]; then
+            printf 'The test daemon for %s did not start\n' "$1" >&2
+            exit 1
+        fi
+        waited=$((waited + 1))
+        sleep 0.05
+    done
     [ -z "${2:-}" ] || printf '%s %s %s\n' "$2" "$!" "$1" >> "$HOME/running"
 }
 expect_restarts() {
