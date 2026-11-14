@@ -415,7 +415,6 @@ impl RecoveryCopy {
 struct Backup {
     space: SpaceDo,
     held_commits: Vec<BTreeSet<u64>>,
-    held: Held,
     in_history: Held,
     spent: Vec<Spent>,
     placements: Vec<BTreeSet<Placement>>,
@@ -665,7 +664,6 @@ impl World {
                 self.earlier_backup = self.backup.replace(Backup {
                     space: self.space.clone(),
                     held_commits: self.held_commits.clone(),
-                    held: self.held.clone(),
                     in_history: self.in_history.clone(),
                     spent: self.spent.clone(),
                     placements: self.placements.clone(),
@@ -930,6 +928,12 @@ impl World {
         };
         let before = shapes(&self.space);
         let held_before = writes(&self.space);
+        let lost_history: BTreeSet<i64> = (self.writers.keys())
+            .filter(|write| {
+                stored(&self.in_history, **write) && !stored(&backup.in_history, **write)
+            })
+            .copied()
+            .collect();
         self.space.restore(&backup.space);
         self.pending_authors = backup.pending_authors.clone();
         self.held_commits = backup.held_commits.clone();
@@ -975,7 +979,7 @@ impl World {
         }
         for write in self.writers.keys() {
             let taken = (held_before.difference(&held_after)).any(|(_, held)| held == write);
-            if !taken && (!stored(&self.held, *write) || stored(&backup.held, *write)) {
+            if !taken && !lost_history.contains(write) {
                 continue;
             }
             if self.devices.iter().any(|device| device.disk.holds(*write)) {
