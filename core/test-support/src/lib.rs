@@ -2,18 +2,33 @@
 
 use std::any::Any;
 use std::collections::BTreeSet;
+use std::env::{self, VarError};
 use std::fmt::Debug;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use proptest::test_runner::{Config, FailurePersistence, PersistedSeed};
+use proptest::test_runner::{Config, FailurePersistence, PersistedSeed, RngSeed};
+
+const DETERMINISTIC: &str = "KOIDRIVE_PROPTEST_DETERMINISTIC";
+const FIXED_SEED: u64 = 0;
 
 /// Replays saved regressions beside `legacy` and saves each new failure in its own file.
+/// With `KOIDRIVE_PROPTEST_DETERMINISTIC=true`, the generated cases come from seed 0.
 pub fn regression_config(legacy: &'static str, cases: u32) -> Config {
+    let default = Config::with_cases(cases);
     Config {
         failure_persistence: Some(Box::new(RegressionCases(PathBuf::from(legacy)))),
-        ..Config::with_cases(cases)
+        rng_seed: rng_seed(env::var(DETERMINISTIC), default.rng_seed),
+        ..default
+    }
+}
+
+fn rng_seed(deterministic: Result<String, VarError>, default: RngSeed) -> RngSeed {
+    match deterministic.as_deref() {
+        Err(VarError::NotPresent) | Ok("false") => default,
+        Ok("true") => RngSeed::Fixed(FIXED_SEED),
+        other => panic!("{DETERMINISTIC} must be true or false, got {other:?}"),
     }
 }
 
@@ -136,6 +151,7 @@ impl FailurePersistence for RegressionCases {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::strategy::{Strategy, ValueTree};
     use proptest::test_runner::{TestCaseError, TestRunner};
     use std::cell::Cell;
 
@@ -277,6 +293,45 @@ mod tests {
                 .run(&(1u8..10), |_| Err(TestCaseError::fail("mutant")))
                 .is_err()
         );
+    }
+
+    fn generated(config: Config) -> Vec<u64> {
+        let mut runner = TestRunner::new(config);
+        (0..16)
+            .map(|_| {
+                proptest::num::u64::ANY
+                    .new_tree(&mut runner)
+                    .unwrap()
+                    .current()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn deterministic_mode_generates_the_same_cases_on_every_run() {
+        let config = || Config {
+            rng_seed: rng_seed(Ok("true".into()), RngSeed::Random),
+            ..Config::default()
+        };
+        assert_eq!(generated(config()), generated(config()));
+    }
+
+    #[test]
+    fn exploring_mode_keeps_the_default_seed() {
+        assert_eq!(
+            rng_seed(Err(VarError::NotPresent), RngSeed::Random),
+            RngSeed::Random
+        );
+        assert_eq!(
+            rng_seed(Ok("false".into()), RngSeed::Fixed(7)),
+            RngSeed::Fixed(7)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must be true or false")]
+    fn an_unknown_mode_fails_instead_of_exploring() {
+        rng_seed(Ok("1".into()), RngSeed::Random);
     }
 
     #[test]
