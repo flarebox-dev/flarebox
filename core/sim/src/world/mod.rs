@@ -2568,6 +2568,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_restore_does_not_reopen_a_write_already_missing_from_retained_history() {
+        let mut world = World::new(2);
+        world.step(0, &Step::Backup).unwrap();
+        world
+            .phase(
+                0,
+                &[(
+                    0,
+                    Step::User(Action {
+                        kind: 1,
+                        target: 0,
+                        parent: 0,
+                        name: 0,
+                        text: 0,
+                    }),
+                )],
+            )
+            .unwrap();
+        world.restore(false);
+        let exposed = world.exposed[&1].nodes.clone();
+        world.devices[1]
+            .disk
+            .create(Place::Root, "b", Some(content(0, 0, 1)))
+            .unwrap();
+        world.step(0, &Step::Backup).unwrap();
+        world.restore(false);
+        assert!(world.exposed[&1].nodes == exposed);
+        assert_eq!(world.exposed[&1].loose, 0);
+    }
+
+    #[test]
     fn a_rejected_move_with_an_applied_edit_does_not_record_a_placement() {
         let mut world = World::new(1);
         let action = |kind, name| {
