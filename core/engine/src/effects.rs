@@ -302,6 +302,19 @@ impl Effects {
         let chosen = self.choose(trees, in_flight, limit);
         let counter = *self.cleared + chosen.len() as u64;
         for (node, effect, after) in chosen {
+            let target = match &effect {
+                Effect::CreateDir { at }
+                | Effect::WriteFile { at, .. }
+                | Effect::Move { to: at, .. } => Some(at),
+                Effect::RemoveFile { .. } | Effect::RemoveDir { .. } => None,
+            };
+            let after = match (after, target) {
+                (Some(after), Some(Location::At { name, .. })) => Some(Shape {
+                    name: name.clone(),
+                    ..after
+                }),
+                (after, _) => after,
+            };
             self.failed.remove(&node);
             self.in_flight.get_mut().push(EffectRecord {
                 effect_id: ids.uuid_v7(now_ms),

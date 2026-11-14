@@ -441,6 +441,19 @@ fn a_changed_file_is_replaced_through_quarantine() {
 }
 
 #[test]
+fn a_file_changed_elsewhere_keeps_the_spelling_of_its_name_on_disk() {
+    let (mut trees, mut disk) = space(&[(
+        "f",
+        Some(file(ROOT, "e\u{301}", 1)),
+        Some(file(ROOT, "\u{e9}", 2)),
+    )]);
+    converge(&mut trees, &mut disk, 10).unwrap();
+    let local = trees.local().get("f").map(|node| node.shape.name.as_str());
+    assert_eq!(local, Some("e\u{301}"));
+    assert_in_sync(&mut trees);
+}
+
+#[test]
 fn a_file_moved_and_changed_is_written_at_its_new_place() {
     let (mut trees, mut disk) = space(&[("f", Some(file(ROOT, "a", 1)), Some(file(ROOT, "b", 2)))]);
     let done = converge(&mut trees, &mut disk, 10).unwrap();
