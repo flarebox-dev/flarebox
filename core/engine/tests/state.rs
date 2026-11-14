@@ -129,6 +129,7 @@ fn trees_state() -> TreesState {
         unsent_edits: Default::default(),
         dropped_edits: ["a".into()].into(),
         resends: Default::default(),
+        resent_edits: Default::default(),
         local_changes: ["b".into()].into(),
         replaced_versions: [("a".into(), vec!["v1".into()])].into(),
         kept_originals: [("t".into(), "a".into())].into(),
@@ -203,6 +204,16 @@ fn a_resend_restores_only_while_l_holds_the_node() {
     let (mut trees, mut state) = unsent();
     state.resends.insert("g".into());
     assert_eq!(trees.restore(state), Err(StateError::NotResend("g".into())));
+}
+
+#[test]
+fn resent_content_restores_only_as_an_unsent_edit() {
+    let (mut trees, mut state) = unsent();
+    state.resent_edits.insert("g".into());
+    assert_eq!(
+        trees.restore(state),
+        Err(StateError::NotUnsentEdit("g".into()))
+    );
 }
 
 #[test]

@@ -189,9 +189,9 @@ proptest! {
             );
         }
         for (i, (id, _)) in files.iter().enumerate() {
-            let remote = trees.remote().get(*id).unwrap();
+            let remote = trees.remote().get(id).unwrap();
             prop_assert!(
-                !changes[i].1 || trees.local().get(*id).is_none() || remote.edit_rev > 1,
+                !changes[i].1 || trees.local().get(id).is_none() || remote.edit_rev > 1,
                 "the server holds no edit of {id} made after the restore: {remote:?}"
             );
         }
