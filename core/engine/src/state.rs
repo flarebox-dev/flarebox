@@ -126,7 +126,9 @@ pub struct TreesState {
 
 /// A pending rename this device is finishing (RFC 0017 §3): the node moves within `parent` from
 /// `pending` to `name`. It holds while S and R hold the node at `pending`, and L holds it at
-/// `pending` or `name`.
+/// `pending` or `name`. When the finishing move lands after the user moved the node back to
+/// `pending`, it also holds while S and R hold the node at `name` and L at `pending`, until the
+/// user's move back is sent, and a delete R then holds of the node wins over that move.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingFinish {
     pub parent: NodeId,

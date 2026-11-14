@@ -540,7 +540,13 @@ impl Trees {
                 old.content_rev == node.content_rev && old.meta_rev != node.meta_rev
             })
             && local.is_some_and(|local| {
-                !local.parked && synced.is_some_and(|synced| synced.same(&local.shape))
+                !local.parked
+                    && synced.is_some_and(|synced| synced.same(&local.shape))
+                    && !(self.pending_finishes.get(&id)).is_some_and(|finish| {
+                        finish.disk_first
+                            && local.shape.parent == finish.parent
+                            && nfc(&local.shape.name) == nfc(&finish.pending)
+                    })
             });
         let edited_over_delete = local_gone
             && synced.is_some()
@@ -1017,7 +1023,7 @@ impl Trees {
     }
 
     pub(crate) fn check_finishes(&mut self) {
-        let ended: Vec<(NodeId, bool)> = (self.pending_finishes.iter())
+        let ended: Vec<(NodeId, bool, Option<Shape>)> = (self.pending_finishes.iter())
             .filter(|(_, finish)| !finish.sending)
             .filter_map(|(id, finish)| {
                 let at = |shape: &Shape, name: &str| {
@@ -1025,6 +1031,29 @@ impl Trees {
                 };
                 let local = self.l.get(id).map(|local| &local.shape);
                 let taken = local.is_some_and(|local| at(local, &finish.name));
+                let moved_back = finish.disk_first
+                    && local.is_some_and(|local| at(local, &finish.pending))
+                    && (self.s.get(id)).is_some_and(|synced| at(synced, &finish.name));
+                if moved_back {
+                    let remote = self.r.get(id);
+                    let landed = remote.is_some_and(|remote| {
+                        !remote.trashed
+                            && at(&remote.shape, &finish.name)
+                            && match finish.origin {
+                                FinishOrigin::Mark { meta_rev } => remote.meta_rev == meta_rev,
+                                FinishOrigin::Legacy => true,
+                            }
+                    });
+                    let deleted = (remote.is_some_and(|remote| remote.trashed))
+                        .then(|| local.zip(self.s.get(id)))
+                        .flatten()
+                        .map(|(local, synced)| Shape {
+                            parent: local.parent.clone(),
+                            name: local.name.clone(),
+                            ..synced.clone()
+                        });
+                    return (!landed).then(|| (id.clone(), false, deleted));
+                }
                 let holds = (local.is_some_and(|local| taken || at(local, &finish.pending)))
                     && self
                         .s
@@ -1042,15 +1071,28 @@ impl Trees {
                                 FinishOrigin::Legacy => true,
                             }
                     });
-                let reached = (self.r.live(id)).is_some_and(|remote| at(remote, &finish.name))
-                    || (self.s.get(id)).is_some_and(|synced| at(synced, &finish.name));
-                (!holds).then(|| (id.clone(), taken && !reached))
+                let synced = (self.s.get(id)).is_some_and(|synced| at(synced, &finish.name));
+                let remote = (self.r.live(id)).filter(|remote| at(remote, &finish.name));
+                let reached = synced || remote.is_some();
+                let agreed = (remote.filter(|_| taken && !synced))
+                    .zip(self.s.get(id))
+                    .map(|(remote, synced)| Shape {
+                        parent: remote.parent.clone(),
+                        name: remote.name.clone(),
+                        ..synced.clone()
+                    });
+                (!holds).then(|| (id.clone(), taken && !reached, agreed))
             })
             .collect();
-        for (id, revert) in ended {
+        for (id, revert, agreed) in ended {
             self.pending_finishes.remove(&id);
             if revert {
-                self.revert(id);
+                self.revert(id.clone());
+            }
+            if let Some(shape) = agreed
+                && !self.set_synced_if_valid(id.clone(), Some(shape.clone()))
+            {
+                self.wait(id, Some(shape), Origin::Other);
             }
         }
     }
@@ -1109,6 +1151,11 @@ impl Trees {
     /// ([`TreesState::resends`]) is an edit the server does not have ([`Trees::unsent_edits`]), even
     /// when it ends at the bytes S holds.
     pub fn set_local_changed(&mut self, id: NodeId, node: LocalNode) {
+        if !node.parked
+            && (self.l.get(&id)).is_some_and(|old| !old.shape.same_position(&node.shape))
+        {
+            self.unsent_marks.remove(&id);
+        }
         if !(self.l.get(&id)).is_some_and(|old| old.shape.same(&node.shape)) {
             if node.shape.content.is_some() && self.resends.contains(&id) {
                 self.unsent_edits.insert(id.clone());

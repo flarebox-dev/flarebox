@@ -171,25 +171,20 @@ fn reviving_an_owed_rename() -> impl Strategy<Value = Vec<Vec<(usize, Step)>>> {
         Just(Reply::Refused(error::Code::RetryLater)),
     ];
     let revival = prop_oneof![Just(user(1, 0, 1, "b")), Just(user(0, 0, 1, "b"))];
-    (
-        owing_a_rename(Losses::None),
-        any::<prop::sample::Index>(),
-        owed_reply,
-        revival,
-    )
-        .prop_map(|(mut phases, at, owed_reply, revival)| {
-            let mut block = vec![(2, Step::Work(0)); 8];
+    (owing_a_rename(Losses::None), owed_reply, revival).prop_map(
+        |(mut phases, owed_reply, revival)| {
+            let mut block = vec![(0, folder("A")), (0, rename(0, 1, "a"))];
+            block.extend([(0, Step::Work(0)); 5]);
+            block.extend([(1, Step::Work(0)); 5]);
             block.push((0, Step::Commit(owed_reply)));
             block.push((1, delete(1)));
             block.extend(commit(1));
-            block.extend([(0, Step::Work(0)); 4]);
-            block.push((2, revival));
-            block.extend(commit(2));
-            let owed = &mut phases[1];
-            let at = owing().len() + at.index(owed.len() - owing().len() + 1);
-            owed.splice(at..at, block);
+            block.push((0, revival));
+            block.extend(commit(0));
+            phases[1].splice(0..owing().len(), block);
             phases
-        })
+        },
+    )
 }
 
 /// Devices that print every step with the state it leaves when `KOIDRIVE_SIM_TRACE` is set.
@@ -6345,15 +6340,7 @@ fn a_folder_owing_its_name_that_another_device_deletes_and_a_third_brings_back_l
     ]);
     let world = converge(3, &[vec![(0, file("a"))], steps]).unwrap();
     for device in 0..3 {
-        assert_eq!(
-            paths_on(&world, device),
-            [
-                "A (conflict from device-0 2026-11-09)",
-                "A (conflict from device-0 2026-11-09)/a",
-                "a",
-            ],
-            "device {device}"
-        );
+        assert_eq!(paths_on(&world, device), ["A", "A/a"], "device {device}");
     }
 }
 

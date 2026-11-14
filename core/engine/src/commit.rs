@@ -1221,9 +1221,10 @@ impl Commits {
             .map(ToOwned::to_owned),
         );
 
-        let require_head = (finishing.iter())
-            .any(|id| trees.pending_finishes()[id].origin == FinishOrigin::Legacy)
-            || !released.is_empty()
+        let require_head = (finishing.iter()).any(|id| {
+            trees.pending_finishes()[id].origin == FinishOrigin::Legacy
+                || (trees.remote().get(id)).is_none_or(|remote| remote.pending_for.is_none())
+        }) || !released.is_empty()
             || (ops.iter().filter_map(|op| op.op.as_ref()))
                 .any(|op| trees.resends().contains(op_node(op)));
         let restores = (ops.iter().enumerate())
@@ -1703,7 +1704,18 @@ impl Commits {
                         .filter(|finish| finish.sending)
                         .map(|finish| finish.disk_first);
                     let superseded = code == Code::Superseded && moved.from.is_some();
-                    if finishing.is_some() && (applied || superseded) {
+                    let moved_back = finishing == Some(true)
+                        && applied
+                        && (trees.local().get(id).filter(|local| !local.parked)).is_some_and(
+                            |local| {
+                                let finish = &trees.pending_finishes()[id];
+                                local.shape.parent == finish.parent
+                                    && nfc(&local.shape.name) == nfc(&finish.pending)
+                            },
+                        );
+                    if moved_back {
+                        trees.restart_finish(id, result.seq);
+                    } else if finishing.is_some() && (applied || superseded) {
                         trees.end_finish(id);
                     }
                     let finished = finishing == Some(false)
@@ -2699,8 +2711,10 @@ pub(crate) fn finishes<'a>(
             let parent = &remote.shape.parent;
             let free = holder(trees, parent, name, id).is_none()
                 && trees.local_holders(parent, name).all(|other| other == id);
-            let owed = finish.is_some_and(|finish| finish.origin == FinishOrigin::Legacy)
-                || (remote.pending_by.is_some() && remote.pending_by.as_deref() == device_id);
+            let owed = finish.is_some_and(|finish| {
+                finish.origin == FinishOrigin::Legacy || remote.pending_for.is_none()
+            }) || (remote.pending_by.is_some()
+                && remote.pending_by.as_deref() == device_id);
             if !local.shape.same_position(&remote.shape)
                 || !synced.same_position(&remote.shape)
                 || !(free || owed)
@@ -2984,12 +2998,15 @@ fn plan(
                 parent: local.parent.clone(),
                 name: local.name.clone(),
                 guarded: trees.resends().contains(id)
-                    || (trees.remote().live(id)).is_some_and(|remote| {
-                        let node = &trees.remote().get(id).expect("a live node of R");
-                        node.pending_by.as_deref() == Some(device_id)
-                            && remote.parent == local.parent
+                    || (trees.remote().get(id)).is_some_and(|node| {
+                        !node.trashed
+                            && node.pending_by.as_deref() == Some(device_id)
+                            && node.shape.parent == local.parent
                             && (node.pending_for.as_deref())
                                 .is_some_and(|mark| nfc(mark) == nfc(&local.name))
+                    })
+                    || (trees.pending_finishes().get(id)).is_some_and(|finish| {
+                        finish.parent == local.parent && nfc(&finish.name) == nfc(&local.name)
                     }),
                 pending_for: None,
             });
