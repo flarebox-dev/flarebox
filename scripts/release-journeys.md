@@ -1,6 +1,6 @@
 # Check a published macOS release
 
-Run **Release journeys** in GitHub Actions and enter the published tag, such as `v0.1.0-alpha.3`. The tag must match the release offered by `koidrive/tap`.
+Run **Release journeys** in GitHub Actions and enter the published tag, such as `v0.1.0-alpha.4`. The tag must match the release offered by `koidrive/tap`.
 
 Each runtime case gets a separate [GitHub-hosted macOS 26 runner](https://docs.github.com/en/actions/reference/runners/github-hosted-runners). The check refuses local execution and existing Koidrive state. It uses released binaries, preserves quarantine, and does not use a test build or replace signing verification.
 
@@ -11,7 +11,7 @@ Each runtime case gets a separate [GitHub-hosted macOS 26 runner](https://docs.g
 | Formula first | Record whether Homebrew rejects the binary collision or installs the app while skipping its CLI link. The formula's executable and version must remain intact, including after cask removal. Evidence includes the exact warning or error and resulting installation state. |
 | Shell installer | The pinned installer runs through `curl \| sh` in a controlling terminal, completes guided setup with the released CLI, and leaves a usable installation. Cleanup stops the test's app and services. |
 
-The manual shell case uses immutable installer commit `93bdd798ac6d6a4dfa29fb534e5cec76c0f0d9eb`, checked against SHA-256 `0b823ae7b578ce869824bc1451aeff3e3433738f004b7ee0e6ed940b0fb88706`. It exercises the installer before publication without deploying it. A local Worker and public CLI commands supply test authentication and a shared folder. They do not substitute for the installer or pre-link its folder.
+The manual shell case uses immutable installer commit `ba22319c238a1fa98daffd16ac5375694596701c`, checked against SHA-256 `e5cbe45c87e69190d6f7e7883af7b1524de4698654a7c8c6c9794d4383868a8c`. It exercises the installer before publication without deploying it. A local Worker and public CLI commands supply test authentication and a shared folder. They do not substitute for the installer or pre-link its folder.
 
 The manual `installer_source` input defaults to `held`, the immutable raw URL. Set it to `live` to download `https://koidrive.com/install.sh` after deployment. Both manual sources must match the same accepted SHA-256 before any installer or bootstrap CLI executes. No custom URL or digest input is accepted.
 
@@ -27,7 +27,7 @@ CLI distribution runs the Homebrew cases only when both tap entries select the p
 
 Before the workflow is on the default branch, run the existing **Installer** workflow from the proposed branch with `release_tag` set. That invokes the same reusable workflow without redeploying the site.
 
-For post-deploy acceptance, use **Installer** with `release_tag=v0.1.0-alpha.3` and `installer_source=live`, after confirming that the merged and served script match the accepted digest. The source and downloaded hash are retained in the installer artifact.
+For post-deploy acceptance, use **Installer** with `release_tag=v0.1.0-alpha.4` and `installer_source=live`, after confirming that the merged and served script match the accepted digest. The source and downloaded hash are retained in the installer artifact.
 
 Run the non-mutating unit tests locally:
 
