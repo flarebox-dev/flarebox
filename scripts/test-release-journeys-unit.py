@@ -10,8 +10,11 @@ from pathlib import Path
 import plistlib
 import re
 import shlex
+import signal
+import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from unittest.mock import patch
 
@@ -49,6 +52,54 @@ class ReleaseJourneys(unittest.TestCase):
         path.write_bytes(plistlib.dumps({"Label": label, "ProgramArguments": [str(binary), "_daemon"],
                                          "EnvironmentVariables": {"XDG_STATE_HOME": state}}))
         return path
+
+    def stubborn_group(self, leader_exits):
+        evidence = self.evidence()
+        ready = self.root / "child.json"
+        child_code = "\n".join([
+            "import json,os,pathlib,signal,time",
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN)",
+            "pathlib.Path(" + repr(str(ready)) + ").write_text(json.dumps({'pid':os.getpid(),'pgid':os.getpgrp(),'sid':os.getsid(0)}))",
+            "while True: time.sleep(1)",
+        ])
+        leader_code = "\n".join([
+            "import os,pathlib,subprocess,sys,time",
+            "subprocess.Popen([sys.executable,'-c'," + repr(child_code) + "],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)",
+            "while not pathlib.Path(" + repr(str(ready)) + ").exists(): time.sleep(0.01)",
+            "os._exit(0)" if leader_exits else "time.sleep(60)",
+        ])
+        item = evidence.start([sys.executable, "-c", leader_code])
+        process = item[0]
+
+        def cleanup():
+            if not process.group_closed:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            process.wait(timeout=3)
+            for capture in item[2:]:
+                capture.thread.join(timeout=3)
+            self.assertTrue(DRIVER.until(lambda: not self.group_exists(process.pid), 3), "Owned regression group survived cleanup")
+
+        self.addCleanup(cleanup)
+        self.assertTrue(DRIVER.until(lambda: ready.exists(), 3), "Regression child did not start")
+        child = json.loads(ready.read_text())
+        self.assertEqual(child["pgid"], process.pid)
+        self.assertEqual(child["sid"], process.pid)
+        self.assertNotEqual(process.pid, os.getpgrp())
+        if leader_exits:
+            process.wait(timeout=3)
+        return evidence, item, child
+
+    def group_exists(self, pgid):
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
 
     def test_strict_tags(self):
         for tag in ("v0.1.0-alpha.3", "v1.2.3", "v10.20.30-rc.0"):
@@ -102,7 +153,7 @@ class ReleaseJourneys(unittest.TestCase):
 
     def test_main_refuses_local_runtime_before_starting_any_command(self):
         destination = self.root / "evidence"
-        with patch.dict(os.environ, {}, clear=True), patch.object(DRIVER.subprocess, "Popen") as popen, patch("builtins.print"):
+        with patch.dict(os.environ, {}, clear=True), patch.object(DRIVER, "OwnedProcess") as popen, patch("builtins.print"):
             status = DRIVER.main(["--tag", "v0.1.0-alpha.3", "--scenario", "installer", "--evidence", str(destination)])
         popen.assert_not_called()
         report = json.loads((destination / "report.json").read_text())
@@ -529,6 +580,127 @@ class ReleaseJourneys(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 DRIVER.stop_group(process)
         killpg.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "Process groups require POSIX")
+    def test_stop_group_removes_stubborn_child_after_leader_already_exited(self):
+        _, item, child = self.stubborn_group(leader_exits=True)
+        process = item[0]
+        self.assertEqual(process.returncode, 0)
+        self.assertEqual(os.getpgid(child["pid"]), process.pid)
+        DRIVER.stop_group(process, term_timeout=0.1, kill_timeout=2)
+        self.assertTrue(DRIVER.until(lambda: not self.group_exists(process.pid), 1), "Child survived cleanup after its leader exited")
+
+    @unittest.skipUnless(os.name == "posix", "Process groups require POSIX")
+    def test_stop_group_removes_stubborn_child_when_term_exits_only_leader(self):
+        _, item, child = self.stubborn_group(leader_exits=False)
+        process = item[0]
+        self.assertEqual(os.getpgid(child["pid"]), process.pid)
+        DRIVER.stop_group(process, term_timeout=0.1, kill_timeout=2)
+        self.assertTrue(DRIVER.until(lambda: not self.group_exists(process.pid), 1), "TERM killed only the group leader")
+
+    @unittest.skipUnless(os.name == "posix", "Process groups require POSIX")
+    def test_finished_command_reaps_its_group_before_accepting_redirected_output(self):
+        evidence, item, _ = self.stubborn_group(leader_exits=True)
+        stop = DRIVER.stop_group
+        with patch.object(DRIVER, "stop_group", side_effect=lambda process: stop(process, term_timeout=0.1, kill_timeout=2)):
+            status, _, _ = evidence.finish(item)
+        self.assertEqual(status, 0)
+        self.assertTrue(item[0].group_closed)
+        self.assertFalse(self.group_exists(item[0].pid))
+
+    @unittest.skipUnless(os.name == "posix", "Process groups require POSIX")
+    def test_evidence_close_checks_group_even_when_leader_has_exited(self):
+        evidence, item, _ = self.stubborn_group(leader_exits=True)
+        item[1]["status"] = 0
+        stop = DRIVER.stop_group
+        with patch.object(DRIVER, "stop_group", side_effect=lambda process: stop(process, term_timeout=0.1, kill_timeout=2)), patch("builtins.print"):
+            evidence.close()
+        self.assertTrue(item[0].group_closed)
+        self.assertFalse(self.group_exists(item[0].pid))
+        self.assertTrue(evidence.report["cleanup"])
+        self.assertTrue(all(item["passed"] for item in evidence.report["cleanup"]))
+
+    @unittest.skipUnless(os.name == "posix", "Process groups require POSIX")
+    def test_stop_group_refuses_changed_group_session_or_reused_leader(self):
+        _, item, _ = self.stubborn_group(leader_exits=False)
+        process = item[0]
+        for pgid, sid in ((os.getpgrp(), process.pid), (process.pid, os.getsid(0))):
+            with self.subTest(pgid=pgid, sid=sid), patch.object(DRIVER.os, "getpgid", return_value=pgid), \
+                    patch.object(DRIVER.os, "getsid", return_value=sid), patch.object(DRIVER.os, "killpg") as killpg:
+                with self.assertRaisesRegex(RuntimeError, "changed or reused"):
+                    DRIVER.stop_group(process)
+            killpg.assert_not_called()
+        os.kill(process.pid, signal.SIGTERM)
+        process.wait(timeout=3)
+        with patch.object(DRIVER.os, "getpgid", return_value=process.pid), \
+                patch.object(DRIVER.os, "getsid", return_value=process.pid), patch.object(DRIVER.os, "killpg") as killpg:
+            with self.assertRaisesRegex(RuntimeError, "changed or reused"):
+                DRIVER.stop_group(process)
+        killpg.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "Process groups require POSIX")
+    def test_closed_group_is_not_probed_again_after_pid_can_be_reused(self):
+        evidence = self.evidence()
+        evidence.run([sys.executable, "-c", "pass"])
+        process = evidence.processes[0][0]
+        self.assertTrue(process.group_closed)
+        with patch.object(DRIVER.os, "getpgid") as getpgid, patch.object(DRIVER.os, "killpg") as killpg:
+            DRIVER.stop_group(process)
+        getpgid.assert_not_called()
+        killpg.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "Process groups require POSIX")
+    def test_unknown_group_probe_failure_cannot_mark_cleanup_successful(self):
+        evidence, item, _ = self.stubborn_group(leader_exits=False)
+        process = item[0]
+        with patch.object(DRIVER.os, "killpg", side_effect=PermissionError("group probe denied")) as killpg:
+            self.assertFalse(evidence.cleanup("owned group", lambda: DRIVER.stop_group(process)))
+        killpg.assert_called_once_with(process.pid, 0)
+        self.assertFalse(process.group_closed)
+        self.assertFalse(evidence.report["cleanup"][0]["passed"])
+
+    def test_group_cleanup_escalates_and_fails_if_sigkill_cannot_remove_group(self):
+        evidence = self.evidence()
+        process = unittest.mock.Mock(pid=12345)
+        with patch.object(DRIVER, "group_present", return_value=True), patch.object(DRIVER.os, "killpg", create=True) as killpg:
+            self.assertFalse(evidence.cleanup("owned group", lambda: DRIVER.stop_group(process, term_timeout=0, kill_timeout=0)))
+        self.assertEqual(killpg.call_args_list, [unittest.mock.call(12345, signal.SIGTERM), unittest.mock.call(12345, signal.SIGKILL)])
+        self.assertIn("survived SIGKILL", evidence.report["cleanup"][0]["detail"])
+
+    @unittest.skipUnless(os.name == "posix", "Workflow shell selection requires POSIX")
+    def test_release_tap_selection_runs_actual_workflow_shell_on_final_tap_state(self):
+        release = (DRIVER.REPO / ".github/workflows/release-cli.yml").read_text()
+        blocks = re.findall(r'(?ms)^          selected=true\n.*?^          echo "selected=\$selected" >> "\$GITHUB_OUTPUT"$', release)
+        self.assertEqual(len(blocks), 1)
+        script = "tap=$1\n" + textwrap.dedent(blocks[0])
+        tap = self.root / "tap"
+        for kind in ("Formula", "Casks"):
+            (tap / kind).mkdir(parents=True)
+        output = self.root / "github-output"
+        requested = "v0.1.0-alpha.3"
+        for formula, cask, expected in ((requested, requested, "true"),
+                                         ("v0.1.0-alpha.2", requested, "false"),
+                                         (requested, "v0.1.0-alpha.2", "false"),
+                                         ("v0.1.0", "v0.1.0", "false")):
+            for kind, tag in (("Formula", formula), ("Casks", cask)):
+                (tap / kind / "koidrive.rb").write_text(f'url "https://github.com/koidrive/koidrive/releases/download/{tag}/asset"\n')
+            output.unlink(missing_ok=True)
+            with self.subTest(formula=formula, cask=cask):
+                result = subprocess.run(["/bin/bash", "-eu", "-c", script, "tap-selection", str(tap)],
+                                        env={"PATH": DRIVER.SYSTEM_PATH, "TAG": requested, "GITHUB_OUTPUT": str(output)},
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(output.read_text(), "selected=" + expected + "\n")
+
+    def test_reusable_workflow_keeps_installer_when_final_tap_does_not_select_tag(self):
+        release = (DRIVER.REPO / ".github/workflows/release-cli.yml").read_text()
+        journeys = (DRIVER.REPO / ".github/workflows/release-journeys.yml").read_text()
+        matrix = re.search(r"scenario: \$\{\{ fromJSON\(inputs\.skip_homebrew && '([^']+)' \|\| '([^']+)'\) \}\}", journeys)
+        self.assertIsNotNone(matrix)
+        self.assertEqual(json.loads(matrix[1]), ["installer"])
+        self.assertEqual(json.loads(matrix[2]), ["formula-conflict", "cask", "installer"])
+        self.assertIn("selected: ${{ steps.tap.outputs.selected }}", release)
+        self.assertRegex(release, r"(?s)  release-journeys:\n.*?needs: homebrew.*?skip_homebrew: \$\{\{ needs\.homebrew\.outputs\.selected != 'true' \}\}")
 
     @patch.object(DRIVER.os, "getuid", return_value=501, create=True)
     def test_native_service_cleanup_refuses_foreign_profile_or_binary(self, _uid):

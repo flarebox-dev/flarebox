@@ -113,17 +113,56 @@ def passed(report):
             and not report["errors"])
 
 
-def stop_group(process):
-    if process.poll() is not None:
-        return
-    if os.getpgid(process.pid) != process.pid:
+class OwnedProcess(subprocess.Popen):
+    def __init__(self, *args, **kwargs):
+        kwargs["start_new_session"] = True
+        super().__init__(*args, **kwargs)
+        self.group_closed = False
+
+
+def group_present(process):
+    if not isinstance(process, OwnedProcess) or process.pid <= 1 or process.pid == os.getpgrp():
         raise RuntimeError("Refusing to signal a process outside its owned session")
-    os.killpg(process.pid, signal.SIGTERM)
+    if process.group_closed:
+        return False
+    exited = process.poll() is not None
     try:
-        process.wait(timeout=8)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.wait(timeout=8)
+        pgid = os.getpgid(process.pid)
+        sid = os.getsid(process.pid)
+    except ProcessLookupError:
+        if not exited and process.poll() is None:
+            raise RuntimeError("Could not verify the owned session leader")
+    else:
+        if exited or pgid != process.pid or sid != process.pid:
+            raise RuntimeError("Refusing to signal a changed or reused session leader")
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        process.group_closed = True
+        process.poll()
+        return False
+    return True
+
+
+def stop_group(process, term_timeout=8, kill_timeout=8):
+    for signum, timeout in ((signal.SIGTERM, term_timeout), (signal.SIGKILL, kill_timeout)):
+        if not group_present(process):
+            return
+        try:
+            os.killpg(process.pid, signum)
+        except ProcessLookupError:
+            process.group_closed = True
+            process.poll()
+            return
+        deadline = time.monotonic() + timeout
+        while group_present(process):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.05, remaining))
+        else:
+            return
+    raise RuntimeError("Owned process group survived SIGKILL: " + str(process.pid))
 
 
 class Capture:
@@ -176,9 +215,9 @@ class Evidence:
                   "stdout": stem.with_suffix(".stdout").name,
                   "stderr": stem.with_suffix(".stderr").name}
         self.report["commands"].append(record)
-        process = subprocess.Popen(argv, env=self.env if env is None else env, cwd=REPO,
-                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, start_new_session=True)
+        process = OwnedProcess(argv, env=self.env if env is None else env, cwd=REPO,
+                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE)
         out = Capture(process.stdout, self.directory / record["stdout"], self.secrets)
         err = Capture(process.stderr, self.directory / record["stderr"], self.secrets)
         self.processes.append((process, record, out, err))
@@ -189,10 +228,10 @@ class Evidence:
         try:
             process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            stop_group(process)
             record["status"] = 124
         else:
             record["status"] = process.returncode
+        stop_group(process)
         for capture in (out, err):
             capture.thread.join(timeout=10)
             if capture.thread.is_alive() or capture.error:
@@ -219,7 +258,7 @@ class Evidence:
     def close(self):
         for item in reversed(self.processes):
             process, record, _, _ = item
-            if process.poll() is None:
+            if not process.group_closed:
                 self.cleanup("owned process group", lambda p=process: stop_group(p))
             if record["status"] is None:
                 self.cleanup("owned process logs", lambda i=item: self.finish(i, 10))
@@ -592,8 +631,8 @@ def attended(evidence, command, folder, timeout=360):
     env.pop("CI", None)
     bootstrap = "import fcntl,os,sys,termios; fcntl.ioctl(0,termios.TIOCSCTTY,0); os.execv('/bin/sh',['/bin/sh','-c',sys.argv[1]])"
     try:
-        process = subprocess.Popen([sys.executable, "-c", bootstrap, command], env=env, cwd=REPO,
-                                   stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+        process = OwnedProcess([sys.executable, "-c", bootstrap, command], env=env, cwd=REPO,
+                               stdin=slave, stdout=slave, stderr=slave)
         os.close(slave)
         slave = None
         deadline = time.monotonic() + timeout
@@ -628,12 +667,14 @@ def attended(evidence, command, folder, timeout=360):
             record["status"] = process.returncode
         return record["status"], transcript, answers
     finally:
-        if process is not None:
-            stop_group(process)
-        if slave is not None:
-            os.close(slave)
-        os.close(master)
-        (evidence.directory / record["stdout"]).write_text(sanitized(transcript, evidence.secrets))
+        try:
+            if process is not None:
+                stop_group(process)
+        finally:
+            if slave is not None:
+                os.close(slave)
+            os.close(master)
+            (evidence.directory / record["stdout"]).write_text(sanitized(transcript, evidence.secrets))
 
 
 def service_cleanup(evidence, profiles, binaries, timeout=15):
@@ -834,7 +875,7 @@ def main(argv=None):
         evidence.report["errors"].append(sanitized(str(error), evidence.secrets))
     finally:
         for process, _, _, _ in evidence.processes:
-            if process.poll() is None:
+            if not process.group_closed:
                 evidence.cleanup("stop owned process group", lambda p=process: stop_group(p))
         if root is not None:
             if all(item["passed"] for item in evidence.report["cleanup"]):

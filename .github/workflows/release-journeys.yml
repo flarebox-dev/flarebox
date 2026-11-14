@@ -16,6 +16,10 @@ on:
       tag:
         required: true
         type: string
+      skip_homebrew:
+        description: Skip Homebrew when the tap retains another release
+        default: false
+        type: boolean
   pull_request:
     paths:
       - .github/workflows/release-journeys.yml
@@ -76,7 +80,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scenario: [formula-conflict, cask, installer]
+        scenario: ${{ fromJSON(inputs.skip_homebrew && '["installer"]' || '["formula-conflict", "cask", "installer"]') }}
     env:
       RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
       HOMEBREW_NO_AUTO_UPDATE: '1'

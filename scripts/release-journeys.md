@@ -9,13 +9,17 @@ Each runtime case gets a separate [GitHub-hosted macOS 26 runner](https://docs.g
 | Published assets | The Mac CLI and DMG match `SHA256SUMS`; the signed app and DMG pass Gatekeeper assessment and stapled-ticket validation. |
 | Clean cask | The public cask installs, and the next command, `koi --version`, reports the requested release. Plain uninstall removes the app and CLI. A second installation followed by zap removes app state without deleting a test document. |
 | Formula first | Record whether Homebrew rejects the binary collision or installs the app while skipping its CLI link. The formula's executable and version must remain intact, including after cask removal. Evidence includes the exact warning or error and resulting installation state. |
-| Shell installer | The pinned installer runs through `curl | sh` in a controlling terminal, completes guided setup with the released CLI, and leaves a usable installation. Cleanup stops the test's app and services. |
+| Shell installer | The pinned installer runs through `curl \| sh` in a controlling terminal, completes guided setup with the released CLI, and leaves a usable installation. Cleanup stops the test's app and services. |
 
 The shell case uses immutable installer commit `b31c0c0232e1083c8b13210c59893c9eecd057f2`, checked against SHA-256 `ccc71c1fcd8381391ab57109d9d365afeea662c142dbbbda6bc4fe700460c276`. It exercises the installer before publication without deploying it. A local Worker and public CLI commands supply test authentication and a shared folder. They do not substitute for the installer or pre-link its folder.
 
 Each job uploads sanitized commands, transcripts, assertions, and cleanup results as `release-journeys-*` artifacts. A failed prerequisite, runtime assertion, or cleanup fails the job. Read the formula-conflict artifact first when checking coexistence.
 
+Cleanup checks the native unregister hook and absence of owned launchd jobs. It does not independently inspect the macOS background-task database or assert menu attachment.
+
 Release publication starts this workflow. The CLI distribution workflow also calls it after tap publication because [events produced by `GITHUB_TOKEN` do not start another workflow](https://docs.github.com/en/actions/concepts/security/github_token#when-github_token-triggers-workflow-runs).
+
+CLI distribution runs the Homebrew cases only when both tap entries select the published tag. If the tap retains another release, distribution still checks the published assets and shell installer.
 
 Before the workflow is on the default branch, run the existing **Installer** workflow from the proposed branch with `release_tag` set. That invokes the same reusable workflow without redeploying the site.
 
