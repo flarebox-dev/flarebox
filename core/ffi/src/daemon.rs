@@ -12,7 +12,7 @@ use koidrive_net::{Api, PROTO_MAX, PROTO_MIN};
 use tokio::runtime::Runtime;
 use tokio::sync::{Notify, watch};
 
-use crate::core::{Core, Events, pairing_code};
+use crate::core::{Core, Events, pairing_code, refuse_line_breaks};
 use crate::helper::{
     AccountData, DevicesData, Done, FolderData, Helper, InvitationData, Outcome, Refusal,
     RequestsData, RestoreAskedData, ShareLinkData, ShareLinksData, SharedData, SpaceData,
@@ -667,12 +667,8 @@ impl Core for DaemonCore {
         };
         let mut args = vec!["share", "create", "--expires", expires];
         let input = match password {
-            Some(password) if password.contains(['\n', '\r']) => {
-                return Err(SessionError::Failed {
-                    reason: "a link's password cannot contain a line break".into(),
-                });
-            }
             Some(password) => {
+                refuse_line_breaks(&password)?;
                 args.push("--password");
                 Some(password + "\n")
             }

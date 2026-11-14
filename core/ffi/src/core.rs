@@ -8,6 +8,15 @@ use crate::types::{
     Space, SpaceUsage, TelemetrySetting, Trash,
 };
 
+pub(crate) fn refuse_line_breaks(password: &str) -> Result<(), SessionError> {
+    match password.contains(['\n', '\r']) {
+        true => Err(SessionError::Failed {
+            reason: "a link's password cannot contain a line break".into(),
+        }),
+        false => Ok(()),
+    }
+}
+
 pub(crate) fn pairing_code<'a>(text: &'a str, server_url: &str) -> Result<&'a str, SessionError> {
     let unquoted = |word: &'a str| word.trim_matches('\'');
     let words: Vec<&str> = text.split_whitespace().map(unquoted).collect();

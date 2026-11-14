@@ -6,7 +6,7 @@ use std::path::{Component, Path};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::core::{Core, Events, pairing_code};
+use crate::core::{Core, Events, pairing_code, refuse_line_breaks};
 use crate::types::{
     Account, Answer, ChangeKind, DeletedItem, Device, Direction, FileVersion, FileVersions,
     FolderPath, FolderState, HeldItem, ItemDetail, LinkedFolder, MassDeleteLimit, NewShareLink,
@@ -1039,8 +1039,15 @@ impl Core for FakeCore {
     fn share_links(&self) -> Result<Vec<ShareLink>, SessionError> {
         let mut state = self.lock();
         state.take_failure()?;
-        state.saved.account()?;
-        Ok(state.saved.share_links.clone())
+        let saved = &state.saved;
+        saved.account()?;
+        let linked = |folder: &String| saved.folders.iter().any(|linked| &linked.path == folder);
+        Ok((saved.share_links.iter().cloned())
+            .map(|link| ShareLink {
+                folder: link.folder.filter(linked),
+                ..link
+            })
+            .collect())
     }
 
     fn create_share_link(
@@ -1051,6 +1058,9 @@ impl Core for FakeCore {
     ) -> Result<NewShareLink, SessionError> {
         let mut state = self.lock();
         state.take_failure()?;
+        if let Some(password) = &password {
+            refuse_line_breaks(password)?;
+        }
         if (password.as_ref())
             .is_some_and(|password| !(8..=256).contains(&password.chars().count()))
         {
@@ -2140,6 +2150,25 @@ mod tests {
     }
 
     #[test]
+    fn a_link_into_an_unlinked_folder_names_no_folder() {
+        let h = Harness::new();
+        h.core.load_scenario(FakeScenario::UpToDate).unwrap();
+        let documents = folder_of(&h.core, DOCUMENTS);
+        let in_documents = |links: &[ShareLink]| {
+            (links.iter())
+                .filter(|link| link.folder.as_deref() == Some(documents.path.as_str()))
+                .count()
+        };
+        let before = h.core.share_links().unwrap();
+        assert!(in_documents(&before) > 0);
+
+        h.core.unlink_folder(&documents.space_id).unwrap();
+
+        let after = h.core.share_links().unwrap();
+        assert_eq!((after.len(), in_documents(&after)), (before.len(), 0));
+    }
+
+    #[test]
     fn a_new_link_needs_a_path_in_a_linked_folder_and_a_password_of_8_to_256_characters() {
         let h = Harness::new();
         h.core.load_scenario(FakeScenario::UpToDate).unwrap();
@@ -2168,6 +2197,12 @@ mod tests {
         assert_eq!(
             share(&at("Old Slides/Intro.pptx"), None),
             Err(SessionError::NothingAtPath)
+        );
+        assert_eq!(
+            share(&at("Notes.txt"), Some("abcdefgh\n")),
+            Err(SessionError::Failed {
+                reason: "a link's password cannot contain a line break".into()
+            })
         );
         for password in ["seven77", &"x".repeat(257)] {
             assert_eq!(
