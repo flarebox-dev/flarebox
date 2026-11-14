@@ -2391,9 +2391,13 @@ impl Trees {
         }
     }
 
-    /// Records that the server acknowledged an edit of `id` to `sent`, so L's content is no longer
-    /// an edit it lacks ([`Trees::unsent_edits`]), unless L has since taken other content.
+    /// Records that the server acknowledged an edit of `id` to `sent`: this device held the content
+    /// ([`TreesState::held_contents`]), and L's content is no longer an edit the server lacks
+    /// ([`Trees::unsent_edits`]), unless L has since taken other content.
     pub fn sent_edit(&mut self, id: &str, sent: Option<&Content>) {
+        if let Some(sent) = sent {
+            self.hold_content(id, sent.manifest_digest.clone());
+        }
         let local = self.l.live(id).and_then(|shape| shape.content.as_ref());
         if matches!((local, sent), (Some(local), Some(sent)) if !same_content(local, sent)) {
             return;

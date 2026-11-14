@@ -6292,3 +6292,39 @@ fn a_delete_after_the_listing_that_lost_its_edit_leaves_a_restored_write_its_use
 fn a_delete_after_a_scan_that_follows_the_listing_leaves_a_restored_write_its_user_never_had() {
     a_delete_after_a_restore_lost_its_edit(&[(1, Step::Scan)]);
 }
+
+fn a_delete_after_a_restore_to_a_write_saved_over_before_its_record(devices: usize) {
+    let world = converge(
+        devices,
+        &[
+            vec![(0, file("a"))],
+            vec![
+                (0, overwrite(0)),
+                (0, SCAN),
+                (0, COMMIT),
+                (0, COMMIT),
+                (0, BACKUP),
+                (0, overwrite(0)),
+                (0, SCAN),
+            ],
+            vec![(0, RESTORE), (0, delete(0))],
+        ],
+    )
+    .unwrap();
+    assert!(
+        world
+            .devices
+            .iter()
+            .all(|device| device.disk.entries().is_empty())
+    );
+}
+
+#[test]
+fn a_delete_after_a_restore_removes_a_write_saved_over_before_its_record_arrived() {
+    a_delete_after_a_restore_to_a_write_saved_over_before_its_record(1);
+}
+
+#[test]
+fn a_delete_after_a_restore_removes_a_write_saved_over_before_its_record_arrived_everywhere() {
+    a_delete_after_a_restore_to_a_write_saved_over_before_its_record(2);
+}

@@ -119,7 +119,8 @@ pub struct TreesState {
     pub local_changes: BTreeSet<NodeId>,
     /// For each file, the manifest digests of the contents this device held, least recently held
     /// first, at most [`HELD_CONTENTS_KEPT`](crate::classify::HELD_CONTENTS_KEPT): each content L
-    /// held while R held the same bytes at a version. A user's delete of a file with a lost edit or
+    /// held while R held the same bytes at a version, and each content this device sent that the
+    /// server took. A user's delete of a file with a lost edit or
     /// a content resend removes only content listed here (section 4.4).
     pub held_contents: BTreeMap<NodeId, Vec<Vec<u8>>>,
 }
