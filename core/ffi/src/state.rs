@@ -12,13 +12,13 @@ use crate::types::{
     RecoveryGroup, RecoveryTrigger, SessionState, SyncProgress, SyncStatus,
 };
 
-pub(crate) type Halted = BTreeMap<String, (String, i64)>;
+pub(crate) type Seen = BTreeMap<String, (String, i64)>;
 
 pub(crate) fn session_state(
     status: &Status,
     questions: &[driver::Question],
     started: bool,
-    halted: &mut Halted,
+    seen: &mut Seen,
     helper: &Helper,
 ) -> SessionState {
     let shown = match started {
@@ -36,7 +36,7 @@ pub(crate) fn session_state(
         recent_changes: Vec::new(),
         questions: questions.iter().cloned().filter_map(question).collect(),
         problems: {
-            let mut problems = problems(status, halted);
+            let mut problems = problems(status, seen);
             problems.extend(questions.iter().filter_map(|asked| conflict(asked, helper)));
             problems.sort_by_key(|problem| problem.since_ms);
             problems
@@ -58,12 +58,12 @@ fn sync_status(status: &Status) -> SyncStatus {
     let any = |state| status.folders.iter().any(|folder| folder.state == state);
     if any(DriverFolderState::Halted) {
         SyncStatus::Halted
+    } else if any(DriverFolderState::Offline) {
+        SyncStatus::Offline
     } else if any(DriverFolderState::Bootstrapping) || any(DriverFolderState::CatchingUp) {
         SyncStatus::Syncing
     } else if any(DriverFolderState::Connecting) || any(DriverFolderState::Stopped) {
         SyncStatus::Connecting
-    } else if any(DriverFolderState::Offline) {
-        SyncStatus::Offline
     } else {
         SyncStatus::Idle
     }
@@ -101,9 +101,8 @@ pub(crate) fn folder(folder: &driver::FolderStatus) -> LinkedFolder {
         space_name: folder.space_name.clone(),
         path: folder.path.clone(),
         state: match folder.state {
-            DriverFolderState::Stopped
-            | DriverFolderState::Connecting
-            | DriverFolderState::Offline => FolderState::Waiting,
+            DriverFolderState::Stopped | DriverFolderState::Connecting => FolderState::Waiting,
+            DriverFolderState::Offline => FolderState::Offline,
             DriverFolderState::Bootstrapping | DriverFolderState::CatchingUp => {
                 FolderState::Syncing
             }
@@ -120,34 +119,61 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
-fn problems(status: &Status, halted: &mut Halted) -> Vec<Problem> {
+fn problems(status: &Status, seen: &mut Seen) -> Vec<Problem> {
     let now = now_ms();
-    let current: Halted = status
-        .folders
-        .iter()
-        .filter(|folder| folder.state == DriverFolderState::Halted)
-        .map(|folder| {
+    let mut found: Vec<(String, String, Problem)> = Vec::new();
+    for folder in &status.folders {
+        let space = &folder.space_id;
+        let space_id = Some(space.clone());
+        if folder.state == DriverFolderState::Halted {
             let reason = folder.problem.clone().unwrap_or_default();
-            let since = match halted.get(&folder.space_id) {
-                Some((seen, since)) if *seen == reason => *since,
-                _ => now,
-            };
-            (folder.space_id.clone(), (reason, since))
-        })
-        .collect();
-    *halted = current;
-    let mut problems: Vec<Problem> = halted
-        .iter()
-        .map(|(space_id, (reason, since))| Problem {
-            id: format!("halted-{space_id}"),
-            space_id: Some(space_id.clone()),
-            path: None,
-            kind: ProblemKind::FolderHalted {
-                reason: reason.clone(),
-            },
-            since_ms: *since,
-        })
-        .collect();
+            found.push((
+                format!("halted-{space}"),
+                reason.clone(),
+                Problem {
+                    id: String::new(),
+                    space_id: space_id.clone(),
+                    path: None,
+                    kind: ProblemKind::FolderHalted { reason },
+                    since_ms: 0,
+                },
+            ));
+        }
+        if let Some((unreachable, retry_at_ms)) = folder.unreachable() {
+            found.push((
+                format!("offline-{space}"),
+                String::new(),
+                Problem {
+                    id: String::new(),
+                    space_id: space_id.clone(),
+                    path: None,
+                    kind: match unreachable.no_internet {
+                        true => ProblemKind::NoInternet { retry_at_ms },
+                        false => ProblemKind::ServerUnreachable {
+                            reason: unreachable.why.clone(),
+                            retry_at_ms,
+                        },
+                    },
+                    since_ms: 0,
+                },
+            ));
+        }
+    }
+    let mut problems = Vec::new();
+    let mut current = Seen::new();
+    for (id, key, problem) in found {
+        let since = match seen.get(&id) {
+            Some((was, since)) if *was == key => *since,
+            _ => now,
+        };
+        current.insert(id.clone(), (key, since));
+        problems.push(Problem {
+            id,
+            since_ms: since,
+            ..problem
+        });
+    }
+    *seen = current;
     problems.sort_by_key(|problem| problem.since_ms);
     problems
 }
@@ -410,8 +436,8 @@ mod tests {
             ],
         };
         let status = status_of(&[DriverFolderState::Halted]);
-        let mut halted = Halted::new();
-        let state = session_state(&status, &[asked], true, &mut halted, &helper);
+        let mut seen = Seen::new();
+        let state = session_state(&status, &[asked], true, &mut seen, &helper);
         assert!(state.questions.is_empty());
         assert_eq!(state.problems.len(), 2);
         let problem = state
@@ -438,7 +464,7 @@ mod tests {
             String::from_utf8(parsed.stdout).unwrap(),
             "1\nresolve\n/Users/Ada's home\n/private/other $(false) profile\nunset\nunset\n"
         );
-        let resolved = session_state(&status, &[], true, &mut halted, &helper);
+        let resolved = session_state(&status, &[], true, &mut seen, &helper);
         assert_eq!(resolved.problems.len(), 1);
         assert!(matches!(
             resolved.problems[0].kind,
@@ -519,12 +545,15 @@ mod tests {
             (vec![Bootstrapping, Connecting], SyncStatus::Syncing),
             (vec![UpToDate, Connecting], SyncStatus::Connecting),
             (vec![Offline, UpToDate], SyncStatus::Offline),
+            (vec![Offline, CatchingUp], SyncStatus::Offline),
+            (vec![Bootstrapping, Offline], SyncStatus::Offline),
+            (vec![Connecting, Offline], SyncStatus::Offline),
         ] {
             assert_eq!(status(&status_of(&states), true), expected, "{states:?}");
         }
         assert_eq!(
             folder(&folder_in(Offline, None)).state,
-            FolderState::Waiting
+            FolderState::Offline
         );
         assert_eq!(
             folder(&folder_in(CatchingUp, None)).state,
@@ -537,14 +566,72 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_that_cannot_reach_the_server_is_a_problem_dated_when_it_first_appeared() {
+        let mut seen = Seen::new();
+        let mut status = status_of(&[]);
+        let waiting = |why: &str, until_ms| {
+            Some(driver::Wait {
+                kind: driver::WaitKind::Retry,
+                until_ms: Some(until_ms),
+                unreachable: Some(driver::Unreachable {
+                    why: why.into(),
+                    no_internet: false,
+                }),
+            })
+        };
+        status.folders = vec![driver::FolderStatus {
+            wait: waiting("the server's address could not be found", 1_000),
+            ..folder_in(DriverFolderState::Offline, None)
+        }];
+        let first = problems(&status, &mut seen);
+        let kinds: Vec<_> = (first.iter())
+            .map(|problem| (problem.path.clone(), problem.kind.clone()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [(
+                None,
+                ProblemKind::ServerUnreachable {
+                    reason: "the server's address could not be found".into(),
+                    retry_at_ms: Some(1_000),
+                }
+            )]
+        );
+
+        std::thread::sleep(Duration::from_millis(5));
+        status.folders[0].wait = waiting("the connection timed out", 3_000);
+        let later = problems(&status, &mut seen);
+        assert_eq!(later[0].since_ms, first[0].since_ms);
+
+        status.folders[0].wait =
+            (waiting("the connection timed out", 3_000)).map(|wait| driver::Wait {
+                until_ms: None,
+                ..wait
+            });
+        let trying = problems(&status, &mut seen);
+        assert_eq!(trying[0].since_ms, first[0].since_ms);
+        assert_eq!(
+            trying[0].kind,
+            ProblemKind::ServerUnreachable {
+                reason: "the connection timed out".into(),
+                retry_at_ms: None,
+            }
+        );
+
+        status.folders[0].wait = None;
+        assert!(problems(&status, &mut seen).is_empty());
+        assert!(seen.is_empty());
+    }
+
+    #[test]
     fn a_halted_folder_is_a_problem_dated_when_its_reason_first_appeared() {
-        let mut halted = Halted::new();
+        let mut seen = Seen::new();
         let mut status = status_of(&[]);
         status.folders = vec![folder_in(
             DriverFolderState::Halted,
             Some("the marker is missing"),
         )];
-        let first = problems(&status, &mut halted);
+        let first = problems(&status, &mut seen);
         assert_eq!(first.len(), 1);
         assert_eq!(
             first[0].kind,
@@ -553,15 +640,15 @@ mod tests {
             }
         );
         std::thread::sleep(Duration::from_millis(5));
-        assert_eq!(problems(&status, &mut halted), first);
+        assert_eq!(problems(&status, &mut seen), first);
 
         status.folders[0].problem = Some("the folder is missing".into());
-        let changed = problems(&status, &mut halted);
+        let changed = problems(&status, &mut seen);
         assert!(changed[0].since_ms > first[0].since_ms);
 
         status.folders[0].state = DriverFolderState::UpToDate;
-        assert!(problems(&status, &mut halted).is_empty());
-        assert!(halted.is_empty());
+        assert!(problems(&status, &mut seen).is_empty());
+        assert!(seen.is_empty());
     }
 
     #[test]
@@ -621,7 +708,7 @@ mod tests {
             &status_of(&[]),
             &questions,
             true,
-            &mut Halted::new(),
+            &mut Seen::new(),
             &helper(),
         );
         let limits = vec![
@@ -672,6 +759,90 @@ mod tests {
             (Answer::Cancel, "cancel"),
         ] {
             assert_eq!(word(answer), expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod unreachable_tests {
+    use super::*;
+
+    #[test]
+    fn a_device_without_internet_is_its_own_problem() {
+        let status = Status {
+            folders: vec![driver::FolderStatus {
+                space_id: "abc".into(),
+                space_name: "Documents".into(),
+                path: "/Users/ada/Documents".into(),
+                state: DriverFolderState::Offline,
+                history_id: None,
+                last_seq: None,
+                head_seq: None,
+                remote_nodes: 0,
+                local_entries: None,
+                questions: 0,
+                problem: Some(
+                    "no internet connection; trying again at 2026-11-14 12:00 UTC".into(),
+                ),
+                progress: None,
+                wait: Some(driver::Wait {
+                    kind: driver::WaitKind::Retry,
+                    until_ms: Some(7),
+                    unreachable: Some(driver::Unreachable {
+                        why: "there is no internet connection".into(),
+                        no_internet: true,
+                    }),
+                }),
+                recovery: None,
+            }],
+            ..Status::default()
+        };
+        let listed = problems(&status, &mut Seen::new());
+        let kinds: Vec<_> = listed.iter().map(|problem| problem.kind.clone()).collect();
+        assert_eq!(
+            kinds,
+            [ProblemKind::NoInternet {
+                retry_at_ms: Some(7)
+            }]
+        );
+    }
+
+    #[test]
+    fn a_stopped_or_halted_folder_is_not_a_server_unreachable_problem() {
+        for state in [DriverFolderState::Stopped, DriverFolderState::Halted] {
+            let status = Status {
+                folders: vec![driver::FolderStatus {
+                    space_id: "abc".into(),
+                    space_name: "Documents".into(),
+                    path: "/Users/ada/Documents".into(),
+                    state,
+                    history_id: None,
+                    last_seq: None,
+                    head_seq: None,
+                    remote_nodes: 0,
+                    local_entries: None,
+                    questions: 0,
+                    problem: Some("the folder is missing".into()),
+                    progress: None,
+                    wait: Some(driver::Wait {
+                        kind: driver::WaitKind::Retry,
+                        until_ms: Some(1),
+                        unreachable: Some(driver::Unreachable {
+                            why: "the server's address could not be found".into(),
+                            no_internet: false,
+                        }),
+                    }),
+                    recovery: None,
+                }],
+                ..Status::default()
+            };
+            let listed = problems(&status, &mut Seen::new());
+            assert!(
+                !listed
+                    .iter()
+                    .any(|problem| matches!(problem.kind, ProblemKind::ServerUnreachable { .. })),
+                "{state:?}: {listed:?}"
+            );
         }
     }
 }
