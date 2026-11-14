@@ -126,8 +126,6 @@ impl Paths {
         Ok(self.spaces().join(space_id).join("store.sqlite"))
     }
 
-    /// The directories a linked folder must neither contain nor sit inside, so that the credential, the stores and
-    /// the configuration are never synced.
     pub fn private_dirs(&self) -> Vec<PathBuf> {
         let mut dirs = vec![self.state_dir.clone(), self.runtime_dir.clone()];
         dirs.extend(self.config_file.parent().map(Path::to_path_buf));

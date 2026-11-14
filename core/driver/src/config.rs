@@ -83,7 +83,6 @@ impl Default for LocalTrash {
 }
 
 impl LocalTrash {
-    /// The cap in bytes.
     pub fn cap(&self) -> u64 {
         self.max_size_mb.saturating_mul(1_000_000)
     }
@@ -185,7 +184,6 @@ impl Config {
     }
 }
 
-/// One folder of the include list, with the folders it holds that are included one by one.
 #[derive(Default)]
 struct Included {
     whole: bool,
@@ -193,9 +191,6 @@ struct Included {
 }
 
 impl SyncRules {
-    /// The rules as lines of a root `.koiignore` file. An include list becomes `/*` followed by negations that
-    /// re-include each listed path and the folders leading to it, since a path cannot be re-included once one of
-    /// its parents is excluded. The exclude patterns follow, so they win over the include list.
     pub fn lines(&self) -> Result<Vec<String>, String> {
         let mut lines = Vec::new();
         if !self.include.is_empty() {
@@ -255,7 +250,6 @@ fn reinclude(node: &Included, prefix: &str, lines: &mut Vec<String>) {
     }
 }
 
-/// Escapes a name so that `.gitignore` syntax reads it literally.
 fn escape(name: &str) -> String {
     let mut escaped = String::with_capacity(name.len());
     for c in name.chars() {

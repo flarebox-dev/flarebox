@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! How much this process synced since it started, from zero: commits sent and received, and content bytes uploaded and
-//! downloaded. The counts only grow. Usage reports read them and send each day's total.
-
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static COMMITS_SENT: AtomicU64 = AtomicU64::new(0);
