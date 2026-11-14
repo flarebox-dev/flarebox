@@ -2083,7 +2083,13 @@ impl Commits {
             let rewound = (self.in_flight.as_ref())
                 .is_some_and(|flight| flight.commit.history_id != welcome.history_id);
             let cause = match *self.halted {
-                Some(Halt::Recovery(cause)) => cause,
+                Some(Halt::Recovery(cause))
+                    if !(rewound
+                        && cause.trigger == RecoveryTrigger::SpaceRewound
+                        && cause.restore_seq.is_none()) =>
+                {
+                    cause
+                }
                 _ if rewound => {
                     RecoveryCause::rewind(welcome.restore_seq, welcome.restore_point_ms)
                 }

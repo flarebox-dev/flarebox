@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use koidrive_engine::classify::{Class, Origin, Trees, Waiting};
-use koidrive_engine::commit::{Base, Commits, Failure, Reconnect};
+use koidrive_engine::commit::{Base, Commits, Failure, Halt, Reconnect};
 use koidrive_engine::effects::{BatchLimit, Effect, Effects};
 use koidrive_engine::ids::IdGen;
 use koidrive_engine::ignore::RuleFile;
@@ -1462,4 +1462,35 @@ fn an_answer_split_across_commits_keeps_its_approval_only_for_what_it_showed() {
         [("update", rest.to_owned())]
     );
     assert!(commits.in_flight().unwrap().commit.require_head);
+}
+
+#[test]
+fn a_rewind_a_refused_commit_found_takes_its_restore_point_from_the_next_welcome() {
+    let mut trees = trees(
+        &[("n", file(ROOT, "a", 2))],
+        &[("n", file(ROOT, "a", 1))],
+        &[live("n", file(ROOT, "a", 1))],
+    );
+    let mut commits = Commits::default();
+    let mut ids = IdGen::new(7);
+    assert!(commits.build(&mut trees, &mut ids, NOW, OLD, 1).is_some());
+    let mismatch = Error {
+        code: error::Code::HistoryMismatch as i32,
+        ..Default::default()
+    };
+    assert!(matches!(
+        commits.failed(&mismatch),
+        Ok(Failure::Halted(Halt::Recovery(_)))
+    ));
+    let welcome = Welcome {
+        history_id: NEW.into(),
+        restore_seq: 4,
+        restore_point_ms: NOW as i64,
+        ..Default::default()
+    };
+    assert_eq!(commits.connected(&welcome), Reconnect::Recovery);
+    assert_eq!(
+        commits.halted(),
+        Some(Halt::Recovery(RecoveryCause::rewind(4, NOW as i64)))
+    );
 }
