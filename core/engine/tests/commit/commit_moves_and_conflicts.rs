@@ -1048,6 +1048,39 @@ fn a_move_that_closes_a_cycle_against_trashed_folders_in_r_is_reverted() {
 }
 
 #[test]
+fn a_move_into_a_new_folder_inside_a_folder_r_moved_into_it_and_trashed_is_reverted() {
+    let mut trees = trees(&[
+        (
+            "d",
+            None,
+            Some(dir(ROOT, "d")),
+            Some(trashed(dir(ROOT, "d"))),
+        ),
+        (
+            "q",
+            Some(dir("n", "q")),
+            Some(dir("d", "q")),
+            Some(trashed(dir("d", "q"))),
+        ),
+        (
+            "p",
+            Some(dir(ROOT, "p")),
+            Some(dir(ROOT, "p")),
+            Some(trashed(dir("q", "p"))),
+        ),
+        ("n", Some(dir("p", "n")), None, None),
+    ]);
+    let (mut commits, mut ids) = (Commits::default(), IdGen::new(1));
+    assert_eq!(build(&mut commits, &mut trees, &mut ids), None);
+    assert!(trees.reverted().contains("q"));
+    let commit = build(&mut commits, &mut trees, &mut ids).unwrap();
+    assert!(
+        matches!(&ops(&commit)[..], [op::Op::CreateDir(create)] if create.node_id == "n" && create.parent_id == "p"),
+        "{commit:?}"
+    );
+}
+
+#[test]
 fn a_create_into_a_trashed_folder_that_moves_out_of_a_live_one_goes_first() {
     let mut trees = trees(&[
         (
