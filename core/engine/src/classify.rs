@@ -1429,27 +1429,14 @@ impl Trees {
     }
 
     /// After a listing replaces R, makes each node of `removed` that R now holds live and L
-    /// doesn't hold a local delete again when `here`, given the node's revision and the node
-    /// with the folders above it, says this device brought it back.
-    pub fn listed_removals(
-        &mut self,
-        removed: BTreeMap<NodeId, u64>,
-        here: impl Fn(u64, &[NodeId]) -> bool,
-    ) {
+    /// doesn't hold a local delete again when `here` says this device brought it back at the
+    /// node's revision.
+    pub fn listed_removals(&mut self, removed: BTreeMap<NodeId, u64>, here: impl Fn(u64) -> bool) {
         for id in removed.into_keys() {
             let Some(node) = self.r.get(&id).filter(|node| !node.trashed) else {
                 continue;
             };
-            let mut nodes = vec![id.clone()];
-            let mut current = &node.shape.parent;
-            while let Some(above) = self.r.get(current) {
-                if nodes.len() > self.r.len() {
-                    break;
-                }
-                nodes.push(current.clone());
-                current = &above.shape.parent;
-            }
-            if self.l.get(&id).is_some() || !here(node.meta_rev, &nodes) {
+            if self.l.get(&id).is_some() || !here(node.meta_rev) {
                 continue;
             }
             let shape = node.shape.clone();

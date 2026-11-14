@@ -1495,7 +1495,7 @@ impl World {
                         trees.set_listed_remote(id, node);
                     }
                 }
-                trees.listed_removals(removed, |seq, nodes| commits.listed_here(seq, nodes));
+                trees.listed_removals(removed, |seq| commits.listed_here(seq));
                 if *behind {
                     trees.forget_lost(
                         trashed,

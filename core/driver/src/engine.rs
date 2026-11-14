@@ -515,7 +515,7 @@ impl Engine {
             }
         }
         let commits = &self.commits;
-        (self.trees).listed_removals(removed, |seq, nodes| commits.listed_here(seq, nodes));
+        (self.trees).listed_removals(removed, |seq| commits.listed_here(seq));
         if behind {
             (self.trees).forget_lost(
                 trashed,

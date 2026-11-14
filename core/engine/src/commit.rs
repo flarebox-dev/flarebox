@@ -391,23 +391,12 @@ impl Commits {
     }
 
     /// Whether a listed node at revision `seq` was placed there by this device: by a commit of
-    /// this device that the server kept, or by the commit in flight, which is the commit at its
-    /// result's seq, or before its result arrives, a commit that moves or restores one of `nodes`.
-    pub fn listed_here(&self, seq: u64, nodes: &[NodeId]) -> bool {
-        if self.made_here(seq) && !self.lost_here(seq) {
-            return true;
-        }
-        let Some(flight) = self.in_flight.as_ref() else {
-            return false;
-        };
-        if let Some(result) = &flight.result {
-            return result.seq == seq;
-        }
-        flight.commit.ops.iter().any(|op| match &op.op {
-            Some(op::Op::Move(moved)) => nodes.contains(&moved.node_id),
-            Some(op::Op::Restore(restore)) => nodes.contains(&restore.node_id),
-            _ => false,
-        })
+    /// this device that the server kept, or by the commit in flight, whose result has that seq.
+    pub fn listed_here(&self, seq: u64) -> bool {
+        (self.made_here(seq) && !self.lost_here(seq))
+            || (self.in_flight.as_ref())
+                .and_then(|flight| flight.result.as_ref())
+                .is_some_and(|result| result.seq == seq)
     }
 
     /// Whether one of this device's commits that the server lost has seq `seq`: one above
