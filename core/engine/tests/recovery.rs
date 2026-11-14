@@ -901,6 +901,25 @@ fn discarding_an_edit_of_a_file_the_rewind_trashed_sends_nothing() {
 }
 
 #[test]
+fn an_edit_of_a_trashed_file_whose_sent_revival_the_rewind_took_is_held_and_not_sent() {
+    let mut trees = trees(
+        &[("n", file(ROOT, "a", 2))],
+        &[("n", file(ROOT, "a", 1))],
+        &[Remote("n", file(ROOT, "a", 1), true, 1)],
+    );
+    assert!(trees.unsent_edits().contains("n"));
+    trees.set_synced("n".into(), Some(file(ROOT, "a", 2)));
+    let (mut commits, mut ids) = recovered(&mut trees, 0);
+    let question = asked(&commits, RecoveryGroup::ChangedOnThisDevice, &["n"]);
+    assert_eq!(ops(&mut commits, &mut trees, &mut ids), []);
+    assert!(commits.decide(&question.id, Answer::Publish));
+    assert_eq!(
+        ops(&mut commits, &mut trees, &mut ids),
+        [("update", "n".to_owned())]
+    );
+}
+
+#[test]
 fn a_name_the_disk_and_the_server_agree_on_at_recovery_is_not_sent_after_the_server_moves_on() {
     let mut trees = trees(
         &[("n", file(ROOT, "a", 2))],
